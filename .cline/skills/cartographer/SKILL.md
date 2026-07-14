@@ -59,25 +59,25 @@ First, check if `docs/CODEBASE_MAP.md` already exists:
 
 ### Step 2: Scan the Codebase
 
-Run the scanner script to get an overview. The script is located at `.cursor/skills/cartographer/scripts/scan-codebase.py`.
+Run the scanner script to get an overview. The script is located at `.cline/skills/cartographer/scripts/scan-codebase.py`.
 
 Run from the repository root (where `pyproject.toml` lives). Try these methods in order until one works:
 
 ```bash
 # Option 1: UV run (auto-installs tiktoken in isolated env)
-uv run .cursor/skills/cartographer/scripts/scan-codebase.py . --format json
+uv run .cline/skills/cartographer/scripts/scan-codebase.py . --format json
 
 # Option 2: Using project venv directly (Windows)
-.venv\Scripts\python .cursor/skills/cartographer/scripts/scan-codebase.py . --format json
+.venv\Scripts\python .cline/skills/cartographer/scripts/scan-codebase.py . --format json
 
 # Option 3: Using project venv directly (Unix)
-.venv/bin/python .cursor/skills/cartographer/scripts/scan-codebase.py . --format json
+.venv/bin/python .cline/skills/cartographer/scripts/scan-codebase.py . --format json
 
 # Option 4: Direct execution with system Python (requires tiktoken installed)
-python .cursor/skills/cartographer/scripts/scan-codebase.py . --format json
+python .cline/skills/cartographer/scripts/scan-codebase.py . --format json
 
 # Option 5: Explicit python3
-python3 .cursor/skills/cartographer/scripts/scan-codebase.py . --format json
+python3 .cline/skills/cartographer/scripts/scan-codebase.py . --format json
 ```
 
 **Note:** The scanner requires `tiktoken`. When using `uv run`, tiktoken is pulled automatically via the script's inline metadata — no separate install needed.

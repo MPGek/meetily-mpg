@@ -310,7 +310,7 @@ impl WhisperEngine {
                     // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
 
                     // Load whisper context with hardware-optimized parameters
-                    WhisperContext::new_with_params(&model_info.path.to_string_lossy(), context_param)
+                    WhisperContext::new_with_params(model_info.path.to_string_lossy().as_ref(), context_param)
                         .map_err(|e| anyhow!("Failed to load model {}: {}", model_name, e))?
                     // Suppressor dropped here, stderr restored
                 };
@@ -555,7 +555,7 @@ impl WhisperEngine {
 
         // Additional suppression to reduce C library verbosity
         params.set_suppress_blank(true);
-        params.set_suppress_non_speech_tokens(true);
+        params.set_suppress_nst(true);
         params.set_temperature(adaptive_config.temperature);
         params.set_max_initial_ts(1.0);
         params.set_entropy_thold(2.4);
@@ -592,29 +592,30 @@ impl WhisperEngine {
         let mut total_confidence = 0.0;
         let mut segment_count = 0;
 
-        let num_segments = num_segments?;
-        for i in 0..num_segments {
-            let segment_text = match state.full_get_segment_text_lossy(i) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
+        // whisper-rs v0.16.0: full_n_segments() returns i32 directly, not Result
+        // get_segment() returns Option<WhisperSegment> instead of old full_get_segment_text returning Result<String>
+        let num_seg_count = num_segments;
+        for i in 0..num_seg_count as i32 {
+            if let Some(segment) = state.get_segment(i) {
+                let segment_text = segment.to_str_lossy().unwrap_or_default().to_string();
 
-            // Calculate confidence based on segment length and duration (simplified approach)
-            let segment_length = segment_text.len() as f32;
+                // Calculate confidence based on segment length and duration (simplified approach)
+                let segment_length = segment_text.len() as f32;
             let segment_confidence = if segment_length > 0.0 {
                 (segment_length / 100.0).min(0.9) + 0.1 // 0.1 to 1.0 confidence based on text length
             } else {
                 0.1
             };
-            total_confidence += segment_confidence;
-            segment_count += 1;
+                total_confidence += segment_confidence;
+                segment_count += 1;
 
-            let cleaned_text = segment_text.trim();
-            if !cleaned_text.is_empty() {
-                if !result.is_empty() {
-                    result.push(' ');
+                let cleaned_text = segment_text.trim();
+                if !cleaned_text.is_empty() {
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(cleaned_text);
                 }
-                result.push_str(cleaned_text);
             }
         }
 
@@ -670,8 +671,8 @@ impl WhisperEngine {
 
         // BALANCED settings - good quality with reasonable speed
         params.set_suppress_blank(true);
-        params.set_suppress_non_speech_tokens(true);
-        params.set_temperature(0.3);             // Lower than 0.4 for consistency, higher than 0.0 for quality
+        params.set_suppress_nst(true);
+        params.set_temperature(0.3);             // Lower than 0.4 for consistency, higher than 0.0 for accuracy
         params.set_max_initial_ts(1.0);
         params.set_entropy_thold(2.4);
         params.set_logprob_thold(-1.0);
@@ -740,39 +741,37 @@ impl WhisperEngine {
         state.full(params, &audio_data)?;
 
         // Extract text with improved segment handling
-        let num_segments = state.full_n_segments()?;
+        // whisper-rs v0.16.0: full_n_segments() returns i32 directly, not Result
+        let num_seg_count = state.full_n_segments();
 
         // Performance optimization: reduce segment completion logging
         // Only log for significant transcriptions to avoid I/O overhead
-        if (should_log_transcription || num_segments > 0) && (num_segments > 3 || duration_seconds > 5.0) {
-            perf_debug!("Transcription #{} completed with {} segments ({:.1}s)", transcription_count, num_segments, duration_seconds);
+        if (should_log_transcription || num_seg_count > 0) && (num_seg_count > 3 || duration_seconds > 5.0) {
+            perf_debug!("Transcription #{} completed with {} segments ({:.1}s)", transcription_count, num_seg_count, duration_seconds);
         }
         let mut result = String::new();
 
-        for i in 0..num_segments {
-            let segment_text = match state.full_get_segment_text_lossy(i) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
+        for i in 0..num_seg_count as i32 {
+            if let Some(segment) = state.get_segment(i) {
+                let segment_text = segment.to_str_lossy().unwrap_or_default().to_string();
 
-            let _start_time = state.full_get_segment_t0(i).unwrap_or(0);
-            let _end_time = state.full_get_segment_t1(i).unwrap_or(0);
-
-            // Performance optimization: remove per-segment debug logging
-            // This was causing significant I/O overhead during transcription
-            // Only log segments for very long audio (>30s) or when explicitly debugging
-            if duration_seconds > 30.0 {
-                perf_trace!("Segment {} ({:.2}s-{:.2}s): '{}'",
-                           i, _start_time as f64 / 100.0, _end_time as f64 / 100.0, segment_text);
-            }
-
-            // Clean and append segment text
-            let cleaned_text = segment_text.trim();
-            if !cleaned_text.is_empty() {
-                if !result.is_empty() {
-                    result.push(' ');
+                // Performance optimization: remove per-segment debug logging
+                // This was causing significant I/O overhead during transcription
+                // Only log segments for very long audio (>30s) or when explicitly debugging
+                if duration_seconds > 30.0 {
+                    let start_s = segment.start_timestamp() as f64 / 100.0;
+                    let end_s = segment.end_timestamp() as f64 / 100.0;
+                    perf_trace!("Segment {} ({:.2}s-{:.2}s): '{}'", i, start_s, end_s, segment_text);
                 }
-                result.push_str(cleaned_text);
+
+                // Clean and append segment text
+                let cleaned_text = segment_text.trim();
+                if !cleaned_text.is_empty() {
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(cleaned_text);
+                }
             }
         }
 
