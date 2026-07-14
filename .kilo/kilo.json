@@ -1,0 +1,6 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "plugin": [
+    "file:///D:/Projects_VK/Own/meetily/.kilo/plugins/graphify.js"
+  ]
+}

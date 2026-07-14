@@ -153,12 +153,24 @@ This step has two parts: **structural extraction** (deterministic, free) and **s
 
 > **graphify needs no API key. Never ask the user for one, and never block on one.** Code is extracted structurally (AST) with no LLM and no key at all — a code-only corpus (the common `/graphify .` on a repo) skips semantic extraction entirely, so it needs nothing here: go straight to Part A and skip Part B. Semantic extraction (only for docs, papers, and images) uses Gemini **only if** `GEMINI_API_KEY`/`GOOGLE_API_KEY` is already set; otherwise the host agent itself is the LLM. graphify does **not** read `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or any other provider key. If you catch yourself about to prompt for, wait on, or stop because of a missing API key, that is a misread of this skill — proceed without one.
 
-**Before semantic extraction:** check whether `GEMINI_API_KEY` or `GOOGLE_API_KEY` is set. If neither is set, print this one-liner to the user:
-> Tip: set `GEMINI_API_KEY` or `GOOGLE_API_KEY` to use Gemini for semantic extraction (`pip install 'graphifyy[gemini]'`).
+**Before semantic extraction:** check for a custom extraction endpoint, then Gemini, then fall back to subagent dispatch:
 
-Print it once, then continue — do not wait for the user to supply a key. If `GEMINI_API_KEY` or `GOOGLE_API_KEY` IS set, use `graphify.llm.extract_corpus_parallel(files, backend="gemini")` for semantic extraction instead of dispatching subagents. The default Gemini model is `gemini-3-flash-preview`; set `GRAPHIFY_GEMINI_MODEL` or pass `--model` in headless CLI flows to override it.
+1. **Custom endpoint (highest priority):** If `GRAPHIFY_EXTRACT_URL` is set (e.g. `http://192.168.12.130:1234/v1`), use it as an OpenAI-compatible backend. Set `GRAPHIFY_OPENAI_API_KEY` to any non-empty value (the value is ignored when a custom URL is used) to activate this mode. The default model is inferred from the endpoint or set via `GRAPHIFY_EXTRACT_MODEL`.
 
-> **No other API keys are read.** When `GEMINI_API_KEY`/`GOOGLE_API_KEY` are unset, semantic extraction falls to the host agent itself — the running session is the LLM. On a host that dispatches subagents (e.g. Claude Code), dispatch them as written in Part B. On a host that runs the CLI directly in a terminal and cannot dispatch subagents, do not stall: a code-only corpus has no semantic work, so write the empty semantic file (Part B "Fast path") and continue to Part C; for a corpus with docs/papers/images, either set a Gemini key or extract those inline yourself, but in no case prompt for `ANTHROPIC_API_KEY` — that prompt is a misread of this skill.
+2. **Gemini:** If `GEMINI_API_KEY` or `GOOGLE_API_KEY` IS set, use `graphify.llm.extract_corpus_parallel(files, backend="gemini")` for semantic extraction instead of dispatching subagents. The default Gemini model is `gemini-3-flash-preview`; set `GRAPHIFY_GEMINI_MODEL` or pass `--model` in headless CLI flows to override it.
+
+3. **Fallback:** If neither a custom endpoint nor Gemini is configured, print this one-liner and fall back to subagent dispatch:
+> Tip: set `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `GRAPHIFY_EXTRACT_URL` to use an LLM for semantic extraction (`pip install 'graphifyy[gemini]'`).
+
+Print it once, then continue — do not wait for the user to supply a key.
+
+**Perform semantic extraction using one of these backends:**
+
+- **Custom endpoint (highest priority):** If `GRAPHIFY_EXTRACT_URL` is set, use `graphify.llm.extract_corpus_parallel(files, backend="openai", base_url=GRAPHIFY_EXTRACT_URL)` for OpenAI-compatible API extraction. Set `GRAPHIFY_OPENAI_API_KEY` to any non-empty value (the key itself is ignored when a custom URL is active). Model selection via `GRAPHIFY_EXTRACT_MODEL`.
+- **Gemini:** If `GEMINI_API_KEY` or `GOOGLE_API_KEY` IS set, use `graphify.llm.extract_corpus_parallel(files, backend="gemini")` for semantic extraction instead of dispatching subagents. The default Gemini model is `gemini-3-flash-preview`; set `GRAPHIFY_GEMINI_MODEL` or pass `--model` in headless CLI flows to override it.
+- **Fallback:** When neither custom endpoint nor Gemini, fall back to the host agent itself (or subagent dispatch on hosts like Claude Code).
+
+> **No other API keys are read.** When no custom endpoint and no Gemini key are set, semantic extraction falls to the host agent itself — the running session is the LLM. On a host that dispatches subagents (e.g. Claude Code), dispatch them as written in Part B. On a host that runs the CLI directly in a terminal and cannot dispatch subagents, do not stall: a code-only corpus has no semantic work, so write the empty semantic file (Part B "Fast path") and continue to Part C; for a corpus with docs/papers/images, either set a Gemini key or extract those inline yourself, but in no case prompt for `ANTHROPIC_API_KEY` — that prompt is a misread of this skill.
 
 **Run Part A (AST) and Part B (semantic) in parallel. Dispatch all semantic subagents AND start AST extraction in the same message. Both can run simultaneously since they operate on different file types. Merge results in Part C as before.**
 
