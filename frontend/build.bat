@@ -5,6 +5,8 @@ REM This script sets up environment variables and builds the Tauri application
 REM Exit on error
 setlocal enabledelayedexpansion
 
+chcp 65001
+
 REM Check if debug mode is set
 if "%~1" == "debug" (
     set "DEBUG=true"

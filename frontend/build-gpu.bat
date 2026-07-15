@@ -6,6 +6,8 @@ REM Based on the existing build.bat with GPU detection enhancements
 REM Exit on error
 setlocal enabledelayedexpansion
 
+chcp 65001
+
 REM Check if help is requested
 if "%~1" == "help" (
     call :_print_help

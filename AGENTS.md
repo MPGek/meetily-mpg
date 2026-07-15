@@ -45,6 +45,15 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
+## Version Changes
+
+When bumping the app version, update **all three** locations:
+- `frontend/src-tauri/Cargo.toml` — Rust package version
+- `frontend/src-tauri/tauri.conf.json` — Tauri app version (this is what the running app reads)
+- Any hardcoded version strings in UI components (e.g. `Sidebar/index.tsx`)
+
+Tauri ignores `Cargo.toml` for its runtime version; it only reads `tauri.conf.json`.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**

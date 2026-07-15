@@ -5,7 +5,10 @@
   ],
   "indexing": {
     "enabled": true,
-    "provider": "kilo",
-    "model": "mistralai/mistral-embed-2312"
+    "provider": "openai-compatible",
+    "openai-compatible": {
+      "baseUrl": "http://192.168.12.130:1234/v1/embeddings"
+    },
+    "dimension": 768
   }
 }

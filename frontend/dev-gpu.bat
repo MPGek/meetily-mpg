@@ -3,6 +3,8 @@ REM Meetily GPU-Accelerated Development Script for Windows
 REM Automatically detects and runs in development mode with optimal GPU features
 REM Based on build-gpu.bat but for development (debug build, tauri dev)
 
+chcp 65001
+
 REM Exit on error
 setlocal enabledelayedexpansion
 
