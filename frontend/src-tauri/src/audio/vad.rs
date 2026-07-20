@@ -3,6 +3,7 @@ use silero_rs::{VadConfig, VadSession, VadTransition};
 use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::time::Duration;
+use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 /// Represents a complete speech segment detected by VAD
 #[derive(Debug, Clone)]
@@ -26,6 +27,10 @@ pub struct ContinuousVadProcessor {
     speech_start_sample: usize,
     // State tracking for smart logging
     last_logged_state: bool,
+    // Persistent rubato resampler for 48kHz → 16kHz conversion
+    resampler: Option<SincFixedIn<f32>>,
+    resampler_input_buffer: Vec<f32>,
+    resampler_chunk_size: usize,
 }
 
 impl ContinuousVadProcessor {
@@ -64,21 +69,55 @@ impl ContinuousVadProcessor {
         // VAD uses 30ms chunks at 16kHz (480 samples)
         let vad_chunk_size = (VAD_SAMPLE_RATE as f32 * 0.03) as usize; // 480 samples
 
+        // Initialize persistent rubato resampler for 48kHz → 16kHz conversion
+        const RESAMPLER_CHUNK_SIZE: usize = 512;
+        let resampler = if input_sample_rate != VAD_SAMPLE_RATE {
+            let ratio = input_sample_rate as f64 / VAD_SAMPLE_RATE as f64;
+            let params = SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 256,
+                window: WindowFunction::BlackmanHarris2,
+            };
+
+            match SincFixedIn::<f32>::new(
+                1.0 / ratio, // Downsample ratio (input_rate / output_rate inverted for rubato)
+                2.0,
+                params,
+                RESAMPLER_CHUNK_SIZE,
+                1, // Mono
+            ) {
+                Ok(r) => {
+                    info!("VAD resampler initialized: {}Hz → {}Hz", input_sample_rate, VAD_SAMPLE_RATE);
+                    Some(r)
+                }
+                Err(e) => {
+                    warn!("Failed to create VAD resampler: {}, will use fallback", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         info!("VAD processor created: input={}Hz, vad={}Hz, chunk_size={} samples",
               input_sample_rate, VAD_SAMPLE_RATE, vad_chunk_size);
 
         Ok(Self {
             session,
             chunk_size: vad_chunk_size,
-            sample_rate: input_sample_rate, // Store input rate for resampling ratio in resample_to_16k()
+            sample_rate: input_sample_rate,
             buffer: Vec::with_capacity(vad_chunk_size * 2),
             speech_segments: VecDeque::new(),
             current_speech: Vec::new(),
             in_speech: false,
             processed_samples: 0,
             speech_start_sample: 0,
-            // Initialize state tracking
             last_logged_state: false,
+            resampler,
+            resampler_input_buffer: Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2),
+            resampler_chunk_size: RESAMPLER_CHUNK_SIZE,
         })
     }
 
@@ -109,54 +148,56 @@ impl ContinuousVadProcessor {
         Ok(completed_segments)
     }
 
-    /// Improved resampling from input sample rate to 16kHz with anti-aliasing
-    /// Uses linear interpolation and basic low-pass filtering for better quality
-    fn resample_to_16k(&self, samples: &[f32]) -> Result<Vec<f32>> {
+    /// Resample from input sample rate to 16kHz using persistent rubato resampler
+    fn resample_to_16k(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
         if self.sample_rate == 16000 {
             return Ok(samples.to_vec());
         }
 
-        // Calculate downsampling ratio
-        let ratio = self.sample_rate as f64 / 16000.0;
-        let output_len = (samples.len() as f64 / ratio) as usize;
-        let mut resampled = Vec::with_capacity(output_len);
+        let mut resampled_output = Vec::new();
 
-        // Apply simple low-pass filter before downsampling to reduce aliasing
-        let cutoff_freq = 0.4; // Normalized frequency (0.4 * Nyquist)
-        let mut filtered_samples = Vec::with_capacity(samples.len());
-        
-        // Simple moving average filter (basic low-pass)
-        let filter_size = (self.sample_rate as f64 / (cutoff_freq * self.sample_rate as f64)) as usize;
-        let filter_size = std::cmp::max(1, std::cmp::min(filter_size, 5)); // Limit filter size
-        
-        for i in 0..samples.len() {
-            let start = if i >= filter_size { i - filter_size } else { 0 };
-            let end = std::cmp::min(i + filter_size + 1, samples.len());
-            let sum: f32 = samples[start..end].iter().sum();
-            filtered_samples.push(sum / (end - start) as f32);
-        }
+        // Add new samples to input buffer
+        self.resampler_input_buffer.extend_from_slice(samples);
 
-        // Linear interpolation downsampling
-        for i in 0..output_len {
-            let source_pos = i as f64 * ratio;
-            let source_index = source_pos as usize;
-            let fraction = source_pos - source_index as f64;
-            
-            if source_index + 1 < filtered_samples.len() {
-                // Linear interpolation
-                let sample1 = filtered_samples[source_index];
-                let sample2 = filtered_samples[source_index + 1];
-                let interpolated = sample1 + (sample2 - sample1) * fraction as f32;
-                resampled.push(interpolated);
-            } else if source_index < filtered_samples.len() {
-                resampled.push(filtered_samples[source_index]);
+        // Process complete chunks through the resampler
+        if let Some(ref mut resampler) = self.resampler {
+            while self.resampler_input_buffer.len() >= self.resampler_chunk_size {
+                let chunk: Vec<f32> = self.resampler_input_buffer.drain(..self.resampler_chunk_size).collect();
+                let waves_in = vec![chunk];
+
+                match resampler.process(&waves_in, None) {
+                    Ok(mut waves_out) => {
+                        if let Some(output) = waves_out.pop() {
+                            resampled_output.extend_from_slice(&output);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("VAD resampler processing failed: {}", e);
+                        break;
+                    }
+                }
             }
         }
 
-        debug!("Resampled from {} samples ({}Hz) to {} samples (16kHz) with anti-aliasing",
-               samples.len(), self.sample_rate, resampled.len());
+        // If no resampler or processing failed, fall back to simple linear interpolation
+        if resampled_output.is_empty() && self.resampler.is_none() {
+            let ratio = self.sample_rate as f64 / 16000.0;
+            let output_len = (samples.len() as f64 / ratio) as usize;
+            for i in 0..output_len {
+                let source_pos = i as f64 * ratio;
+                let source_index = source_pos as usize;
+                let fraction = source_pos - source_index as f64;
 
-        Ok(resampled)
+                if source_index + 1 < samples.len() {
+                    let interpolated = samples[source_index] + (samples[source_index + 1] - samples[source_index]) * fraction as f32;
+                    resampled_output.push(interpolated);
+                } else if source_index < samples.len() {
+                    resampled_output.push(samples[source_index]);
+                }
+            }
+        }
+
+        Ok(resampled_output)
     }
 
     /// Flush any remaining audio and return final speech segments

@@ -71,6 +71,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    source_device,
 }: {
     id: string;
     timestamp: number;
@@ -78,12 +79,94 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    source_device?: string;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
+    // Determine layout based on source_device
+    const isMic = source_device === 'Microphone';
+    const isSystem = source_device === 'System';
+    const isLegacy = !isMic && !isSystem;
+
+    if (isLegacy) {
+        // Legacy neutral style - left-aligned, no bubble
+        return (
+            <div id={`segment-${id}`} className="mb-3">
+                <div className="flex items-start gap-2">
+                    <Tooltip>
+                        <TooltipTrigger>
+                            <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                                {formatRecordingTime(timestamp)}
+                            </span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                            {confidence !== undefined && showConfidence && (
+                                <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
+                            )}
+                        </TooltipContent>
+                    </Tooltip>
+                    <div className="flex-1">
+                        {isStreaming ? (
+                            <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
+                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                            </div>
+                        ) : (
+                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        )}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    if (isMic) {
+        // Microphone: left-aligned, timestamp on left, blue bubble
+        return (
+            <div id={`segment-${id}`} className="mb-3">
+                <div className="flex items-start gap-2">
+                    <Tooltip>
+                        <TooltipTrigger>
+                            <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                                {formatRecordingTime(timestamp)}
+                            </span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                            {confidence !== undefined && showConfidence && (
+                                <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
+                            )}
+                        </TooltipContent>
+                    </Tooltip>
+                    <div className="flex-1 max-w-[80%]">
+                        {isStreaming ? (
+                            <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                            </div>
+                        ) : (
+                            <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // System: right-aligned, timestamp on right, green bubble
     return (
         <div id={`segment-${id}`} className="mb-3">
-            <div className="flex items-start gap-2">
+            <div className="flex items-start gap-2 justify-end">
+                <div className="flex-1 max-w-[80%]">
+                    {isStreaming ? (
+                        <div className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        </div>
+                    ) : (
+                        <div className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        </div>
+                    )}
+                </div>
                 <Tooltip>
                     <TooltipTrigger>
                         <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
@@ -96,15 +179,6 @@ const TranscriptSegment = memo(function TranscriptSegment({
                         )}
                     </TooltipContent>
                 </Tooltip>
-                <div className="flex-1">
-                    {isStreaming ? (
-                        <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
-                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
-                        </div>
-                    ) : (
-                        <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
-                    )}
-                </div>
             </div>
         </div>
     );
@@ -296,6 +370,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        source_device={segment.source_device}
                                     />
                                 </div>
                             );
@@ -352,6 +427,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        source_device={segment.source_device}
                                     />
                                 </motion.div>
                             );

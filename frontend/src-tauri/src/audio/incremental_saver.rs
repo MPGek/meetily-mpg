@@ -96,7 +96,7 @@ impl IncrementalAudioSaver {
         encode_single_audio(
             bytemuck::cast_slice(&audio_data),
             self.sample_rate,
-            1,  // mono
+            2,  // stereo
             &checkpoint_path
         )?;
 
@@ -440,6 +440,7 @@ mod tests {
                 timestamp: i as f64 * 0.5,  // timestamp in seconds
                 chunk_id: i as u64,
                 device_type: DeviceType::Microphone,
+                channels: 1,
             };
             saver.add_chunk(chunk).unwrap();
         }
