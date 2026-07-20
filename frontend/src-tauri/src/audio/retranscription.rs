@@ -1,8 +1,9 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
+use crate::api::TranscriptSegment;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{create_transcript_segments, create_transcript_segments_with_source, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
@@ -217,86 +218,178 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    // Convert to 16kHz mono format (CPU-intensive, run in blocking task)
-    let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format()
-    })
-    .await
-    .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
-    info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
+    // Determine if audio is stereo or mono
+    let is_stereo = decoded.channels == 2;
+    info!("Audio is {} ({} channels)", if is_stereo { "stereo" } else { "mono" }, decoded.channels);
 
-    emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
+    // Extract channels and resample to 16kHz
+    // For stereo: left=Microphone, right=System
+    // For mono: single channel with source_device=None
+    let (mic_samples, sys_samples) = if is_stereo {
+        emit_progress(&app, &meeting_id, "decoding", 17, "Extracting audio channels...");
+
+        let decoded_for_extract = decoded.clone();
+        let (left, right) = tokio::task::spawn_blocking(move || {
+            decoded_for_extract.extract_channels()
+        })
+        .await
+        .map_err(|e| anyhow!("Channel extraction task panicked: {}", e))?;
+
+        let left_samples = left.unwrap_or_default();
+        let right_samples = right.unwrap_or_default();
+
+        emit_progress(&app, &meeting_id, "decoding", 18, "Resampling channels to 16kHz...");
+
+        // Resample each channel independently in blocking tasks
+        let sample_rate = decoded.sample_rate;
+        let left_for_resample = left_samples;
+        let right_for_resample = right_samples;
+
+        let mic_resampled = tokio::task::spawn_blocking(move || {
+            resample_channel_to_16k(&left_for_resample, sample_rate)
+        })
+        .await
+        .map_err(|e| anyhow!("Mic resample task panicked: {}", e))?;
+
+        let sys_resampled = tokio::task::spawn_blocking(move || {
+            resample_channel_to_16k(&right_for_resample, sample_rate)
+        })
+        .await
+        .map_err(|e| anyhow!("System resample task panicked: {}", e))?;
+
+        info!("Resampled mic channel: {} samples, system channel: {} samples",
+            mic_resampled.len(), sys_resampled.len());
+
+        (Some(mic_resampled), Some(sys_resampled))
+    } else {
+        // Mono: convert to 16kHz using existing path
+        let mono_samples = tokio::task::spawn_blocking(move || {
+            decoded.to_whisper_format()
+        })
+        .await
+        .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
+        info!("Converted mono to 16kHz format: {} samples", mono_samples.len());
+        (Some(mono_samples), None)
+    };
 
     // Check for cancellation
     if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    // Use VAD to find natural speech boundaries (same approach as live transcription)
-    // IMPORTANT: Run VAD in a blocking task to avoid blocking the async runtime
-    // For large files (35+ minutes), VAD processing can take several minutes
-    let app_for_vad = app.clone();
-    let meeting_id_for_vad = meeting_id.clone();
+    // Run VAD on each channel independently
+    // For stereo: VAD on mic (20-25%) and system (25-30%)
+    // For mono: VAD on single channel (20-25%)
+    let (mic_speech_segments, sys_speech_segments) = if is_stereo {
+        let mic_audio = mic_samples.as_ref().unwrap().clone();
+        let sys_audio = sys_samples.as_ref().unwrap().clone();
 
-    let speech_segments = tokio::task::spawn_blocking(move || {
-        get_speech_chunks_with_progress(
-            &audio_samples,
-            VAD_REDEMPTION_TIME_MS,
-            |vad_progress, segments_found| {
-                // Map VAD progress (0-100) to overall progress (20-25)
-                let overall_progress = 20 + (vad_progress as f32 * 0.05) as u32;
-                emit_progress(
-                    &app_for_vad,
-                    &meeting_id_for_vad,
-                    "vad",
-                    overall_progress,
-                    &format!("Detecting speech segments... {}% ({} found)", vad_progress, segments_found),
-                );
+        emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech in microphone channel...");
 
-                // Return false to cancel if cancellation requested
-                !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
-            },
-        )
-    })
-    .await
-    .map_err(|e| anyhow!("VAD task panicked: {}", e))?
-    .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
+        let app_for_mic_vad = app.clone();
+        let meeting_id_for_mic_vad = meeting_id.clone();
+        let mic_segments = tokio::task::spawn_blocking(move || {
+            get_speech_chunks_with_progress(
+                &mic_audio,
+                VAD_REDEMPTION_TIME_MS,
+                |vad_progress, segments_found| {
+                    let overall_progress = 20 + (vad_progress as f32 * 0.05) as u32;
+                    emit_progress(
+                        &app_for_mic_vad,
+                        &meeting_id_for_mic_vad,
+                        "vad",
+                        overall_progress,
+                        &format!("Mic VAD... {}% ({} found)", vad_progress, segments_found),
+                    );
+                    !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("Mic VAD task panicked: {}", e))?
+        .map_err(|e| anyhow!("Mic VAD processing failed: {}", e))?;
 
-    let total_segments = speech_segments.len();
-    info!("VAD detected {} speech segments (redemption_time={}ms)", total_segments, VAD_REDEMPTION_TIME_MS);
-
-    // Diagnostic: log segment duration distribution
-    if !speech_segments.is_empty() {
-        let durations_ms: Vec<f64> = speech_segments.iter()
-            .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
-            .collect();
-        let total_speech_ms: f64 = durations_ms.iter().sum();
-        let avg_duration = total_speech_ms / durations_ms.len() as f64;
-        let min_duration = durations_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_duration = durations_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        info!(
-            "VAD segment stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s/{:.1}s ({:.0}%)",
-            avg_duration, min_duration, max_duration,
-            total_speech_ms / 1000.0, duration_seconds,
-            (total_speech_ms / 1000.0 / duration_seconds) * 100.0
-        );
-        // Log first 10 segments for detailed inspection
-        for (i, seg) in speech_segments.iter().take(10).enumerate() {
-            let dur = seg.end_timestamp_ms - seg.start_timestamp_ms;
-            debug!("  Segment {}: {:.0}ms-{:.0}ms ({:.0}ms, {} samples)",
-                i, seg.start_timestamp_ms, seg.end_timestamp_ms, dur, seg.samples.len());
+        // Check for cancellation between channels
+        if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+            return Err(anyhow!("Retranscription cancelled"));
         }
-        if total_segments > 10 {
-            debug!("  ... and {} more segments", total_segments - 10);
-        }
-    }
 
+        emit_progress(&app, &meeting_id, "vad", 25, "Detecting speech in system channel...");
+
+        let app_for_sys_vad = app.clone();
+        let meeting_id_for_sys_vad = meeting_id.clone();
+        let sys_segments = tokio::task::spawn_blocking(move || {
+            get_speech_chunks_with_progress(
+                &sys_audio,
+                VAD_REDEMPTION_TIME_MS,
+                |vad_progress, segments_found| {
+                    let overall_progress = 25 + (vad_progress as f32 * 0.05) as u32;
+                    emit_progress(
+                        &app_for_sys_vad,
+                        &meeting_id_for_sys_vad,
+                        "vad",
+                        overall_progress,
+                        &format!("System VAD... {}% ({} found)", vad_progress, segments_found),
+                    );
+                    !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("System VAD task panicked: {}", e))?
+        .map_err(|e| anyhow!("System VAD processing failed: {}", e))?;
+
+        info!("VAD detected {} mic segments, {} system segments",
+            mic_segments.len(), sys_segments.len());
+
+        (mic_segments, sys_segments)
+    } else {
+        // Mono: single VAD pass
+        let mono_audio = mic_samples.as_ref().unwrap().clone();
+
+        emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
+
+        let app_for_vad = app.clone();
+        let meeting_id_for_vad = meeting_id.clone();
+        let mono_segments = tokio::task::spawn_blocking(move || {
+            get_speech_chunks_with_progress(
+                &mono_audio,
+                VAD_REDEMPTION_TIME_MS,
+                |vad_progress, segments_found| {
+                    let overall_progress = 20 + (vad_progress as f32 * 0.05) as u32;
+                    emit_progress(
+                        &app_for_vad,
+                        &meeting_id_for_vad,
+                        "vad",
+                        overall_progress,
+                        &format!("Detecting speech segments... {}% ({} found)", vad_progress, segments_found),
+                    );
+                    !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("VAD task panicked: {}", e))?
+        .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
+
+        info!("VAD detected {} speech segments", mono_segments.len());
+
+        (mono_segments, vec![])
+    };
+
+    let total_mic_segments = mic_speech_segments.len();
+    let total_sys_segments = sys_speech_segments.len();
+    let total_segments = total_mic_segments + total_sys_segments;
+
+    // Log segment stats
     if total_segments == 0 {
         warn!("No speech detected in audio");
         return Err(anyhow!("No speech detected in audio file"));
     }
 
-    emit_progress(&app, &meeting_id, "transcribing", 25, "Loading transcription engine...");
+    info!("Total VAD segments: {} (mic: {}, system: {})", total_segments, total_mic_segments, total_sys_segments);
+
+    emit_progress(&app, &meeting_id, "transcribing", 30, "Loading transcription engine...");
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
@@ -311,95 +404,124 @@ async fn run_retranscription<R: Runtime>(
     };
 
     // Split very long segments at silence boundaries for better transcription quality.
-    // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
-    // for the lowest-energy window near the target split point and cut there.
     const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
 
-    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &speech_segments {
+    // Prepare processable segments for each channel
+    let mut mic_processable: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
+    for segment in &mic_speech_segments {
         if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            debug!(
-                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
-                segment.end_timestamp_ms - segment.start_timestamp_ms,
-                segment.samples.len()
-            );
-
             let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            debug!("Split into {} sub-segments", sub_segments.len());
-            processable_segments.extend(sub_segments);
+            mic_processable.extend(sub_segments);
         } else {
-            processable_segments.push(segment.clone());
+            mic_processable.push(segment.clone());
         }
     }
 
-    let processable_count = processable_segments.len();
-    info!("Processing {} segments (after splitting)", processable_count);
+    let mut sys_processable: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
+    for segment in &sys_speech_segments {
+        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
+            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
+            sys_processable.extend(sub_segments);
+        } else {
+            sys_processable.push(segment.clone());
+        }
+    }
 
-    // Process each speech segment with progress updates
-    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
+    let mic_count = mic_processable.len();
+    let sys_count = sys_processable.len();
+    let total_processable = mic_count + sys_count;
+    info!("Processing {} segments (mic: {}, system: {})", total_processable, mic_count, sys_count);
+
+    // Transcribe each channel's segments with progress updates
+    // Progress range: 30-80% for transcription
+    let mut mic_transcripts: Vec<(String, f64, f64)> = Vec::new();
+    let mut sys_transcripts: Vec<(String, f64, f64)> = Vec::new();
     let mut total_confidence = 0.0f32;
+    let mut transcribed_count = 0;
 
-    for (i, segment) in processable_segments.iter().enumerate() {
-        // Check for cancellation before each segment
+    // Transcribe microphone segments
+    for (i, segment) in mic_processable.iter().enumerate() {
         if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
             return Err(anyhow!("Retranscription cancelled"));
         }
 
-        // Calculate progress (25% to 80% range for transcription)
-        let progress = 25 + ((i as f32 / processable_count as f32) * 55.0) as u32;
+        // Progress: 30-55% for mic (if stereo) or 30-80% for mono
+        let progress_range = if is_stereo { 25.0 } else { 50.0 };
+        let progress = 30 + ((i as f32 / mic_count.max(1) as f32) * progress_range) as u32;
         let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
         emit_progress(
             &app,
             &meeting_id,
             "transcribing",
             progress,
-            &format!(
-                "Transcribing segment {} of {} ({:.1}s)...",
-                i + 1,
-                processable_count,
-                segment_duration_sec
-            ),
+            &format!("Transcribing mic segment {} of {} ({:.1}s)...", i + 1, mic_count, segment_duration_sec),
         );
 
-        // Skip very short segments (< 100ms of audio = 1600 samples at 16kHz)
         if segment.samples.len() < 1600 {
-            debug!("Skipping short segment {} with {} samples", i, segment.samples.len());
+            debug!("Skipping short mic segment {} with {} samples", i, segment.samples.len());
             continue;
         }
 
-        // Transcribe this segment
-        let (text, conf) = if use_parakeet {
-            let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
-                .await
-                .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
-        } else {
-            let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
-                .await
-                .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
-        };
+        let (text, conf) = transcribe_segment(
+            segment,
+            &whisper_engine,
+            &parakeet_engine,
+            use_parakeet,
+            language.clone(),
+        ).await?;
 
-        // Skip empty transcripts
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            debug!(
-                "Segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
-                i + 1, processable_count, segment_duration_sec, conf,
-                if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
-            );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            debug!("Mic segment {}/{}: {:.1}s, conf={:.2}, text='{}'", i + 1, mic_count, segment_duration_sec, conf,
+                if trimmed.len() > 80 { &trimmed[..80] } else { trimmed });
+            mic_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
             total_confidence += conf;
-        } else {
-            debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
+            transcribed_count += 1;
         }
     }
 
-    let transcribed_count = all_transcripts.len();
+    // Transcribe system segments (stereo only)
+    if is_stereo {
+        for (i, segment) in sys_processable.iter().enumerate() {
+            if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+                return Err(anyhow!("Retranscription cancelled"));
+            }
+
+            // Progress: 55-80% for system
+            let progress = 55 + ((i as f32 / sys_count.max(1) as f32) * 25.0) as u32;
+            let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
+            emit_progress(
+                &app,
+                &meeting_id,
+                "transcribing",
+                progress,
+                &format!("Transcribing system segment {} of {} ({:.1}s)...", i + 1, sys_count, segment_duration_sec),
+            );
+
+            if segment.samples.len() < 1600 {
+                debug!("Skipping short system segment {} with {} samples", i, segment.samples.len());
+                continue;
+            }
+
+            let (text, conf) = transcribe_segment(
+                segment,
+                &whisper_engine,
+                &parakeet_engine,
+                use_parakeet,
+                language.clone(),
+            ).await?;
+
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                debug!("System segment {}/{}: {:.1}s, conf={:.2}, text='{}'", i + 1, sys_count, segment_duration_sec, conf,
+                    if trimmed.len() > 80 { &trimmed[..80] } else { trimmed });
+                sys_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+                total_confidence += conf;
+                transcribed_count += 1;
+            }
+        }
+    }
+
     let avg_confidence = if transcribed_count > 0 {
         total_confidence / transcribed_count as f32
     } else {
@@ -407,8 +529,8 @@ async fn run_retranscription<R: Runtime>(
     };
 
     info!(
-        "Transcription complete: {} segments transcribed out of {}, avg confidence: {:.2}",
-        transcribed_count, processable_count, avg_confidence
+        "Transcription complete: {} segments transcribed out of {} (mic: {}, system: {}), avg confidence: {:.2}",
+        transcribed_count, total_processable, mic_transcripts.len(), sys_transcripts.len(), avg_confidence
     );
 
     // Check for cancellation
@@ -418,8 +540,32 @@ async fn run_retranscription<R: Runtime>(
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
-    // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
+    // Create transcript segments with source_device labels
+    let mut mic_segments = create_transcript_segments_with_source(
+        &mic_transcripts,
+        Some("Microphone".to_string()),
+    );
+    let mut sys_segments = create_transcript_segments_with_source(
+        &sys_transcripts,
+        Some("System".to_string()),
+    );
+
+    // For mono, use None source_device
+    if !is_stereo {
+        mic_segments = create_transcript_segments(&mic_transcripts);
+        sys_segments.clear();
+    }
+
+    // Merge and sort by audio_start_time
+    let mut segments: Vec<TranscriptSegment> = mic_segments;
+    segments.extend(sys_segments);
+    segments.sort_by(|a, b| {
+        let a_time = a.audio_start_time.unwrap_or(0.0);
+        let b_time = b.audio_start_time.unwrap_or(0.0);
+        a_time.partial_cmp(&b_time).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    info!("Merged and sorted {} transcript segments", segments.len());
 
     // Save to database
     let app_state = app
@@ -831,6 +977,55 @@ pub async fn cancel_retranscription_command() -> Result<(), String> {
 #[tauri::command]
 pub async fn is_retranscription_in_progress_command() -> bool {
     is_retranscription_in_progress()
+}
+
+/// Resample a single channel to 16kHz mono format for VAD and transcription.
+/// Reuses the same normalization and resampling logic as DecodedAudio::to_whisper_format.
+fn resample_channel_to_16k(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    use crate::audio::decoder::normalize_audio_samples;
+    use crate::audio::audio_processing::resample_audio;
+
+    const WHISPER_SAMPLE_RATE: u32 = 16000;
+
+    // Normalize samples to valid range
+    let normalized = normalize_audio_samples(samples.to_vec());
+
+    // Resample to 16kHz if needed
+    if sample_rate != WHISPER_SAMPLE_RATE {
+        let mut resampled = resample_audio(&normalized, sample_rate, WHISPER_SAMPLE_RATE);
+        // Clamp after resampling (Gibbs phenomenon)
+        for s in &mut resampled {
+            *s = s.clamp(-1.0, 1.0);
+        }
+        resampled
+    } else {
+        normalized
+    }
+}
+
+/// Transcribe a single speech segment using the configured engine.
+async fn transcribe_segment(
+    segment: &crate::audio::vad::SpeechSegment,
+    whisper_engine: &Option<Arc<WhisperEngine>>,
+    parakeet_engine: &Option<Arc<ParakeetEngine>>,
+    use_parakeet: bool,
+    language: Option<String>,
+) -> Result<(String, f32)> {
+    if use_parakeet {
+        let engine = parakeet_engine.as_ref().unwrap();
+        let text = engine
+            .transcribe_audio(segment.samples.clone())
+            .await
+            .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
+        Ok((text, 0.9f32))
+    } else {
+        let engine = whisper_engine.as_ref().unwrap();
+        let (text, conf, _) = engine
+            .transcribe_audio_with_confidence(segment.samples.clone(), language)
+            .await
+            .map_err(|e| anyhow!("Whisper transcription failed: {}", e))?;
+        Ok((text, conf))
+    }
 }
 
 #[cfg(test)]

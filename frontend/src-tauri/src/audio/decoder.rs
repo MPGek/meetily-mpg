@@ -106,6 +106,45 @@ impl DecodedAudio {
             mono_samples
         }
     }
+
+    /// Extract separate audio channels from interleaved stereo audio.
+    ///
+    /// Returns `(left_channel, right_channel)` where:
+    /// - For stereo (2 channels): Both are `Some` with de-interleaved samples
+    /// - For mono (1 channel): Left is `Some(samples)`, right is `None`
+    /// - For other channel counts: Treated as mono (left only)
+    ///
+    /// Stereo samples are de-interleaved: [L0, R0, L1, R1, ...] → (left=[L0, L1, ...], right=[R0, R1, ...])
+    pub fn extract_channels(&self) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+        if self.channels == 2 {
+            // Stereo: de-interleave into left and right channels
+            let sample_count = self.samples.len() / 2;
+            let mut left = Vec::with_capacity(sample_count);
+            let mut right = Vec::with_capacity(sample_count);
+
+            for chunk in self.samples.chunks(2) {
+                if chunk.len() == 2 {
+                    left.push(chunk[0]);
+                    right.push(chunk[1]);
+                }
+            }
+
+            info!(
+                "Extracted stereo channels: {} samples per channel ({} total)",
+                sample_count,
+                self.samples.len()
+            );
+
+            (Some(left), Some(right))
+        } else {
+            // Mono or unsupported: return samples as left channel only
+            info!(
+                "Audio is {} channel(s), treating as mono source",
+                self.channels
+            );
+            (Some(self.samples.clone()), None)
+        }
+    }
 }
 
 /// Resample large audio files in fixed-size chunks through the sinc resampler.
@@ -229,7 +268,7 @@ fn chunked_resample_with_progress(
 
 /// Normalize audio samples to the valid range (-1.0 to 1.0)
 /// This handles audio files that may have samples slightly outside the expected range
-fn normalize_audio_samples(mut samples: Vec<f32>) -> Vec<f32> {
+pub fn normalize_audio_samples(mut samples: Vec<f32>) -> Vec<f32> {
     // First, find the maximum absolute value
     let max_abs = samples
         .iter()
@@ -821,5 +860,82 @@ mod tests {
         assert!(!needs_ffmpeg_conversion(Path::new("audio.m4a")));
         // No extension
         assert!(!needs_ffmpeg_conversion(Path::new("noext")));
+    }
+
+    #[test]
+    fn test_extract_channels_stereo() {
+        // Stereo input: [L0, R0, L1, R1, L2, R2]
+        let audio = DecodedAudio {
+            samples: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            sample_rate: 16000,
+            channels: 2,
+            duration_seconds: 0.0001875,
+        };
+
+        let (left, right) = audio.extract_channels();
+
+        // Both channels should be present
+        assert!(left.is_some(), "Left channel should be present for stereo");
+        assert!(right.is_some(), "Right channel should be present for stereo");
+
+        let left = left.unwrap();
+        let right = right.unwrap();
+
+        // Each channel should have half the samples
+        assert_eq!(left.len(), 3, "Left channel should have 3 samples");
+        assert_eq!(right.len(), 3, "Right channel should have 3 samples");
+
+        // Verify de-interleaving
+        assert!((left[0] - 0.1).abs() < 0.001, "Left[0] should be 0.1");
+        assert!((left[1] - 0.3).abs() < 0.001, "Left[1] should be 0.3");
+        assert!((left[2] - 0.5).abs() < 0.001, "Left[2] should be 0.5");
+
+        assert!((right[0] - 0.2).abs() < 0.001, "Right[0] should be 0.2");
+        assert!((right[1] - 0.4).abs() < 0.001, "Right[1] should be 0.4");
+        assert!((right[2] - 0.6).abs() < 0.001, "Right[2] should be 0.6");
+    }
+
+    #[test]
+    fn test_extract_channels_mono() {
+        // Mono input
+        let audio = DecodedAudio {
+            samples: vec![0.1, 0.2, 0.3],
+            sample_rate: 16000,
+            channels: 1,
+            duration_seconds: 0.0001875,
+        };
+
+        let (left, right) = audio.extract_channels();
+
+        // Left channel should be present, right should be None
+        assert!(left.is_some(), "Left channel should be present for mono");
+        assert!(right.is_none(), "Right channel should be None for mono");
+
+        let left = left.unwrap();
+        assert_eq!(left.len(), 3, "Left channel should have all 3 samples");
+        assert!((left[0] - 0.1).abs() < 0.001);
+        assert!((left[1] - 0.2).abs() < 0.001);
+        assert!((left[2] - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_extract_channels_empty_stereo() {
+        // Empty stereo input
+        let audio = DecodedAudio {
+            samples: vec![],
+            sample_rate: 16000,
+            channels: 2,
+            duration_seconds: 0.0,
+        };
+
+        let (left, right) = audio.extract_channels();
+
+        assert!(left.is_some(), "Left channel should be present even if empty");
+        assert!(right.is_some(), "Right channel should be present even if empty");
+
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left.len(), 0, "Left channel should be empty");
+        assert_eq!(right.len(), 0, "Right channel should be empty");
     }
 }

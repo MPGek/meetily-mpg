@@ -22,18 +22,19 @@ The system SHALL support starting and stopping audio recording with configurable
 - **THEN** system stops capture, saves audio file, and releases resources
 
 ### Requirement: Dual-channel audio capture
-The system SHALL simultaneously capture microphone and system audio on supported platforms.
+The system SHALL simultaneously capture microphone and system audio on supported platforms, keeping each source on a dedicated stereo channel (microphone on left, system audio on right) without mixing.
 
 #### Scenario: Capture both mic and system audio on macOS
 - **WHEN** recording starts with mic_device_name and system_device_name specified
-- **THEN** system opens two independent audio streams and processes them concurrently
+- **THEN** system opens two independent audio streams and processes them as separate stereo channel contributions
 
-### Requirement: Audio mixing
-The system SHALL mix microphone and system audio channels according to configured mixing mode.
+#### Scenario: Microphone mapped to left channel
+- **WHEN** microphone audio is captured by AudioCapture
+- **THEN** audio data SHALL be interleaved as stereo with microphone samples on the left channel and zeros on the right channel
 
-#### Scenario: Mix audio with fixed ratio
-- **WHEN** user selects Fixed mixing mode with mic_ratio=0.7, system_ratio=0.3
-- **THEN** recorded output applies the specified volume ratios to each channel
+#### Scenario: System audio mapped to right channel
+- **WHEN** system audio is captured by AudioCapture
+- **THEN** audio data SHALL be interleaved as stereo with zeros on the left channel and system audio samples on the right channel
 
 ### Requirement: Audio level monitoring
 The system SHALL monitor and report audio levels (RMS) for active capture devices.

@@ -49,6 +49,15 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
 /// Create transcript segments from transcription results.
 /// Each tuple is (text, start_ms, end_ms) from VAD timestamps.
 pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> Vec<TranscriptSegment> {
+    create_transcript_segments_with_source(transcripts, None)
+}
+
+/// Create transcript segments with a specific source_device label.
+/// Each tuple is (text, start_ms, end_ms) from VAD timestamps.
+pub(crate) fn create_transcript_segments_with_source(
+    transcripts: &[(String, f64, f64)],
+    source_device: Option<String>,
+) -> Vec<TranscriptSegment> {
     transcripts
         .iter()
         .map(|(text, start_ms, end_ms)| {
@@ -63,7 +72,7 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> 
                 audio_start_time: Some(start_seconds),
                 audio_end_time: Some(end_seconds),
                 duration: Some(duration),
-                source_device: None,
+                source_device: source_device.clone(),
             }
         })
         .collect()
