@@ -324,14 +324,22 @@ impl ParakeetModel {
         waveforms: &ArrayViewD<f32>,
         waveforms_len: &ArrayViewD<i64>,
     ) -> Result<Vec<TimestampedResult>, ParakeetError> {
+        log::info!("Parakeet recognize_batch: waveforms shape {:?}, len {:?}", waveforms.shape(), waveforms_len);
+
         // Preprocess and encode
         let (features, features_lens) = self.preprocess(waveforms, waveforms_len)?;
+        log::info!("Parakeet preprocessor output: features shape {:?}, lens shape {:?}",
+                   features.shape(), features_lens.shape());
+
         let (encoder_out, encoder_out_lens) =
             self.encode(&features.view(), &features_lens.view())?;
+        log::info!("Parakeet encoder output: shape {:?}, lens shape {:?}",
+                   encoder_out.shape(), encoder_out_lens.shape());
 
         // Decode for each batch item
         let mut results = Vec::new();
-        for (encodings, &encodings_len) in encoder_out.outer_iter().zip(encoder_out_lens.iter()) {
+        for (i, (encodings, &encodings_len)) in encoder_out.outer_iter().zip(encoder_out_lens.iter()).enumerate() {
+            log::info!("Parakeet decoding batch item {}: encoding shape {:?}, len={}", i, encodings.shape(), encodings_len);
             let (tokens, timestamps) =
                 self.decode_sequence(&encodings.view(), encodings_len as usize)?;
             let result = self.decode_tokens(tokens, timestamps);
@@ -343,7 +351,7 @@ impl ParakeetModel {
 
     fn decode_sequence(
         &mut self,
-        encodings: &ArrayViewD<f32>, // [time_steps, 1024]
+        encodings: &ArrayViewD<f32>,
         encodings_len: usize,
     ) -> Result<(Vec<i32>, Vec<usize>), ParakeetError> {
         let mut prev_state = self.create_decoder_state()?;
@@ -352,38 +360,84 @@ impl ParakeetModel {
 
         let mut t = 0;
         let mut emitted_tokens = 0;
+        // Absolute forward-progress guard: if we do a full pass through the loop
+        // without advancing t, force advance to prevent infinite loop.
+        let mut prev_t = 0usize.wrapping_sub(1);
+
+        log::info!(
+            "Parakeet decode_sequence: {} frames, vocab_size={}",
+            encodings_len, self.vocab_size
+        );
 
         while t < encodings_len {
+            // Absolute forward-progress guard
+            if t == prev_t {
+                log::warn!(
+                    "Parakeet decode_sequence stuck at frame {} — forcing advance",
+                    t
+                );
+                t += 1;
+                emitted_tokens = 0;
+                continue;
+            }
+            prev_t = t;
+
             let encoder_step = encodings.slice(ndarray::s![t, ..]);
-            // Convert to dynamic dimension to match decode_step parameter type
             let encoder_step_dyn = encoder_step.to_owned().into_dyn();
             let (probs, new_state) =
                 self.decode_step(&tokens, &prev_state, &encoder_step_dyn.view())?;
 
-            // For TDT models, split output into vocab logits and duration logits
+            // Log tensor shapes on first frame for debugging
+            if t == 0 {
+                log::info!("Parakeet decoder output shape: {:?}, len={}", probs.shape(), probs.len());
+            }
+
+            // For TDT models, split output into vocab logits and duration logits.
             // output[:vocab_size] = vocabulary logits
             // output[vocab_size:] = duration logits
-            let vocab_logits_slice = probs.as_slice().ok_or_else(|| {
-                ParakeetError::Shape(ndarray::ShapeError::from_kind(
-                    ndarray::ErrorKind::IncompatibleShape,
-                ))
-            })?;
+            //
+            // Handle non-contiguous tensors that as_slice() rejects.
+            let total_logits = probs.len();
+            if total_logits < self.vocab_size {
+                return Err(ParakeetError::Shape(ndarray::ShapeError::from_kind(
+                    ndarray::ErrorKind::OutOfBounds,
+                )));
+            }
 
-            let is_tdt = probs.len() > self.vocab_size;
-            let (vocab_logits, duration_logits) = if is_tdt {
-                let (v, d) = vocab_logits_slice.split_at(self.vocab_size);
-                (v, Some(d))
+            let is_tdt = total_logits > self.vocab_size;
+
+            // Access vocab logits: use as_slice when contiguous, fall back to
+            // element-by-element when not.
+            let token = if is_tdt {
+                if let Some(slice) = probs.as_slice() {
+                    let (vocab, _) = slice.split_at(self.vocab_size);
+                    vocab.iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as i32)
+                        .unwrap_or(self.blank_idx)
+                } else {
+                    (0..self.vocab_size)
+                        .map(|i| (i, probs[i]))
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as i32)
+                        .unwrap_or(self.blank_idx)
+                }
             } else {
-                (vocab_logits_slice, None)
+                if let Some(slice) = probs.as_slice() {
+                    slice.iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as i32)
+                        .unwrap_or(self.blank_idx)
+                } else {
+                    (0..total_logits)
+                        .map(|i| (i, probs[i]))
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx as i32)
+                        .unwrap_or(self.blank_idx)
+                }
             };
-
-            // Get argmax token from vocabulary logits only
-            let token = vocab_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx as i32)
-                .unwrap_or(self.blank_idx);
 
             if token != self.blank_idx {
                 prev_state = new_state;
@@ -392,14 +446,26 @@ impl ParakeetModel {
                 emitted_tokens += 1;
             }
 
-            if let Some(duration_logits) = duration_logits {
+            if is_tdt {
                 // TDT: advance by the model's predicted duration (frames to skip).
-                let dur_idx = duration_logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0);
+                let dur_idx = if let Some(slice) = probs.as_slice() {
+                    let (_, duration) = slice.split_at(self.vocab_size);
+                    duration.iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0)
+                } else {
+                    // Non-contiguous fallback: only look at the first 5 elements
+                    // of duration logits (TDT_DURATIONS has 5 bins).
+                    let max_dur_bins = self.vocab_size.min(total_logits - self.vocab_size);
+                    let actual_bins = max_dur_bins.min(5);
+                    (0..actual_bins)
+                        .map(|i| (i, probs[self.vocab_size + i]))
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0)
+                };
                 let mut skip = TDT_DURATIONS.get(dur_idx).copied().unwrap_or(1);
 
                 // Ensure forward progress on blank-with-zero-duration, and cap
@@ -420,10 +486,15 @@ impl ParakeetModel {
             }
         }
 
-        // NEW: Log if no tokens were decoded (helps debugging empty transcriptions)
         if tokens.is_empty() {
-            log::debug!(
-                "Parakeet decoded zero tokens (all blank) for audio with {} encoding timesteps - audio may be too short or low energy",
+            log::info!(
+                "Parakeet decoded zero tokens for audio with {} encoding timesteps — audio may be too short or low energy",
+                encodings_len
+            );
+        } else {
+            log::info!(
+                "Parakeet decoded {} tokens from {} encoding timesteps",
+                tokens.len(),
                 encodings_len
             );
         }
@@ -473,11 +544,32 @@ impl ParakeetModel {
         &mut self,
         samples: Vec<f32>,
     ) -> Result<TimestampedResult, ParakeetError> {
-        let batch_size = 1;
         let samples_len = samples.len();
 
+        // Validate minimum audio length (100ms at 16kHz = 1600 samples)
+        if samples_len < 1600 {
+            log::info!(
+                "Parakeet transcribe_samples: audio too short ({} samples, minimum 1600), returning empty",
+                samples_len
+            );
+            return Ok(TimestampedResult {
+                text: String::new(),
+                timestamps: Vec::new(),
+                tokens: Vec::new(),
+            });
+        }
+
+        let batch_size = 1;
+
+        log::info!(
+            "Parakeet transcribe_samples: {} samples ({:.1}s)",
+            samples_len,
+            samples_len as f64 / 16000.0
+        );
+
         // Create waveforms array [batch_size, samples_len]
-        let waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)?.into_dyn();
+        let waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)
+            .map_err(|e| ParakeetError::Shape(e))?.into_dyn();
 
         // Create waveforms_lens array [batch_size] with the actual length
         let waveforms_lens = Array1::from_vec(vec![samples_len as i64]).into_dyn();

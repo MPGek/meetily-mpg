@@ -457,19 +457,46 @@ impl ParakeetEngine {
             .as_mut()
             .ok_or_else(|| anyhow!("No Parakeet model loaded. Please load a model first."))?;
 
-        let duration_seconds = audio_data.len() as f64 / 16000.0; // Assuming 16kHz
-        log::debug!(
+        let duration_seconds = audio_data.len() as f64 / 16000.0;
+        log::info!(
             "Parakeet transcribing {} samples ({:.1}s duration)",
             audio_data.len(),
             duration_seconds
         );
 
-        // Transcribe using Parakeet model
-        let result = model
-            .transcribe_samples(audio_data)
-            .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
+        // Run inference with timeout and panic catch.
+        // ORT native code can hang or segfault on corrupted models / bad inputs;
+        // Rust panics from ndarray shape mismatches are caught so they don't kill
+        // the transcription worker task.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
 
-        log::debug!("Parakeet transcription result: '{}'", result.text);
+        let inference = catch_unwind(AssertUnwindSafe(|| {
+            model.transcribe_samples(audio_data)
+        }));
+
+        let result = match inference {
+            Ok(Ok(ts)) => ts,
+            Ok(Err(e)) => {
+                let msg = format!("Parakeet inference failed: {}", e);
+                log::error!("{}", msg);
+                return Err(anyhow!(msg));
+            }
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic during Parakeet inference".to_string()
+                };
+                log::error!("Parakeet model panicked: {}. Unloading corrupted model state.", msg);
+                drop(model_guard);
+                self.unload_model().await;
+                return Err(anyhow!("Parakeet model panicked and has been unloaded: {}", msg));
+            }
+        };
+
+        log::info!("Parakeet transcription result: '{}'", result.text);
 
         Ok(result.text)
     }
