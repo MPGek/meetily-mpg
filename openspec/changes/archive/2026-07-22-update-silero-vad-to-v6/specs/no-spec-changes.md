@@ -1,0 +1,1 @@
+This change has no new or modified capability specifications. It is a pure engine-level implementation change — replacing the ONNX model and updating the inference wrapper. All existing VAD-related specs (`per-channel-vad`, `independent-vad`) remain unchanged in their requirements.

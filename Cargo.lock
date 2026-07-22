@@ -3612,10 +3612,9 @@ dependencies = [
  "regex",
  "reqwest 0.11.27",
  "ringbuf",
- "rubato 0.15.0",
+ "rubato",
  "serde",
  "serde_json",
- "silero",
  "sqlx",
  "strsim 0.10.0",
  "symphonia",
@@ -5230,18 +5229,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rubato"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5258099699851cfd0082aeb645feb9c084d9a5e1f1b8d5372086b989fc5e56a1"
-dependencies = [
- "num-complex",
- "num-integer",
- "num-traits",
- "realfft",
-]
-
-[[package]]
 name = "rust_decimal"
 version = "1.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5798,19 +5785,6 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "silero"
-version = "0.1.0"
-source = "git+https://github.com/emotechlab/silero-rs?rev=26a6460#26a646003cd8532ae2dde424ccdab1b6cdf5d7b0"
-dependencies = [
- "anyhow",
- "ndarray",
- "ort",
- "rubato 0.16.2",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

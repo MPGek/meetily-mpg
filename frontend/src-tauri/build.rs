@@ -2,6 +2,9 @@
 mod ffmpeg;
 
 fn main() {
+    // Ensure Silero VAD v6 ONNX model is present
+    ensure_vad_model();
+
     // GPU Acceleration Detection and Build Guidance
     detect_and_report_gpu_capabilities();
 
@@ -89,4 +92,101 @@ fn detect_and_report_gpu_capabilities() {
         println!("cargo:warning=📊 Performance: CPU-only builds are significantly slower than GPU/BLAS builds");
         println!("cargo:warning=📚 See README.md for GPU/BLAS setup instructions");
     }
+}
+
+/// Ensure the Silero VAD v6 ONNX model file exists.
+/// Extracts from the silero-vad Python package via `uv`, or downloads from GitHub.
+fn ensure_vad_model() {
+    let out_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let model_dir = std::path::Path::new(&out_dir).join("models");
+    let model_path = model_dir.join("silero_vad_v6.onnx");
+
+    if model_path.exists() {
+        let size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+        println!("cargo:warning=✅ VAD model found: {} ({} bytes)", model_path.display(), size);
+        return;
+    }
+
+    println!("cargo:warning=⬇️ VAD model not found, attempting download...");
+
+    // Try extracting via uv from silero-vad Python package
+    if which::which("uv").is_ok() {
+        println!("cargo:warning=🔍 uv found, extracting model from silero-vad==6.2...");
+        std::fs::create_dir_all(&model_dir).ok();
+
+        let script = format!(
+            r#"import importlib.resources as r, shutil, pathlib
+src = r.files('silero_vad.data').joinpath('silero_vad.onnx')
+dst = pathlib.Path(r'{model}')
+dst.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(str(src), str(dst))
+print(f"Model extracted to {{dst}}")
+"#,
+            model = model_path.display()
+        );
+
+        let tmp_script = std::env::temp_dir().join("extract_vad_model.py");
+        std::fs::write(&tmp_script, &script).ok();
+
+        let status = std::process::Command::new("uv")
+            .args(["run", "--with", "silero-vad==6.2", "--python", "3.12", "python", &tmp_script.to_string_lossy()])
+            .status();
+
+        match status {
+            Ok(s) if s.success() && model_path.exists() => {
+                let size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+                println!("cargo:warning=✅ VAD model extracted via uv: {} bytes", size);
+                std::fs::remove_file(&tmp_script).ok();
+                return;
+            }
+            _ => {
+                println!("cargo:warning=⚠️ uv extraction failed, trying direct download...");
+                std::fs::remove_file(&tmp_script).ok();
+            }
+        }
+    } else {
+        println!("cargo:warning=⚠️ uv not found, trying direct download...");
+    }
+
+    // Fallback: download from GitHub releases
+    let url = "https://github.com/snakers4/silero-vad/releases/download/v6.0/silero_vad.onnx";
+    println!("cargo:warning=⬇️ Downloading VAD model from {}...", url);
+
+    match reqwest::blocking::get(url) {
+        Ok(resp) if resp.status().is_success() => {
+            std::fs::create_dir_all(&model_dir).ok();
+            let bytes = resp.bytes().unwrap_or_default();
+            if !bytes.is_empty() {
+                std::fs::write(&model_path, &bytes).ok();
+                let size = bytes.len();
+                println!("cargo:warning=✅ VAD model downloaded: {} bytes", size);
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    // Final fallback: extract from silero_rs git checkout if still present
+    let old_model = std::path::Path::new(&out_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join(".cargo")
+        .join("git")
+        .join("checkouts")
+        .join("silero-rs-16a8cd672fe824c4")
+        .join("26a6460")
+        .join("models")
+        .join("silero_vad.onnx");
+
+    if old_model.exists() {
+        println!("cargo:warning=⚠️ Copying old VAD model as placeholder (v4, not v6 - quality will be lower)");
+        std::fs::create_dir_all(&model_dir).ok();
+        std::fs::copy(&old_model, &model_path).ok();
+        return;
+    }
+
+    println!("cargo:warning=❌ VAD model download failed!");
+    println!("cargo:warning=💡 Run: uv run --with silero-vad==6.2 --python 3.12 python -c \"import importlib.resources as r, shutil; src = r.files('silero_vad.data').joinpath('silero_vad.onnx'); shutil.copy2(str(src), '{}')\"",
+             model_path.display());
 }
