@@ -828,7 +828,7 @@ async fn transcribe_audio_chunk_whisper_rs(chunk: Vec<f32>) -> Result<Transcript
             };
             
             // Transcribe using whisper-rs with final audio chunk
-            match engine.transcribe_audio(final_chunk).await {
+            match engine.transcribe_audio(final_chunk, None).await {
                 Ok(text) => {
                     log_info!("Whisper-rs transcription result: {}", text);
                     
@@ -2262,7 +2262,7 @@ async fn whisper_is_model_loaded() -> Result<bool, String> {
 async fn whisper_transcribe_audio(audio_data: Vec<f32>) -> Result<String, String> {
     unsafe {
         if let Some(engine) = &WHISPER_ENGINE {
-            engine.transcribe_audio(audio_data).await
+            engine.transcribe_audio(audio_data, None).await
                 .map_err(|e| format!("Transcription failed: {}", e))
         } else {
             Err("Whisper engine not initialized".to_string())

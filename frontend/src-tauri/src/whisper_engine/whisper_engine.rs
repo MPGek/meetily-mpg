@@ -513,7 +513,7 @@ impl WhisperEngine {
     }
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
-    pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+    pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>, initial_prompt: Option<String>) -> Result<(String, f32, bool)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -563,6 +563,13 @@ impl WhisperEngine {
         params.set_no_speech_thold(adaptive_config.no_speech_thold);
         params.set_max_len(adaptive_config.max_len);
         params.set_single_segment(false);
+
+        // Forward previous transcript text as context prompt
+        if let Some(ref prompt) = initial_prompt {
+            if !prompt.is_empty() {
+                params.set_initial_prompt(prompt);
+            }
+        }
 
         // Set thread count based on hardware (if supported by whisper.cpp)
         if let Some(_max_threads) = adaptive_config.max_threads {
@@ -628,7 +635,7 @@ impl WhisperEngine {
         Ok((cleaned_result, avg_confidence, is_partial))
     }
 
-    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {
+    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>, initial_prompt: Option<String>) -> Result<String> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -678,6 +685,13 @@ impl WhisperEngine {
         // Reasonable length limits
         params.set_max_len(adaptive_config.max_len);
         params.set_single_segment(false);
+
+        // Forward previous transcript text as context prompt
+        if let Some(ref prompt) = initial_prompt {
+            if !prompt.is_empty() {
+                params.set_initial_prompt(prompt);
+            }
+        }
 
         // Note: compression_ratio_threshold would be ideal but not available in current whisper-rs
         // This would help detect repetitive outputs: params.set_compression_ratio_threshold(2.4);

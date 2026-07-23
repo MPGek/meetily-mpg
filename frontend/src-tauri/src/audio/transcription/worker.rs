@@ -111,6 +111,10 @@ pub fn start_transcription_task<R: Runtime>(
                     warn!("⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped", worker_id, engine_name);
                 }
 
+                // Previous transcription text for context forwarding (per source device)
+                let mut last_mic_text: String = String::new();
+                let mut last_sys_text: String = String::new();
+
                 loop {
                     // Try to get a chunk to process
                     let chunk = {
@@ -145,11 +149,22 @@ pub fn start_transcription_task<R: Runtime>(
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
                             let chunk_device_type = chunk.device_type.clone();
 
+                            // Determine previous-text prompt for this source device
+                            let prompt = match &chunk_device_type {
+                                crate::audio::RecordingDeviceType::Microphone => {
+                                    if last_mic_text.is_empty() { None } else { Some(last_mic_text.clone()) }
+                                }
+                                crate::audio::RecordingDeviceType::System => {
+                                    if last_sys_text.is_empty() { None } else { Some(last_sys_text.clone()) }
+                                }
+                            };
+
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
                                 &engine_clone,
                                 chunk,
                                 &app_clone,
+                                prompt,
                             )
                             .await
                             {
@@ -191,6 +206,16 @@ pub fn start_transcription_task<R: Runtime>(
                                             }
                                         } else {
                                             info!("🔍 Speech already detected in this session, not re-emitting");
+                                        }
+
+                                        // Cache transcript text for context forwarding to next segment
+                                        match &chunk_device_type {
+                                            crate::audio::RecordingDeviceType::Microphone => {
+                                                last_mic_text = transcript.clone();
+                                            }
+                                            crate::audio::RecordingDeviceType::System => {
+                                                last_sys_text = transcript.clone();
+                                            }
                                         }
 
                                         // Generate sequence ID and calculate timestamps FIRST
@@ -415,6 +440,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
+    initial_prompt: Option<String>,
 ) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
@@ -455,7 +481,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             let language = crate::get_language_preference_internal();
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language)
+                .transcribe_audio_with_confidence(speech_samples, language, initial_prompt.clone())
                 .await
             {
                 Ok((text, confidence, is_partial)) => {

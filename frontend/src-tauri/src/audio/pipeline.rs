@@ -11,7 +11,7 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
-use super::vad::{ContinuousVadProcessor};
+use super::vad::{ContinuousVadProcessor, SpeechSegment, merge_segments, VadConfig};
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -665,6 +665,10 @@ pub struct AudioPipeline {
     vad_buffer_mic: Vec<f32>,
     vad_buffer_sys: Vec<f32>,
     vad_dispatch_threshold_samples: usize,
+    // Segment accumulation buffers for merge-before-transcribe
+    vad_pending_mic: Vec<SpeechSegment>,
+    vad_pending_sys: Vec<SpeechSegment>,
+    live_vad_config: VadConfig,
 }
 
 impl AudioPipeline {
@@ -706,6 +710,7 @@ impl AudioPipeline {
             }
         };
 
+        let vad_config_clone = vad_config.clone();
         let vad_processor_sys = match ContinuousVadProcessor::new(sample_rate, vad_config) {
             Ok(processor) => {
                 info!("VAD Sys processor created");
@@ -747,7 +752,49 @@ impl AudioPipeline {
             vad_buffer_mic: Vec::with_capacity(vad_dispatch_threshold_samples * 2),
             vad_buffer_sys: Vec::with_capacity(vad_dispatch_threshold_samples * 2),
             vad_dispatch_threshold_samples,
+            vad_pending_mic: Vec::new(),
+            vad_pending_sys: Vec::new(),
+            live_vad_config: vad_config_clone,
         }
+    }
+
+    /// Merge accumulated VAD segments and dispatch to transcription.
+    /// Segments with gap < 500ms are merged into coherent chunks.
+    fn flush_pending_segments(&mut self, device_type: DeviceType) {
+        let pending = match device_type {
+            DeviceType::Microphone => &mut self.vad_pending_mic,
+            DeviceType::System => &mut self.vad_pending_sys,
+        };
+        if pending.is_empty() {
+            return;
+        }
+
+        let merged = merge_segments(pending, 500.0, 25 * 16000);
+        for segment in merged {
+            if segment.samples.len() < self.live_vad_config.min_segment_samples {
+                continue;
+            }
+            info!("📤 Sending merged segment [{:?}]: {:.0}ms, {} samples",
+                  device_type,
+                  segment.end_timestamp_ms - segment.start_timestamp_ms,
+                  segment.samples.len());
+
+            let transcription_chunk = AudioChunk {
+                data: segment.samples,
+                sample_rate: 16000,
+                timestamp: segment.start_timestamp_ms / 1000.0,
+                chunk_id: self.chunk_id_counter,
+                device_type: device_type.clone(),
+                channels: 1,
+            };
+
+            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+                warn!("Failed to send merged segment: {}", e);
+            } else {
+                self.chunk_id_counter += 1;
+            }
+        }
+        pending.clear();
     }
 
     /// Run the VAD-driven audio processing pipeline
@@ -826,31 +873,37 @@ impl AudioPipeline {
 
                         match vad.process_audio(&accumulated) {
                             Ok(speech_segments) => {
-                                for segment in speech_segments {
-                                    let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
+                                let pending_ref = match chunk.device_type {
+                                    DeviceType::Microphone => &mut self.vad_pending_mic,
+                                    DeviceType::System => &mut self.vad_pending_sys,
+                                };
 
-                                    if segment.samples.len() >= 800 {
-                                        info!("📤 Sending VAD segment [{:?}]: {:.1}ms, {} samples",
-                                              chunk.device_type, duration_ms, segment.samples.len());
+                                // Check if any new segment is distant from the accumulated tail
+                                let should_flush = speech_segments.first().and_then(|first| {
+                                    pending_ref.last().map(|last| {
+                                        (first.start_timestamp_ms - last.end_timestamp_ms) >= 500.0
+                                    })
+                                }).unwrap_or(false);
 
-                                        let transcription_chunk = AudioChunk {
-                                            data: segment.samples,
-                                            sample_rate: 16000,
-                                            timestamp: segment.start_timestamp_ms / 1000.0,
-                                            chunk_id: self.chunk_id_counter,
-                                            device_type: chunk.device_type.clone(),
-                                            channels: 1,
-                                        };
+                                if should_flush {
+                                    drop(pending_ref); // release borrow before calling flush
+                                    self.flush_pending_segments(chunk.device_type.clone());
+                                }
 
-                                        if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                            warn!("Failed to send VAD segment: {}", e);
-                                        } else {
-                                            self.chunk_id_counter += 1;
-                                        }
-                                    } else {
-                                        debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
-                                               duration_ms, segment.samples.len());
-                                    }
+                                // Re-borrow after flush to extend
+                                let pending_ref = match chunk.device_type {
+                                    DeviceType::Microphone => &mut self.vad_pending_mic,
+                                    DeviceType::System => &mut self.vad_pending_sys,
+                                };
+                                pending_ref.extend(speech_segments);
+
+                                // Flush if accumulated duration would exceed 25s when merged
+                                let total_duration_ms: f64 = pending_ref.iter()
+                                    .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
+                                    .sum();
+                                if total_duration_ms > 25_000.0 {
+                                    drop(pending_ref);
+                                    self.flush_pending_segments(chunk.device_type.clone());
                                 }
                             }
                             Err(e) => {
@@ -910,71 +963,31 @@ impl AudioPipeline {
                 let accumulated: Vec<f32> = std::mem::take(buffer);
                 info!("Flushing VAD buffer [{:?}]: {} samples", device_type, accumulated.len());
 
-                match vad.process_audio(&accumulated) {
-                    Ok(speech_segments) => {
-                        for segment in speech_segments {
-                            let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
-                            if segment.samples.len() >= 800 {
-                                info!("📤 Sending flushed VAD segment [{:?}]: {:.1}ms, {} samples",
-                                      device_type, duration_ms, segment.samples.len());
-
-                                let transcription_chunk = AudioChunk {
-                                    data: segment.samples,
-                                    sample_rate: 16000,
-                                    timestamp: segment.start_timestamp_ms / 1000.0,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: device_type.clone(),
-                                    channels: 1,
-                                };
-
-                                if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                    warn!("Failed to send flushed VAD segment: {}", e);
-                                } else {
-                                    self.chunk_id_counter += 1;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("⚠️ VAD error during buffer flush: {}", e);
+                if let Ok(speech_segments) = vad.process_audio(&accumulated) {
+                    if !speech_segments.is_empty() {
+                        let pending = match device_type {
+                            DeviceType::Microphone => &mut self.vad_pending_mic,
+                            DeviceType::System => &mut self.vad_pending_sys,
+                        };
+                        pending.extend(speech_segments);
                     }
                 }
             }
         }
 
-        // Flush both VAD processors independently
+        // Flush both VAD processors independently (forces end of any ongoing speech)
         for (vad, device_type) in [
             (&mut self.vad_processor_mic, DeviceType::Microphone),
             (&mut self.vad_processor_sys, DeviceType::System),
         ] {
             match vad.flush() {
                 Ok(final_segments) => {
-                    for segment in final_segments {
-                        let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
-
-                        // Send segments >= 50ms (800 samples at 16kHz) - matches main pipeline filter
-                        if segment.samples.len() >= 800 {
-                            info!("📤 Sending final VAD segment [{:?}] to Whisper: {:.1}ms duration, {} samples",
-                                  device_type, duration_ms, segment.samples.len());
-
-                            let transcription_chunk = AudioChunk {
-                                data: segment.samples,
-                                sample_rate: 16000,
-                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                chunk_id: self.chunk_id_counter,
-                                device_type: device_type.clone(),
-                                channels: 1,
-                            };
-
-                            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                warn!("Failed to send final VAD segment: {}", e);
-                            } else {
-                                self.chunk_id_counter += 1;
-                            }
-                        } else {
-                            info!("⏭️ Skipping short final segment: {:.1}ms ({} samples < 800)",
-                                  duration_ms, segment.samples.len());
-                        }
+                    if !final_segments.is_empty() {
+                        let pending = match device_type {
+                            DeviceType::Microphone => &mut self.vad_pending_mic,
+                            DeviceType::System => &mut self.vad_pending_sys,
+                        };
+                        pending.extend(final_segments);
                     }
                 }
                 Err(e) => {
@@ -982,6 +995,10 @@ impl AudioPipeline {
                 }
             }
         }
+
+        // Merge and dispatch all accumulated segments
+        self.flush_pending_segments(DeviceType::Microphone);
+        self.flush_pending_segments(DeviceType::System);
 
         Ok(())
     }

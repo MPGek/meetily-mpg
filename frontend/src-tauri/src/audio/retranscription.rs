@@ -1003,7 +1003,7 @@ async fn transcribe_segment(
     } else {
         let engine = whisper_engine.as_ref().unwrap();
         let (text, conf, _) = engine
-            .transcribe_audio_with_confidence(segment.samples.clone(), language)
+            .transcribe_audio_with_confidence(segment.samples.clone(), language, None)
             .await
             .map_err(|e| anyhow!("Whisper transcription failed: {}", e))?;
         Ok((text, conf))
