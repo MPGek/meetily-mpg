@@ -2,8 +2,8 @@
 
 use crate::api::TranscriptSegment;
 use crate::audio::decoder::decode_audio_file;
-use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{create_transcript_segments, create_transcript_segments_with_source, split_segment_at_silence, write_transcripts_json};
+use crate::audio::vad::{get_speech_chunks_with_progress, merge_segments, VadConfig};
+use super::common::{create_transcript_segments, create_transcript_segments_with_source, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
@@ -45,12 +45,6 @@ impl Drop for RetranscriptionGuard {
         RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
-
-/// VAD redemption time in milliseconds - bridges natural pauses in speech
-/// Batch processing needs longer redemption (2000ms) than live pipeline (400ms)
-/// because the entire file is processed at once by VAD, and 400ms fragments
-/// speech at every natural sentence/topic pause (500ms-2s)
-const VAD_REDEMPTION_TIME_MS: u32 = 2000;
 
 /// Progress update emitted during retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +285,7 @@ async fn run_retranscription<R: Runtime>(
         let mic_segments = tokio::task::spawn_blocking(move || {
             get_speech_chunks_with_progress(
                 &mic_audio,
-                VAD_REDEMPTION_TIME_MS,
+                VadConfig::batch(),
                 |vad_progress, segments_found| {
                     let overall_progress = 20 + (vad_progress as f32 * 0.05) as u32;
                     emit_progress(
@@ -321,7 +315,7 @@ async fn run_retranscription<R: Runtime>(
         let sys_segments = tokio::task::spawn_blocking(move || {
             get_speech_chunks_with_progress(
                 &sys_audio,
-                VAD_REDEMPTION_TIME_MS,
+                VadConfig::batch(),
                 |vad_progress, segments_found| {
                     let overall_progress = 25 + (vad_progress as f32 * 0.05) as u32;
                     emit_progress(
@@ -354,7 +348,7 @@ async fn run_retranscription<R: Runtime>(
         let mono_segments = tokio::task::spawn_blocking(move || {
             get_speech_chunks_with_progress(
                 &mono_audio,
-                VAD_REDEMPTION_TIME_MS,
+                VadConfig::batch(),
                 |vad_progress, segments_found| {
                     let overall_progress = 20 + (vad_progress as f32 * 0.05) as u32;
                     emit_progress(
@@ -403,29 +397,17 @@ async fn run_retranscription<R: Runtime>(
         None
     };
 
-    // Split very long segments at silence boundaries for better transcription quality.
-    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
+    // Merge adjacent segments (gap < 2000ms) and split at 25s boundaries
+    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000;
+    let mic_merged = merge_segments(&mic_speech_segments, 2000.0, MAX_SEGMENT_SAMPLES);
+    let sys_merged = merge_segments(&sys_speech_segments, 2000.0, MAX_SEGMENT_SAMPLES);
 
-    // Prepare processable segments for each channel
-    let mut mic_processable: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &mic_speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            mic_processable.extend(sub_segments);
-        } else {
-            mic_processable.push(segment.clone());
-        }
-    }
+    info!("After merge: mic {}→{} segments, sys {}→{} segments",
+        mic_speech_segments.len(), mic_merged.len(),
+        sys_speech_segments.len(), sys_merged.len());
 
-    let mut sys_processable: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &sys_speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            sys_processable.extend(sub_segments);
-        } else {
-            sys_processable.push(segment.clone());
-        }
-    }
+    let mic_processable = mic_merged;
+    let sys_processable = sys_merged;
 
     let mic_count = mic_processable.len();
     let sys_count = sys_processable.len();
@@ -1126,8 +1108,11 @@ mod tests {
 
     #[test]
     fn test_vad_redemption_time_constant() {
-        // Batch processing uses 2000ms to bridge natural pauses in full-file VAD
-        assert_eq!(VAD_REDEMPTION_TIME_MS, 2000);
+        // Batch config uses 200ms core VAD redemption, combined with
+        // merge_segments at 2000ms gap threshold for batch processing
+        let config = VadConfig::batch();
+        assert_eq!(config.redemption_ms, 200);
+        assert_eq!(config.max_segment_samples, Some(25 * 16000));
     }
 
     #[test]

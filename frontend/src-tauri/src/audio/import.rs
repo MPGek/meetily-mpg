@@ -2,7 +2,7 @@
 
 use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
-use crate::audio::vad::get_speech_chunks_with_progress;
+use crate::audio::vad::{get_speech_chunks_with_progress, merge_segments, VadConfig};
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
@@ -18,7 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{create_transcript_segments, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -50,12 +50,6 @@ impl Drop for ImportGuard {
         IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
-
-/// VAD redemption time in milliseconds - bridges natural pauses in speech
-/// Batch processing needs longer redemption (2000ms) than live pipeline (400ms)
-/// because the entire file is processed at once by VAD, and 400ms fragments
-/// speech at every natural sentence/topic pause (500ms-2s)
-const VAD_REDEMPTION_TIME_MS: u32 = 2000;
 
 /// Maximum file size: 20GB (prevents OOM and excessive processing time)
 const MAX_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20GB
@@ -433,7 +427,7 @@ async fn run_import<R: Runtime>(
     let speech_segments = tokio::task::spawn_blocking(move || {
         get_speech_chunks_with_progress(
             &audio_samples,
-            VAD_REDEMPTION_TIME_MS,
+            VadConfig::batch(),
             |vad_progress, segments_found| {
                 let overall_progress = 25 + (vad_progress as f32 * 0.05) as u32;
                 emit_progress(
@@ -454,7 +448,7 @@ async fn run_import<R: Runtime>(
     .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
 
     let total_segments = speech_segments.len();
-    info!("VAD detected {} speech segments (redemption_time={}ms)", total_segments, VAD_REDEMPTION_TIME_MS);
+    info!("VAD detected {} speech segments (redemption={}ms)", total_segments, VadConfig::batch().redemption_ms);
 
     // Diagnostic: log segment duration distribution
     if !speech_segments.is_empty() {
@@ -520,29 +514,11 @@ async fn run_import<R: Runtime>(
     };
 
     // Split very long segments at silence boundaries for better transcription quality.
-    // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
-    // for the lowest-energy window near the target split point and cut there.
     const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
 
-    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            debug!(
-                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
-                segment.end_timestamp_ms - segment.start_timestamp_ms,
-                segment.samples.len()
-            );
+    let processable_segments = merge_segments(&speech_segments, 2000.0, MAX_SEGMENT_SAMPLES);
 
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            debug!("Split into {} sub-segments", sub_segments.len());
-            processable_segments.extend(sub_segments);
-        } else {
-            processable_segments.push(segment.clone());
-        }
-    }
-
-    let processable_count = processable_segments.len();
-    info!("Processing {} segments (after splitting)", processable_count);
+    info!("After merge: {}→{} segments", speech_segments.len(), processable_segments.len());
 
     // Process each speech segment
     let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new();
@@ -554,7 +530,7 @@ async fn run_import<R: Runtime>(
             return Err(anyhow!("Import cancelled"));
         }
 
-        let progress = 30 + ((i as f32 / processable_count.max(1) as f32) * 50.0) as u32;
+        let progress = 30 + ((i as f32 / processable_segments.len().max(1) as f32) * 50.0) as u32;
         let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
         emit_progress(
             &app,
@@ -563,7 +539,7 @@ async fn run_import<R: Runtime>(
             &format!(
                 "Transcribing segment {} of {} ({:.1}s)...",
                 i + 1,
-                processable_count,
+                processable_segments.len(),
                 segment_duration_sec
             ),
         );
@@ -599,13 +575,13 @@ async fn run_import<R: Runtime>(
         if !trimmed.is_empty() {
             debug!(
                 "Segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
-                i + 1, processable_count, segment_duration_sec, conf,
+                i + 1, processable_segments.len(), segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
             all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
             total_confidence += conf;
         } else {
-            debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
+            debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_segments.len(), segment_duration_sec);
         }
     }
 
@@ -618,7 +594,7 @@ async fn run_import<R: Runtime>(
 
     info!(
         "Transcription complete: {} segments transcribed out of {}, avg confidence: {:.2}",
-        transcribed_count, processable_count, avg_confidence
+        transcribed_count, processable_segments.len(), avg_confidence
     );
 
     // Check for cancellation
@@ -1008,6 +984,7 @@ pub async fn is_import_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::common::split_segment_at_silence;
 
     #[test]
     fn test_audio_extensions() {
@@ -1182,6 +1159,7 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                source_device: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1190,6 +1168,7 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                source_device: None,
             },
         ];
 
@@ -1269,54 +1248,55 @@ mod tests {
         let samples = decoded.to_whisper_format();
         println!("Resampled: {} samples ({:.2}s at 16kHz)", samples.len(), samples.len() as f64 / 16000.0);
 
-        // Step 3: Run VAD with both redemption times and compare
-        for redemption_ms in [400u32, 2000] {
-            println!("\n--- VAD with redemption_time={}ms ---", redemption_ms);
-            let segments = crate::audio::vad::get_speech_chunks_with_progress(
-                &samples,
-                redemption_ms,
-                |progress, count| {
-                    if progress % 20 == 0 {
-                        println!("  VAD progress: {}% ({} segments)", progress, count);
-                    }
-                    true
-                },
-            ).expect("VAD failed");
-
-            let total_segments = segments.len();
-            println!("Found {} segments", total_segments);
-
-            if !segments.is_empty() {
-                let durations: Vec<f64> = segments.iter()
-                    .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
-                    .collect();
-                let total_speech: f64 = durations.iter().sum();
-                let avg = total_speech / durations.len() as f64;
-                let min = durations.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = durations.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-                println!(
-                    "Stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s/{:.1}s ({:.0}%)",
-                    avg, min, max,
-                    total_speech / 1000.0,
-                    decoded.duration_seconds,
-                    (total_speech / 1000.0 / decoded.duration_seconds) * 100.0
-                );
-
-                // Segments over 25s that would be split
-                let oversized = durations.iter().filter(|d| **d > 25_000.0).count();
-                println!("Segments >25s (would be split): {}", oversized);
-
-                // Basic sanity checks
-                assert!(total_speech > 0.0, "No speech detected");
-                for (i, seg) in segments.iter().enumerate() {
-                    assert!(!seg.samples.is_empty(), "Segment {} has no samples", i);
-                    assert!(
-                        seg.end_timestamp_ms > seg.start_timestamp_ms,
-                        "Segment {} has invalid timestamps",
-                        i
-                    );
+        // Step 3: Run VAD with batch config, then compare raw vs merged
+        println!("\n--- VAD with batch config ---");
+        let segments = crate::audio::vad::get_speech_chunks_with_progress(
+            &samples,
+            VadConfig::batch(),
+            |progress, count| {
+                if progress % 20 == 0 {
+                    println!("  VAD progress: {}% ({} segments)", progress, count);
                 }
+                true
+            },
+        ).expect("VAD failed");
+
+        let total_segments = segments.len();
+        println!("Found {} raw segments", total_segments);
+
+        let merged = crate::audio::vad::merge_segments(&segments, 2000.0, 25 * 16000);
+        println!("After merge: {} segments", merged.len());
+
+        if !segments.is_empty() {
+            let durations: Vec<f64> = segments.iter()
+                .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
+                .collect();
+            let total_speech: f64 = durations.iter().sum();
+            let avg = total_speech / durations.len() as f64;
+            let min = durations.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = durations.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+            println!(
+                "Stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s/{:.1}s ({:.0}%)",
+                avg, min, max,
+                total_speech / 1000.0,
+                decoded.duration_seconds,
+                (total_speech / 1000.0 / decoded.duration_seconds) * 100.0
+            );
+
+            // Segments over 25s that would be split
+            let oversized = durations.iter().filter(|d| **d > 25_000.0).count();
+            println!("Segments >25s (would be split): {}", oversized);
+
+            // Basic sanity checks
+            assert!(total_speech > 0.0, "No speech detected");
+            for (i, seg) in segments.iter().enumerate() {
+                assert!(!seg.samples.is_empty(), "Segment {} has no samples", i);
+                assert!(
+                    seg.end_timestamp_ms > seg.start_timestamp_ms,
+                    "Segment {} has invalid timestamps",
+                    i
+                );
             }
         }
     }

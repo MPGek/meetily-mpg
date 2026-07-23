@@ -693,9 +693,9 @@ impl AudioPipeline {
         // Create VAD processors with balanced redemption time for speech accumulation
         // The VAD processor handles 48kHz->16kHz resampling internally
         // Two independent instances: one for mic, one for system audio
-        let redemption_time = if cfg!(target_os = "macos") { 400 } else { 400 };
+        let vad_config = super::vad::VadConfig::live();
 
-        let vad_processor_mic = match ContinuousVadProcessor::new(sample_rate, redemption_time) {
+        let vad_processor_mic = match ContinuousVadProcessor::new(sample_rate, vad_config.clone()) {
             Ok(processor) => {
                 info!("VAD Mic processor created");
                 processor
@@ -706,7 +706,7 @@ impl AudioPipeline {
             }
         };
 
-        let vad_processor_sys = match ContinuousVadProcessor::new(sample_rate, redemption_time) {
+        let vad_processor_sys = match ContinuousVadProcessor::new(sample_rate, vad_config) {
             Ok(processor) => {
                 info!("VAD Sys processor created");
                 processor

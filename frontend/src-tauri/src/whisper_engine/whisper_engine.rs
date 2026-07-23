@@ -557,14 +557,11 @@ impl WhisperEngine {
         params.set_suppress_blank(true);
         params.set_suppress_nst(true);
         params.set_temperature(adaptive_config.temperature);
-        params.set_max_initial_ts(1.0);
-        params.set_entropy_thold(2.4);
-        params.set_logprob_thold(-1.0);
-        // BALANCED FIX: Lowered from 0.75 to 0.55 to allow quiet speech detection
-        // Previous value was too aggressive and rejected valid quiet speech
-        // 0.55 is balanced - prevents hallucinations while preserving quiet speech
-        params.set_no_speech_thold(0.55);
-        params.set_max_len(200);
+        params.set_max_initial_ts(adaptive_config.max_initial_ts);
+        params.set_entropy_thold(adaptive_config.entropy_thold);
+        params.set_logprob_thold(adaptive_config.logprob_thold);
+        params.set_no_speech_thold(adaptive_config.no_speech_thold);
+        params.set_max_len(adaptive_config.max_len);
         params.set_single_segment(false);
 
         // Set thread count based on hardware (if supported by whisper.cpp)
@@ -574,7 +571,7 @@ impl WhisperEngine {
         }
 
         let duration_seconds = audio_data.len() as f64 / 16000.0;
-        let is_partial = duration_seconds < 15.0; // Consider chunks under 15s as partial
+        let is_partial = duration_seconds < adaptive_config.is_partial_threshold_s;
 
         // PERFORMANCE: Suppress verbose C library logs during transcription
         // This hides whisper_full_with_state debug logs and beam search details
@@ -672,18 +669,15 @@ impl WhisperEngine {
         // BALANCED settings - good quality with reasonable speed
         params.set_suppress_blank(true);
         params.set_suppress_nst(true);
-        params.set_temperature(0.3);             // Lower than 0.4 for consistency, higher than 0.0 for accuracy
-        params.set_max_initial_ts(1.0);
-        params.set_entropy_thold(2.4);
-        params.set_logprob_thold(-1.0);
-        // BALANCED FIX: Lowered from 0.75 to 0.55 to allow quiet speech detection
-        // Previous value was too aggressive and rejected valid quiet speech
-        // 0.55 is balanced - prevents hallucinations while preserving quiet speech
-        params.set_no_speech_thold(0.55);
+        params.set_temperature(0.3);
+        params.set_max_initial_ts(adaptive_config.max_initial_ts);
+        params.set_entropy_thold(adaptive_config.entropy_thold);
+        params.set_logprob_thold(adaptive_config.logprob_thold);
+        params.set_no_speech_thold(adaptive_config.no_speech_thold);
 
         // Reasonable length limits
-        params.set_max_len(200);                 // Reasonable length
-        params.set_single_segment(false);        // Allow multiple segments for better accuracy
+        params.set_max_len(adaptive_config.max_len);
+        params.set_single_segment(false);
 
         // Note: compression_ratio_threshold would be ideal but not available in current whisper-rs
         // This would help detect repetitive outputs: params.set_compression_ratio_threshold(2.4);

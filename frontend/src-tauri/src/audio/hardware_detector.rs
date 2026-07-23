@@ -37,6 +37,12 @@ pub struct AdaptiveWhisperConfig {
     pub use_gpu: bool,
     pub max_threads: Option<usize>,
     pub chunk_size_preference: ChunkSizePreference,
+    pub max_len: i32,
+    pub max_initial_ts: f32,
+    pub entropy_thold: f32,
+    pub logprob_thold: f32,
+    pub no_speech_thold: f32,
+    pub is_partial_threshold_s: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,7 +208,6 @@ impl HardwareProfile {
 
     /// Generate adaptive Whisper configuration based on hardware
     pub fn get_whisper_config(&self) -> AdaptiveWhisperConfig {
-        // Windows-specific override: Always use beam size 2 for stability
         #[cfg(target_os = "windows")]
         {
             return AdaptiveWhisperConfig {
@@ -211,40 +216,53 @@ impl HardwareProfile {
                 use_gpu: self.has_gpu_acceleration,
                 max_threads: Some(self.cpu_cores.min(8) as usize),
                 chunk_size_preference: ChunkSizePreference::Balanced,
+                max_len: 200,
+                max_initial_ts: 1.0,
+                entropy_thold: 2.4,
+                logprob_thold: -1.0,
+                no_speech_thold: 0.55,
+                is_partial_threshold_s: 15.0,
             };
         }
 
-        // Platform-adaptive configuration for non-Windows systems
         #[cfg(not(target_os = "windows"))]
         {
             match self.performance_tier {
                 PerformanceTier::Ultra => AdaptiveWhisperConfig {
-                    beam_size: 5,  // Maximum quality
+                    beam_size: 5,
                     temperature: 0.1,
                     use_gpu: self.has_gpu_acceleration,
                     max_threads: Some(self.cpu_cores.min(8) as usize),
                     chunk_size_preference: ChunkSizePreference::Quality,
+                    max_len: 200, max_initial_ts: 1.0, entropy_thold: 2.4,
+                    logprob_thold: -1.0, no_speech_thold: 0.55, is_partial_threshold_s: 15.0,
                 },
                 PerformanceTier::High => AdaptiveWhisperConfig {
-                    beam_size: 3,  // High quality
+                    beam_size: 3,
                     temperature: 0.2,
                     use_gpu: self.has_gpu_acceleration,
                     max_threads: Some(self.cpu_cores.min(6) as usize),
                     chunk_size_preference: ChunkSizePreference::Balanced,
+                    max_len: 200, max_initial_ts: 1.0, entropy_thold: 2.4,
+                    logprob_thold: -1.0, no_speech_thold: 0.55, is_partial_threshold_s: 15.0,
                 },
                 PerformanceTier::Medium => AdaptiveWhisperConfig {
-                    beam_size: 2,  // Balanced
+                    beam_size: 2,
                     temperature: 0.3,
                     use_gpu: self.has_gpu_acceleration,
                     max_threads: Some(self.cpu_cores.min(4) as usize),
                     chunk_size_preference: ChunkSizePreference::Balanced,
+                    max_len: 200, max_initial_ts: 1.0, entropy_thold: 2.4,
+                    logprob_thold: -1.0, no_speech_thold: 0.55, is_partial_threshold_s: 15.0,
                 },
                 PerformanceTier::Low => AdaptiveWhisperConfig {
-                    beam_size: 1,  // Fast processing
+                    beam_size: 1,
                     temperature: 0.4,
-                    use_gpu: false, // Force CPU to avoid GPU overhead on weak hardware
+                    use_gpu: false,
                     max_threads: Some(2),
                     chunk_size_preference: ChunkSizePreference::Fast,
+                    max_len: 200, max_initial_ts: 1.0, entropy_thold: 2.4,
+                    logprob_thold: -1.0, no_speech_thold: 0.55, is_partial_threshold_s: 15.0,
                 },
             }
         }
