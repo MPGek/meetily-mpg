@@ -25,3 +25,4 @@
 - [x] 4.2 Add unit test for segment accumulation: two segments with 1000ms gap remain separate
 - [x] 4.3 Run `cargo test -- audio::vad::tests` — all tests must pass
 - [x] 4.4 Run `cargo test -- audio` — no regressions
+- [x] 4.5 Add integration test comparing live vs enhance segmentation on real audio file

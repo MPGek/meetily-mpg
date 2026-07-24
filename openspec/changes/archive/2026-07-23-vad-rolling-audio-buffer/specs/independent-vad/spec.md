@@ -1,11 +1,9 @@
-# independent-vad Specification
+# independent-vad Specification Delta
 
-## Purpose
-Per-source voice activity detection for simultaneous microphone and system audio processing.
+## MODIFIED Requirements
 
-## Requirements
 ### Requirement: Per-source VAD processing
-The system SHALL run independent Voice Activity Detection on microphone and system audio streams, using separate VAD processor instances configured via `VadConfig::live()`. Each VAD processor SHALL maintain a rolling audio buffer that stores the most recent processed windows and uses it to backfill speech onset audio when speech is detected.
+The system SHALL run independent Voice Activity Detection on microphone and system audio streams, using separate VAD processor instances with identical initial configuration. Each VAD processor SHALL maintain a rolling audio buffer that stores the most recent processed windows and uses it to backfill speech onset audio when speech is detected.
 
 #### Scenario: Microphone speech detected
 - **WHEN** audio is captured from the microphone device and contains human speech above VAD threshold
