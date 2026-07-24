@@ -1265,7 +1265,9 @@ mod tests {
         println!("Found {} raw segments", total_segments);
 
         let merged = crate::audio::vad::merge_segments(&segments, 2000.0, 25 * 16000);
-        println!("After merge: {} segments", merged.len());
+        println!("After merge (2000ms gap): {} segments", merged.len());
+        let merged_live = crate::audio::vad::merge_segments(&segments, 500.0, 25 * 16000);
+        println!("After merge (500ms gap - live mode): {} segments", merged_live.len());
 
         if !segments.is_empty() {
             let durations: Vec<f64> = segments.iter()
@@ -1299,5 +1301,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Integration test that compares VAD segmentation between live and enhance modes.
+    /// Run with: TEST_AUDIO_PATH=/path/to/audio.mp4 cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_compare_live_vs_enhance_segmentation() {
+        let audio_path = std::env::var("TEST_AUDIO_PATH")
+            .expect("Set TEST_AUDIO_PATH to run this integration test");
+
+        let path = Path::new(&audio_path);
+        assert!(path.exists(), "Audio file not found: {}", audio_path);
+
+        // Step 1: Decode
+        println!("Decoding {}...", audio_path);
+        let decoded = crate::audio::decoder::decode_audio_file(path)
+            .expect("Failed to decode audio file");
+        println!("Decoded: {:.2}s", decoded.duration_seconds);
+
+        // Step 2: Resample to 16kHz mono
+        let samples = decoded.to_whisper_format();
+        println!("Resampled: {} samples ({:.2}s at 16kHz)", samples.len(), samples.len() as f64 / 16000.0);
+
+        // Step 3: Run VAD
+        println!("\n--- Running VAD ---");
+        let segments = crate::audio::vad::get_speech_chunks_with_progress(
+            &samples,
+            VadConfig::batch(),
+            |progress, count| {
+                if progress % 20 == 0 {
+                    println!("  VAD progress: {}% ({} segments)", progress, count);
+                }
+                true
+            },
+        ).expect("VAD failed");
+        println!("Raw VAD: {} segments", segments.len());
+
+        // Step 4: Merge for both modes
+        let merged_live = crate::audio::vad::merge_segments(&segments, 500.0, 25 * 16000);
+        let merged_enhance = crate::audio::vad::merge_segments(&segments, 2000.0, 25 * 16000);
+        
+        println!("\n=== SEGMENTATION COMPARISON ===");
+        println!("Live mode (500ms merge): {} segments", merged_live.len());
+        println!("Enhance mode (2000ms merge): {} segments", merged_enhance.len());
+        println!("Ratio: {:.2}x more segments in live mode", 
+                 merged_live.len() as f64 / merged_enhance.len() as f64);
+        
+        // Calculate average segment durations
+        let live_avg_duration = merged_live.iter()
+            .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
+            .sum::<f64>() / merged_live.len() as f64;
+        let enhance_avg_duration = merged_enhance.iter()
+            .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
+            .sum::<f64>() / merged_enhance.len() as f64;
+        
+        println!("\nAverage segment duration:");
+        println!("  Live mode: {:.1}s", live_avg_duration / 1000.0);
+        println!("  Enhance mode: {:.1}s", enhance_avg_duration / 1000.0);
+        
+        // Show first few segments from each mode for comparison
+        println!("\n=== FIRST 5 SEGMENTS ===");
+        println!("Live mode segments:");
+        for (i, seg) in merged_live.iter().take(5).enumerate() {
+            let duration_s = (seg.end_timestamp_ms - seg.start_timestamp_ms) / 1000.0;
+            println!("  [{}] {:.1}s - {:.1}s ({:.1}s)", 
+                     i+1, seg.start_timestamp_ms/1000.0, seg.end_timestamp_ms/1000.0, duration_s);
+        }
+        
+        println!("\nEnhance mode segments:");
+        for (i, seg) in merged_enhance.iter().take(5).enumerate() {
+            let duration_s = (seg.end_timestamp_ms - seg.start_timestamp_ms) / 1000.0;
+            println!("  [{}] {:.1}s - {:.1}s ({:.1}s)", 
+                     i+1, seg.start_timestamp_ms/1000.0, seg.end_timestamp_ms/1000.0, duration_s);
+        }
+        
+        println!("\n=== ANALYSIS ===");
+        println!("Live mode produces {:.1}x more transcription calls than enhance mode.", 
+                 merged_live.len() as f64 / merged_enhance.len() as f64);
+        println!("Each live mode segment is shorter, providing less context to Whisper.");
+        println!("This can lead to:");
+        println!("  - More opportunities for missing speech onset (first words)");
+        println!("  - Less contextual information for transcription accuracy");
+        println!("  - More fragmented output requiring more post-processing");
     }
 }

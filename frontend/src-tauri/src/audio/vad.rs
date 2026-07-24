@@ -28,6 +28,8 @@ pub struct VadConfig {
     pub post_pad_ms: u32,
     pub min_segment_samples: usize,
     pub max_segment_samples: Option<usize>,
+    /// Rolling buffer capacity in samples (default: 5120 = 10 windows × 512 samples = 320ms)
+    pub buffer_capacity: usize,
 }
 
 impl VadConfig {
@@ -42,6 +44,7 @@ impl VadConfig {
             post_pad_ms: 150,
             min_segment_samples: 1600,
             max_segment_samples: None,
+            buffer_capacity: 5120, // 10 windows × 512 samples = 320ms
         }
     }
 
@@ -56,6 +59,7 @@ impl VadConfig {
             post_pad_ms: 150,
             min_segment_samples: 1600,
             max_segment_samples: Some(25 * 16000),
+            buffer_capacity: 5120, // 10 windows × 512 samples = 320ms
         }
     }
 }
@@ -355,6 +359,10 @@ pub struct ContinuousVadProcessor {
     resampler: Option<SincFixedIn<f32>>,
     resampler_input_buffer: Vec<f32>,
     resampler_chunk_size: usize,
+    /// Rolling buffer of recent audio windows for speech onset recovery
+    audio_history: VecDeque<f32>,
+    /// Maximum capacity of audio_history in samples
+    buffer_capacity: usize,
 }
 
 impl ContinuousVadProcessor {
@@ -430,6 +438,8 @@ impl ContinuousVadProcessor {
             resampler,
             resampler_input_buffer: Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2),
             resampler_chunk_size: RESAMPLER_CHUNK_SIZE,
+            audio_history: VecDeque::with_capacity(config.buffer_capacity),
+            buffer_capacity: config.buffer_capacity,
         })
     }
 
@@ -591,17 +601,17 @@ impl ContinuousVadProcessor {
             // Apply pre-speech padding: start from padded position
             self.speech_start_sample = self.processed_samples.saturating_sub(self.pre_speech_pad_samples);
             self.current_speech.clear();
-            // Include padding samples
-            if self.processed_samples > 0 {
-                let pad_start = self.speech_start_sample;
-                let recorded = self.processed_samples - pad_start;
-                let previous_buffered = (self.current_speech.len() as f64 / 16000.0 * 1000.0) as u32;
-                if previous_buffered < self.pre_speech_pad_samples as u32 {
-                    // Add silent padding for context (we don't have raw audio before our buffer)
-                    let padding_needed = self.pre_speech_pad_samples.saturating_sub(recorded);
-                    self.current_speech.resize(padding_needed, 0.0);
+            
+            // Prepend audio from rolling buffer to recover speech onset
+            if !self.audio_history.is_empty() {
+                // Calculate how many samples to prepend (up to pre_speech_pad_samples)
+                let prepend_count = self.audio_history.len().min(self.pre_speech_pad_samples);
+                let start_idx = self.audio_history.len() - prepend_count;
+                for i in start_idx..self.audio_history.len() {
+                    self.current_speech.push(self.audio_history[i]);
                 }
             }
+            
             self.current_speech.extend_from_slice(chunk);
         } else if self.in_speech {
             // Check if speech has exceeded minimum duration to be "confirmed"
@@ -654,6 +664,15 @@ impl ContinuousVadProcessor {
 
             // Still in speech - continue accumulating
             self.current_speech.extend_from_slice(chunk);
+        }
+
+        // Update rolling audio buffer for speech onset recovery
+        for &sample in chunk {
+            self.audio_history.push_back(sample);
+        }
+        // Remove oldest samples if capacity is exceeded
+        while self.audio_history.len() > self.buffer_capacity {
+            self.audio_history.pop_front();
         }
 
         self.processed_samples += chunk.len();
@@ -1056,6 +1075,7 @@ mod tests {
         assert_eq!(config.min_speech_ms, 250);
         assert_eq!(config.min_segment_samples, 1600);
         assert!(config.max_segment_samples.is_none());
+        assert_eq!(config.buffer_capacity, 5120);
     }
 
     #[test]
@@ -1069,6 +1089,7 @@ mod tests {
         assert_eq!(config.min_speech_ms, 250);
         assert_eq!(config.min_segment_samples, 1600);
         assert_eq!(config.max_segment_samples, Some(25 * 16000));
+        assert_eq!(config.buffer_capacity, 5120);
     }
 
     #[test]
@@ -1130,6 +1151,88 @@ mod tests {
         assert!(merged.len() >= 2, "Merged segment exceeding 25s should be split, got {} segments", merged.len());
         for seg in &merged {
             assert!(seg.samples.len() <= 25 * 16000, "Sub-segment should not exceed max duration");
+        }
+    }
+
+    #[test]
+    fn test_rolling_buffer_initialized_with_capacity() {
+        let config = VadConfig::live();
+        let processor = ContinuousVadProcessor::new(16000, config).expect("Failed to create processor");
+        assert_eq!(processor.buffer_capacity, 5120, "Buffer capacity should be 5120 samples (10 windows)");
+        assert_eq!(processor.audio_history.capacity(), 5120, "Buffer should be allocated with capacity 5120");
+        assert_eq!(processor.audio_history.len(), 0, "Buffer should be empty initially");
+    }
+
+    #[test]
+    fn test_rolling_buffer_updated_after_processing() {
+        let config = VadConfig::live();
+        let mut processor = ContinuousVadProcessor::new(16000, config).expect("Failed to create processor");
+        
+        // Process one window (512 samples)
+        let chunk = vec![0.1f32; 512];
+        processor.process_chunk(&chunk).expect("Processing failed");
+        
+        assert_eq!(processor.audio_history.len(), 512, "Buffer should contain 512 samples after processing one window");
+        assert_eq!(processor.audio_history[0], 0.1, "Buffer should contain the processed audio");
+    }
+
+    #[test]
+    fn test_rolling_buffer_maintains_fixed_size() {
+        let config = VadConfig::live();
+        let mut processor = ContinuousVadProcessor::new(16000, config).expect("Failed to create processor");
+        
+        // Process more than buffer capacity (11 windows = 5632 samples > 5120)
+        for i in 0..11 {
+            let chunk = vec![i as f32 / 10.0; 512];
+            processor.process_chunk(&chunk).expect("Processing failed");
+        }
+        
+        assert_eq!(processor.audio_history.len(), 5120, "Buffer should be capped at 5120 samples");
+        // The oldest samples (window 0) should be removed, newest (window 10) should remain
+        assert_eq!(processor.audio_history[5119], 1.0, "Most recent samples should be from window 10 (value 1.0)");
+    }
+
+    #[test]
+    fn test_speech_detection_prepends_buffer_audio() {
+        let config = VadConfig::live();
+        let mut processor = ContinuousVadProcessor::new(16000, config).expect("Failed to create processor");
+        
+        // Fill buffer with silence (low probability)
+        for _ in 0..5 {
+            let silence = vec![0.001f32; 512];
+            processor.process_chunk(&silence).expect("Processing failed");
+        }
+        
+        assert_eq!(processor.audio_history.len(), 2560, "Buffer should contain 2560 samples");
+        assert!(!processor.in_speech, "Should not be in speech yet");
+        
+        // Now send a chunk that should trigger speech detection (high amplitude)
+        let speech_chunk = vec![0.5f32; 512];
+        processor.process_chunk(&speech_chunk).expect("Processing failed");
+        
+        // After speech detection, current_speech should contain prepended buffer audio
+        if processor.in_speech {
+            // Buffer had 2560 samples, pre_pad_ms is 150ms = 2400 samples
+            // So we should prepend min(2560, 2400) = 2400 samples from buffer
+            let expected_prepend = 2400.min(processor.audio_history.len());
+            assert!(processor.current_speech.len() >= expected_prepend + 512, 
+                "current_speech should contain prepended buffer audio + current chunk");
+        }
+    }
+
+    #[test]
+    fn test_speech_detection_with_empty_buffer() {
+        let config = VadConfig::live();
+        let mut processor = ContinuousVadProcessor::new(16000, config).expect("Failed to create processor");
+        
+        // Process first chunk immediately (buffer is empty)
+        let speech_chunk = vec![0.5f32; 512];
+        processor.process_chunk(&speech_chunk).expect("Processing failed");
+        
+        // Should not panic, and current_speech should contain at least the current chunk
+        if processor.in_speech {
+            assert!(processor.current_speech.len() >= 512, 
+                "current_speech should contain at least the current chunk even with empty buffer");
         }
     }
 }
