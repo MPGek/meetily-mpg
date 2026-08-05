@@ -10,5 +10,6 @@
       "baseUrl": "http://192.168.12.130:1234/v1/embeddings"
     },
     "dimension": 768
-  }
+  },
+  "snapshot": false
 }
