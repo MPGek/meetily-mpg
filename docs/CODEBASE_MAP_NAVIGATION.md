@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-07-13T14:40:00Z
+last_mapped: 2026-08-05T15:04:00Z
 section: navigation
 ---
 
@@ -8,97 +8,82 @@ section: navigation
 
 # Navigation Guide
 
-## Quick Start Paths
+## Getting Started
 
-### "I want to understand the project structure"
-→ Read [`CODEBASE_MAP_ARCHITECTURE.md`](CODEBASE_MAP_ARCHITECTURE.md) for high-level overview
+1. Read [`CODEBASE_MAP_ARCHITECTURE.md`](CODEBASE_MAP_ARCHITECTURE.md) for the system overview.
+2. Read [`CODEBASE_MAP_MODULES.md`](CODEBASE_MAP_MODULES.md) for the module index.
+3. For build/dev commands, see [`CODEBASE_MAP_OPERATIONS.md`](CODEBASE_MAP_OPERATIONS.md).
+4. To develop: `cd frontend && pnpm install && pnpm tauri:dev` (auto GPU detection) — or `frontend/dev-gpu.bat` on Windows for the full GPU sidecar flow.
 
-### "I need to modify recording functionality"
-→ See [`CODEBASE_MAP_MODULE_AUDIO.md`](CODEBASE_MAP_MODULE_AUDIO.md) and [`CODEBASE_MAP_MODULES.md`](CODEBASE_MAP_MODULES.md#frontend-recording-page)
-
-### "I want to add a new transcription provider"
-→ See [`CODEBASE_MAP_MODULE_WHISPER.md`](CODEBASE_MAP_MODULE_WHISPER.md) and [`CODEBASE_MAP_MODULE_PARAKEET.md`](CODEBASE_MAP_MODULE_PARAKEET.md)
-
-### "I need to change the AI summarization logic"
-→ See [`CODEBASE_MAP_MODULE_SUMMARY.md`](CODEBASE_MAP_MODULE_SUMMARY.md) and [`CODEBASE_MAP_MODULE_AI_PROVIDERS.md`](CODEBASE_MAP_MODULE_AI_PROVIDERS.md)
-
-### "I'm building a new UI component"
-→ See [`CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md`](CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md)
-
-## Entry Points by Role
-
-| Role | Start Here | Key Files |
-|------|-----------|-----------|
-| **Full-stack developer** | `README.md` → `CODEBASE_MAP_ARCHITECTURE.md` | All module files |
-| **Frontend developer** | `CODEBASE_MAP_MODULE_FRONTEND_APP.md` + `CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md` | `frontend/src/app/`, `frontend/src/components/` |
-| **Backend/Rust developer** | `CODEBASE_MAP_ARCHITECTURE.md` → Rust section | `src/audio/`, `src/whisper_engine/`, `src/summary/` |
-| **Python backend dev** | `backend/README.md` | `backend/app/` |
-| **DevOps/Build engineer** | `CODEBASE_MAP_OPERATIONS.md` | Dockerfiles, build scripts |
-
-## Module Quick Reference
-
-### Rust Backend (`src/`)
+## Module Quick Reference (Rust — `frontend/src-tauri/src/`)
 
 ```
-src/
-├── lib.rs                    ← Command registration (START HERE)
-├── audio/                    ← Audio capture module
-│   ├── mod.rs                ← Re-exports
-│   └── device_manager.rs     ← Device enumeration
-├── whisper_engine/           ← Whisper.cpp wrapper
-│   ├── mod.rs
-│   └── engine.rs             ← Core inference
-├── parakeet/                 ← Parakeet integration
-│   ├── mod.rs
-│   └── client.rs             ← API client
-├── summary/                  ← AI summarization
-│   ├── mod.rs
-│   ├── llm_client.rs         ← Trait definition
-│   ├── service.rs            ← Orchestration
-│   ├── ollama/               ← Ollama provider
-│   ├── openai/               ← OpenAI provider
-│   ├── anthropic/            ← Anthropic provider
-│   ├── groq/                 ← Groq provider
-│   └── openrouter/           ← OpenRouter provider
-├── database/                 ← SQLite layer
-│   ├── mod.rs
-│   ├── models.rs             ← Schema structs
-│   └── setup.rs              ← Migration logic
-├── notifications/            ← Desktop notifications
-│   └── mod.rs
-├── analytics/                ← Usage tracking
-│   └── mod.rs
-└── main.rs                   ← Tauri app entry point
+src-tauri/src/
+├── lib.rs                     ← Tauri builder + command registration (START HERE)
+├── audio/                     ← Audio engine (mic + system capture, VAD, stereo mix, recording)
+│   ├── mod.rs                 ← Module root / re-exports
+│   ├── pipeline.rs            ← Per-channel VAD + stereo mixing
+│   ├── vad.rs                 ← Silero VAD v6 + rolling buffer
+│   ├── recording_*.rs         ← State, commands, preferences, saver, manager
+│   ├── retranscription.rs     ← "Enhance" re-transcribe
+│   ├── import.rs              ← Audio import
+│   ├── transcription/         ← STT provider abstraction
+│   └── audio_v2/              ← ORPHANED (dead, not declared)
+├── whisper_engine/            ← Whisper.cpp wrapper (engine.rs, commands.rs, parallel_processor.rs)
+├── parakeet_engine/           ← Parakeet ONNX streaming (engine, model.rs)
+├── summary/                   ← AI summarization (service, processor, llm_client, debug_log, summary_engine/)
+├── api/                       ← IPC commands + shared DTOs + legacy HTTP client (api.rs)
+├── database/                  ← SQLite (manager, models, repositories/)
+├── ollama|openai|anthropic|groq|openrouter/ ← LLM provider modules
+├── notifications/             ← Desktop notifications
+├── analytics/                 ← PostHog
+├── main.rs                    ← App entry point
+└── tray.rs, onboarding.rs     ← Tray + onboarding
 ```
 
 ### Frontend (`frontend/src/`)
 
 ```
-frontend/src/
-├── app/                      ← Next.js App Router
-│   ├── layout.tsx            ← Root layout (START HERE)
-│   ├── page.tsx              ← Home page
-│   └── ...                   ← Other pages
-├── components/               ← UI Components
-│   ├── ui/                   ← Shadcn/ui primitives
-│   ├── features/             ← Feature components
-│   └── icons/                ← SVG icons
-├── hooks/                    ← Custom React hooks
-├── lib/                      ← Utilities & config
-├── stores/                   ← Zustand stores
-└── types/                    ← TypeScript types
+src/
+├── app/                       ← Next.js App Router (layout.tsx, page.tsx, settings, meeting-details, notes)
+├── components/                ← UI (Sidebar, VirtualizedTranscriptView, RecordingControls, ...)
+│   └── ui/                    ← Shadcn/ui primitives
+├── hooks/                     ← Custom hooks (usePaginatedTranscripts, useRecordingStart, ...)
+├── contexts/                  ← React contexts (RecordingState, Transcript, Config, SidebarProvider, ...)
+├── services/                  ← IPC service wrappers (transcriptService, recordingService, ...)
+├── lib/                       ← Utilities (analytics, etc.)
+├── types/                     ← TypeScript contracts
+└── constants/, config/        ← Constants + config
 ```
 
-### Backend Server (`backend/app/`)
+## Common Tasks — "I want to..."
 
-```
-backend/app/
-├── main.py                   ← FastAPI entry point (START HERE)
-├── models.py                 ← Pydantic models
-├── config.py                 ← Configuration
-├── whisper_server.py         ← Whisper server wrapper
-└── ...                       ← Other endpoints
-```
+| I want to... | Module | Key Files | Notes |
+|--------------|--------|-----------|-------|
+| Change how recording starts/stops | Audio | `audio/recording_commands.rs`, `recording_manager.rs`, `recording_state.rs` | Tauri commands `start_recording_with_devices_and_meeting`, `stop_recording` |
+| Modify VAD behavior | Audio | `audio/vad.rs` | `VadConfig::live()`/`batch()`; Silero v6 model is embedded at build time |
+| Add a channel to the recording (beyond mic/system) | Audio | `audio/pipeline.rs`, `recording_state.rs` | Stereo layout is left=mic/right=sys — changes ripple to retranscription + saver |
+| Change the transcription engine selection | Audio + engines | `audio/transcription/`, `whisper_engine/`, `parakeet_engine/` | Provider abstraction in `transcription/engine.rs`; config via `transcript_settings` |
+| Add a new Whisper model to the catalog | Whisper | `whisper_engine/whisper_engine.rs` + `config.rs` (`WHISPER_MODEL_CATALOG`) | Download URL in `download_model` |
+| Change Parakeet quantization / download | Parakeet | `parakeet_engine/parakeet_engine.rs` | Catalog + URLs; Int8 only |
+| Modify summarization prompts/logic | Summary | `summary/processor.rs`, `service.rs`, `templates/` | `generate_meeting_summary`; templates custom→bundled→built-in |
+| Add a new LLM provider | Summary | `summary/llm_client.rs` (`LLMProvider`) | URL/header/body per provider; also `summary_engine/` for built-in |
+| Toggle LLM debug logging | Summary | `summary/debug_log.rs` | `DEBUG = true` compile-time flag; writes per-call files to meeting folder |
+| Change the DB schema | Database | `database/migrations/*`, `database/models.rs`, `repositories/` | sqlx runtime queries; `source_device`/`speaker` drift is a known gotcha |
+| Add a transcript pagination tweak | Frontend | `hooks/usePaginatedTranscripts.ts`, `components/VirtualizedTranscriptView.tsx`, `api/api.rs` | Page size 100, `api_get_meeting_transcripts` |
+| Change mic/system transcript colors | Frontend | `components/VirtualizedTranscriptView.tsx` | Mic=blue left, System=green right |
+| Add a UI component | Frontend | `components/`, `components/ui/` | Shadcn/ui primitives + `cn()` |
+| Change GPU build features | Ops | `frontend/scripts/tauri-auto.js`, `auto-detect-gpu.js`, `scripts/env-cuda.*` | `TAURI_GPU_FEATURE` override |
+| Bump the app version | Ops/UI | `frontend/src-tauri/Cargo.toml`, `tauri.conf.json`, `components/Sidebar/index.tsx` | Update all three (per AGENTS.md) |
+
+## Entry Points by Role
+
+| Role | Start Here | Key Files |
+|------|-----------|-----------|
+| Full-stack developer | `docs/CODEBASE_MAP_ARCHITECTURE.md` | All module docs |
+| Frontend developer | `CODEBASE_MAP_MODULE_FRONTEND_APP.md` + `FRONTEND_COMPONENTS.md` + `FRONTEND_HOOKS.md` | `frontend/src/app/`, `components/`, `hooks/`, `contexts/` |
+| Backend/Rust developer | `CODEBASE_MAP_ARCHITECTURE.md` → Rust section | `audio/`, `whisper_engine/`, `parakeet_engine/`, `summary/`, `database/` |
+| Build/DevOps engineer | `CODEBASE_MAP_OPERATIONS.md` | `frontend/build-gpu.*`, `dev-gpu.*`, `scripts/`, `llama-helper/` |
 
 ## Cross-Reference Map
 
@@ -106,98 +91,64 @@ backend/app/
 
 | Change | Also Check | Why |
 |--------|------------|-----|
-| Audio device selection | `audio/device_manager.rs`, `useAudioDevices` hook | Device flows through all layers |
-| Transcription provider | `whisper_engine/`, `parakeet/`, config | Provider switch affects both Rust and frontend |
-| Database schema | `database/models.rs`, migrations, API responses | Schema changes propagate to UI |
-| LLM provider config | `summary/service.rs`, AI providers module | Config → client → API call chain |
-| Recording page UI | `useRecording` hook, Tauri commands | UI ↔ Backend IPC must stay in sync |
+| Audio capture / device selection | `audio/stream.rs`, `devices/`, `recording_commands.rs`, frontend `DeviceSelection` | Device flows through all layers |
+| VAD or pipeline | `audio/vad.rs`, `pipeline.rs`, `retranscription.rs`, `import.rs` | Shared VAD + segment helpers in `common.rs` |
+| Transcription provider | `audio/transcription/`, `whisper_engine/`, `parakeet_engine/`, `transcript_settings` config | Provider switch affects Rust + frontend + retranscription |
+| Database schema | `database/migrations`, `models.rs`, `repositories/`, `api/api.rs` DTOs | Schema → repo → API → UI chain |
+| Summary config/LLM | `summary/service.rs`, `llm_client.rs`, AI provider modules | Config → client → API call chain |
+| Recording UI | `contexts/TranscriptContext.tsx`, `RecordingControls`, `hooks/useRecording*` | UI ↔ backend IPC must stay in sync |
 
 ### "Where is feature X implemented?"
 
 | Feature | Primary File(s) | Secondary Files |
 |---------|-----------------|-----------------|
-| Audio capture | `src/audio/device_manager.rs` | `frontend/src/hooks/use-audio-devices.ts` |
-| Live transcription | `src/whisper_engine/engine.rs` | `frontend/src/components/features/transcript-display.tsx` |
-| Meeting storage | `src/database/models.rs` | `frontend/src/app/page.tsx` (meeting list) |
-| AI summarization | `src/summary/service.rs` | `frontend/src/components/features/summary-viewer.tsx` |
-| Desktop notifications | `src/notifications/mod.rs` | Settings page |
-| Analytics tracking | `src/analytics/mod.rs` | Background, no UI |
-| GPU acceleration | `Cargo.toml` (features) | `whisper_engine/engine.rs` |
+| Audio capture (mic/system) | `audio/stream.rs`, `audio/recording_state.rs` | `audio/capture/`, `audio/devices/` |
+| Voice Activity Detection | `audio/vad.rs` | `audio/pipeline.rs` (dual VAD) |
+| Live transcription | `audio/transcription/worker.rs` + `engine.rs` | `whisper_engine/`, `parakeet_engine/` |
+| Stereo recording file | `audio/pipeline.rs` (interleave), `audio/recording_saver.rs` | `audio/incremental_saver.rs` |
+| Re-transcription ("Enhance") | `audio/retranscription.rs` | `audio/common.rs` |
+| Audio import | `audio/import.rs` | frontend `ImportAudio/` (beta) |
+| AI summarization | `summary/service.rs`, `processor.rs` | `summary/llm_client.rs`, `summary_engine/` |
+| Transcript pagination | `hooks/usePaginatedTranscripts.ts` | `api/api.rs`, `database/repositories/meeting.rs` |
+| Meeting storage | `database/manager.rs`, `models.rs`, `repositories/` | `api/api.rs` |
+| Desktop notifications | `notifications/` | Settings page |
+| Analytics | `analytics/` | `lib/analytics` (frontend) |
 
 ## File Search Patterns
 
-### "Find all Tauri commands"
-```bash
-grep -r "#\[tauri::command\]" src/
-```
-
-### "Find all database queries"
-```bash
-grep -r "sqlx\|query!" src/database/
-```
-
-### "Find all API client implementations"
-```bash
-find frontend/src/components/features -name "*selector*"
-find src/summary -name "*.rs" | xargs grep -l "send_request"
-```
-
-### "Find all Zustand stores"
-```bash
-grep -r "create<" frontend/src/stores/
-```
-
-## Architecture Decision Records (Key Locations)
-
-| Decision | Documented In | Implementation |
-|----------|---------------|----------------|
-| Tauri over Electron | `README.md` → Architecture section | `frontend/src-tauri/` |
-| Whisper.cpp via Rust bindings | `src/whisper_engine/Cargo.toml` | `src/whisper_engine/engine.rs` |
-| Parakeet for streaming | `backend/parakeet/` + docs | `src/parakeet/client.rs` |
-| SQLite over Postgres | `src/database/setup.rs` | `sqlx` dependency |
-| Zustand over Redux | `frontend/src/stores/` | `zustand` package |
-| Shadcn/ui for components | `frontend/src/components/ui/` | Copied primitives |
-
-## Common Developer Tasks Quick Links
-
-| Task | Files to Edit | Files to Check |
-|------|---------------|----------------|
-| Add new setting | Settings page + config struct | `lib/config.ts`, `src/summary/service.rs` |
-| Add new API provider | `src/summary/{provider}/` | `llm_client.rs` trait |
-| Modify recording UI | `frontend/src/components/features/recording-controls.tsx` | `useRecording` hook |
-| Change database schema | `src/database/models.rs`, `setup.rs` | Migration logic |
-| Add new page route | `frontend/src/app/{new-page}/page.tsx` | `layout.tsx` |
-| Update dependencies | `Cargo.toml`, `package.json`, `requirements.txt` | Lock files |
-| Change build config | `tauri.conf.json`, `Dockerfile.*` | Build scripts |
+- **All Tauri commands**: `rg "#\[tauri::command\]" frontend/src-tauri/src`
+- **All database queries**: `rg "sqlx::" frontend/src-tauri/src/database`
+- **All `transcript-update` events**: `rg "transcript-update" frontend/src-tauri/src`
+- **Provider dispatch**: `rg "LLMProvider" frontend/src-tauri/src/summary`
 
 ## Documentation Hierarchy
 
 ```
 docs/
-├── CODEBASE_MAP.md                    ← Main index (create first)
-├── CODEBASE_MAP_ARCHITECTURE.md       ← System architecture overview
-├── CODEBASE_MAP_MODULES.md            ← Module index with cross-refs
-│   ├── CODEBASE_MAP_MODULE_AUDIO.md   ← Audio capture module
-│   ├── CODEBASE_MAP_MODULE_WHISPER.md ← Whisper.cpp wrapper
-│   ├── CODEBASE_MAP_MODULE_PARAKEET.md← Parakeet streaming
-│   ├── CODEBASE_MAP_MODULE_SUMMARY.md ← AI summarization service
-│   ├── CODEBASE_MAP_MODULE_DATABASE.md← SQLite data layer
+├── CODEBASE_MAP.md                       ← Main index
+├── CODEBASE_MAP_ARCHITECTURE.md          ← System architecture overview
+├── CODEBASE_MAP_MODULES.md               ← Module index with cross-refs
+│   ├── CODEBASE_MAP_MODULE_AUDIO.md
+│   ├── CODEBASE_MAP_MODULE_WHISPER.md
+│   ├── CODEBASE_MAP_MODULE_PARAKEET.md
+│   ├── CODEBASE_MAP_MODULE_SUMMARY.md
+│   ├── CODEBASE_MAP_MODULE_AI_PROVIDERS.md
+│   ├── CODEBASE_MAP_MODULE_DATABASE.md
 │   ├── CODEBASE_MAP_MODULE_NOTIFICATIONS.md
 │   ├── CODEBASE_MAP_MODULE_ANALYTICS.md
-│   ├── CODEBASE_MAP_MODULE_AI_PROVIDERS.md
 │   ├── CODEBASE_MAP_MODULE_FRONTEND_APP.md
 │   ├── CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md
 │   └── CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md
-├── CODEBASE_MAP_DATA_FLOW.md          ← Data flow diagrams
-├── CODEBASE_MAP_CONVENTIONS.md        ← Naming & style conventions
-├── CODEBASE_MAP_OPERATIONS.md         ← Build, deploy, run
-└── CODEBASE_MAP_NAVIGATION.md         ← This file (quick navigation)
+├── CODEBASE_MAP_DATA_FLOW.md            ← Data flow diagrams
+├── CODEBASE_MAP_CONVENTIONS.md          ← Naming & style conventions
+├── CODEBASE_MAP_OPERATIONS.md           ← Build, deploy, run
+└── CODEBASE_MAP_NAVIGATION.md           ← This file (quick navigation)
 ```
 
 ## Navigation Tips
 
-1. **Start with architecture** → Understand the system before diving into modules
-2. **Follow the data flow** → Trace a recording from capture to storage
-3. **Use conventions** → Naming patterns help locate files quickly
-4. **Check dependencies** → `grep` for imports to find related code
-5. **Read tests** → Test files show expected behavior and edge cases
+1. **Start with architecture** → Understand the system before diving into modules.
+2. **Follow the data flow** → Trace a recording from mic/system capture to storage and summary.
+3. **Use conventions** → Naming patterns help locate files quickly.
+4. **Check dependencies** → `rg` for imports to find related code.
+5. **Read AGENTS.md** → It lists recent additions and the version-bump locations.

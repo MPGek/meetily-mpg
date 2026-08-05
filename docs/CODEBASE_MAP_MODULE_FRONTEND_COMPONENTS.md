@@ -1,165 +1,131 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-07-13T14:35:00Z
+last_mapped: 2026-08-05T14:59:00Z
 module: frontend_components
 ---
 
 > Part of [Module Guide](CODEBASE_MAP_MODULES.md) | [Codebase Map](CODEBASE_MAP.md)
 
-# Module: Frontend Components (Shadcn/ui + Custom)
+# Module: Frontend Components (React / Next.js)
 
 ## Overview
 
-**Purpose**: The frontend components module provides reusable UI components built with Shadcn/ui, Radix primitives, and Tailwind CSS. Used across all pages for consistent design system, accessibility, and responsive layout.
+**Purpose**: All React UI for the Meetily desktop app — nav (Sidebar), live recording UI (RecordingControls, TranscriptPanel), the virtualized transcript renderer, model managers, settings, and Shadcn/ui primitives. Recent changes added **mic/system visual separation** in the transcript view and **infinite-scroll pagination** for persisted meetings.
 
-**Entry point**: `frontend/src/components/ui/` — component library root
-**Framework**: React + TypeScript + Tailwind CSS + Shadcn/ui
+**Entry point**: `frontend/src/components/` (feature components) and `frontend/src/components/ui/` (primitives). Pages in `frontend/src/app/`.
 
-## File Reference
+**Framework**: React 18 + Next.js App Router + TypeScript + Tailwind + `@tanstack/react-virtual` + Framer Motion + Shadcn/ui.
 
-### Core Components (`components/ui/`)
-
-| File | Purpose | Key Exports | Tokens |
-|------|---------|-------------|--------|
-| `button.tsx` | Button variant styles | Button component, variants | ~1k |
-| `card.tsx` | Card container | Card, CardHeader, CardContent | ~2k |
-| `dialog.tsx` | Modal dialog | Dialog, DialogContent, DialogTitle | ~3k |
-| `dropdown-menu.tsx` | Dropdown menus | DropdownMenu, MenuItem | ~2k |
-| `input.tsx` | Text input fields | Input component | ~1k |
-| `label.tsx` | Form labels | Label component | ~0.5k |
-| `select.tsx` | Select dropdowns | Select, SelectItem | ~3k |
-| `slider.tsx` | Range slider | Slider component | ~2k |
-| `switch.tsx` | Toggle switch | Switch component | ~1k |
-| `tabs.tsx` | Tab navigation | Tabs, TabsContent, TabsList | ~2k |
-| `toast.tsx` | Toast notifications | toast(), useToast() | ~3k |
-| `tooltip.tsx` | Hover tooltips | Tooltip, TooltipContent | ~2k |
-| `badge.tsx` | Status badges | Badge component | ~0.5k |
-| `separator.tsx` | Visual separators | Separator component | ~0.5k |
-
-### Layout Components (`components/layout/`)
+## File Reference (key + recently-changed files)
 
 | File | Purpose | Key Exports | Tokens |
 |------|---------|-------------|--------|
-| `app-sidebar.tsx` | App sidebar navigation | AppSidebar, nav items | ~3k |
-| `header.tsx` | Page header component | PageHeader | ~2k |
-| `main-content.tsx` | Main content wrapper | MainContent | ~1k |
+| `Sidebar/index.tsx` | Left nav: Home/Notes/Settings, meeting list, search, record toggle, dialogs | `Sidebar`, `SidebarProvider` | ~6.8k |
+| `VirtualizedTranscriptView.tsx` | **Primary transcript renderer** — virtualization + mic/sys separation + infinite scroll | `VirtualizedTranscriptView`, `VirtualizedTranscriptViewProps` | ~3.6k |
+| `TranscriptPanel.tsx` (app/_components) | Home-page live transcript panel (adapts context → segments) | `TranscriptPanel` | ~0.9k |
+| `RecordingControls.tsx` | Start/pause/resume/stop recording | `RecordingControls` | — |
+| `RecordingStatusBar.tsx` | Recording status overlay | `RecordingStatusBar` | — |
+| `ConfidenceIndicator.tsx` | Per-segment confidence display | `ConfidenceIndicator` | — |
+| `PermissionWarning.tsx` | Mic/system permission warnings | `PermissionWarning` | — |
+| `DeviceSelection.tsx` | Audio device picker | `DeviceSelection` | — |
+| `AudioLevelMeter.tsx` / `AudioPlayer.tsx` | Level meter / playback | — | — |
+| `WhisperModelManager.tsx`, `ParakeetModelManager.tsx`, `BuiltInModelManager.tsx` | Model download/management | — | — |
+| `MeetingDetails/TranscriptPanel.tsx`, `SummaryPanel.tsx` | Persisted meeting view | — | — |
+| `ImportAudio/`, `DatabaseImport/`, `TranscriptRecovery/` | Import + recovery UI | — | — |
+| `ui/` | Shadcn/ui primitives (button, dialog, tooltip, etc.) | `cn()` helper | — |
 
-### Feature Components (`components/features/`)
+### Full inventory (feature components under `src/components/`)
+`Sidebar`, `MainContent`, `MainNav`, `RecordingControls`, `RecordingStatusBar`, `TranscriptView`, `VirtualizedTranscriptView`, `TranscriptSettings`, `ConfidenceIndicator`, `PermissionWarning`, `AudioLevelMeter`, `AudioPlayer`, `DeviceSelection`, `EditableTitle`, `Logo`, `Info`, `MessageToast`, `ComplianceNotification`, `About`, `AnalyticsProvider`/`AnalyticsConsentSwitch`/`AnalyticsDataModal`, `SettingTabs`, `ModelSettingsModal`, `SummaryModelSettings`, `SummaryLanguageSettings`, `LanguageSelection`, `LanguagePickerPopover`, `WhisperModelManager`, `ParakeetModelManager`, `BuiltInModelManager`, `ModelDownloadProgress`, `RecordingSettings`, `PreferenceSettings`, `BetaSettings`, `ConsoleToggle`, `AudioBackendSelector`, `BluetoothPlaybackWarning`, `ChunkProgressDisplay`, `CustomDialog`, `ConfirmationModel/`, `BlockNoteEditor/`, `AISummary/`, `MeetingDetails/` (TranscriptPanel, SummaryPanel, TranscriptButtonGroup, …), `ImportAudio/`, `DatabaseImport/`, `TranscriptRecovery/`, `UpdateCheckProvider`/`UpdateDialog`/`UpdateNotification`, `molecules/`, `shared/`, `ui/`, `onboarding/`.
 
-| File | Purpose | Key Exports | Tokens |
-|------|---------|-------------|--------|
-| `recording-controls.tsx` | Recording start/stop UI | RecordingControls | ~4k |
-| `meeting-card.tsx` | Meeting list item | MeetingCard | ~3k |
-| `transcript-display.tsx` | Transcript text display | TranscriptDisplay | ~5k |
-| `summary-viewer.tsx` | AI summary display | SummaryViewer | ~4k |
-| `device-selector.tsx` | Audio device selection | DeviceSelector | ~6k |
-| `provider-selector.tsx` | LLM provider selection | ProviderSelector | ~3k |
+## Public API (key components)
 
-### Icons (`components/icons/`)
-
-| File | Purpose | Key Exports | Tokens |
-|------|---------|-------------|--------|
-| `mic-icon.tsx` | Microphone icon | MicIcon | ~0.5k |
-| `record-icon.tsx` | Record button icon | RecordIcon | ~0.5k |
-| `stop-icon.tsx` | Stop button icon | StopIcon | ~0.5k |
-| `summary-icon.tsx` | Summary icon | SummaryIcon | ~0.5k |
-
-## Public API (Component Props)
-
-### RecordingControls
+### VirtualizedTranscriptView
 
 ```tsx
-interface RecordingControlsProps {
-  isRecording: boolean;
-  duration: number;
-  onToggleRecording: () => void;
-  meetingName?: string;
+interface VirtualizedTranscriptViewProps {
+  segments: TranscriptSegmentData[];       // { id, timestamp(=audio_start_time), endTime?, text, confidence?, source_device? }
+  isRecording?: boolean;
+  isPaused?: boolean;
+  isProcessing?: boolean;
+  isStopping?: boolean;
+  enableStreaming?: boolean;              // typewriter effect
+  showConfidence?: boolean;
+  disableAutoScroll?: boolean;            // meeting-details page
+  hasMore?: boolean;                      // pagination
+  isLoadingMore?: boolean;
+  totalCount?: number; loadedCount?: number;
+  onLoadMore?: () => void;
 }
 ```
 
-### DeviceSelector
+- **Mic/System separation**: `source_device === 'Microphone'` → left-aligned **blue** bubble; `'System'` → right-aligned **green** bubble; `undefined` (legacy) → neutral no-bubble.
+- **Virtualization threshold = 10**; below → simple map + Framer Motion entrance; at/above → `useVirtualizer` (`estimateSize: 60`, `overscan: 10`).
+- **Infinite scroll**: `IntersectionObserver` on `loadMoreTriggerRef` (+ rAF scroll fallback within 200px), gated on `onLoadMore && hasMore && !isLoadingMore && !isRecording`.
+
+### Sidebar
 
 ```tsx
-interface DeviceSelectorProps {
-  devices: AudioDevice[];
-  selectedDeviceId: string | null;
-  onSelectDevice: (deviceId: string) => void;
-  onRefreshDevices: () => void;
-}
+export default function Sidebar(): React.FC
+// 'use client'. Nav: Home, Meeting Notes, Settings. Meeting routing to /meeting-details?id=.
+// Transcript search (api_search_transcripts), record toggle (start-recording-from-sidebar window event
+//   or sessionStorage['autoStartRecording']='true' + route to /), meeting CRUD dialogs,
+//   model/transcript config modals, import-audio (beta-gated), version footer.
 ```
 
-### TranscriptDisplay
+### TranscriptPanel (home page)
 
 ```tsx
-interface TranscriptDisplayProps {
-  transcript: string;
-  isLive?: boolean;
-  onUpdate?: (newText: string) => void;
-  wordCount?: number;
-}
+TranscriptPanel({ isProcessingStop, isStopping, showModal })
+// useMemo maps Transcript[] → TranscriptSegmentData[] (carries source_device),
+// renders VirtualizedTranscriptView with recording-driven props; Copy + Language header controls;
+// PermissionWarning (skipped on Linux).
 ```
 
 ## Internal Architecture
 
-### Component Composition Pattern
-
-```tsx
-// Shadcn/ui primitive composition
-<Card>
-  <CardHeader>
-    <CardTitle>Title</CardTitle>
-  </CardHeader>
-  <CardContent>
-    {/* Custom feature component */}
-    <RecordingControls {...props} />
-  </CardContent>
-</Card>
-```
-
-### Theme Integration
-
-- CSS variables in `globals.css` for theme colors
-- Dark mode via class-based toggle (`dark` class on `<html>`)
-- Tailwind `dark:` variant for dark-specific styling
-
-### Responsive Design
-
-- Mobile-first with Tailwind breakpoints (sm, md, lg, xl)
-- Sidebar collapses to drawer on mobile
-- Grid layouts adjust columns based on viewport
+- **Component composition**: Shadcn/ui primitives + `cn()` + lucide-react icons + sonner toasts. Feature components consume context hooks (`useRecordingState`, `useTranscripts`, `useSidebar`, `useConfig`) and Tauri services.
+- **Two transcript panels**: `app/_components/TranscriptPanel.tsx` (live, non-paginated, uses `TranscriptContext.transcripts`) vs `components/MeetingDetails/TranscriptPanel.tsx` (persisted, paginated via `usePaginatedTranscripts`).
+- **Beta gating**: Import-audio UI renders only when `betaFeatures.importAndRetranscribe` is set.
 
 ## Dependencies (imports FROM)
 
 | Module/Package | What is imported | Why |
 |---------------|-----------------|-----|
-| `@radix-ui/react-*` | Dialog, Select, Switch, etc. | Accessible UI primitives |
-| `lucide-react` | Icon components | SVG icons |
-| `clsx` + `tailwind-merge` | cn() helper | Conditional class names |
-| `sonner` | toast() | Toast notifications |
+| `@tanstack/react-virtual` | `useVirtualizer` | Transcript virtualization |
+| `framer-motion` | `motion`, `AnimatePresence` | Entrance/status animations |
+| `@tauri-apps/api` | `invoke`, `listen`, `emit` | IPC + events |
+| `lucide-react` | icons | Icon set |
+| `sonner` | `toast` | Notifications |
+| `next/navigation` | `useRouter`, `usePathname` | Routing |
 
 ## Dependents (imported BY)
 
 | Consumer Module | What it uses | Context |
 |----------------|-------------|---------|
-| All pages | UI components | Page layout and interaction |
-| Shared layouts | Sidebar, header | App navigation structure |
+| `app/layout.tsx` | `Sidebar`, providers, Toaster | App shell |
+| `app/page.tsx` | `TranscriptPanel`, `RecordingControls`, overlays | Live home page |
+| `app/meeting-details/page.tsx` | `MeetingDetails/*`, `VirtualizedTranscriptView` | Persisted meeting view |
+| `app/settings/page.tsx` | `SettingTabs`, model managers, settings | Settings page |
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `theme` | system | Theme mode (light/dark/system) |
-| `fontFamily` | Inter | Font family for text |
-| `sidebar_collapsed` | false | Sidebar default state |
+| `VIRTUALIZATION_THRESHOLD` | 10 | Switch to virtualization above this segment count |
+| `estimateSize` / `overscan` | 60 / 10 | Virtualizer sizing |
+| Version string | `v0.5.0` | Hardcoded in sidebar footer (one of 3 version-bump locations) |
 
 ## Error Handling
 
-- **Missing props**: TypeScript strict types prevent runtime errors
-- **Invalid device ID**: Validation before passing to Tauri backend
-- **Component mount errors**: React error boundaries catch rendering failures
+- TypeScript strict types prevent most runtime errors.
+- Recording/permission failures surfaced via toasts (`sonner`) and `PermissionWarning`.
+- Per-command errors returned as `Result<_, String>` from Tauri and shown via toast.
 
 ## Gotchas and Tech Debt
 
-- **Shadcn/ui customization**: Components are copied into project (not packages) — must manually update when primitives change
-- **Tailwind class conflicts**: `cn()` helper handles merging but complex cases need manual review
-- **Icon consistency**: Some custom icons may not match Lucide style perfectly
+- **Dead conditional in `TranscriptSegment`**: the `isStreaming` branch returns the same markup as the final state for both mic and system (cosmetic).
+- **Duplicated JSX**: virtualized and non-virtualized branches contain near-identical infinite-scroll and listening-indicator markup.
+- **`playback`/`showPlayback` UI is vestigial** (`setShowPlayback(true)` commented out).
+- **Version string hardcoded** in the sidebar (drift risk with `tauri.conf.json`).
+- `modelConfig` defaults deliberately **not** applied ("let DB be the source of truth").
+- Clean-stop-word logic strips filler words for display only (not copy).

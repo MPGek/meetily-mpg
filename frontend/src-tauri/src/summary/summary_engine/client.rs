@@ -1,6 +1,7 @@
 // High-level client API for built-in AI summary generation
 // Provides simple interface for generating text using the sidecar
 
+use crate::summary::debug_log;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -127,6 +129,7 @@ fn get_cached_model_path(app_data_dir: &PathBuf, model_name: &str) -> Result<Pat
 /// * `system_prompt` - System instructions for the model
 /// * `user_prompt` - User message/task
 /// * `cancellation_token` - Optional token for cancellation
+/// * `debug_log_dir` - Optional directory for debug logs (LLM interaction payloads)
 ///
 /// # Returns
 /// Generated text
@@ -136,6 +139,7 @@ pub async fn generate_with_builtin(
     system_prompt: &str,
     user_prompt: &str,
     cancellation_token: Option<&CancellationToken>,
+    debug_log_dir: Option<PathBuf>,
 ) -> Result<String> {
     // Check cancellation at start
     if let Some(token) = cancellation_token {
@@ -143,6 +147,10 @@ pub async fn generate_with_builtin(
             return Err(anyhow!("Generation cancelled before starting"));
         }
     }
+
+    let call_start = Instant::now();
+    let iteration = debug_log::next_iteration();
+    let start_timestamp = debug_log::iso_timestamp();
 
     log::info!("Built-in AI generation request");
     log::info!("Model: {}", model_name);
@@ -197,6 +205,17 @@ pub async fn generate_with_builtin(
 
     let request_json = serde_json::to_string(&request)?;
 
+    let debug_entry = debug_log_dir.as_ref().map(|_| {
+        let json_val: serde_json::Value = serde_json::from_str(&request_json).unwrap_or_default();
+        debug_log::DebugLogEntry {
+            start_timestamp: start_timestamp.clone(),
+            provider: "BuiltInAI".to_string(),
+            model: model_name.to_string(),
+            request_json: json_val,
+            iteration,
+        }
+    });
+
     // Send request with timeout
     let timeout = Duration::from_secs(models::GENERATION_TIMEOUT_SECS);
 
@@ -206,11 +225,33 @@ pub async fn generate_with_builtin(
     let response_json = if let Some(token) = cancellation_token {
         tokio::select! {
             result = manager.send_request(request_json, timeout) => {
-                result?
+                match result {
+                    Ok(json) => json,
+                    Err(e) => {
+                        if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+                            let log_result = debug_log::DebugLogResult::Error {
+                                end_timestamp: debug_log::iso_timestamp(),
+                                elapsed_secs: debug_log::elapsed_secs(&call_start),
+                                error_message: e.to_string(),
+                                partial_response: None,
+                            };
+                            debug_log::write_debug_log(log_dir, entry, &log_result);
+                        }
+                        return Err(e);
+                    }
+                }
             }
             _ = token.cancelled() => {
                 log::warn!("Generation cancelled by user, shutting down sidecar");
-                // Shutdown sidecar to stop generation immediately
+                if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+                    let log_result = debug_log::DebugLogResult::Error {
+                        end_timestamp: debug_log::iso_timestamp(),
+                        elapsed_secs: debug_log::elapsed_secs(&call_start),
+                        error_message: "Generation cancelled by user".to_string(),
+                        partial_response: None,
+                    };
+                    debug_log::write_debug_log(log_dir, entry, &log_result);
+                }
                 if let Err(e) = manager.shutdown().await {
                     log::error!("Failed to shutdown sidecar during cancellation: {}", e);
                 }
@@ -218,12 +259,35 @@ pub async fn generate_with_builtin(
             }
         }
     } else {
-        manager.send_request(request_json, timeout).await?
+        match manager.send_request(request_json, timeout).await {
+            Ok(json) => json,
+            Err(e) => {
+                if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+                    let log_result = debug_log::DebugLogResult::Error {
+                        end_timestamp: debug_log::iso_timestamp(),
+                        elapsed_secs: debug_log::elapsed_secs(&call_start),
+                        error_message: e.to_string(),
+                        partial_response: None,
+                    };
+                    debug_log::write_debug_log(log_dir, entry, &log_result);
+                }
+                return Err(e);
+            }
+        }
     };
 
     // Check cancellation before parsing response
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
+            if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+                let log_result = debug_log::DebugLogResult::Error {
+                    end_timestamp: debug_log::iso_timestamp(),
+                    elapsed_secs: debug_log::elapsed_secs(&call_start),
+                    error_message: "Generation cancelled".to_string(),
+                    partial_response: None,
+                };
+                debug_log::write_debug_log(log_dir, entry, &log_result);
+            }
             return Err(anyhow!("Generation cancelled"));
         }
     }
@@ -232,7 +296,7 @@ pub async fn generate_with_builtin(
     let response: Response = serde_json::from_str(&response_json)
         .with_context(|| format!("Failed to parse response: {}", response_json))?;
 
-    match response {
+    let result = match response {
         Response::Response { text, error } => {
             if let Some(err_msg) = error {
                 Err(anyhow!("Generation failed: {}", err_msg))
@@ -242,7 +306,32 @@ pub async fn generate_with_builtin(
             }
         }
         Response::Error { message } => Err(anyhow!("Sidecar error: {}", message)),
+    };
+
+    if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+        match &result {
+            Ok(text) => {
+                let log_result = debug_log::DebugLogResult::Success {
+                    end_timestamp: debug_log::iso_timestamp(),
+                    elapsed_secs: debug_log::elapsed_secs(&call_start),
+                    status_code: 0,
+                    response_body: text.clone(),
+                };
+                debug_log::write_debug_log(log_dir, entry, &log_result);
+            }
+            Err(err) => {
+                let log_result = debug_log::DebugLogResult::Error {
+                    end_timestamp: debug_log::iso_timestamp(),
+                    elapsed_secs: debug_log::elapsed_secs(&call_start),
+                    error_message: err.to_string(),
+                    partial_response: None,
+                };
+                debug_log::write_debug_log(log_dir, entry, &log_result);
+            }
+        }
     }
+
+    result
 }
 
 /// Shutdown the global sidecar (graceful cleanup)

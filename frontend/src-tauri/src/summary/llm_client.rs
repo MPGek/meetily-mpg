@@ -1,7 +1,8 @@
+use crate::summary::debug_log::{self, DebugLogEntry, DebugLogResult};
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -106,6 +107,7 @@ impl LLMProvider {
 /// * `temperature` - Optional temperature (for CustomOpenAI provider)
 /// * `top_p` - Optional top_p (for CustomOpenAI provider)
 /// * `app_data_dir` - Optional app data directory (for BuiltInAI provider)
+/// * `debug_log_dir` - Optional directory for debug logs (LLM interaction payloads)
 /// * `cancellation_token` - Optional token to cancel the request
 ///
 /// # Returns
@@ -123,6 +125,7 @@ pub async fn generate_summary(
     temperature: Option<f32>,
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
+    debug_log_dir: Option<PathBuf>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
     // Check if cancelled before starting
@@ -131,6 +134,10 @@ pub async fn generate_summary(
             return Err("Summary generation was cancelled".to_string());
         }
     }
+
+    let call_start = Instant::now();
+    let iteration = debug_log::next_iteration();
+    let start_timestamp = debug_log::iso_timestamp();
 
     // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)
     if provider == &LLMProvider::BuiltInAI {
@@ -143,6 +150,7 @@ pub async fn generate_summary(
             system_prompt,
             user_prompt,
             cancellation_token,
+            debug_log_dir,
         )
         .await
         .map_err(|e| e.to_string());
@@ -253,7 +261,16 @@ pub async fn generate_summary(
         })
     };
 
-    info!("🐞 LLM Request to {}: model={}", provider_name(provider), model_name);
+    let provider_name_str = provider_name(provider);
+    info!("🐞 LLM Request to {}: model={}", provider_name_str, model_name);
+
+    let debug_entry = debug_log_dir.as_ref().map(|_| DebugLogEntry {
+        start_timestamp: start_timestamp.clone(),
+        provider: provider_name_str.to_string(),
+        model: model_name.to_string(),
+        request_json: request_body.clone(),
+        iteration,
+    });
 
     // Send request with timeout and cancellation support
     let request_future = client
@@ -267,38 +284,76 @@ pub async fn generate_summary(
     let response = if let Some(token) = cancellation_token {
         tokio::select! {
             result = request_future => {
-                result.map_err(|e| {
-                    if e.is_timeout() {
-                        format!("LLM request timed out after 60 seconds")
-                    } else {
-                        format!("Failed to send request to LLM: {}", e)
+                match result {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        let err_msg = if e.is_timeout() {
+                            "LLM request timed out after 60 seconds".to_string()
+                        } else {
+                            format!("Failed to send request to LLM: {}", e)
+                        };
+                        if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+                            let result = DebugLogResult::Error {
+                                end_timestamp: debug_log::iso_timestamp(),
+                                elapsed_secs: debug_log::elapsed_secs(&call_start),
+                                error_message: err_msg.clone(),
+                                partial_response: None,
+                            };
+                            debug_log::write_debug_log(log_dir, entry, &result);
+                        }
+                        return Err(err_msg);
                     }
-                })?
+                }
             }
             _ = token.cancelled() => {
                 return Err("Summary generation was cancelled".to_string());
             }
         }
     } else {
-        request_future.await.map_err(|e| {
-            if e.is_timeout() {
-                format!("LLM request timed out after 60 seconds")
-            } else {
-                format!("Failed to send request to LLM: {}", e)
+        match request_future.await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err_msg = if e.is_timeout() {
+                    "LLM request timed out after 60 seconds".to_string()
+                } else {
+                    format!("Failed to send request to LLM: {}", e)
+                };
+                if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+                    let result = DebugLogResult::Error {
+                        end_timestamp: debug_log::iso_timestamp(),
+                        elapsed_secs: debug_log::elapsed_secs(&call_start),
+                        error_message: err_msg.clone(),
+                        partial_response: None,
+                    };
+                    debug_log::write_debug_log(log_dir, entry, &result);
+                }
+                return Err(err_msg);
             }
-        })?
+        }
     };
+
+    let status_code = response.status().as_u16();
 
     if !response.status().is_success() {
         let error_body = response
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("LLM API request failed: {}", error_body));
+        let err_msg = format!("LLM API request failed: {}", error_body);
+        if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+            let result = DebugLogResult::Error {
+                end_timestamp: debug_log::iso_timestamp(),
+                elapsed_secs: debug_log::elapsed_secs(&call_start),
+                error_message: err_msg.clone(),
+                partial_response: Some(error_body),
+            };
+            debug_log::write_debug_log(log_dir, entry, &result);
+        }
+        return Err(err_msg);
     }
 
     // Parse response based on provider
-    if provider == &LLMProvider::Claude {
+    let result: Result<String, String> = if provider == &LLMProvider::Claude {
         let chat_response = response
             .json::<ClaudeChatResponse>()
             .await
@@ -311,15 +366,16 @@ pub async fn generate_summary(
             .get(0)
             .ok_or("No content in LLM response")?
             .text
-            .trim();
-        Ok(content.to_string())
+            .trim()
+            .to_string();
+        Ok(content)
     } else {
         let chat_response = response
             .json::<ChatResponse>()
             .await
             .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
 
-        info!("🐞 LLM Response received from {}", provider_name(provider));
+        info!("🐞 LLM Response received from {}", provider_name_str);
 
         let content = chat_response
             .choices
@@ -327,9 +383,35 @@ pub async fn generate_summary(
             .ok_or("No content in LLM response")?
             .message
             .content
-            .trim();
-        Ok(content.to_string())
+            .trim()
+            .to_string();
+        Ok(content)
+    };
+
+    if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+        match &result {
+            Ok(text) => {
+                let log_result = DebugLogResult::Success {
+                    end_timestamp: debug_log::iso_timestamp(),
+                    elapsed_secs: debug_log::elapsed_secs(&call_start),
+                    status_code,
+                    response_body: text.clone(),
+                };
+                debug_log::write_debug_log(log_dir, entry, &log_result);
+            }
+            Err(err) => {
+                let log_result = DebugLogResult::Error {
+                    end_timestamp: debug_log::iso_timestamp(),
+                    elapsed_secs: debug_log::elapsed_secs(&call_start),
+                    error_message: err.clone(),
+                    partial_response: None,
+                };
+                debug_log::write_debug_log(log_dir, entry, &log_result);
+            }
+        }
     }
+
+    result
 }
 
 /// Helper function to get provider name for logging

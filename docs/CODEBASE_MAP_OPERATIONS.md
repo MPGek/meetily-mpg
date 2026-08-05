@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-07-13T14:39:00Z
+last_mapped: 2026-08-05T15:01:00Z
 section: operations
 ---
 
@@ -8,237 +8,94 @@ section: operations
 
 # Operations & Deployment
 
-## Build Commands
+## Environment Requirements
 
-### Frontend (Tauri + Next.js)
+- **Node.js** ≥ 18, **Rust** toolchain **1.77+** (enforced in both `Cargo.toml` files), edition 2021.
+- **Package manager**: `pnpm` preferred, `npm` accepted (scripts auto-detect).
+- **CMake** ≥ 3.5 (checked/upgraded by clean build scripts).
+- **Tauri CLI**: `@tauri-apps/cli ^2.1.0`; `tauri = "2.6.2"`, `tauri-build = "2.3.0"`.
+- **`uv`** (Python, optional): used by `build.rs` to extract the Silero VAD model; falls back to direct GitHub download.
+- **Windows**: VS Build Tools 2022 (C++ desktop workload), Windows SDK, **LLVM/Clang** at `C:\Program Files\LLVM\bin` (`LIBCLANG_PATH` required by `whisper-rs-sys`).
+- **Linux**: `build-essential cmake git`; GPU dev SDKs (CUDA toolkit / ROCm / Vulkan + `libopenblas-dev`) — drivers alone are insufficient.
+- **macOS**: Xcode Command Line Tools, Homebrew (`cmake node pnpm`); Metal acceleration on by default.
 
-| Command | Description | Location |
-|---------|-------------|----------|
-| `pnpm install` | Install dependencies | frontend/ |
-| `pnpm dev` | Start Next.js dev server | frontend/ |
-| `pnpm tauri dev` | Run Tauri desktop app in dev mode | frontend/ |
-| `pnpm tauri build` | Build production desktop app | frontend/ |
-| `pnpm build` | Build Next.js production bundle | frontend/ |
-| `./build.bat` / `./build.ps1` | Windows batch build scripts | frontend/ |
-| `./build.sh` | Linux/Mac build script | frontend/ |
+## Build and Deployment
 
-### Rust Backend (Tauri)
+### GPU feature detection & scripts
+
+- `pnpm tauri:dev` / `pnpm tauri:build` run **`scripts/tauri-auto.js`** which reads `TAURI_GPU_FEATURE` (env override) or runs `scripts/auto-detect-gpu.js`, then calls `tauri dev|build -- --features <feat>`. Detection priority: macOS arm64→`coreml` (Intel→`metal`), NVIDIA→`cuda`, AMD ROCm→`hipblas`, Vulkan→`vulkan`, OpenBLAS→`openblas`, else CPU.
+- Feature-pinned variants: `tauri:dev:cpu/cuda/vulkan/metal/coreml/openblas/hipblas` and `tauri:build:*`.
+- **`frontend/build-gpu.bat` / `dev-gpu.bat` are the authoritative Windows flows**:
+  1. Set `LIBCLANG_PATH`; locate & call `vcvars64.bat` (with hard-coded MSVC/SDK fallback).
+  2. `call ..\scripts\env-cuda.bat` — sets CUDA env (see below).
+  3. Detect GPU feature → `TAURI_GPU_FEATURE`.
+  4. **Build the `llama-helper` sidecar** (`cargo build --release [--features <feat>]`), copy the target-triple binary to `src-tauri/binaries/llama-helper-<triple>.exe`.
+  5. Run `pnpm run tauri:build` / `tauri:dev`.
+- **`build-gpu.sh`/`dev-gpu.sh`** (Unix): export CUDA CMake flags on Linux (`CMAKE_CUDA_ARCHITECTURES=75`, `CMAKE_CUDA_STANDARD=17`, `CMAKE_POSITION_INDEPENDENT_CODE=ON`); `source scripts/env-cuda.sh`; **llama-helper has no `coreml` feature → remap to `metal`** on Apple Silicon; `build-gpu.sh` sets `NO_STRIP=true` for AppImage.
+- **`build-gpu.ps1`/`dev-gpu.ps1`** are **Vulkan-pinned and do NOT** auto-detect GPU or build the llama-helper sidecar — not drop-in equivalents; prefer `.bat`/`.sh`.
+- **`scripts/env-cuda.bat` / `.sh`** (idempotent) hard-code **CUDA Toolkit v13.3**: `CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3`, `CUDA_PATH`, `CUDA_PATH_V13_3`, `CUDA_MODULE_LOADING=LAZY`, prepend `<root>\bin`/`<root>\bin\x64` to PATH. Header warns: *"UPDATE THE PATH BELOW IF THE CUDA TOOLKIT VERSION CHANGES."* Does **not** set `CUDNN_LIBRARY` or `BLAS_INCLUDE_DIRS`.
+
+### Standard commands (`frontend/package.json`)
 
 | Command | Description |
 |---------|-------------|
-| `cargo build` | Build debug binary |
-| `cargo build --release` | Build optimized release binary |
-| `cargo clippy` | Run linter |
-| `cargo test` | Run tests |
+| `pnpm dev` | `next dev -p 3118` (frontend only) |
+| `pnpm build` | `next build` |
+| `pnpm tauri:dev` / `pnpm tauri:build` | Tauri dev/build with auto GPU detection |
+| `pnpm tauri dev` / `pnpm tauri build` | Direct Tauri (CPU default) |
 
-### Python Backend (Optional)
+### Signed release build
 
-| Command | Description | Location |
-|---------|-------------|----------|
-| `pip install -r requirements.txt` | Install Python dependencies | backend/ |
-| `python main.py` | Start Python server | backend/ |
+`frontend/build.ps1` loads `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` from `.env` (via `scripts/load-env.ps1`, key from `.tauri\meetily.key`), requires them, invokes `.\build-gpu.bat`, then nulls the env vars.
 
-## Development Workflow
+## Cargo Features
 
-```mermaid
-graph LR
-    DevFrontend[Frontend dev<br/>pnpm tauri dev] --> DevApp[Desktop App Opens]
-    DevApp --> Code[Edit Code]
-    Code --> HMR[Hot Reload]
-    HMR --> DevApp
-    
-    subgraph Tauri["Tauri Window"]
-        NextJS[Next.js Server<br/>port 14269]
-        RustBackend[Rust Backend<br/>Tauri commands]
-        SQLite[(SQLite DB)]
-    end
-    
-    NextJS --> Tauri
-    RustBackend --> Tauri
-    SQLite --> Tauri
-```
+Main crate (`frontend/src-tauri/Cargo.toml`):
+- `default = ["platform-default"]`; `platform-default` is a **no-op marker** — real defaults come from target-specific `whisper-rs` deps.
+- GPU/BLAS features all forward to `whisper-rs`: `metal`, `coreml`, `cuda`, `vulkan`, `hipblas`, `openblas`, `openmp`.
+- Target-specific whisper-rs: macOS → `["raw-api","metal","coreml"]`; Windows/Linux → `["raw-api"]` (CPU; add GPU manually).
+- Tauri features: `macos-private-api`, `protocol-asset`, `tray-icon`.
+- Notable pins: `tauri = "2.6.2"`, `ort = "2.0.0-rc.10"`, `tauri-plugin-single-instance = "=2.3.7"` (exact), `cpal` (git rev), `ffmpeg-sidecar` (git branch `main`), `esaxx-rs` (branch `feat/dynamic-msvc-link`).
 
-### Dev Environment Setup
+`llama-helper/Cargo.toml` (sidecar): features `metal`/`cuda`/`vulkan` forwarded to `llama-cpp-2 = "=0.1.146"` (exact-pinned). **No `coreml`/`hipblas`/`openblas`** — hence the coreml→metal remap. Release profile: `codegen-units=1`, `lto=true`, `opt-level="s"`.
 
-1. **Install prerequisites**: Node.js 20+, pnpm, Rust toolchain, Python 3.10+
-2. **Frontend dependencies**: `cd frontend && pnpm install`
-3. **Rust dependencies**: `cargo build` (downloads whisper.cpp, ort, etc.)
-4. **Optional Python**: `cd backend && pip install -r requirements.txt`
-5. **Run dev**: `pnpm tauri dev` from frontend/
+Workspace members: `frontend/src-tauri`, `llama-helper`; **target dir at repo root** (`./target`).
 
-## Production Build Process
+## Tauri Config (`tauri.conf.json`)
 
-### Desktop App (Tauri)
+- `productName: meetily`, `version: 0.5.0`, `identifier: com.meetily.ai`.
+- `frontendDist: "../out"` (static Next.js export), `devUrl: http://localhost:3118`, `beforeDevCommand: "pnpm dev"`, `beforeBuildCommand: "pnpm build"`.
+- Window 1100×700, `macOSPrivateApi: true`. Tight CSP (`default-src 'self'`; `connect-src` allows localhost Ollama `11434`, `5167`, `8178`, `https://api.ollama.ai`).
+- Capabilities (`main`): `fs:default`, `fs:read-all`, `fs:write-all`, `core:*:default`, `store:default`, `notification:default`, `updater:default`, `process:default`.
+- Bundle targets: `deb`, `appimage`, `msi`, `nsis`, `app`, `dmg`. `externalBin`: `binaries/llama-helper`, `binaries/ffmpeg`. Resources: `templates/*.json`. Windows signing via `scripts/sign-windows.ps1`; macOS ad-hoc signing + hardened runtime. Updater endpoint: GitHub `meetily/meeting-minutes` latest.json.
 
-```bash
-# 1. Install dependencies
-pnpm install
+## Gotchas
 
-# 2. Build Next.js production bundle
-pnpm build
+- **CUDA path hard-coded to v13.3** in `env-cuda.*`; a different toolkit version breaks CUDA builds silently.
+- **MSVC/SDK paths hard-coded** in `.bat` fallback (10.0.22621.0, MSVC 14.44.35207) — fragile if `vcvars64.bat` fails.
+- **`LIBCLANG_PATH`** must point at LLVM on Windows or `whisper-rs-sys` fails to parse headers.
+- **llama-helper lacks `coreml`/`hipblas`/`openblas`** → remap to `metal`; others build CPU.
+- **`NO_STRIP=true`** required for AppImage (set in `build-gpu.sh`).
+- **Drivers ≠ acceleration**: auto-detect needs the full dev SDK (`CUDA_PATH`/`nvcc`, `ROCM_PATH`/`hipcc`, `VULKAN_SDK` + `BLAS_INCLUDE_DIRS`).
+- Two diverging build paths: `tauri-auto.js` (auto) vs `tauri:build:vulkan` (pinned).
+- CUDA CMake flags only set on Linux; change `CMAKE_CUDA_ARCHITECTURES` to your GPU compute capability.
 
-# 3. Build Tauri app (creates platform-specific installer)
-pnpm tauri build
-```
-
-Output locations:
-- **Windows**: `frontend/src-tauri/target/release/`
-- **macOS**: `frontend/src-tauri/target/release/`
-- **Linux**: `frontend/src-tauri/target/release/`
-
-### Docker (Backend Server)
-
-| Image | Purpose | File |
-|-------|---------|------|
-| `meetily-server-cpu` | CPU-only server | `backend/Dockerfile.server-cpu` |
-| `meetily-server-gpu` | GPU-accelerated server | `backend/Dockerfile.server-gpu` |
-| `meetily-app` | Full app with frontend | `backend/Dockerfile.app` |
-
-```bash
-# Build CPU-only server
-docker build -t meetily-server-cpu -f backend/Dockerfile.server-cpu backend/
-
-# Build GPU server (requires NVIDIA container toolkit)
-docker build -t meetily-server-gpu -f backend/Dockerfile.server-gpu backend/
-
-# Run with GPU
-docker run --gpus all -p 8000:8000 meetily-server-gpu
-```
-
-## Configuration Files
-
-| File | Purpose | Location |
-|------|---------|----------|
-| `tauri.conf.json` | Tauri app config (name, version, windows) | frontend/src-tauri/ |
-| `Cargo.toml` | Rust dependencies and features | root + frontend/src-tauri/ |
-| `package.json` | Node.js dependencies and scripts | frontend/ |
-| `.env` / `.env.local` | Environment variables | frontend/ |
-| `requirements.txt` | Python backend dependencies | backend/ |
-
-### Key Tauri Config (`tauri.conf.json`)
-
-```json
-{
-  "productName": "Meetily",
-  "version": "1.0.0",
-  "identifier": "com.meetily.app",
-  "app": {
-    "windows": [
-      {
-        "title": "Meetily",
-        "width": 1200,
-        "height": 800
-      }
-    ]
-  },
-  "bundle": {
-    "activeTargetPlatform": "deb",
-    "icon": ["icons/"]
-  }
-}
-```
-
-## Runtime Dependencies
-
-### Desktop App (Tauri)
-
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| `tauri` | 2.x | Desktop framework |
-| `whisper-rs` | latest | Whisper.cpp bindings |
-| `ort` | latest | ONNX Runtime |
-| `sqlx` | 0.7+ | Async SQLite |
-| `portaudio` | system | Audio capture |
-
-### Frontend (Node.js)
-
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| `next` | 14+ | React framework |
-| `react` | 18+ | UI library |
-| `zustand` | latest | State management |
-| `@tauri-apps/api` | 2.x | Tauri IPC |
-| `tailwindcss` | 3+ | CSS framework |
-
-## Platform-Specific Notes
-
-### Windows
-
-- **Build**: Use `pnpm tauri build` — requires Visual Studio Build Tools
-- **Audio**: PortAudio WASAPI backend
-- **GPU**: CUDA (NVIDIA) or Vulkan (AMD/Intel)
-- **Installer**: NSIS installer generated automatically
-
-### macOS
-
-- **Build**: `pnpm tauri build` — codesigning required for distribution
-- **Audio**: CoreAudio backend
-- **GPU**: Metal + CoreML (Apple Silicon only)
-- **Notarization**: Required for Gatekeeper
-
-### Linux
-
-- **Build**: Requires libsqlite3-dev, alsa-lib, portaudio19-dev
-- **Audio**: ALSA/PulseAudio/PipeWire backend
-- **GPU**: Vulkan or CUDA (depending on driver)
-- **Package**: DEB/RPM generated automatically
-
-## Environment Variables
-
-| Variable | Purpose | Default | Required |
-|----------|---------|---------|----------|
-| `WHISPER_MODEL_PATH` | Custom model path | — | No |
-| `OLLAMA_BASE_URL` | Ollama server URL | http://localhost:11434 | No |
-| `OPENAI_API_KEY` | OpenAI API key | — | Conditional |
-| `ANTHROPIC_API_KEY` | Anthropic API key | — | Conditional |
-| `GROQ_API_KEY` | Groq API key | — | Conditional |
-| `OPENROUTER_API_KEY` | OpenRouter API key | — | Conditional |
-
-## Update/Migration Process
-
-### App Version Updates
-
-1. **Bump version**: Update `tauri.conf.json` and `package.json`
-2. **Run migrations**: Database schema changes in `database/setup.rs`
-3. **Build**: `pnpm tauri build -- --features update-check`
-4. **Distribute**: Platform-specific artifacts generated
-
-### Database Schema Migrations
-
-```rust
-// In database/setup.rs
-async fn migrate_schema(pool: &SqlitePool) -> Result<(), DatabaseError> {
-    // Check current version
-    // Apply ALTER TABLE if needed
-    // Update version marker
-}
-```
-
-## Monitoring & Diagnostics
-
-### Logs
-
-| Source | Location | Content |
-|--------|----------|---------|
-| Tauri | Console/DevTools | Rust backend logs, errors |
-| Next.js | Terminal | Build output, API errors |
-| Python (optional) | Terminal | Server logs |
-
-### Debug Mode
-
-```bash
-# Enable verbose logging
-RUST_LOG=debug pnpm tauri dev
-
-# Check GPU acceleration status
-# Settings → Diagnostics page in app UI
-```
-
-### Common Issues & Fixes
+## Troubleshooting
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| Audio device not found | PortAudio permission | Grant microphone access in OS settings |
-| Model download fails | Network issue | Check internet, retry download |
-| GPU inference slow | Vulkan driver issue | Update graphics drivers |
-| Ollama connection refused | Server not running | Start Ollama: `ollama serve` |
+| "CUDA toolkit not found" | Missing/version-locked toolkit | Install CUDA or update `scripts/env-cuda.*` path |
+| Vulkan deps missing | Missing `BLAS_INCLUDE_DIRS` | `export VULKAN_SDK=/usr`, `export BLAS_INCLUDE_DIRS=...` |
+| llama-helper binary not found | Sidecar didn't build/copy | Check `../target/{release,debug}` (workspace target at repo root) |
+| No GPU acceleration | Only drivers installed, not dev SDK | Install dev SDK or force `TAURI_GPU_FEATURE=cuda` |
+| AppImage symbol-strip failure | `NO_STRIP` unset | Set `NO_STRIP=true` |
+| Port 3118 in use | Stale dev server | Scripts auto-kill processes on 3118 |
+| Missing signing key | No `.env` | Create from `.env.example` with `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` |
+| `whisper-rs-sys`/libclang errors | LLVM missing | Verify `C:\Program Files\LLVM\bin` + `LIBCLANG_PATH` |
+| Silero VAD model not found at build | `uv`/download failed | Run the printed `uv run` command manually |
+
+## Performance Considerations
+
+- **`llama-cpp-2` sidecar release profile** is size-optimized (`opt-level="s"`) for faster load.
+- GPU feature choice materially affects whisper.cpp speed; `auto-detect-gpu.js` chooses based on detected hardware.
+- The app relies on **local** transcription/summarization (no cloud dependency) — CPU fallback exists when no GPU backend is detected.

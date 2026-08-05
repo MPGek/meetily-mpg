@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-07-13T14:33:00Z
+last_mapped: 2026-08-05T14:57:00Z
 module: database
 ---
 
@@ -10,198 +10,157 @@ module: database
 
 ## Overview
 
-**Purpose**: The database module provides SQLite-based persistent storage for all Meetily data — meetings, transcripts, summaries, recording metadata, and application settings. Built with sqlx for compile-time query checking and async operations via tokio runtime.
+**Purpose**: Complete persistence layer for meetings, transcripts, summary jobs, transcript chunks, and app config, built on **SQLite via sqlx 0.8** (tokio runtime). Owns the DB file lifecycle including legacy `.db` → `.sqlite` migration and WAL-corruption recovery. Recent changes added `source_device` (mic/system channel) storage on transcripts and paginated transcript queries.
 
-**Entry point**: `database/mod.rs` — module root
+> **Note:** Queries are **runtime strings** (`sqlx::query_as`, `query`), not compile-time `query!` macros — a notable tech-debt point.
+
+**Entry point**: `database/mod.rs` — module root.
+
 **Sub-packages**:
-- `repositories/` — Repository pattern implementations for each entity type
+- `repositories/` — Five stateless, pool-taking repository structs doing raw SQL.
 
 ## File Reference
 
 | File | Purpose | Key Exports | Tokens |
 |------|---------|-------------|--------|
-| `mod.rs` | Module root, re-exports all sub-modules | database types | ~1k |
-| `manager.rs` | Database connection management | DBManager struct, init/execute/query | ~8k |
-| `models.rs` | SQL table definitions and Rust structs | Meeting, Transcript, Summary models | ~6k |
-| `setup.rs` | Schema initialization and migrations | create_tables(), migrate_schema() | ~4k |
-| `commands.rs` | Tauri command handlers for DB operations | get_meetings, save_transcript, etc. | ~8k |
-
-### repositories/ sub-package
-
-| File | Purpose | Key Exports | Tokens |
-|------|---------|-------------|--------|
-| `mod.rs` | Repository module root | re-exports | ~0.5k |
-| `meeting_repository.rs` | Meeting CRUD operations | MeetingRepository, create/get/list/delete | ~6k |
-| `transcript_repository.rs` | Transcript CRUD operations | TranscriptRepository, save/get_by_meeting() | ~5k |
-| `summary_repository.rs` | Summary CRUD operations | SummaryRepository, save/get_by_meeting() | ~4k |
+| `mod.rs` | Module root, declares 5 submodules | — | <1k |
+| `manager.rs` | Connection pool + lifecycle, legacy import, WAL recovery | `DatabaseManager` | ~2k |
+| `setup.rs` | Startup init (first-launch event vs immediate init) | `initialize_database_on_startup` | <1k |
+| `commands.rs` | Tauri IPC for DB import/init/utility | `check_first_launch`, `initialize_fresh_database`, `import_and_initialize_database` | ~2k |
+| `models.rs` | Entity structs (`FromRow`) | `MeetingModel`, `Transcript`, `SummaryProcess`, `TranscriptChunk`, `Setting`, `TranscriptSetting`, `DateTimeUtc` | ~1k |
+| `repositories/mod.rs` | Repository module root | — | <1k |
+| `repositories/meeting.rs` | Meeting + transcript CRUD, pagination | `MeetingsRepository` | ~2k |
+| `repositories/transcript.rs` | Save meeting+segments transactionally, search | `TranscriptsRepository` | ~1k |
+| `repositories/transcript_chunk.rs` | Persist full transcript + chunking params | `TranscriptChunksRepository` | <1k |
+| `repositories/summary.rs` | Summary job state machine + result backup/restore | `SummaryProcessesRepository` | ~1.5k |
+| `repositories/setting.rs` | Summary/transcript config + API keys | `SettingsRepository` | ~2.6k |
 
 ## Public API
 
-### Key Functions (Tauri Commands)
+### Key Functions (Tauri Commands — `database/commands.rs`)
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `get_all_meetings` | `(page?, limit?) -> Result<Vec<MeetingEntry>, String>` | List meetings with pagination |
-| `get_meeting_by_id` | `(meeting_id) -> Result<Option<Meeting>, String>` | Get single meeting by ID |
-| `create_meeting` | `(title, description?, recording_path?) -> Result<String, String>` | Create new meeting entry |
-| `update_meeting` | `(meeting_id, updates) -> Result<(), String>` | Update meeting metadata |
-| `delete_meeting` | `(meeting_id) -> Result<(), String>` | Delete meeting and related data |
-| `save_transcript` | `(meeting_id, transcript_text) -> Result<(), String>` | Save/update transcript for meeting |
-| `get_transcript_for_meeting` | `(meeting_id) -> Result<Option<String>, String>` | Get transcript text for meeting |
-| `save_summary` | `(meeting_id, summary_content, provider?, model?) -> Result<(), String>` | Save AI summary for meeting |
-| `get_summaries_for_meeting` | `(meeting_id) -> Result<Vec<SummaryEntry>, String>` | Get all summaries for meeting |
-| `update_transcript` | `(transcript_id, new_text) -> Result<(), String>` | Update transcript content |
-| `delete_transcript` | `(transcript_id) -> Result<(), String>` | Delete transcript entry |
-| `import_meeting_data` | `(json_data) -> Result<String, String>` | Import meeting data from JSON backup |
+| `check_first_launch` | `(app) -> Result<bool, String>` | `!meeting_minutes.sqlite.exists()` |
+| `select_legacy_database_path` | `(app) -> Result<Option<String>, String>` | OS file dialog for legacy `.db` |
+| `detect_legacy_database` | `(selected_path: String) -> Result<Option<String>, String>` | Heuristic detection |
+| `check_homebrew_database` | `(path: String) -> Result<Option<DatabaseCheckResult>, String>` | Detect old Python-backend installs |
+| `import_and_initialize_database` | `(app, legacy_db_path) -> Result<(), String>` | Import + manage AppState; emits `database-initialized` |
+| `initialize_fresh_database` | `(app) -> Result<(), String>` | Fresh init + seeds default model configs |
+| `get_database_directory` / `open_database_folder` | `(app) -> Result<.., String>` | DB dir helpers |
+
+> Most data access from the frontend goes through the **`api/api.rs`** commands (e.g. `api_get_meetings`, `api_get_meeting_transcripts`, `api_save_transcript`) which wrap these repositories — not through `database/commands.rs`.
 
 ### Key Types
 
 ```rust
-struct DBManager {
+struct DatabaseManager {
     pool: SqlitePool,
 }
+// new(tauri_db_path, backend_db_path), new_from_app_handle, is_first_launch,
+// import_legacy_database, pool(), with_transaction, cleanup()
 
-struct Meeting {
-    id: String,
-    title: String,
-    description: Option<String>,
-    recording_path: Option<String>,
-    audio_format: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+struct Transcript {                       // models.rs — includes audio sync + device channel
+    id: String, meeting_id: String, transcript: String, timestamp: String,
+    summary: Option<String>, action_items: Option<String>, key_points: Option<String>,
+    audio_start_time: Option<f64>, audio_end_time: Option<f64>, duration: Option<f64>,
+    source_device: Option<String>,       // 'mic' | 'system'  (mic/system channel)
 }
+```
 
-struct TranscriptEntry {
-    id: String,
-    meeting_id: String,
-    content: String,
-    word_count: usize,
-    language: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
+### Schema (from 11 embedded migrations)
 
-struct SummaryEntry {
-    id: String,
-    meeting_id: String,
-    content: String,
-    provider: Option<String>,
-    model: Option<String>,
-    token_count: usize,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
+```mermaid
+erDiagram
+    meetings ||--o{ transcripts : has
+    meetings ||--o{ summary_processes : has
+    meetings ||--o{ transcript_chunks : has
+    meetings ||--o{ meeting_notes : has
+    meetings {
+        string id PK
+        string title
+        datetime created_at
+        datetime updated_at
+        string folder_path
+    }
+    transcripts {
+        string id PK
+        string meeting_id FK
+        string transcript
+        string timestamp
+        real audio_start_time
+        real audio_end_time
+        real duration
+        string speaker          -- added 2025-11 (values 'mic'/'system')
+        string source_device    -- added 2026-07 (mic/system)
+    }
+    settings { string id PK, string provider, string model, ... api keys, customOpenAIConfig }
+    transcript_settings { string id PK, string provider, string model, ... api keys }
+    summary_processes { string meeting_id PK, string status, string result, ... result_backup }
+    transcript_chunks { string meeting_id PK, string transcript_text, ... }
+    licensing { string license_key PK, ... }
+    meeting_notes { string meeting_id PK, ... }
 ```
 
 ## Internal Architecture
 
-### Schema Design
-
-```mermaid
-erDiagram
-    MEETING ||--o{ TRANSCRIPT : has
-    MEETING ||--o{ SUMMARY : has
-    MEETING {
-        string id PK
-        string title
-        string description
-        string recording_path
-        string audio_format
-        datetime created_at
-        datetime updated_at
-    }
-    TRANSCRIPT {
-        string id PK
-        string meeting_id FK
-        string content
-        int word_count
-        string language
-        datetime created_at
-        datetime updated_at
-    }
-    SUMMARY {
-        string id PK
-        string meeting_id FK
-        string content
-        string provider
-        string model
-        int token_count
-        datetime created_at
-        datetime updated_at
-    }
-```
-
-### Connection Management
-
-1. **Initialization**: `DBManager::new()` creates connection pool to SQLite file in app_data directory
-2. **Schema Setup**: `setup.rs` runs CREATE TABLE IF NOT EXISTS on first connect
-3. **Migrations**: Schema migrations applied automatically on version changes
-4. **Connection Pooling**: sqlx SqlitePool manages concurrent connections
-
-### Repository Pattern
-
-Each entity type has a dedicated repository:
-```rust
-struct MeetingRepository {
-    db: Arc<DBManager>,
-}
-
-impl MeetingRepository {
-    async fn create(&self, meeting: &Meeting) -> Result<String, DatabaseError> { ... }
-    async fn get_by_id(&self, id: &str) -> Result<Option<Meeting>, DatabaseError> { ... }
-    async fn list_all(&self, page: u32, limit: u32) -> Result<Vec<Meeting>, DatabaseError> { ... }
-    async fn delete(&self, id: &str) -> Result<(), DatabaseError> { ... }
-}
-```
-
-### Concurrency Model
-
-- sqlx SqlitePool manages connection pooling (max 10 connections by default)
-- All operations are async via tokio
-- `Arc<DBManager>` shared across tasks via AppState
-- SQLite WAL mode enabled for concurrent read/write
+- **manager.rs**: single managed `DatabaseManager` in `AppState`; `new_from_app_handle` resolves `app_data_dir()` (`meeting_minutes.sqlite` primary, `meeting_minutes.db` legacy), runs `sqlx::migrate!`, and on "malformed"/"corrupt" error deletes `-wal`/`-shm` and retries once. `cleanup()` runs `PRAGMA wal_checkpoint(TRUNCATE)` then closes pool.
+- **setup.rs**: on first launch spawns a 500ms-delayed `first-launch-detected` event (AppState NOT yet managed); otherwise initializes immediately.
+- **repositories/**: raw-SQL unit structs taking `&SqlitePool`. `MeetingsRepository::get_meeting_transcripts_paginated` orders by `audio_start_time` and returns `(Vec<Transcript>, total)` for infinite scroll. `TranscriptsRepository::save_transcript` inserts meeting + segments atomically (incl. `audio_start_time/end_time/duration/source_device`).
+- **summary.rs**: `SummaryProcessesRepository` implements a `PENDING → completed/failed/cancelled` state machine with **result backup/restore**: `create_or_reset_process` backs up `result`→`result_backup`; `update_process_failed`/`cancelled` restores `result = COALESCE(result_backup, result)`.
+- **setting.rs**: singleton config rows `id='1'` via UPSERT; per-provider API keys; custom OpenAI as JSON blob.
 
 ## Dependencies (imports FROM)
 
 | Module/Package | What is imported | Why |
 |---------------|-----------------|-----|
-| `sqlx` | `SqlitePool`, `Row` | Async SQLite connection pool |
-| `chrono` | `DateTime<Utc>`, `Utc` | Timestamp handling |
-| `uuid` | `Uuid::v4()` | Unique ID generation for records |
+| `sqlx` | `SqlitePool`, `Row`, `Connection`, `Transaction` | SQLite pool/querying |
+| `chrono` | `DateTime<Utc>` | Timestamps |
+| `api::api` | `MeetingDetails`, `MeetingTranscript`, `TranscriptSegment`, `TranscriptSearchResult` | DTOs consumed/produced |
+| `summary` | `CustomOpenAIConfig` | Custom OpenAI config parsing |
+| `config` | `DEFAULT_PARAKEET_MODEL` | Default seeding |
+| `summary::summary_engine::commands` | `get_recommended_summary_model_for_current_system` | Default model seeding |
 
 ## Dependents (imported BY)
 
 | Consumer Module | What it uses | Context |
 |----------------|-------------|---------|
-| `audio/` | Save transcripts to DB | After transcription complete |
-| `summary/` | Save/retrieve summaries from DB | AI summarization results storage |
-| `lib.rs` (main) | All Tauri commands | Entry point for frontend data queries |
+| `api/api.rs` | All repositories | Most `api_*` commands are SQLite IPC wrappers |
+| `summary/` (service, commands) | `MeetingsRepository`, `SummaryProcessesRepository`, `TranscriptChunksRepository`, `SettingsRepository` | Summary pipeline + config |
+| `state.rs`, `lib.rs` | `DatabaseManager` | Managed state, exit cleanup |
+| `audio/` | via api/repositories | Transcript persistence |
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `db_path` | app_data/Meetily/meetily.db | SQLite database file location |
-| `pool_size` | 10 | Maximum connection pool size |
-| `wal_mode` | enabled | Write-Ahead Logging for concurrency |
+| DB file | `app_data_dir()/meeting_minutes.sqlite` | Primary SQLite (WAL mode implied by `-wal`/`-shm`) |
+| Legacy file | `app_data_dir()/meeting_minutes.db` | Auto-import source |
+| Migrations | embedded `./migrations` dir | Applied at open |
+| Default seed | summary provider `builtin-ai` + recommended model (fallback `qwen3.5:2b`); whisper `large-v3`; transcription `parakeet` + `DEFAULT_PARAKEET_MODEL` | Fresh init / onboarding |
+| Config rows | singleton `id='1'` | `settings` + `transcript_settings` |
 
 ## Error Handling
 
-- **Database locked**: Retry with exponential backoff (SQLite busy timeout)
-- **Constraint violation**: Return user-friendly error message
-- **Migration failure**: Rollback and log error; app may still function with old schema
-- **File not found**: Auto-create database on first access
+- `sqlx::Error` throughout; repos return `SqlxError::Protocol` for invalid input (e.g. empty meeting_id), `RowNotFound` when absent.
+- `SqlxError::Io` for filesystem failures; WAL-corruption recovery via error-string matching + single retry.
+- `save_api_key`/`get_api_key` use **dynamic SQL column interpolation** (`format!`) — column names come from a fixed provider→column match, not user input.
+- `cleanup` treats WAL-checkpoint failure as non-fatal.
 
 ## Concurrency and Thread Safety
 
-- `Arc<DBManager>` for shared database connection across tasks
-- sqlx SqlitePool handles concurrent read/write via WAL mode
-- No explicit mutex needed — pool provides its own synchronization
+- Single shared `SqlitePool` (tokio, `Send+Sync`), WAL journaling, explicit transactions via `pool.begin()`/`conn.begin()`, `ON CONFLICT DO UPDATE` upserts.
+- No compile-time query checking (runtime SQL).
+- `app_data_dir().expect(...)` panics on failure.
 
 ## Gotchas and Tech Debt
 
-- **SQLite file size**: Grows unbounded as meetings accumulate; VACUUM not run periodically
-- **No migration framework**: Schema changes require manual migration logic in `setup.rs`
-- **Text storage**: Transcripts stored as plain text blobs — no structured field-level storage
-- **Search**: Limited search functionality; full-text search (FTS5) table not yet implemented
-- **Backup**: No automated backup mechanism; relies on user's manual export
+- **`speaker` vs `source_device` drift**: schema has both columns for mic/system channel; the Rust `Transcript` model only exposes `source_device` (added 2026-07). The `speaker` column is unreachable from Rust — two competing fields.
+- **`update_meeting_title` vs `update_meeting_name`** are near-duplicates (one also updates `transcript_chunks.meeting_name`); naming confusing.
+- **Runtime SQL** (no `query!`), and `SELECT *` in `get_meeting` vs explicit columns elsewhere.
+- **Dynamic column interpolation** is SQL-injection-adjacent (mitigated by fixed match).
+- **Hardcoded defaults** in `save_api_key` (`openai`/`gpt-4o-2024-11-20`/`large-v3`) override whatever provider/model the caller intended — footgun.
+- **No FTS5**: `LOWER(transcript) LIKE '%q%'` → O(N) full scans on large transcripts.
+- `with_transaction` on `DatabaseManager` is unused (repos open transactions directly).
+- Default-seeding logic duplicated in `onboarding.rs`; `geminiApiKey` column not in `Setting` model; `licensing`/`meeting_notes` tables have no repo.
+- `search_transcripts` decodes tuples rather than a `FromRow` struct.

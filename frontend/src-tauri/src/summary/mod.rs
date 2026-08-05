@@ -31,6 +31,7 @@ pub struct CustomOpenAIConfig {
 }
 
 pub mod commands;
+pub(crate) mod debug_log;
 pub(crate) mod language_detection;
 pub mod llm_client;
 pub(crate) mod metadata;
@@ -69,6 +70,7 @@ pub use template_commands::{
 };
 
 // Re-export commonly used items
+pub use debug_log::{next_iteration, reset_iteration_counter, write_debug_log, DebugLogEntry, DebugLogResult, DEBUG};
 pub use llm_client::LLMProvider;
 pub use processor::{
     chunk_text, clean_llm_markdown_output, extract_meeting_name_from_markdown,

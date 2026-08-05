@@ -99,6 +99,9 @@ if exist "package.json" (
     exit /b 1
 )
 
+REM Set local CUDA environment variables (idempotent; safe to call repeatedly)
+call ..\scripts\env-cuda.bat
+
 REM Check if pnpm or npm is available
 where pnpm >nul 2>&1
 if %errorlevel% equ 0 (
@@ -190,6 +193,18 @@ if exist "%SRC_PATH%" (
     exit /b 1
 )
 
+REM Copy required CUDA runtime libraries into the output folder BEFORE building
+REM so the NSIS bundler picks them up alongside meetily.exe.
+echo 📦 Copying required CUDA runtime libraries...
+call ..\scripts\copy-cuda-libs.bat
+if errorlevel 1 (
+    echo.
+    echo ❌ Failed to copy CUDA runtime libraries
+    exit /b 1
+)
+echo ✅ CUDA runtime libraries copied
+echo.
+
 REM Build using npm scripts
 echo.
 echo 📦 Building complete Tauri application...
@@ -214,6 +229,7 @@ echo ========================================
 echo.
 echo 🎉 Complete Tauri application built with GPU acceleration!
 echo.
+
 exit /b 0
 
 :_print_help

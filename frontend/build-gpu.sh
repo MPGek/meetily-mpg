@@ -51,6 +51,9 @@ else
   exit 1
 fi
 
+# Set local CUDA environment variables (idempotent; safe to source repeatedly)
+source ../scripts/env-cuda.sh
+
 echo ""
 echo -e "${BLUE}📦 Building Meetily...${NC}"
 echo ""
@@ -169,6 +172,16 @@ else
     ls -la "$WORKSPACE_ROOT/target/release/" || ls -la "target/release/"
     exit 1
 fi
+
+# Copy required CUDA runtime libraries into the output folder BEFORE building
+# so the bundler picks them up alongside the main executable.
+echo ""
+echo -e "${BLUE}📦 Copying required CUDA runtime libraries...${NC}"
+if ! ../scripts/copy-cuda-libs.sh; then
+  echo -e "${RED}❌ Failed to copy CUDA runtime libraries${NC}"
+  exit 1
+fi
+echo -e "${GREEN}✅ CUDA runtime libraries copied${NC}"
 
 # Build using npm scripts
 echo -e "${BLUE}Building complete Tauri application...${NC}"

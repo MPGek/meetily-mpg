@@ -13,9 +13,10 @@ Meetily is a **privacy-first AI meeting assistant** desktop application built wi
 
 1. **Rust Backend (Tauri)**: Handles audio capture (microphone + system), professional audio mixing, Voice Activity Detection (VAD), transcription via Whisper.cpp/Parakeet ONNX streaming, AI summarization through multiple LLM providers (Ollama, Claude, Groq, OpenAI, OpenRouter), SQLite database storage, desktop notifications, and system tray integration.
 2. **Next.js Frontend**: Provides the UI for meeting management, transcript editing, settings configuration, onboarding flows, and real-time audio level monitoring.
-3. **Python Backend** (legacy archive): A FastAPI-based server for AI summarization services using Pydantic-AI — unsupported but documented for reference.
 
-All data stays local by default — no cloud dependency unless explicitly configured for AI summaries.
+The audio engine captures **microphone and system-audio channels separately** (recorded as stereo, left=mic / right=system) with per-channel VAD. All data stays local by default — no cloud dependency unless explicitly configured for AI summaries.
+
+> **Note:** A legacy Python/FastAPI backend previously existed but has been **removed** (commit "Remove old backend project"). All summarization/transcription is now native Rust; the only residual HTTP is the built-in `llama-helper` sidecar and cloud LLM providers.
 
 ## High-Level Architecture Diagram
 
@@ -34,10 +35,11 @@ graph TB
             Onboarding[Onboarding Flow]
             
             subgraph AudioEngine["Audio Engine"]
-                Capture[Stream Capture<br/>Microphone + System]
-                Mixer[Professional Audio Mixer<br/>RMS Ducking + Clipping Prevention]
-                VAD[Voice Activity Detection]
+                Capture[Stream Capture<br/>Microphone + System channels]
+                VAD[Per-channel Voice Activity Detection<br/>Silero v6 + rolling buffer]
+                Mixer[Stereo Mix<br/>left=mic right=system]
                 DeviceMgmt[Device Management<br/>Detection + Reconnection]
+                Record[Recording<br/>Enhance/Re-transcribe/Import]
             end
             
             subgraph TranscriptionEngines["Transcription Engines"]
@@ -65,11 +67,6 @@ graph TB
         end
     end
     
-    subgraph PythonBackend["Python Backend (Legacy)"]
-        FastAPI[FastAPI Server]
-        PydanticAI[Pydantic-AI LLM Orchestration]
-    end
-    
     UI --> Entry
     Pages --> Entry
     Hooks --> Entry
@@ -77,11 +74,13 @@ graph TB
     Entry --> Onboarding
     Entry --> AudioEngine
     AudioEngine --> Capture
-    Capture --> Mixer
-    Mixer --> VAD
+    Capture --> VAD
     VAD --> ProviderAbstraction
     ProviderAbstraction --> Whisper
     ProviderAbstraction --> Parakeet
+    Capture --> Mixer
+    Mixer --> Record
+    Record --> DB
     Whisper --> SummaryService
     Parakeet --> SummaryService
     SummaryService --> Processor
@@ -94,8 +93,6 @@ graph TB
     DB --> Transcripts
     Entry --> Notifications
     Entry --> Analytics
-    
-    SummaryService -.-> FastAPI
 ```
 
 ## Component Details
@@ -138,23 +135,14 @@ The backend has evolved significantly with modular audio processing:
 | **Analytics** | `analytics/analytics.rs` | PostHog integration for product analytics (opt-in) |
 | **Hardware Detection** | `audio/hardware_detector.rs` | Auto-detects CPU cores, GPU type (Metal/CUDA/Vulkan), memory → recommends Whisper config |
 
-### Python Backend Archive (Optional)
+### Python Backend Archive
 
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| Framework | FastAPI + uvicorn | REST API server |
-| LLM Orchestration | Pydantic-AI 0.2.x | Multi-provider AI agent framework |
-| Database | aiosqlite | Async SQLite access |
-| Local LLM | ollama Python SDK | Ollama model management |
+**Removed.** The `backend/` FastAPI + Pydantic-AI server was deleted (commit "Remove old backend project"). No Python runtime is required for the app; the only optional Python use is `uv` for the Silero VAD model during build.
 
 ## Directory Structure
 
 ```
 meetily/
-├── backend/                          # Python backend (legacy archive)
-│   ├── app/                          # FastAPI application code
-│   ├── whisper-custom/               # Custom Whisper server modifications
-│   └── requirements.txt              # Python dependencies
 ├── docs/                             # Documentation and architecture maps
 │   └── CODEBASE_MAP_*.md             # Auto-generated codebase documentation
 ├── frontend/                         # Tauri app (Rust + Next.js)
@@ -172,46 +160,47 @@ meetily/
 │       │   │   ├── devices/          # Device enumeration and config
 │       │   │   │   └── platform/     # Windows WASAPI, macOS CoreAudio, Linux ALSA
 │       │   │   ├── transcription/    # STT provider abstraction layer
-│       │   │   ├── audio_v2/         # Next-gen audio pipeline (in development)
-│       │   │   ├── pipeline.rs       # Audio mixing and VAD processing
-│       │   │   ├── stream.rs          # Audio stream management
+│       │   │   ├── audio_v2/         # ORPHANED/dead next-gen audio pipeline (NOT declared)
+│       │   │   ├── pipeline.rs       # Per-channel VAD + stereo mixing
+│       │   │   ├── stream.rs         # Audio stream management
 │       │   │   ├── recording_*.rs    # Recording state, commands, preferences, saver
 │       │   │   ├── device_detection.rs  # Input device kind detection (BT/wired/virtual)
 │       │   │   ├── device_monitor.rs    # Device disconnect/reconnect monitoring
 │       │   │   ├── hardware_detector.rs # CPU/GPU/memory profiling for Whisper config
-│       │   │   ├── vad.rs             # Voice Activity Detection
-│       │   │   ├── decoder.rs         # Audio file decoding (ffmpeg fallback)
+│       │   │   ├── vad.rs            # Silero VAD v6 (streaming + batch + rolling buffer)
+│       │   │   ├── decoder.rs        # Audio file decoding (ffmpeg fallback)
 │       │   │   ├── incremental_saver.rs # Checkpoint-based saving for crash recovery
-│       │   │   ├── retranscription.rs # Re-process stored audio with different settings
-│       │   │   ├── import.rs          # Import external audio files as meetings
-│       │   │   ├── post_processor.rs  # Text cleanup and normalization
-│       │   │   ├── buffer_pool.rs     # Memory-efficient audio buffer pooling
+│       │   │   ├── retranscription.rs   # "Enhance" re-transcribe stored audio (stereo split)
+│       │   │   ├── import.rs         # Import external audio files as meetings
+│       │   │   ├── post_processor.rs # Text cleanup and normalization
+│       │   │   ├── buffer_pool.rs    # Memory-efficient audio buffer pooling
 │       │   │   ├── batch_processor.rs # Batch processing with metrics
-│       │   │   ├── async_logger.rs    # Async logging infrastructure
-│       │   │   └── system_audio_*.rs  # System audio detection and monitoring
-│       │   ├── whisper_engine/        # Whisper.cpp integration
-│       │   ├── parakeet_engine/       # Parakeet ONNX model integration
-│       │   ├── summary/               # AI summarization engine
-│       │   │   └── templates/         # Customizable summary templates
-│       │   ├── database/              # SQLite data layer
-│       │   │   └── repositories/      # Repository pattern implementations
-│       │   ├── notifications/         # System notification system
-│       │   ├── analytics/             # PostHog analytics
-│       │   ├── ollama/                # Ollama LLM provider
-│       │   ├── openai/                # OpenAI LLM provider
-│       │   ├── anthropic/             # Anthropic (Claude) LLM provider
-│       │   ├── groq/                  # Groq LLM provider
-│       │   ├── openrouter/            # OpenRouter LLM provider
-│       │   ├── main.rs                # Application entry point
-│       │   ├── lib.rs                 # Tauri builder + command registration
-│       │   ├── tray.rs                # System tray management
-│       │   └── onboarding.rs          # First-launch setup flow
-│       ├── Cargo.toml                # Rust dependencies
-│       └── tauri.conf.json           # Tauri configuration
-├── llama-helper/                     # Separate Rust crate (helper utilities)
+│       │   │   ├── async_logger.rs   # Async logging infrastructure
+│       │   │   └── system_audio_*.rs # System audio detection and monitoring
+│       │   ├── whisper_engine/       # Whisper.cpp integration
+│       │   ├── parakeet_engine/      # Parakeet ONNX model integration
+│       │   ├── summary/              # AI summarization engine
+│       │   │   └── templates/        # Customizable summary templates
+│       │   ├── database/             # SQLite data layer
+│       │   │   └── repositories/     # Repository pattern implementations
+│       │   ├── notifications/        # System notification system
+│       │   ├── analytics/            # PostHog analytics
+│       │   ├── api/                  # IPC + legacy HTTP client + shared DTOs
+│       │   ├── ollama/               # Ollama LLM provider (metadata)
+│       │   ├── openai/               # OpenAI LLM provider
+│       │   ├── anthropic/            # Anthropic (Claude) LLM provider
+│       │   ├── groq/                 # Groq LLM provider
+│       │   ├── openrouter/           # OpenRouter LLM provider
+│       │   ├── main.rs               # Application entry point
+│       │   ├── lib.rs                # Tauri builder + command registration
+│       │   ├── tray.rs               # System tray management
+│       │   └── onboarding.rs         # First-launch setup flow
+│       ├── Cargo.toml               # Rust dependencies
+│       └── tauri.conf.json          # Tauri configuration
+├── llama-helper/                     # Sidecar Rust crate (built-in AI LLM)
 ├── openspec/                         # OpenSpec change management workflow
-├── scripts/                          # Build and utility scripts
-└── .cline/skills/                    # Cursor agent skills
+├── scripts/                          # Build and utility scripts (env-cuda, etc.)
+└── .agents/skills/                   # Agent skills
 ```
 
 ## Component Relationships
@@ -363,24 +352,19 @@ The Rust backend uses **tokio async runtime** extensively:
 - **GDPR-ready**: Data export and deletion support through database layer
 - **Privacy-by-design**: No data leaves the machine unless user explicitly configures cloud AI
 
-## New Modules Since Last Map (2026-07-13)
+## Recent Changes (since 2026-07-13 mapping)
 
-Significant additions since the previous mapping:
+Highlights of what changed since the previous map:
 
-| Module | Location | Purpose |
-|--------|----------|---------|
-| Device Detection | `audio/device_detection.rs` | Detects input device kind (Bluetooth/Wired/Virtual) for adaptive buffering |
-| Hardware Detector | `audio/hardware_detector.rs` | Auto-detects CPU/GPU/memory → recommends Whisper config |
-| Incremental Saver | `audio/incremental_saver.rs` | Checkpoint-based audio saving for crash recovery |
-| Retranscription | `audio/retranscription.rs` | Re-process stored audio with different transcription settings |
-| Audio Import | `audio/import.rs` | Import external audio files (WAV/MP3/MP4) as new meetings |
-| Post Processor | `audio/post_processor.rs` | Text cleanup, artifact removal, normalization for transcripts |
-| Buffer Pool | `audio/buffer_pool.rs` | Memory-efficient pooled audio buffer management |
-| Batch Processor | `audio/batch_processor.rs` | Batch processing with metrics collection and reporting |
-| Async Logger | `audio/async_logger.rs` | Asynchronous structured logging infrastructure |
-| Device Monitor | `audio/device_monitor.rs` | Background monitoring for device disconnect/reconnect events |
-| Playback Monitor | `audio/playback_monitor.rs` | Active output device detection (for Bluetooth warnings) |
-| Transcription Provider | `audio/transcription/` | Abstract STT provider interface with engine lifecycle management |
-| Language Detection | `summary/language_detection.rs` | Detects transcript language for summary localization |
-| Summary Metadata | `summary/metadata.rs` | JSON metadata storage for summary language preferences |
-| Template System | `summary/template_commands.rs`, `templates/` | Customizable meeting summary templates with validation |
+| Area | Change |
+|------|--------|
+| **Mic/System channel separation** | Recording now captures mic + system as separate channels, recorded stereo (left=mic, right=system), stored via `source_device` on transcripts, displayed distinctly in the UI, and split again in re-transcription. |
+| **VAD rewritten** | `vad.rs` now uses **Silero VAD v6** (ONNX), a **unified `VadConfig`** (`live()`/`batch()`), and a **rolling buffer** for speech-onset recovery. |
+| **Transcription provider abstraction** | New `audio/transcription/` subpackage (`engine.rs`, `provider.rs`, `worker.rs`, `whisper_provider.rs`, `parakeet_provider.rs`) wraps the engines for live transcription. |
+| **Enhance / Re-transcription** | `audio/retranscription.rs` re-processes stored audio per-channel, cancellable, with atomic DB replacement. |
+| **Audio Import** | `audio/import.rs` imports external audio as meetings (beta-gated). |
+| **LLM debug logging** | New `summary/debug_log.rs` writes a file per LLM call into the meeting folder. |
+| **Frontend** | Paginated transcripts (`usePaginatedTranscripts` + `VirtualizedTranscriptView` infinite scroll); mic/sys visual separation in transcript UI. |
+| **Build/GPU** | New `scripts/env-cuda.*` and `frontend/build-gpu.*`/`dev-gpu.*`; `llama-helper` sidecar built by GPU scripts. |
+| **Python backend removed** | `backend/` deleted; all summarization/transcription is native Rust. |
+| **DB schema** | `transcripts.source_device` column added (2026-07); paginated transcript queries. |

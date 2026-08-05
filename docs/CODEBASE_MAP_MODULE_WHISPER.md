@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-07-13T14:31:00Z
+last_mapped: 2026-08-05T14:56:00Z
 module: whisper_engine
 ---
 
@@ -10,22 +10,24 @@ module: whisper_engine
 
 ## Overview
 
-**Purpose**: The Whisper engine module provides speech-to-text transcription using the Whisper.cpp C library via Rust bindings (`whisper-rs`). It manages model loading/unloading, GPU acceleration (Metal/CUDA/Vulkan), parallel chunk processing for real-time recording transcription, and model download management. Supports both local CPU and GPU-accelerated inference.
+**Purpose**: Local Whisper.cpp transcription via the `whisper-rs` Rust bindings. Manages a global `WhisperEngine` (model catalog discovery, load/unload/delete, streaming download from HuggingFace, adaptive GPU acceleration, and transcription), a Tauri command layer, and a (currently **unwired**) parallel processor for multi-worker chunk transcription.
 
-**Entry point**: `whisper_engine/mod.rs` — module root
-**Sub-packages**: None (single directory)
+**Entry point**: `whisper_engine/mod.rs` — module root.
+
+**Sub-packages**: None (single directory).
 
 ## File Reference
 
 | File | Purpose | Key Exports | Tokens |
 |------|---------|-------------|--------|
-| `mod.rs` | Module root, re-exports all sub-modules | whisper_engine types, commands | ~1k |
-| `whisper_engine.rs` | Core Whisper.cpp wrapper | WhisperEngine struct, load/unload/transcribe | ~15k |
-| `commands.rs` | Tauri command handlers | whisper_init, transcribe_audio, download_model | ~8k |
-| `parallel_commands.rs` | Parallel processing commands | initialize_parallel_processor, start_parallel_processing | ~6k |
-| `parallel_processor.rs` | Parallel chunk processor | ParallelProcessor, worker pool management | ~10k |
-| `acceleration.rs` | GPU acceleration detection/config | detect_acceleration(), get_backend() | ~3k |
-| `system_monitor.rs` | System resource monitoring | CPU/GPU/memory monitoring for parallel processing | ~4k |
+| `mod.rs` | Module root, declares 6 active submodules + re-exports | `crate::whisper_engine::*` | <1k |
+| `whisper_engine.rs` | Core engine: model mgmt, download, transcription (`whisper-rs`) | `WhisperEngine`, `ModelInfo`, `ModelStatus` | ~10k |
+| `commands.rs` | Tauri commands + global `WHISPER_ENGINE` singleton | `whisper_*` commands, `WHISPER_ENGINE`, `MODELS_DIR` | ~4k |
+| `parallel_commands.rs` | Tauri commands for the parallel processor | `ParallelProcessorState`, `*_parallel_processing` | ~2k |
+| `parallel_processor.rs` | Multi-worker parallel transcription engine | `ParallelProcessor`, `ParallelConfig`, `ProcessingEvent` | ~4k |
+| `acceleration.rs` | GPU backend abstraction | `WhisperCompiledBackend`, `WhisperContextAcceleration` | ~1k |
+| `system_monitor.rs` | `sysinfo`-based resource monitoring | `SystemMonitor`, `SystemResources`, `ResourceStatus` | ~2k |
+| `_stderr_suppressor.rs` | **Dead file** (entirely commented out, not declared in mod.rs) | — | <1k |
 
 ## Public API
 
@@ -33,146 +35,108 @@ module: whisper_engine
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `whisper_init` | `(app) -> Result<(), String>` | Initialize Whisper engine and load default model |
-| `whisper_load_model` | `(model_path) -> Result<(), String>` | Load a specific model from path |
-| `whisper_unload_model` | `() -> Result<(), String>` | Unload current model from memory |
-| `whisper_is_model_loaded` | `() -> bool` | Check if model is currently loaded |
-| `whisper_get_current_model` | `() -> Option<String>` | Get name of currently loaded model |
-| `whisper_transcribe_audio` | `(audio_path) -> Result<TranscriptionResult, String>` | Transcribe a single audio file |
-| `whisper_get_available_models` | `() -> Vec<AvailableModel>` | List all available/installed models |
-| `whisper_download_model` | `(model_name) -> Result<DownloadHandle, String>` | Download model from HuggingFace |
-| `whisper_cancel_download` | `(download_id) -> Result<(), String>` | Cancel an in-progress download |
-| `whisper_get_models_directory` | `() -> PathBuf` | Get path to models storage directory |
-| `initialize_parallel_processor` | `(app, config) -> Result<(), String>` | Initialize parallel chunk processor |
-| `start_parallel_processing` | `(audio_stream) -> Result<ProcessorHandle, String>` | Start parallel transcription processing |
-| `pause_parallel_processing` | `() -> Result<(), String>` | Pause parallel processing |
-| `resume_parallel_processing` | `() -> Result<(), String>` | Resume paused processing |
-| `stop_parallel_processing` | `() -> Result<Vec<TranscriptionResult>, String>` | Stop and collect all results |
-| `get_system_resources` | `() -> SystemResources` | Get current CPU/GPU/memory stats |
+| `whisper_init` | `() -> Result<(), String>` | Create engine if not present |
+| `whisper_get_available_models` | `() -> Result<Vec<ModelInfo>, String>` | Discover models (falls back to `discover_models_standalone` when Parakeet is active) |
+| `whisper_load_model` | `(app_handle, model_name) -> Result<(), String>` | Load model; emits `model-loading-started/completed/failed` |
+| `whisper_get_current_model` | `() -> Result<Option<String>, String>` | Current model name |
+| `whisper_is_model_loaded` | `() -> Result<bool, String>` | Loaded flag |
+| `whisper_validate_model_ready` | `() -> Result<String, String>` | Load first available model if none loaded |
+| `whisper_transcribe_audio` | `(audio_data: Vec<f32>) -> Result<String, String>` | Transcribe (uses global language preference) |
+| `whisper_download_model` | `(app_handle, model_name) -> Result<(), String>` | Stream download; emits `model-download-*` events |
+| `whisper_cancel_download` / `whisper_delete_corrupted_model` | `(model_name) -> Result<(), String>` | Cancel / delete |
+| `open_models_folder` | `() -> Result<(), String>` | Open models dir in file explorer |
 
 ### Key Types
 
 ```rust
 struct WhisperEngine {
-    context: whisper_rs::Context,
-    full_params: FullParams,
-    model_path: PathBuf,
+    models_dir: PathBuf,
+    current_context: Arc<RwLock<Option<WhisperContext>>>,
+    current_model: Arc<RwLock<Option<String>>>,
+    available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
+    cancel_download_flag: Arc<RwLock<Option<String>>>,
+    active_downloads: Arc<RwLock<HashSet<String>>>,
+    // + logging state
 }
 
-struct ParallelProcessor {
-    worker_pool: ThreadPool,
-    chunk_queue: mpsc::Sender<AudioChunk>,
-    is_running: AtomicBool,
-    config: ParallelConfig,
-}
+enum ModelStatus { Available, Missing, Downloading { progress: u8 }, Error(String), Corrupted { .. } }
 
-enum ModelSize {
-    Tiny,
-    Base,
-    Small,
-    Medium,
-    Large,
-    LargeV3,
-}
-
-struct AvailableModel {
-    name: String,
-    size: ModelSize,
-    path: PathBuf,
-    is_downloading: bool,
-    download_progress: Option<f64>,
-}
+// Engine methods (all &self, async):
+// transcribe_audio(audio: Vec<f32>, language: Option<String>, initial_prompt: Option<String>) -> Result<String>
+// transcribe_audio_with_confidence(...) -> Result<(String, f32, bool)>   // (text, avg_confidence, is_partial)
+// discover_models() / load_model(name) / unload_model() / download_model(name, cb) / cancel_download(name) / delete_model(name)
 ```
 
 ## Internal Architecture
 
-### Model Loading Flow
+### Model Lifecycle Flow
 
-1. **Detection**: `acceleration.rs` detects available GPU (Metal on macOS, CUDA/Vulkan on Windows/Linux)
-2. **Configuration**: FullParams configured based on detected acceleration backend
-3. **Loading**: Model file loaded from models directory into whisper-rs context
-4. **Verification**: Model validated via `whisper_validate_model_ready()` command
+1. **Init**: `new_with_models_dir` sets env `GGML_METAL_LOG_LEVEL=1`, `WHISPER_LOG_LEVEL=1`; resolves models dir (dev: `./models`; prod: `data_dir()/Meetily/models`).
+2. **Discovery**: `discover_models` scans `WHISPER_MODEL_CATALOG`, validates GGML magic bytes + sizes.
+3. **Load**: `load_model` unloads current, calls `HardwareProfile::detect()`, builds `WhisperContextParameters` (`use_gpu`, `gpu_device`, `flash_attn`) via `whisper_context_acceleration_for`.
+4. **Transcription**: `transcribe_audio_with_confidence` does beam search, returns `(text, avg_confidence, is_partial)` where `is_partial = duration < adaptive_config.is_partial_threshold_s`.
+5. **Download**: streams from HF `ggerganov/whisper.cpp`, progress every ≥1% or ≥2s, honors `cancel_download_flag`, guarded by `active_downloads`.
 
-### Parallel Processing Architecture
+### Acceleration (`acceleration.rs`)
 
-```mermaid
-graph LR
-    AudioChunks[Audio Chunks<br/>from Recording] --> Queue[Chunk Queue]
-    Queue --> WorkerPool[Worker Pool<br/>rayon ThreadPool]
-    WorkerPool --> Workers[Individual Workers]
-    Workers --> Results[Transcription Results]
-    Results --> Merge[Merge & Order]
-    Merge --> Transcript[Final Transcript]
-```
+`WhisperCompiledBackend::current()` priority: `cuda` > `vulkan` > `hipblas` > (macOS `metal`) > `Cpu`. `use_gpu = backend != Cpu`; `flash_attn` only for Metal/Cuda on High/Ultra performance tiers. `gpu_device` always `0`.
 
-- Chunks arrive from audio engine via mpsc channel
-- Parallel processor distributes chunks across rayon thread pool
-- Results are ordered by chunk sequence number before merging
-- Configurable worker count based on system resources (detected by `system_monitor.rs`)
+### Parallel Processor (`parallel_processor.rs`)
+
+Each worker creates its **own `WhisperEngine` and loads the same model name** (so it's N copies of one model, not multi-model), gated by a tokio `Semaphore` (max 4 workers), 120s per-chunk timeout, retry logic, and resource-monitor auto-pause. **The frontend does NOT call any parallel command** — this path is effectively unused; the live path uses `audio/transcription/worker.rs` (`NUM_WORKERS=1`).
 
 ### Concurrency Model
 
-- **Model loading**: Blocking operation in tokio spawn to avoid blocking async runtime
-- **Parallel processing**: rayon ThreadPool for CPU-bound inference tasks
-- **Chunk queue**: tokio mpsc channel for async chunk delivery from recording pipeline
-- **Resource monitoring**: Periodic tokio task polling system resources
+All mutable engine state behind `tokio::sync::RwLock`; transcription serialized on `current_context`. Global `WHISPER_ENGINE` is `std::sync::Mutex<Option<Arc<WhisperEngine>>>`. Note: `transcribe_audio*` takes a **read** lock but calls `create_state()` + `state.full()` — overlapping readers could share one `WhisperContext` (safe today only because the worker serializes access).
 
 ## Dependencies (imports FROM)
 
 | Module/Package | What is imported | Why |
 |---------------|-----------------|-----|
-| `whisper-rs` | `Context`, `FullParams`, `GlobalOptions` | Whisper.cpp Rust bindings |
-| `ort` | ONNX runtime types | For model format detection |
-| `rayon` | `ThreadPool`, `join` | Parallel chunk processing |
-| `tokio` | `sync::mpsc`, `spawn` | Async chunk delivery and task management |
+| `whisper-rs` | `WhisperContext`, `WhisperContextParameters`, `FullParams`, `SamplingStrategy` | Whisper.cpp bindings |
+| `config` | `WHISPER_MODEL_CATALOG` | Model catalog data |
+| `audio` | `HardwareProfile`, `GpuType`, `PerformanceTier` | Adaptive GPU config |
+| `api::api` | `api_get_transcript_config` | Decide model to load (in `whisper_validate_model_ready_with_config`) |
+| `reqwest`, `tokio`, `futures_util` | HTTP download | Model streaming download |
 
 ## Dependents (imported BY)
 
 | Consumer Module | What it uses | Context |
 |----------------|-------------|---------|
-| `audio/transcription/` | Transcribe audio chunks | Real-time transcription during recording |
-| `summary/` | Transcript text from completed recordings | AI summarization input |
-| `lib.rs` (main) | All Tauri commands | Entry point for frontend control |
+| `audio/transcription/engine.rs`, `whisper_provider.rs` | `WHISPER_ENGINE`, `WhisperEngine` | Live transcription |
+| `audio/import.rs`, `retranscription.rs`, `common.rs` | `WHISPER_ENGINE` | Import / re-transcribe / unload |
+| `audio/recording_commands.rs` | `WHISPER_ENGINE` | Model validation on start |
+| `tray.rs`, `lib.rs` | Commands | Registration / tray |
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `model_size` | base | Default model size (tiny/base/small/medium/large) |
-| `gpu_device` | Auto-detect | GPU device ID for CUDA/Vulkan/Metal |
-| `n_threads` | CPU core count / 2 | Number of parallel threads for inference |
-| `n_threads_batch` | CPU core count | Batch processing thread count |
-| `offset_ms` | 0 | Offset in milliseconds for partial transcription |
-| `duration_ms` | 0 (full file) | Duration to transcribe from offset |
-| `language` | auto-detect | Source language for transcription |
-
-### GPU Backend Selection
-
-```rust
-// Platform defaults:
-macOS → Metal + CoreML (if Apple Silicon)
-Windows → CUDA (NVIDIA) or Vulkan (AMD/Intel)
-Linux → CUDA / Vulkan / ROCm (based on hardware)
-```
+| `WHISPER_MODEL_CATALOG` | tiny…large-v3-turbo/large-v3 + q5_1/q5_0 | Available models (config.rs) |
+| `DEFAULT_WHISPER_MODEL` | `large-v3` | Config fallback |
+| Cargo features | `metal`, `coreml`, `cuda`, `vulkan`, `hipblas`, `openblas`, `openmp` | GPU/BLAS backends (forwarded to whisper-rs) |
+| Env | `GGML_METAL_LOG_LEVEL`, `WHISPER_LOG_LEVEL`, `MEMORY_GB` | Logging / memory |
+| Adaptive params | from `HardwareProfile::get_whisper_config()` | beam_size, temperature, thresholds, `is_partial_threshold_s`, max_threads |
 
 ## Error Handling
 
-- **Model not found**: Returns error with path to models directory for download
-- **GPU memory insufficient**: Falls back to CPU inference automatically
-- **Invalid model file**: Deleted via `whisper_delete_corrupted_model()` and re-downloaded
-- **Transcription timeout**: Configurable timeout per chunk; partial results returned
+- `anyhow::Result` throughout; Tauri commands map to `Result<_, String>`.
+- Download paths always clean `active_downloads`; `validate_model_file` checks GGML/GGUF magic.
+- Transcription errors if no model loaded. `delete_model` only for `Corrupted`/`Available`.
 
 ## Concurrency and Thread Safety
 
-- `Arc<Mutex<WhisperEngine>>` for shared engine state
-- Rayon ThreadPool with configurable worker count
-- Tokio mpsc channel for async chunk delivery
-- Atomic flags for processing state (running/paused/stopped)
+- `tokio::sync::RwLock`-protected engine state; serialized inference on `current_context`.
+- Global singletons via `std::sync::Mutex`.
+- Parallel workers gated by tokio `Semaphore` (max 4) + 120s timeout + resource auto-pause.
 
 ## Gotchas and Tech Debt
 
-- **Model download blocking**: Large models (large-v3 ~1.5GB) can take significant time; progress must be tracked asynchronously
-- **GPU memory management**: Loading large models on devices with <8GB VRAM may cause OOM — auto-fallback to CPU exists but should be more robust
-- **Vulkan on Windows**: Requires Vulkan SDK; some NVIDIA drivers have compatibility issues
-- **CoreML on macOS**: Only available on Apple Silicon (M1/M2/M3); Intel Macs fall back to CPU
-- **Model file format**: Models stored in GGUF format; version mismatches between whisper-rs and model can cause silent errors
+- **Race hazard**: read-lock on `current_context` while calling `create_state()` — latent if two transcribe calls overlap.
+- **Confidence is fake**: `(length/100.0).min(0.9) + 0.1` — text-length heuristic, not model probability.
+- **Parallel path is dead**: fully registered as commands but the frontend never invokes it; `ParallelConfig` memory budget not enforced (Semaphore only limits concurrency).
+- **`_stderr_suppressor.rs` is dead** (commented out; not declared). Its former call sites (lines 310, 586) are also commented — if uncommented without re-enabling the module, compilation fails. Env vars now suppress C log spam instead. Recommend deleting.
+- **Duplicate logic** between `commands.rs`/`MODELS_DIR` and Parakeet's `commands.rs`; `discover_models_standalone` diverges from `discover_models` (no GGML check, 90%-size rule).
+- **`set_no_timestamps(true)` + `set_token_timestamps(true)`** intentionally contradictory (defeats whisper.cpp chunk-skipping heuristics).
+- `max_threads` computed but thread-setting code is empty; `whisper_transcribe_audio` has no language/prompt params.
+- Cargo feature `openmp` logged but only `metal`/`coreml` enabled by default on macOS.

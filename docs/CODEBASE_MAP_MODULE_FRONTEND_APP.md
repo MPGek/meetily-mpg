@@ -1,118 +1,102 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-07-13T14:35:00Z
+last_mapped: 2026-08-05T15:00:00Z
 module: frontend_app
 ---
 
 > Part of [Module Guide](CODEBASE_MAP_MODULES.md) | [Codebase Map](CODEBASE_MAP.md)
 
-# Module: Frontend App (Next.js + Tauri)
+# Module: Frontend App (Next.js + Tauri shell)
 
 ## Overview
 
-**Purpose**: The frontend app module provides the main Next.js application shell that runs inside the Tauri desktop wrapper. It handles routing, state management via Zustand, and serves as the entry point for all UI pages and global configuration.
+**Purpose**: The Next.js App Router application shell running inside the Tauri v2 desktop window. Sets up the global provider tree, onboarding gating, tray/drag-drop event handling, and page routing. This is a **client-heavy** app — nearly every component uses `'use client'` (it is a desktop app, not SSG/SSR).
 
-**Entry point**: `frontend/src/app/layout.tsx` — root layout
-**Framework**: Next.js 14+ (App Router) + Tauri Desktop Wrapper
+**Entry point**: `frontend/src/app/layout.tsx` (RootLayout).
+**Framework**: Next.js App Router + React 18 + TypeScript, served as a static export (`frontendDist: "../out"`).
 
 ## File Reference
 
 | File | Purpose | Key Exports | Tokens |
 |------|---------|-------------|--------|
-| `app/layout.tsx` | Root layout component | Global providers, theme, fonts | ~3k |
-| `app/page.tsx` | Home page (meeting list) | MeetingListPage | ~2k |
-| `app/globals.css` | Global styles + Tailwind directives | CSS variables, base styles | ~4k |
-| `lib/config.ts` | App configuration | APP_CONFIG constant | ~1k |
-| `lib/constants.ts` | Shared constants | App-wide constants | ~0.5k |
+| `app/layout.tsx` | Root layout: fonts, provider tree, onboarding gating, tray/drag events, Sidebar + MainContent | `RootLayout` | — |
+| `app/page.tsx` | Live recording home page | `Home` | — |
+| `app/settings/page.tsx` | Settings page (General/Recordings/Transcription/Summary/Beta tabs) | `SettingsPage` | — |
+| `app/meeting-details/page.tsx` | Persisted meeting view (paginated transcripts + summary) | `MeetingDetailsPage` (wrapped in `Suspense`) | — |
+| `app/notes/[id]/` | Per-note route (BlockNote editor) | — | — |
+| `app/_components/` | Page-local components | `TranscriptPanel`, `SettingsModal`, `StatusOverlays` | — |
+| `app/globals.css` | Global styles + Tailwind | — | — |
+| `contexts/` | React contexts | `RecordingStateContext`, `TranscriptContext`, `ConfigContext`, `SidebarProvider`, `OnboardingContext`, `ImportDialogContext`, `OllamaDownloadContext`, `RecordingPostProcessingProvider` | — |
+| `services/` | IPC service wrappers | `transcriptService`, `recordingService`, `storageService`, `indexedDBService`, `configService`, `updateService` | — |
+| `lib/` | Utility modules | `analytics`, `summary-language-preferences`, `recordingNotification` | — |
+| `constants/` / `config/` / `types/` | Constants, config, data contracts | `audioFormats`, `Transcript`, `TranscriptUpdate` | — |
 
-## Public API (Components)
-
-### Root Layout Structure
-
-```tsx
-// app/layout.tsx
-<Html>
-  <Body>
-    <ThemeProvider>
-      <FontProvider>
-        <ZustandStore>
-          <TauriContext>
-            {children}
-          </TauriContext>
-        </ZustandStore>
-      </FontProvider>
-    </ThemeProvider>
-  </Body>
-</Html>
-```
-
-### Page Routes
+## Public API (Routes)
 
 | Route | Component | Description |
 |-------|-----------|-------------|
-| `/` | MeetingListPage | Home page with meeting list |
-| `/meeting/[id]` | MeetingDetailPage | Single meeting detail view |
-| `/recording` | RecordingPage | Active recording interface |
-| `/settings` | SettingsPage | App settings and configuration |
+| `/` | `Home` | Live recording + transcript panel |
+| `/settings` | `SettingsPage` | Tabs: General, Recordings, Transcription, Summary, Beta |
+| `/meeting-details?id=` | `MeetingDetailsPage` | Persisted meeting (paginated transcripts, summary, retranscription) |
+| `/notes/[id]` | Notes page | BlockNote editor |
 
 ## Internal Architecture
 
+### Provider Tree (`app/layout.tsx`, outer → inner)
+
+`AnalyticsProvider → RecordingStateProvider → TranscriptProvider → ConfigProvider → OllamaDownloadProvider → OnboardingProvider → UpdateCheckProvider → SidebarProvider → TooltipProvider → RecordingPostProcessingProvider → ImportDialogProvider` — plus `DownloadProgressToastProvider`, `ImportDropOverlay`, `ConditionalImportDialog` (beta-gated), `Toaster`. Handles `request-recording-toggle` tray events, `tauri://drag-enter/leave/drop` for audio import, and onboarding completion (window reload).
+
 ### State Management
 
-- **Zustand stores**: Global state (audio devices, transcription status, UI preferences)
-- **React Context**: Theme, font family, Tauri app handle
-- **Server Components**: Data fetching for meeting list (Next.js Server Components)
+- **React Context** (not Zustand) layered over Tauri IPC service wrappers.
+- `RecordingStateContext` — single source of truth for recording state (backend-polled 500ms + events); `RecordingStatus` lifecycle enum.
+- `TranscriptContext` — live transcript buffer (sequence ordering + IndexedDB persistence).
+- `SidebarProvider` — meeting list, search, current meeting, summary polling registry, server addresses.
 
-### Configuration
+### Data Fetching
 
-```typescript
-// lib/config.ts
-const APP_CONFIG = {
-  appName: 'Meetily',
-  version: '1.0.0',
-  maxRecordingDuration: 4 * 60 * 60, // 4 hours
-  supportedFormats: ['wav', 'mp3', 'mka'],
-  defaultTranscriptionProvider: 'parakeet' as const,
-};
-```
+- **Tauri `invoke`** for commands (`api_*`, `start_recording_with_devices_and_meeting`, `get_transcript_history`, `get_audio_devices`, `parakeet_*`).
+- **Tauri `listen`/`emit`** for events (`transcript-update`, `recording-*`, `model-config-updated`, `speech-detected`, `transcription-error`, `request-recording-toggle`).
+- **Polling**: recording state 500ms; recording sync 1s; summary generation 5s (max 200 polls); transcription completion 500ms (60s cap).
+- Next.js App Router but effectively all client components.
 
-### Concurrency Model
+### Two Transcript Pipelines
 
-- **Server Components**: Data fetching at build/request time (Next.js App Router)
-- **Client Components**: Interactive UI with Tauri command calls via `@tauri-apps/api`
-- **SWR**: Data revalidation and caching for meeting list
+- **Live** (`TranscriptContext`, home page) — buffered `transcript-update` events, no pagination.
+- **Persisted** (`usePaginatedTranscripts`, meeting-details page) — offset/limit infinite scroll from `api_get_meeting_transcripts`.
 
 ## Dependencies (imports FROM)
 
 | Module/Package | What is imported | Why |
 |---------------|-----------------|-----|
-| `next/font/google` | Geist, Inter fonts | Typography |
-| `@tauri-apps/api` | invoke, event | Tauri IPC communication |
-| `zustand` | create, useStore | Global state management |
+| `@tauri-apps/api/core` + `/event` | `invoke`, `listen`, `emit` | Tauri IPC |
+| `next/navigation` | `useRouter`, `usePathname`, `useSearchParams` | Routing |
+| `@tanstack/react-virtual` | `useVirtualizer` | Transcript virtualization |
+| `framer-motion` | `motion`, `AnimatePresence` | Animations |
+| `sonner` | `toast` | Notifications |
 
 ## Dependents (imported BY)
 
 | Consumer Module | What it uses | Context |
 |----------------|-------------|---------|
-| All pages | Layout, config, constants | App shell and routing |
+| All feature components | Contexts, services | State + IPC access |
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `appName` | Meetily | Application display name |
-| `maxRecordingDuration` | 4 hours | Maximum recording time limit |
-| `supportedFormats` | wav, mp3, mka | Accepted audio formats |
-| `defaultProvider` | parakeet | Default transcription provider |
+| `serverAddress` / `transcriptServerAddress` | `http://localhost:5167` / `http://127.0.0.1:8178/stream` | Hardcoded in SidebarProvider (legacy) |
+| Dev server port | 3118 | `pnpm dev` / `devUrl` |
 
 ## Error Handling
 
-- **Tauri invoke failure**: Show toast notification with error message
-- **Network unavailable**: Graceful degradation for cloud features
-- **Font loading fallback**: System font if Google Fonts fails
+- Tauri command errors (`Result<_, String>`) surfaced via `sonner` toasts.
+- `Suspense` + `useSearchParams` for dynamic pages.
+- Onboarding completion reloads the window; update checks handled by `UpdateCheckProvider`.
 
 ## Gotchas and Tech Debt
 
-- **Hydration mismatch**: Some components may hydrate differently between server/client
-- **Tauri API calls**: Must use `invoke()` — not direct Rust function calls
-- **Next.js App Router**: Server vs Client Components must be carefully managed
+- **App is fully client-side** — "server components" are minimal; hydration concerns are mostly moot in a Tauri window.
+- **Hardcoded server addresses** (`localhost:5167`, `127.0.0.1:8178/stream`) in SidebarProvider are legacy leftovers.
+- Version string `v0.5.0` hardcoded in sidebar footer (one of 3 version-bump locations).
+- Startup cleanup deletes old meetings (`deleteOldMeetings(7)`, `deleteSavedMeetings(24)`).

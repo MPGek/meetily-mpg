@@ -57,6 +57,23 @@ if (feature && feature !== 'none') {
 }
 console.log('');
 
+// Copy required CUDA runtime libraries into the release output folder BEFORE
+// tauri build, so the NSIS bundler picks them up alongside meetily.exe.
+if (command === 'build' && feature && feature !== 'none') {
+  const copyScript = path.resolve(__dirname, '..', '..', 'scripts', 'copy-cuda-libs.ps1');
+  const target = path.resolve(__dirname, '..', '..', 'target', 'release');
+  try {
+    console.log('📦 Copying required CUDA runtime libraries...');
+    execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${copyScript}" -Target "${target}"`, {
+      stdio: 'inherit',
+      env
+    });
+  } catch (err) {
+    console.error('❌ Failed to copy CUDA runtime libraries');
+    process.exit(err.status || 1);
+  }
+}
+
 // Execute the command
 try {
   execSync(tauriCmd, { stdio: 'inherit', env });

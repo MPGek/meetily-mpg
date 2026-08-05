@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-07-13T14:31:00Z
+last_mapped: 2026-08-05T14:56:00Z
 module: parakeet_engine
 ---
 
@@ -10,19 +10,20 @@ module: parakeet_engine
 
 ## Overview
 
-**Purpose**: The Parakeet engine module provides real-time speech-to-text transcription using the Parakeet ONNX model. Unlike Whisper.cpp which uses GGUF format, Parakeet uses ONNX runtime for inference. It's designed for lower-latency transcription with smaller model footprint, suitable for real-time streaming scenarios.
+**Purpose**: Streaming ONNX transcription using NVIDIA Parakeet-TDT models. The `ParakeetModel` (model.rs) runs a 3-session ONNX pipeline (preprocessor `nemo128` → encoder → decoder/joint) implementing streaming-style RNN-T greedy and TDT duration-based token decoding. `ParakeetEngine` (parakeet_engine.rs) handles model discovery, quantization awareness, streaming download with resume, lifecycle, and transcription (wrapping inference in `catch_unwind`).
 
-**Entry point**: `parakeet_engine/mod.rs` — module root
-**Sub-packages**: None (single directory)
+**Entry point**: `parakeet_engine/mod.rs` — module root.
+
+**Sub-packages**: None (single directory).
 
 ## File Reference
 
 | File | Purpose | Key Exports | Tokens |
 |------|---------|-------------|--------|
-| `mod.rs` | Module root, re-exports all sub-modules | parakeet types, commands | ~1k |
-| `parakeet_engine.rs` | Core ONNX inference wrapper | ParakeetEngine struct, load/inference | ~8k |
-| `commands.rs` | Tauri command handlers | parakeet_init, transcribe, model management | ~5k |
-| `model.rs` | Model metadata and versioning | ModelInfo, version checking | ~3k |
+| `mod.rs` | Module root, re-exports | `ParakeetEngine`, `ParakeetModel`, errors | <1k |
+| `parakeet_engine.rs` | Engine layer: model lifecycle, quantization, download/resume, transcription | `ParakeetEngine`, `ModelInfo`, `QuantizationType`, `DownloadProgress` | ~9k |
+| `model.rs` | ONNX `ParakeetModel`: 3-session pipeline + streaming decode | `ParakeetModel`, `TimestampedResult`, `DecoderState`, `ParakeetError` | ~5k |
+| `commands.rs` | Tauri commands + global `PARAKEET_ENGINE` singleton | `parakeet_*` commands, `PARAKEET_ENGINE` | ~4k |
 
 ## Public API
 
@@ -30,73 +31,113 @@ module: parakeet_engine
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `parakeet_init` | `(app) -> Result<(), String>` | Initialize Parakeet engine and load model |
-| `parakeet_unload_model` | `() -> Result<(), String>` | Unload current Parakeet model from memory |
-| `parakeet_is_model_loaded` | `() -> bool` | Check if model is currently loaded |
-| `parakeet_transcribe_audio` | `(audio_path) -> Result<TranscriptionResult, String>` | Transcribe audio using Parakeet ONNX model |
-| `parakeet_get_available_models` | `() -> Vec<ModelInfo>` | List available Parakeet models |
-| `parakeet_download_model` | `(model_name) -> Result<(), String>` | Download Parakeet model from HuggingFace |
+| `parakeet_init` | `() -> Result<(), String>` | Create engine if not present |
+| `parakeet_get_available_models` | `() -> Result<Vec<ModelInfo>, String>` | Discover models |
+| `parakeet_load_model` | `(app_handle, model_name) -> Result<(), String>` | Load; emits `parakeet-model-loading-*` |
+| `parakeet_get_current_model` / `parakeet_is_model_loaded` | `() -> Result<.., String>` | State queries |
+| `parakeet_validate_model_ready` | `() -> Result<String, String>` | Load first available, preferring Int8 |
+| `parakeet_transcribe_audio` | `(audio_data: Vec<f32>) -> Result<String, String>` | Transcribe |
+| `parakeet_download_model` | `(app_handle, model_name) -> Result<(), String>` | Multi-file weighted download w/ resume; emits `parakeet-model-download-*` |
+| `parakeet_retry_download` | `(app_handle, model_name) -> Result<(), String>` | Defensive retry (clears active downloads) |
+| `parakeet_cancel_download` / `parakeet_delete_corrupted_model` | `(model_name) -> Result<.., String>` | Cancel / delete |
+| `open_parakeet_models_folder` | `() -> Result<(), String>` | Open models dir |
 
 ### Key Types
 
 ```rust
 struct ParakeetEngine {
-    session: ort::Session,
-    model_path: PathBuf,
+    models_dir: PathBuf,
+    current_model: Arc<RwLock<Option<ParakeetModel>>>,
+    current_model_name: Arc<RwLock<Option<String>>>,
+    available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
+    cancel_download_flag: Arc<RwLock<Option<String>>>,
+    active_downloads: Arc<RwLock<HashSet<String>>>,
 }
 
-struct ModelInfo {
-    name: String,
-    version: String,
-    path: PathBuf,
-    size_bytes: u64,
+struct ParakeetModel {           // NOT thread-safe (ort::Session is !Sync); all run methods take &mut self
+    encoder: Session, decoder_joint: Session, preprocessor: Session,
+    vocab: Vec<String>, blank_idx: i32, vocab_size: usize,
 }
+
+enum QuantizationType { FP32, Int8 }   // default Int8
 ```
 
 ## Internal Architecture
 
-### ONNX Inference Flow
+### ONNX Streaming Inference (`model.rs`)
 
-1. **Model Loading**: ONNX session created from model file via `ort::Session::builder().commit_from_read()`
-2. **Preprocessing**: Audio samples converted to ONNX-compatible tensor format (float32)
-3. **Inference**: ONNX runtime executes model on CPU (no GPU acceleration currently)
-4. **Post-processing**: Raw output decoded to text with timestamp alignment
+```mermaid
+graph LR
+    Audio[16k f32 samples] --> Pre[preprocessor nemo128]
+    Pre --> Enc[encoder]
+    Enc --> Dec[decoder/joint RNN-T/TDT loop]
+    Dec --> Tokens[token ids]
+    Tokens --> Text[TimestampedResult text + timestamps]
+```
+
+- `ParakeetModel::new(model_dir, quantized)` loads `encoder-model[.int8].onnx`, `decoder_joint-model[.int8].onnx`, `nemo128.onnx`, `vocab.txt`. All sessions use **CPUExecutionProvider** only.
+- `decode_sequence` is the streaming/token loop: handles two decoder output shapes — `total_logits == vocab_size` (plain RNN-T greedy) and `total_logits > vocab_size` (TDT: vocab logits + duration logits). `prev_t` forward-progress guard forces `t += 1` to prevent infinite loops; `MAX_TOKENS_PER_STEP = 3` caps same-frame emissions.
+- `decode_tokens` maps ids→tokens with a spacing regex; timestamps computed as `WINDOW_SIZE (0.01) * SUBSAMPLING_FACTOR (8) * t`.
+- `transcribe_samples` validates ≥1600 samples (100ms @16k), builds `[1, N]` arrays, returns first `TimestampedResult`.
+
+### Engine Layer (`parakeet_engine.rs`)
+
+- `discover_models` catalogs 2 models: `parakeet-tdt-0.6b-v3-int8` (670MB) and `parakeet-tdt-0.6b-v2-int8` (661MB). **No FP32 in the catalog** (FP32 flow exists but is unreachable).
+- `download_model_detailed` does multi-file weighted download with **resume** (Range header), 30s per-chunk timeout, 1h client timeout, 8MB `BufWriter`, 500ms progress; `416` triggers delete-and-retry. Partial files kept on cancel for resume.
+- `transcribe_audio` takes a **write** lock on `current_model` and wraps `transcribe_samples` in `catch_unwind` — on panic it unloads the model and returns a descriptive error (ORT native code can hang/segfault on corrupted models).
 
 ### Concurrency Model
 
-- Model loading in tokio spawn block
-- Inference runs synchronously within async context
-- No parallel processing (single-threaded inference per chunk)
+`ParakeetModel` is not thread-safe; `ParakeetEngine` holds it in `Arc<RwLock<Option<ParakeetModel>>>` and takes a write lock for the whole transcription, serializing all inference.
 
 ## Dependencies (imports FROM)
 
 | Module/Package | What is imported | Why |
 |---------------|-----------------|-----|
-| `ort` | `Session`, `Tensor` | ONNX Runtime for model inference |
-| `tokio` | `spawn` | Async model loading |
+| `ort` | `CPUExecutionProvider`, `inputs`, `GraphOptimizationLevel`, `Session`, `TensorRef` | ONNX inference |
+| `ndarray`, `regex`, `once_cell`, `thiserror` | Arrays / token spacing / lazy regex / errors | Runtime helpers |
+| `reqwest`, `tokio`, `futures_util` | HTTP download | Model download |
+| `config` | `DEFAULT_PARAKEET_MODEL` | Default model name |
 
 ## Dependents (imported BY)
 
 | Consumer Module | What it uses | Context |
 |----------------|-------------|---------|
-| `audio/transcription/` | Transcribe audio chunks | Real-time transcription during recording |
-| `lib.rs` (main) | All Tauri commands | Entry point for frontend control |
+| `audio/transcription/engine.rs`, `parakeet_provider.rs` | `PARAKEET_ENGINE`, `ParakeetEngine` | Live transcription |
+| `audio/import.rs`, `retranscription.rs`, `common.rs` | `PARAKEET_ENGINE` | Import / re-transcribe / unload |
+| `audio/recording_commands.rs` | `PARAKEET_ENGINE` | Model validation on start |
+| `tray.rs`, `lib.rs` | Commands | Registration / tray |
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `model_name` | parakeet-v1.0 | Default Parakeet model version |
-| `sample_rate` | 16000 Hz | Expected input sample rate |
+| `DEFAULT_PARAKEET_MODEL` | `parakeet-tdt-0.6b-v3-int8` | Config fallback (config.rs) |
+| Quantization | Int8 | Only Int8 downloadable; FP32 flow present but unreachable |
+| Runtime | CPU-only | No GPU provider for Parakeet |
+| Decode | `MAX_TOKENS_PER_STEP=3`, `WINDOW_SIZE=0.01`, `SUBSAMPLING_FACTOR=8`, `TDT_DURATIONS=[0,1,2,3,4]` | Streaming token decoding |
+| Download | client timeout 3600s, per-chunk 30s, resume tolerance 1% | Robust downloads |
+| Download URLs | v3 → self-hosted `meetily.towardsgeneralintelligence.com`; v2 → HuggingFace | External availability dependency |
 
 ## Error Handling
 
-- **Model not found**: Returns error with path to models directory
-- **Invalid ONNX file**: Deleted and re-downloaded via cleanup command
-- **Inference failure**: Returns error with model-specific details
+- `ParakeetError` (model.rs, thiserror): `Ort`, `Io`, `Shape`, `InputNotFound`, `OutputNotFound`, `TensorShape`.
+- `ParakeetEngineError` (engine.rs): **essentially unused** — only `Display`/`Error` impls; methods return `anyhow::Result`.
+- Downloads meticulously remove from `active_downloads` and reset status to `Missing` on every failure/timeout/cancel.
+- `catch_unwind` around inference guards against ORT native crashes.
+
+## Concurrency and Thread Safety
+
+- All inference serialized through a write lock on `current_model` (blocks unload/switch during transcription — acceptable for serial use).
+- Global `PARAKEET_ENGINE` via `std::sync::Mutex<Option<Arc<ParakeetEngine>>>`.
 
 ## Gotchas and Tech Debt
 
-- **CPU-only**: No GPU acceleration support yet (unlike Whisper)
-- **Model size**: Smaller than Whisper but potentially less accurate for complex audio
-- **Language support**: May have limited language coverage compared to Whisper
+- **CPU-only despite doc claims** of "GPU cross-platform" — `init_session` only registers `CPUExecutionProvider`.
+- **`ParakeetEngineError` is dead** (unused error surface); two error enums for one engine (`ParakeetError` + `ParakeetEngineError`).
+- **v3 download URL is self-hosted** (`meetily.towardsgeneralintelligence.com`), not HuggingFace — external availability risk.
+- Resume correctness depends on the server honoring `Range`; `416` triggers delete-and-retry.
+- FP32 flow is unreachable from the catalog — effectively only Int8 is used.
+- Heavy `log::info!` in hot inference paths (`recognize_batch`, `decode_sequence`, `transcribe_samples`) — potential overhead.
+- `create_decoder_state` hardcodes batch=1 and channel dim 640.
+- Redundant `download_model` (u8-callback) wrapper preserved only for symmetry with Whisper.

@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-07-13T15:05:00Z
+last_mapped: 2026-08-05T15:03:00Z
 ---
 
 > Part of [Codebase Map](CODEBASE_MAP.md) | [Architecture](CODEBASE_MAP_ARCHITECTURE.md)
@@ -44,17 +44,18 @@ graph LR
 | Module | File | Purpose | Key Classes/Functions | Tokens |
 |--------|------|---------|----------------------|--------|
 | Entry Point | [CODEBASE_MAP_ARCHITECTURE.md](CODEBASE_MAP_ARCHITECTURE.md) | Tauri builder, commands, tray, onboarding | `run()`, `start_recording`, `tray.rs` | ~8k |
-| Audio Engine | [CODEBASE_MAP_MODULE_AUDIO.md](CODEBASE_MAP_MODULE_AUDIO.md) | Capture, mixing, VAD, device management | `RecordingManager`, `AudioPipelineManager`, `VadProcessor` | ~120k |
-| Whisper Engine | [CODEBASE_MAP_MODULE_WHISPER.md](CODEBASE_MAP_MODULE_WHISPER.md) | Whisper.cpp integration and model management | `WhisperEngine`, `ParallelProcessor` | ~30k |
-| Parakeet Engine | [CODEBASE_MAP_MODULE_PARAKEET.md](CODEBASE_MAP_MODULE_PARAKEET.md) | ONNX streaming transcription | `ParakeetClient`, streaming inference | ~15k |
-| Summary Service | [CODEBASE_MAP_MODULE_SUMMARY.md](CODEBASE_MAP_MODULE_SUMMARY.md) | AI summarization with multi-provider support | `SummaryService`, `Processor`, `LanguageDetection` | ~40k |
+| Audio Engine | [CODEBASE_MAP_MODULE_AUDIO.md](CODEBASE_MAP_MODULE_AUDIO.md) | Capture (mic+sys), per-channel VAD, stereo mixing, recording | `RecordingManager`, `AudioPipelineManager`, `ContinuousVadProcessor`, `RecordingSaver` | ~160k |
+| Whisper Engine | [CODEBASE_MAP_MODULE_WHISPER.md](CODEBASE_MAP_MODULE_WHISPER.md) | Whisper.cpp integration and model management | `WhisperEngine`, `ModelInfo`, `ParallelProcessor` (unused) | ~23k |
+| Parakeet Engine | [CODEBASE_MAP_MODULE_PARAKEET.md](CODEBASE_MAP_MODULE_PARAKEET.md) | ONNX streaming transcription | `ParakeetEngine`, `ParakeetModel` (RNN-T/TDT) | ~19k |
+| Summary Service | [CODEBASE_MAP_MODULE_SUMMARY.md](CODEBASE_MAP_MODULE_SUMMARY.md) | AI summarization with multi-provider support | `SummaryService`, `LLMProvider`, `generate_meeting_summary`, `debug_log` | ~48k |
 | AI Providers | [CODEBASE_MAP_MODULE_AI_PROVIDERS.md](CODEBASE_MAP_MODULE_AI_PROVIDERS.md) | Ollama, OpenAI, Anthropic, Groq, OpenRouter adapters | Provider clients, config structs | ~25k |
-| Database | [CODEBASE_MAP_MODULE_DATABASE.md](CODEBASE_MAP_MODULE_DATABASE.md) | SQLite data layer and repositories | `DatabaseManager`, repository implementations | ~20k |
+| Database | [CODEBASE_MAP_MODULE_DATABASE.md](CODEBASE_MAP_MODULE_DATABASE.md) | SQLite data layer and repositories | `DatabaseManager`, repository implementations | ~12k |
+| API | [CODEBASE_MAP_MODULE_AI_PROVIDERS.md](CODEBASE_MAP_MODULE_AI_PROVIDERS.md) → `api/` | IPC commands + shared DTOs + legacy HTTP client | `api_*` commands, `TranscriptSegment` | ~10k |
 | Notifications | [CODEBASE_MAP_MODULE_NOTIFICATIONS.md](CODEBASE_MAP_MODULE_NOTIFICATIONS.md) | Desktop notification system | `NotificationManager`, DND awareness | ~8k |
 | Analytics | [CODEBASE_MAP_MODULE_ANALYTICS.md](CODEBASE_MAP_MODULE_ANALYTICS.md) | PostHog integration | `Analytics` module, event tracking | ~5k |
-| Frontend App | [CODEBASE_MAP_MODULE_FRONTEND_APP.md](CODEBASE_MAP_MODULE_FRONTEND_APP.md) | Next.js app shell and routing | Layouts, pages | ~20k |
-| Frontend Components | [CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md](CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md) | UI component library | Shadcn + custom components | ~30k |
-| Frontend Hooks | [CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md](CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md) | React hooks for state management | Recording, transcript, config hooks | ~15k |
+| Frontend App | [CODEBASE_MAP_MODULE_FRONTEND_APP.md](CODEBASE_MAP_MODULE_FRONTEND_APP.md) | Next.js app shell and routing | Provider tree, pages | ~17k |
+| Frontend Components | [CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md](CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md) | UI components + transcript renderer | `VirtualizedTranscriptView`, `Sidebar`, `TranscriptPanel` | ~143k |
+| Frontend Hooks | [CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md](CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md) | React hooks + contexts | `usePaginatedTranscripts`, `TranscriptContext`, `useRecordingStart` | ~32k |
 
 ## Cross-Module Patterns
 
@@ -65,10 +66,13 @@ graph LR
 
 ### Audio Pipeline Pattern
 ```
-Capture → Mixing → VAD → Transcription Provider → Summary Service
-   ↓           ↓         ↓            ↓                  ↓
- Recording  Metrics  Whisper/     LLM API calls      SQLite storage
-            (batch)  Parakeet
+Mic + System capture → per-channel VAD → Transcription Provider → Summary Service
+   ↓                    ↓ (Silero v6 + rolling buffer)   ↓
+ Stereo mix         Whisper/Parakeet               LLM API calls (llm_client + sidecar)
+ (left=mic,          providers
+  right=sys)            ↓
+   ↓                transcript-update events
+ RecordingSaver     → Frontend (transcript-update) → SQLite
 ```
 
 ### Repository Pattern (Database)
@@ -86,11 +90,14 @@ Capture → Mixing → VAD → Transcription Provider → Summary Service
 | Sender | Receiver | Mechanism | Context |
 |--------|----------|-----------|---------|
 | Frontend | Rust (lib.rs) | Tauri `invoke()` command | Recording start/stop, transcription, DB queries |
-| Rust audio pipeline | Rust whisper engine | Channel (`mpsc::UnboundedSender<AudioChunk>`) | Audio chunks for transcription |
-| Rust whisper engine | Frontend | Tauri `app.emit("transcript-update")` | Real-time transcript segments |
-| Summary service | Database | sqlx async queries | Store/generated summaries |
+| Rust audio pipeline | Rust whisper/parakeet engine | `transcription/worker.rs` provider abstraction | Audio chunks for live transcription |
+| Rust audio pipeline | RecordingSaver | tokio mpsc (stereo mixed, left=mic right=sys) | Recording file |
+| Rust whisper/parakeet engine | Frontend | Tauri `app.emit("transcript-update")` | Real-time transcript segments (per channel) |
+| Summary service | LLM providers | `llm_client.rs` (reqwest) + `summary_engine` sidecar | AI summarization |
+| Summary service | Database | sqlx async queries | Store generated summaries |
 | Recording manager | Device monitor | mpsc channels | Device disconnect/reconnect events |
 | Hardware detector | Whisper engine | Direct function call | Auto-select optimal model/config |
+| Frontend (meeting details) | Database | `api_get_meeting_transcripts` (offset/limit) | Paginated transcript infinite scroll |
 
 ## Audio Engine Sub-Modules (Deep Dive)
 

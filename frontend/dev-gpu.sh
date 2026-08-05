@@ -49,6 +49,9 @@ else
     exit 1
 fi
 
+# Set local CUDA environment variables (idempotent; safe to source repeatedly)
+source ../scripts/env-cuda.sh
+
 echo ""
 echo -e "${BLUE}📦 Starting Meetily in development mode...${NC}"
 echo ""

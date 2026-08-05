@@ -99,6 +99,9 @@ if exist "package.json" (
     exit /b 1
 )
 
+REM Set local CUDA environment variables (idempotent; safe to call repeatedly)
+call ..\scripts\env-cuda.bat
+
 REM Check if pnpm or npm is available
 where pnpm >nul 2>&1
 if %errorlevel% equ 0 (

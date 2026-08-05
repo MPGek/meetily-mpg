@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Operations — Build, deploy, run commands, gotchas ([CODEBASE_MAP_OPERATIONS.md](docs/CODEBASE_MAP_OPERATIONS.md))
 - Navigation — Getting started, common tasks, file quick reference ([CODEBASE_MAP_NAVIGATION.md](docs/CODEBASE_MAP_NAVIGATION.md))
 
-**Recent additions** since last map update: `audio/device_detection.rs`, `audio/hardware_detector.rs`, `audio/incremental_saver.rs`, `audio/retranscription.rs`, `audio/import.rs`, `audio/post_processor.rs`, `audio/buffer_pool.rs`, `audio/batch_processor.rs`, `audio/async_logger.rs`, `audio/device_monitor.rs`, `audio/playback_monitor.rs`, `audio/transcription/` (provider abstraction), `summary/language_detection.rs`, `summary/metadata.rs`, `summary/template_commands.rs`.
+**Recent additions** (since last map update, 2026-08-05): mic/system channel separation (stereo, left=mic right=sys; `source_device` on transcripts), VAD rewritten to **Silero v6** with unified `VadConfig` and a rolling buffer (`audio/vad.rs`), transcription provider abstraction (`audio/transcription/`), "Enhance" re-transcription (`audio/retranscription.rs`), audio import (`audio/import.rs`), LLM debug logging (`summary/debug_log.rs` — NEW, uncommitted working-tree file), frontend transcript pagination (`usePaginatedTranscripts.ts`, `VirtualizedTranscriptView.tsx`), and GPU build scripts (`scripts/env-cuda.*`, `frontend/build-gpu.*`/`dev-gpu.*`). The legacy Python `backend/` was removed.
 
 ## Project Overview
 
@@ -35,8 +35,6 @@ See [docs/PROJECT_OVERVIEW_FULL.md](docs/PROJECT_OVERVIEW_FULL.md) for the compl
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
 
 When the user types `/graphify`, use the installed graphify skill or instructions before doing anything else.
-
-To run graphify command use python command `uv tool run --from graphifyy python`.
 
 Rules:
 - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.

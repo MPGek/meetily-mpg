@@ -1,6 +1,7 @@
 use crate::database::repositories::{
     meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
 };
+use crate::summary::debug_log;
 use crate::summary::llm_client::LLMProvider;
 use crate::summary::language_detection::detect_summary_language;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
@@ -12,7 +13,7 @@ use crate::ollama::metadata::ModelMetadataCache;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -504,6 +505,15 @@ impl SummaryService {
             }),
         };
 
+        // Resolve meeting folder for debug logs
+        let debug_log_dir = match MeetingsRepository::get_meeting_metadata(&pool, &meeting_id).await {
+            Ok(Some(meeting)) => meeting.folder_path
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from),
+            _ => None,
+        };
+        debug_log::reset_iteration_counter();
+
         let client = reqwest::Client::new();
         let result = generate_meeting_summary(
             &client,
@@ -522,6 +532,7 @@ impl SummaryService {
             custom_openai_top_p,
             app_data_dir.as_ref(),
             Some(&cancellation_token),
+            debug_log_dir.clone(),
             summary_language.as_deref(),
             detected_summary_language.as_deref(),
             cached_english.as_deref(),

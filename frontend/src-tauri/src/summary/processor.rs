@@ -337,6 +337,7 @@ pub async fn generate_meeting_summary(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    debug_log_dir: Option<PathBuf>,
     summary_language: Option<&str>,
     detected_transcript_language: Option<&str>,
     cached_english: Option<&str>,
@@ -412,6 +413,7 @@ pub async fn generate_meeting_summary(
                     temperature,
                     top_p,
                     app_data_dir,
+                    debug_log_dir.clone(),
                     cancellation_token,
                 )
                 .await
@@ -465,6 +467,7 @@ pub async fn generate_meeting_summary(
                     temperature,
                     top_p,
                     app_data_dir,
+                    debug_log_dir.clone(),
                     cancellation_token,
                 )
                 .await?
@@ -513,6 +516,7 @@ pub async fn generate_meeting_summary(
             temperature,
             top_p,
             app_data_dir,
+            debug_log_dir.clone(),
             cancellation_token,
         )
         .await?;
@@ -539,6 +543,7 @@ pub async fn generate_meeting_summary(
                 top_p,
                 app_data_dir,
                 cancellation_token,
+                debug_log_dir.clone(),
             )
             .await
             {
@@ -566,6 +571,7 @@ pub async fn generate_meeting_summary(
                     top_p,
                     app_data_dir,
                     cancellation_token,
+                    debug_log_dir.clone(),
                 )
                 .await,
             )?;
@@ -595,6 +601,7 @@ async fn run_markdown_transform(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    debug_log_dir: Option<PathBuf>,
 ) -> Result<String, String> {
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
@@ -615,6 +622,7 @@ async fn run_markdown_transform(
         temperature,
         top_p,
         app_data_dir,
+        debug_log_dir,
         cancellation_token,
     )
     .await
@@ -638,6 +646,7 @@ async fn translate_markdown(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    debug_log_dir: Option<PathBuf>,
 ) -> Result<String, String> {
     info!("Translation pass: target language = {}", target_language);
 
@@ -661,6 +670,7 @@ async fn translate_markdown(
         top_p,
         app_data_dir,
         cancellation_token,
+        debug_log_dir,
     )
     .await
 }
@@ -679,6 +689,7 @@ async fn normalize_markdown_to_english(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    debug_log_dir: Option<PathBuf>,
 ) -> Result<String, String> {
     info!("English normalization pass: preserving Markdown structure");
 
@@ -701,6 +712,7 @@ async fn normalize_markdown_to_english(
         top_p,
         app_data_dir,
         cancellation_token,
+        debug_log_dir,
     )
     .await
 }
