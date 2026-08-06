@@ -236,13 +236,12 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         let update = TranscriptUpdate {
                                             text: transcript,
-                                            timestamp: format_current_timestamp(), // Wall-clock for reference
+                                            timestamp: format_current_timestamp(),
                                             source: "Audio".to_string(),
                                             sequence_id,
-                                            chunk_start_time: chunk_timestamp, // Legacy compatibility
+                                            chunk_start_time: chunk_timestamp,
                                             is_partial,
-                                            confidence: confidence_opt.unwrap_or(0.85), // Default for providers without confidence
-                                            // NEW: Recording-relative timestamps for sync
+                                            confidence: confidence_opt.unwrap_or(0.85),
                                             audio_start_time,
                                             audio_end_time,
                                             duration: chunk_duration,
@@ -250,6 +249,7 @@ pub fn start_transcription_task<R: Runtime>(
                                                 crate::audio::RecordingDeviceType::Microphone => "Microphone".to_string(),
                                                 crate::audio::RecordingDeviceType::System => "System".to_string(),
                                             },
+                                            speaker: None,
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)

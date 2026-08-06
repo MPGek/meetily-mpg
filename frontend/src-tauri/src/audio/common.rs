@@ -73,6 +73,8 @@ pub(crate) fn create_transcript_segments_with_source(
                 audio_end_time: Some(end_seconds),
                 duration: Some(duration),
                 source_device: source_device.clone(),
+                speaker: None,
+                speaker_label: None,
             }
         })
         .collect()

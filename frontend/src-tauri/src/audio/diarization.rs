@@ -2,11 +2,10 @@ use crate::api::TranscriptSegment;
 use crate::audio::decoder::decode_audio_file;
 use crate::database::repositories::meeting::MeetingsRepository;
 use crate::state::AppState;
-use log::{error, info, warn};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 static DIARIZATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -265,14 +264,14 @@ fn run_sherpa_diarization(samples: &[f32], sample_rate: u32, models_dir: &PathBu
     };
 
     let diarizer = OfflineSpeakerDiarization::create(&config)
-        .map_err(|e| format!("Failed to create diarizer: {:?}", e))?;
+        .ok_or_else(|| "Failed to create diarizer — check model paths".to_string())?;
 
-    let result = diarizer.process(sample_rate as i32, samples)
-        .map_err(|e| format!("Diarization processing failed: {:?}", e))?;
+    let result = diarizer.process(samples)
+        .ok_or_else(|| "Diarization processing failed — no result returned".to_string())?;
 
     let segments: Vec<DiarizationSegment> = result
-        .segments()
-        .iter()
+        .sort_by_start_time()
+        .into_iter()
         .map(|s| DiarizationSegment {
             start: s.start,
             end: s.end,
