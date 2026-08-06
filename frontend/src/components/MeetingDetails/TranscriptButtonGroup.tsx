@@ -3,10 +3,11 @@
 import { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, FolderOpen, RefreshCw, Users } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
+import { recordingService } from '@/services/recordingService';
 
 
 interface TranscriptButtonGroupProps {
@@ -29,13 +30,29 @@ export function TranscriptButtonGroup({
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
+  const [isDiarizing, setIsDiarizing] = useState(false);
 
   const handleRetranscribeComplete = useCallback(async () => {
-    // Refetch transcripts to show the updated data
     if (onRefetchTranscripts) {
       await onRefetchTranscripts();
     }
   }, [onRefetchTranscripts]);
+
+  const handleReanalyzeSpeakers = async () => {
+    if (!meetingId || isDiarizing) return;
+    setIsDiarizing(true);
+    try {
+      Analytics.trackButtonClick('reanalyze_speakers', 'meeting_details');
+      await recordingService.startDiarization(meetingId);
+      if (onRefetchTranscripts) {
+        await onRefetchTranscripts();
+      }
+    } catch (err: any) {
+      console.error('Diarization failed:', err);
+    } finally {
+      setIsDiarizing(false);
+    }
+  };
 
   return (
     <div className="flex items-center justify-center w-full gap-2">
@@ -81,6 +98,23 @@ export function TranscriptButtonGroup({
           >
             <RefreshCw className="xl:mr-2" size={18} />
             <span className="hidden lg:inline">Enhance</span>
+          </Button>
+        )}
+
+        {meetingId && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleReanalyzeSpeakers}
+            disabled={isDiarizing}
+            title="Identify who spoke when"
+          >
+            {isDiarizing ? (
+              <RefreshCw className="xl:mr-2 animate-spin" size={18} />
+            ) : (
+              <Users className="xl:mr-2" size={18} />
+            )}
+            <span className="hidden lg:inline">{isDiarizing ? 'Analyzing...' : 'Speakers'}</span>
           </Button>
         )}
       </ButtonGroup>

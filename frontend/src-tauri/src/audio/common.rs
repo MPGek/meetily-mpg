@@ -95,6 +95,9 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
                 "audio_start_time": s.audio_start_time,
                 "audio_end_time": s.audio_end_time,
                 "duration": s.duration,
+                "source_device": s.source_device,
+                "speaker": s.speaker,
+                "speaker_label": s.speaker_label,
                 "sequence_id": i
             })
         }).collect::<Vec<_>>()

@@ -37,6 +37,8 @@ pub struct TranscriptUpdate {
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
     pub source_device: String, // "Microphone" or "System"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>, // Speaker ID from diarization (e.g., "SPEAKER_00")
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions

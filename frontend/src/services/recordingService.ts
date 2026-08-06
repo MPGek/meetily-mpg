@@ -22,6 +22,19 @@ export interface RecordingStoppedPayload {
   meeting_name?: string;
 }
 
+export interface DiarizationProgressPayload {
+  meeting_id: string;
+  status: string;
+  progress: number;
+  message: string;
+}
+
+export interface DiarizationResultPayload {
+  meeting_id: string;
+  segments_labeled: number;
+  speakers_found: number;
+}
+
 /**
  * Recording Service
  * Singleton service for managing recording lifecycle operations
@@ -163,6 +176,65 @@ export class RecordingService {
    */
   async onSpeechDetected(callback: () => void): Promise<UnlistenFn> {
     return listen('speech-detected', callback);
+  }
+
+  // Diarization Methods
+
+  /**
+   * Start speaker diarization on a meeting's audio
+   * @param meetingId - Meeting ID to diarize
+   * @returns Promise with result
+   */
+  async startDiarization(meetingId: string): Promise<DiarizationResultPayload> {
+    return invoke<DiarizationResultPayload>('start_diarization', {
+      meetingId: meetingId,
+    });
+  }
+
+  /**
+   * Get diarization status and speaker names for a meeting
+   * @param meetingId - Meeting ID
+   * @returns Promise with status info
+   */
+  async getDiarizationStatus(meetingId: string): Promise<{
+    meeting_id: string;
+    diarization_status: string | null;
+    speaker_names: string | null;
+  }> {
+    return invoke('get_diarization_status', {
+      meetingId: meetingId,
+    });
+  }
+
+  /**
+   * Update a speaker's display label
+   * @param meetingId - Meeting ID
+   * @param speaker - Speaker ID (e.g., "SPEAKER_00")
+   * @param label - User-friendly label (e.g., "Alice")
+   */
+  async updateSpeakerLabel(
+    meetingId: string,
+    speaker: string,
+    label: string
+  ): Promise<boolean> {
+    return invoke<boolean>('update_speaker_label_command', {
+      meetingId: meetingId,
+      speaker: speaker,
+      label: label,
+    });
+  }
+
+  /**
+   * Listen for diarization-progress events
+   * @param callback - Function to call on progress updates
+   * @returns Unlisten function
+   */
+  async onDiarizationProgress(
+    callback: (payload: DiarizationProgressPayload) => void
+  ): Promise<UnlistenFn> {
+    return listen<DiarizationProgressPayload>('diarization-progress', (event) => {
+      callback(event.payload);
+    });
   }
 }
 

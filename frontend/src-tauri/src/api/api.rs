@@ -123,6 +123,10 @@ pub struct MeetingDetails {
     pub created_at: String,
     pub updated_at: String,
     pub transcripts: Vec<MeetingTranscript>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarization_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_names: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +143,10 @@ pub struct MeetingTranscript {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -183,7 +191,6 @@ pub struct TranscriptSegment {
     pub id: String,
     pub text: String,
     pub timestamp: String,
-    // NEW: Recording-relative timestamps for playback synchronization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_start_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +199,10 @@ pub struct TranscriptSegment {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -883,6 +894,8 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
                     source_device: t.source_device,
+                    speaker: t.speaker,
+                    speaker_label: t.speaker_label,
                 })
                 .collect::<Vec<_>>();
 

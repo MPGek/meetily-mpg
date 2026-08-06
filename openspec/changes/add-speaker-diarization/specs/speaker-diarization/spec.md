@@ -1,0 +1,102 @@
+# speaker-diarization Specification
+
+## Purpose
+Speaker identification ("who spoke when") using ONNX-based diarization models running locally as a post-processing step on recorded meetings.
+
+## ADDED Requirements
+
+### Requirement: Speaker diarization pipeline
+The system SHALL provide a speaker diarization pipeline using sherpa-onnx ONNX models that processes recorded audio and assigns speaker labels to transcript segments.
+
+#### Scenario: Successful diarization of a meeting
+- **WHEN** diarization is triggered for a saved meeting with valid audio
+- **THEN** the system runs segmentation, embedding extraction, and clustering, and assigns `speaker` values ("SPEAKER_00", "SPEAKER_01", etc.) to matching transcript segments
+
+#### Scenario: Diarization handles missing audio file
+- **WHEN** diarization is triggered but the meeting has no audio file
+- **THEN** the system SHALL return an error with a clear message and set `diarization_status` to "failed"
+
+### Requirement: Diarization model management
+The system SHALL support downloading and configuring speaker diarization ONNX models through the settings interface.
+
+#### Scenario: Download diarization models
+- **WHEN** user clicks "Download Models" in the diarization settings section
+- **THEN** the system downloads the segmentation model (~1.5MB) and embedding model (~25MB) to the app's model directory
+
+#### Scenario: Model download progress reporting
+- **WHEN** models are being downloaded
+- **THEN** the system SHALL emit progress events with percentage and bytes downloaded
+
+#### Scenario: Re-download models
+- **WHEN** user clicks download and models already exist on disk
+- **THEN** the system SHALL re-download and overwrite existing files, showing a confirmation prompt first
+
+### Requirement: Diarization trigger modes
+The system SHALL support automatic diarization after recording stops (when enabled) and manual diarization on any past meeting.
+
+#### Scenario: Auto-trigger after recording stops
+- **WHEN** diarization is enabled in settings and recording stops
+- **THEN** the system SHALL automatically start diarization on the saved recording
+
+#### Scenario: Manual trigger on past meeting
+- **WHEN** user clicks "Re-analyze Speakers" on a meeting detail page
+- **THEN** the system SHALL start diarization on that meeting's audio, re-processing even if previously diarized
+
+#### Scenario: Diarization disabled — no auto-trigger
+- **WHEN** diarization is disabled in settings
+- **THEN** no diarization SHALL run automatically after recording stops
+
+### Requirement: Diarization progress reporting
+The system SHALL emit progress events during diarization so the frontend can display status.
+
+#### Scenario: Progress updates during processing
+- **WHEN** diarization is running
+- **THEN** the system SHALL emit `diarization-progress` events with `status`, `progress` (0-100), and `message` fields
+
+#### Scenario: Diarization completion
+- **WHEN** diarization finishes successfully
+- **THEN** the system SHALL emit a final progress event with `status: "complete"` and `progress: 100`
+
+#### Scenario: Diarization failure
+- **WHEN** diarization encounters an unrecoverable error
+- **THEN** the system SHALL emit a progress event with `status: "failed"` and an error message, and set `diarization_status` to "failed" on the meeting
+
+### Requirement: Speaker label assignment
+The system SHALL assign speaker labels to transcript segments by matching diarization time ranges to transcript timestamps.
+
+#### Scenario: Overlap-based speaker matching
+- **WHEN** diarization produces speaker turns with start/end times
+- **THEN** each transcript segment SHALL be assigned the speaker whose time range has the maximum overlap with the segment's `audio_start_time` to `audio_end_time`
+
+#### Scenario: Unmatched transcript segments
+- **WHEN** a transcript segment falls outside all diarization speaker turns
+- **THEN** the segment's `speaker` SHALL remain NULL
+
+#### Scenario: System audio segments overridden
+- **WHEN** a transcript segment has `source_device="System"`
+- **THEN** its `speaker` SHALL be set to "SystemAudio" regardless of diarization output
+
+### Requirement: Speaker naming and labels
+The system SHALL allow users to assign human-readable names to speaker IDs on a per-meeting basis.
+
+#### Scenario: Rename speaker inline
+- **WHEN** user edits a speaker label in the transcript view (e.g., changes "SPEAKER_00" to "Alice")
+- **THEN** the system SHALL persist the label to the `speaker_label` column on all transcripts with that speaker ID, and update `speaker_names` JSON on the meeting record
+
+#### Scenario: Speaker label appears in UI
+- **WHEN** a transcript segment has a `speaker_label` value
+- **THEN** the UI SHALL display the label instead of the raw speaker ID
+
+### Requirement: Diarization cancellation
+The system SHALL support cancelling an in-progress diarization job.
+
+#### Scenario: Cancel during processing
+- **WHEN** user triggers a new diarization or closes the app while diarization is running
+- **THEN** the system SHALL cancel the current diarization task gracefully, leaving partial results (if any) in place
+
+### Requirement: Diarization configuration
+The system SHALL persist diarization configuration in user settings.
+
+#### Scenario: Save diarization preferences
+- **WHEN** user changes diarization settings (enabled/disabled, max speakers, auto-run)
+- **THEN** the system SHALL persist these to the settings store

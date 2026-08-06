@@ -103,6 +103,9 @@ futures-util = "0.3"
 # VAD engine: replaced with direct ort integration (Silero VAD v6)
 # silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", package = "silero" }
 
+# Speaker diarization via sherpa-onnx
+sherpa-onnx = "1.13.4"
+
 # Parakeet (ONNX-based fast transcription) dependencies
 ort = { version = "2.0.0-rc.10" }  # ONNX Runtime for Parakeet models
 thiserror = "2.0.16"                # Error handling for Parakeet

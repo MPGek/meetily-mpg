@@ -38,6 +38,8 @@ function convertTranscriptsToSegments(transcripts: Transcript[]): TranscriptSegm
         text: t.text,
         confidence: t.confidence,
         source_device: t.source_device,
+        speaker: t.speaker,
+        speaker_label: t.speaker_label,
     }));
 }
 

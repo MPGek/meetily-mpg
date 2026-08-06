@@ -9,6 +9,8 @@ pub struct MeetingModel {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub folder_path: Option<String>,
+    pub diarization_status: Option<String>,
+    pub speaker_names: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -36,6 +38,8 @@ pub struct Transcript {
     pub audio_end_time: Option<f64>,
     pub duration: Option<f64>,
     pub source_device: Option<String>,
+    pub speaker: Option<String>,
+    pub speaker_label: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

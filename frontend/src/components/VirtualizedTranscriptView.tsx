@@ -50,6 +50,28 @@ function formatRecordingTime(seconds: number | undefined): string {
     return `[${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
 }
 
+// Speaker color palette — 8 distinct colors
+const SPEAKER_COLORS = [
+    "#3B82F6", // blue
+    "#10B981", // emerald
+    "#F59E0B", // amber
+    "#8B5CF6", // violet
+    "#F43F5E", // rose
+    "#06B6D4", // cyan
+    "#F97316", // orange
+    "#14B8A6", // teal
+];
+
+function getSpeakerColor(speaker: string): string {
+    const idx = parseInt(speaker.replace("SPEAKER_", ""), 10);
+    return SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
+}
+
+function formatSpeakerId(speaker: string): string {
+    const idx = parseInt(speaker.replace("SPEAKER_", ""), 10);
+    return `Speaker ${idx + 1}`;
+}
+
 // Helper function to remove filler words and repetitions
 function cleanStopWords(text: string): string {
     const stopWords = ['uh', 'um', 'er', 'ah', 'hmm', 'hm', 'eh', 'oh'];
@@ -72,6 +94,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming,
     showConfidence,
     source_device,
+    speaker,
+    speaker_label,
 }: {
     id: string;
     timestamp: number;
@@ -80,13 +104,18 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming: boolean;
     showConfidence: boolean;
     source_device?: string;
+    speaker?: string;
+    speaker_label?: string;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
-    // Determine layout based on source_device
     const isMic = source_device === 'Microphone';
     const isSystem = source_device === 'System';
     const isLegacy = !isMic && !isSystem;
+    const hasSpeaker = !!speaker;
+
+    const speakerColor = hasSpeaker ? getSpeakerColor(speaker) : undefined;
+    const speakerName = speaker_label || (speaker ? formatSpeakerId(speaker) : undefined);
 
     if (isLegacy) {
         // Legacy neutral style - left-aligned, no bubble
@@ -120,7 +149,6 @@ const TranscriptSegment = memo(function TranscriptSegment({
     }
 
     if (isMic) {
-        // Microphone: left-aligned, timestamp on left, blue bubble
         return (
             <div id={`segment-${id}`} className="mb-3">
                 <div className="flex items-start gap-2">
@@ -137,15 +165,21 @@ const TranscriptSegment = memo(function TranscriptSegment({
                         </TooltipContent>
                     </Tooltip>
                     <div className="flex-1 max-w-[80%]">
-                        {isStreaming ? (
-                            <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
-                            </div>
-                        ) : (
-                            <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        {hasSpeaker && (
+                            <div className="flex items-center gap-1.5 mb-1 ml-1">
+                                <span
+                                    className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                    style={{ backgroundColor: speakerColor }}
+                                />
+                                <span className="text-xs font-medium text-gray-600">{speakerName}</span>
                             </div>
                         )}
+                        <div
+                            className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2"
+                            style={hasSpeaker ? { borderLeftColor: speakerColor, borderLeftWidth: 3 } : undefined}
+                        >
+                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -371,6 +405,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         source_device={segment.source_device}
+                                        speaker={segment.speaker}
+                                        speaker_label={segment.speaker_label}
                                     />
                                 </div>
                             );

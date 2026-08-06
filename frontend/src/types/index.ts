@@ -17,6 +17,8 @@ export interface Transcript {
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
   source_device?: string;    // "Microphone" or "System"
+  speaker?: string;          // Speaker ID from diarization
+  speaker_label?: string;    // User-assigned speaker name
 }
 
 export interface TranscriptUpdate {
@@ -32,6 +34,7 @@ export interface TranscriptUpdate {
   audio_end_time: number;   // Seconds from recording start
   duration: number;          // Segment duration in seconds
   source_device: string;    // "Microphone" or "System"
+  speaker?: string;         // Speaker ID from diarization
 }
 
 export interface Block {
@@ -110,4 +113,22 @@ export interface TranscriptSegmentData {
   text: string;
   confidence?: number;
   source_device?: string; // "Microphone" or "System"
+  speaker?: string;       // Speaker ID from diarization
+  speaker_label?: string; // User-assigned speaker name
 }
+
+// Speaker diarization types
+export interface DiarizationProgress {
+  meeting_id: string;
+  status: string; // "loading" | "decoding" | "diarizing" | "matching" | "complete" | "failed"
+  progress: number; // 0-100
+  message: string;
+}
+
+export interface DiarizationResult {
+  meeting_id: string;
+  segments_labeled: number;
+  speakers_found: number;
+}
+
+export type SpeakerMap = Record<string, string>; // speaker_id -> label

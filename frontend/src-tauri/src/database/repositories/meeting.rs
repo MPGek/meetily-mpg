@@ -62,7 +62,7 @@ impl MeetingsRepository {
 
         // Get meeting details
         let meeting: Option<MeetingModel> =
-            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?")
+            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path, diarization_status, speaker_names FROM meetings WHERE id = ?")
                 .bind(meeting_id)
                 .fetch_optional(&mut *transaction)
                 .await?;
@@ -93,6 +93,8 @@ impl MeetingsRepository {
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
                     source_device: t.source_device,
+                    speaker: t.speaker,
+                    speaker_label: t.speaker_label,
                 })
                 .collect::<Vec<_>>();
 
@@ -102,6 +104,8 @@ impl MeetingsRepository {
                 created_at: meeting.created_at.0.to_rfc3339(),
                 updated_at: meeting.updated_at.0.to_rfc3339(),
                 transcripts: meeting_transcripts,
+                diarization_status: meeting.diarization_status,
+                speaker_names: meeting.speaker_names,
             }))
         } else {
             transaction.rollback().await?;
@@ -195,6 +199,103 @@ impl MeetingsRepository {
         }
         transaction.commit().await?;
         Ok(true)
+    }
+
+    pub async fn update_speaker_label(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        speaker: &str,
+        label: &str,
+    ) -> Result<bool, SqlxError> {
+        let mut transaction = pool.begin().await?;
+        let rows = sqlx::query(
+            "UPDATE transcripts SET speaker_label = ? WHERE meeting_id = ? AND speaker = ?"
+        )
+        .bind(label)
+        .bind(meeting_id)
+        .bind(speaker)
+        .execute(&mut *transaction)
+        .await?;
+
+        if rows.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+
+        let current_names: Option<String> = sqlx::query_scalar(
+            "SELECT speaker_names FROM meetings WHERE id = ?"
+        )
+        .bind(meeting_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .flatten();
+
+        let mut names_map: serde_json::Map<String, serde_json::Value> = match current_names {
+            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+            None => serde_json::Map::new(),
+        };
+        names_map.insert(speaker.to_string(), serde_json::Value::String(label.to_string()));
+
+        let updated_json = serde_json::to_string(&names_map).unwrap_or_default();
+        sqlx::query("UPDATE meetings SET speaker_names = ? WHERE id = ?")
+            .bind(&updated_json)
+            .bind(meeting_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn update_diarization_status(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        status: &str,
+    ) -> Result<bool, SqlxError> {
+        let rows = sqlx::query("UPDATE meetings SET diarization_status = ? WHERE id = ?")
+            .bind(status)
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
+    pub async fn update_speaker_names(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        names_json: &str,
+    ) -> Result<bool, SqlxError> {
+        let rows = sqlx::query("UPDATE meetings SET speaker_names = ? WHERE id = ?")
+            .bind(names_json)
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
+    pub async fn update_transcript_speaker(
+        pool: &SqlitePool,
+        transcript_id: &str,
+        speaker: &str,
+    ) -> Result<bool, SqlxError> {
+        let rows = sqlx::query("UPDATE transcripts SET speaker = ? WHERE id = ?")
+            .bind(speaker)
+            .bind(transcript_id)
+            .execute(pool)
+            .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
+    pub async fn get_transcripts_for_diarization(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Vec<Transcript>, SqlxError> {
+        sqlx::query_as::<_, Transcript>(
+            "SELECT * FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC"
+        )
+        .bind(meeting_id)
+        .fetch_all(pool)
+        .await
     }
 
     pub async fn update_meeting_name(
