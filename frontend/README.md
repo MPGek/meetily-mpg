@@ -23,7 +23,7 @@ A modern desktop application for recording, transcribing, and analyzing meetings
 - Node.js (v18 or later)
 - Rust (latest stable)
 - pnpm (v8 or later)
-- Visual Studio Build Tools with C++ development tools
+- Visual Studio 2022 or 2026 with C++ development tools
 - Windows 10 or later
 
 
@@ -77,7 +77,7 @@ A modern desktop application for recording, transcribing, and analyzing meetings
    - Install [Node.js](https://nodejs.org/) (v18 or later)
    - Install [Rust](https://www.rust-lang.org/tools/install)
    - Install pnpm: `npm install -g pnpm`
-   - Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with C++ development tools
+   - Install [Visual Studio 2022 or 2026](https://visualstudio.microsoft.com/) (any edition or Build Tools) with the "Desktop development with C++" workload
 
 2. Clone the repository and navigate to the frontend directory:
    ```cmd
@@ -159,7 +159,7 @@ For build and acceleration details, see:
 - For microphone access issues, ensure the app has microphone permissions in System Preferences
 
 ### Common Issues on Windows
-- If you encounter build errors, ensure Visual Studio Build Tools are properly installed
+- If you encounter build errors, ensure Visual Studio 2022 or 2026 with the "Desktop development with C++" workload is properly installed
 - For audio capture issues, check Windows privacy settings for microphone access
 - If the app fails to start, try running Command Prompt as administrator
 

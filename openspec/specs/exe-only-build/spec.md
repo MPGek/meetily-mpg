@@ -18,8 +18,8 @@ The system SHALL provide a `frontend/build-exe.bat` script that builds only the 
 
 ### Requirement: No changes to existing build scripts
 
-The existing `build-gpu.bat` and `build-gpu.sh` scripts SHALL remain unchanged.
+The existing `build-gpu.sh` script SHALL remain unchanged.
 
-#### Scenario: build-gpu.bat unchanged
-- **WHEN** `build-exe.bat` is created
-- **THEN** `frontend/build-gpu.bat` SHALL NOT be modified
+#### Scenario: build-gpu.sh unchanged
+- **WHEN** the Windows build scripts are updated to support Visual Studio 2026
+- **THEN** `frontend/build-gpu.sh` SHALL NOT be modified

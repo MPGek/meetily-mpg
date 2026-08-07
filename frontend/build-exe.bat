@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 REM Meetily GPU-Accelerated Executable-Only Build for Windows
 REM Builds meetily.exe without MSI/NSIS packaging
 REM Based on build-gpu.bat but uses tauri build --no-bundle
@@ -43,40 +43,10 @@ set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
 
 REM Try to find and setup Visual Studio environment
 echo 🔧 Setting up Visual Studio environment...
-if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2022 Build Tools
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-
-    REM Manually set up the environment
-    set "LIB=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\um\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\ucrt\x64"
-    set "INCLUDE=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\ucrt"
-    set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64;C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64;%PATH%"
-) else if exist "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2022 Build Tools
-    call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2022 Community
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2022 Professional
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2022 Enterprise
-    call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2022 Enterprise
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" (
-    echo    Using Visual Studio 2019 Build Tools
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-) else (
-    echo    ⚠️  Visual Studio not found, using manual SDK setup
-    set "WindowsSDKVersion=10.0.22621.0"
-    set "WindowsSDKLibVersion=10.0.22621.0"
-    set "WindowsSDKIncludeVersion=10.0.22621.0"
-    set "LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\um\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\ucrt\x64;%LIB%"
-    set "INCLUDE=C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\ucrt;%INCLUDE%"
-    set "PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64;%PATH%"
+call "%~dp0scripts\setup-vs-env.bat"
+if errorlevel 1 (
+    echo ❌ Error: Failed to set up Visual Studio environment
+    exit /b 1
 )
 
 REM Export environment variables for the child process
@@ -210,7 +180,11 @@ echo.
 echo 📦 Building Meetily executable (no installer)...
 echo.
 
-call tauri build --features cuda --no-bundle
+if %USE_PNPM% equ 1 (
+    call pnpm exec tauri build --features cuda --no-bundle
+) else (
+    call npx tauri build --features cuda --no-bundle
+)
 
 if errorlevel 1 (
     echo.

@@ -26,7 +26,7 @@ section: operations
 - `pnpm tauri:dev` / `pnpm tauri:build` run **`scripts/tauri-auto.js`** which reads `TAURI_GPU_FEATURE` (env override) or runs `scripts/auto-detect-gpu.js`, then calls `tauri dev|build -- --features <feat>`. Detection priority: macOS arm64→`coreml` (Intel→`metal`), NVIDIA→`cuda`, AMD ROCm→`hipblas`, Vulkan→`vulkan`, OpenBLAS→`openblas`, else CPU.
 - Feature-pinned variants: `tauri:dev:cpu/cuda/vulkan/metal/coreml/openblas/hipblas` and `tauri:build:*`.
 - **`frontend/build-gpu.bat` / `dev-gpu.bat` are the authoritative Windows flows**:
-  1. Set `LIBCLANG_PATH`; locate & call `vcvars64.bat` (with hard-coded MSVC/SDK fallback).
+  1. Set `LIBCLANG_PATH`; `scripts/setup-vs-env.bat` locates & calls `vcvars64.bat` (vswhere, then VS 2022/2026 path probing; dynamic MSVC/SDK fallback).
   2. `call ..\scripts\env-cuda.bat` — sets CUDA env (see below).
   3. Detect GPU feature → `TAURI_GPU_FEATURE`.
   4. **Build the `llama-helper` sidecar** (`cargo build --release [--features <feat>]`), copy the target-triple binary to `src-tauri/binaries/llama-helper-<triple>.exe`.
@@ -72,7 +72,7 @@ Workspace members: `frontend/src-tauri`, `llama-helper`; **target dir at repo ro
 ## Gotchas
 
 - **CUDA path hard-coded to v13.3** in `env-cuda.*`; a different toolkit version breaks CUDA builds silently.
-- **MSVC/SDK paths hard-coded** in `.bat` fallback (10.0.22621.0, MSVC 14.44.35207) — fragile if `vcvars64.bat` fails.
+- **VS toolchain auto-detected** by `scripts/setup-vs-env.bat` (vswhere / path probing); requires VS 2022 or 2026 with the C++ workload — no hard-coded MSVC/SDK versions.
 - **`LIBCLANG_PATH`** must point at LLVM on Windows or `whisper-rs-sys` fails to parse headers.
 - **llama-helper lacks `coreml`/`hipblas`/`openblas`** → remap to `metal`; others build CPU.
 - **`NO_STRIP=true`** required for AppImage (set in `build-gpu.sh`).
