@@ -317,3 +317,68 @@ pnpm tauri:build
 By default, the application will be built with CPU-only processing. To enable GPU acceleration, see the [GPU Acceleration Guide](GPU_ACCELERATION.md).
 
 </details>
+
+## ⚡ Build Optimization
+
+The project includes several build optimizations to speed up incremental builds during development.
+
+### sccache (Optional)
+
+[sccache](https://github.com/mozilla/sccache) caches compiled dependencies, making `cargo clean` and branch switches much faster.
+
+**Installation:**
+```bash
+cargo install sccache
+```
+
+**Enable sccache:**
+Edit `.cargo/config.toml` and uncomment the sccache lines:
+```toml
+[build]
+rustc-wrapper = "sccache"
+```
+
+**Verify it's working:**
+```bash
+sccache --show-stats
+```
+
+### Temporarily Re-enable Debug Info
+
+The dev profile disables debug info (`debug = false` in `Cargo.toml`) for faster builds. If you need full debug info for debugging:
+
+**Option 1: Temporary override via environment variable**
+```bash
+CARGO_PROFILE_DEV_DEBUG=true cargo build
+```
+
+**Option 2: Edit `Cargo.toml` temporarily**
+```toml
+[profile.dev]
+debug = true  # Change from false to true
+```
+
+Remember to revert the change or remove the environment variable when done.
+
+### Turbopack Fallback
+
+The frontend dev server uses Turbopack (`next dev --turbo`) by default for faster startup and HMR. If you encounter issues:
+
+**Use webpack instead:**
+```bash
+pnpm dev:webpack
+```
+
+Or update `tauri.conf.json` temporarily:
+```json
+"beforeDevCommand": "pnpm dev:webpack"
+```
+
+### Build Configuration
+
+The project uses optimized build settings in `.cargo/config.toml` and `Cargo.toml`:
+- **Linker:** `rust-lld` on Windows (2-5x faster than MSVC link.exe)
+- **Dev profile:** Debug info disabled, maximum parallelism (codegen-units=256)
+- **Dependencies:** Compiled with opt-level=0 in dev mode
+
+These settings are automatically applied and require no action from developers.

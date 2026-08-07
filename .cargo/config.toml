@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
+# Optional: Uncomment if you have sccache installed for faster rebuilds
+# [build]
+# rustc-wrapper = "sccache"
