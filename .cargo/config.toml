@@ -2,5 +2,5 @@
 linker = "rust-lld"
 
 # Optional: Uncomment if you have sccache installed for faster rebuilds
-# [build]
-# rustc-wrapper = "sccache"
+[build]
+rustc-wrapper = "sccache"
