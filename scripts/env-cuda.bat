@@ -21,3 +21,10 @@ if errorlevel 1 set "PATH=%CUDA_ROOT%\bin;%PATH%"
 
 echo "%PATH%" | findstr /i /c:"%CUDA_ROOT%\bin\x64;" >nul 2>&1
 if errorlevel 1 set "PATH=%CUDA_ROOT%\bin\x64;%PATH%"
+
+REM Use the Ninja generator for llama.cpp (llama-helper) CMake builds when
+REM available: CUDA is driven by nvcc directly, so the NVIDIA CUDA platform
+REM toolset registered inside Visual Studio is not required (not yet shipped
+REM for VS 2026). Remove once the CUDA VS integration supports VS 2026.
+where ninja >nul 2>&1
+if not errorlevel 1 set "CMAKE_GENERATOR=Ninja"

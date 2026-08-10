@@ -88,6 +88,8 @@ When your changes create orphans:
 - Remove imports/variables/functions that YOUR changes made unused.
 - Don't remove pre-existing dead code unless asked.
 
+Keep Unicode emoji (e.g. 🔧 🚀 ✅) in scripts and other files exactly as they are. When editing or rewriting a file that already contains emoji, preserve every emoji that was there — don't strip, replace, or "clean up" existing emoji, and don't reword content in a way that drops them.
+
 The test: Every changed line should trace directly to the user's request.
 
 ## 4. Goal-Driven Execution

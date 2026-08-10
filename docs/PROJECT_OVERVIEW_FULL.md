@@ -299,7 +299,7 @@ RUST_LOG=app_lib::audio=debug ./clean_run.sh
 ### Windows
 - **Audio Capture**: Uses WASAPI (Windows Audio Session API)
 - **GPU**: CUDA (NVIDIA) or Vulkan (AMD/Intel) via Cargo features
-- **Build Tools**: Requires Visual Studio Build Tools with C++ workload
+- **Build Tools**: Requires Visual Studio 2022 or 2026 (any edition or Build Tools) with C++ workload
 - **System Audio**: Uses WASAPI loopback for system capture
 
 ### Linux
