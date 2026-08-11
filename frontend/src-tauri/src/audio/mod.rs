@@ -123,5 +123,5 @@ pub use decoder::{decode_audio_file, DecodedAudio};
 pub use constants::AUDIO_EXTENSIONS;
 
 // Export diarization
-pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult};
+pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, check_diarization_models, download_diarization_models, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult, DiarizationModelStatus, DiarizationDownloadProgress};
 

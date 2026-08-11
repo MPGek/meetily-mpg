@@ -7,6 +7,8 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { recordingService } from '@/services/recordingService';
+import { loadDiarizationSettings } from '@/lib/diarization';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -321,6 +323,42 @@ export function useRecordingStop(
 
           // Mark as completed
           setStatus(RecordingStatus.COMPLETED);
+
+          // Auto-trigger speaker diarization when enabled
+          const diarizationSettings = loadDiarizationSettings();
+          if (diarizationSettings.enabled && diarizationSettings.autoRun) {
+            (async () => {
+              try {
+                const modelStatus = await recordingService.checkDiarizationModels();
+                if (!modelStatus.segmentation_ready || !modelStatus.embedding_ready) {
+                  toast.error('Speaker diarization models not downloaded', {
+                    description: 'Download the models in Settings to enable auto-analysis.',
+                    action: {
+                      label: 'Open Settings',
+                      onClick: () => router.push('/settings?tab=general'),
+                    },
+                    duration: 10000,
+                  });
+                  return;
+                }
+                await recordingService.startDiarization(meetingId, diarizationSettings.maxSpeakers || undefined);
+              } catch (diarizationError) {
+                console.error('Auto diarization failed:', diarizationError);
+                const message = diarizationError instanceof Error ? diarizationError.message : String(diarizationError);
+                const isModelMissing = /model.*not found|download models/i.test(message);
+                toast.error('Speaker analysis failed', {
+                  description: message,
+                  action: isModelMissing
+                    ? {
+                        label: 'Open Settings',
+                        onClick: () => router.push('/settings?tab=general'),
+                      }
+                    : undefined,
+                  duration: 8000,
+                });
+              }
+            })();
+          }
 
           // Show success toast with navigation option
           toast.success('Recording saved successfully!', {

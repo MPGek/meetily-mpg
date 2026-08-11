@@ -2,6 +2,7 @@
 
 import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { Input } from "./ui/input";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
 import { ConfidenceIndicator } from "./ConfidenceIndicator";
@@ -34,6 +35,9 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    // Speaker label editing
+    onUpdateSpeakerLabel?: (speaker: string, label: string) => Promise<void>;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -72,6 +76,74 @@ function formatSpeakerId(speaker: string): string {
     return `Speaker ${idx + 1}`;
 }
 
+// Inline editable speaker label
+function SpeakerLabel({
+    speaker,
+    label,
+    color,
+    onUpdate,
+}: {
+    speaker: string;
+    label?: string;
+    color: string;
+    onUpdate?: (speaker: string, label: string) => Promise<void>;
+}) {
+    const [isEditing, setIsEditing] = useState(false);
+    const [editValue, setEditValue] = useState(label || formatSpeakerId(speaker));
+
+    const displayName = label || formatSpeakerId(speaker);
+
+    const commit = async () => {
+        const trimmed = editValue.trim();
+        const newLabel = trimmed || formatSpeakerId(speaker);
+        setEditValue(newLabel);
+        setIsEditing(false);
+        if (onUpdate && trimmed && trimmed !== label) {
+            try {
+                await onUpdate(speaker, trimmed);
+            } catch (error) {
+                console.error('Failed to update speaker label:', error);
+            }
+        }
+    };
+
+    if (isEditing) {
+        return (
+            <Input
+                autoFocus
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                onBlur={commit}
+                onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                        commit();
+                    } else if (e.key === 'Escape') {
+                        setEditValue(displayName);
+                        setIsEditing(false);
+                    }
+                }}
+                className="h-5 min-w-[80px] max-w-[200px] text-xs py-0 px-1.5"
+            />
+        );
+    }
+
+    return (
+        <span
+            className={`text-xs font-medium text-gray-600 ${onUpdate ? 'cursor-pointer hover:underline' : ''}`}
+            style={{ color }}
+            onClick={() => {
+                if (onUpdate) {
+                    setEditValue(displayName);
+                    setIsEditing(true);
+                }
+            }}
+            title={onUpdate ? 'Click to rename speaker' : undefined}
+        >
+            {displayName}
+        </span>
+    );
+}
+
 // Helper function to remove filler words and repetitions
 function cleanStopWords(text: string): string {
     const stopWords = ['uh', 'um', 'er', 'ah', 'hmm', 'hm', 'eh', 'oh'];
@@ -96,6 +168,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     source_device,
     speaker,
     speaker_label,
+    onUpdateSpeakerLabel,
 }: {
     id: string;
     timestamp: number;
@@ -106,6 +179,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     source_device?: string;
     speaker?: string;
     speaker_label?: string;
+    onUpdateSpeakerLabel?: (speaker: string, label: string) => Promise<void>;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -115,7 +189,6 @@ const TranscriptSegment = memo(function TranscriptSegment({
     const hasSpeaker = !!speaker;
 
     const speakerColor = hasSpeaker ? getSpeakerColor(speaker) : undefined;
-    const speakerName = speaker_label || (speaker ? formatSpeakerId(speaker) : undefined);
 
     if (isLegacy) {
         // Legacy neutral style - left-aligned, no bubble
@@ -135,8 +208,25 @@ const TranscriptSegment = memo(function TranscriptSegment({
                         </TooltipContent>
                     </Tooltip>
                     <div className="flex-1">
+                        {hasSpeaker && (
+                            <div className="flex items-center gap-1.5 mb-1 ml-1">
+                                <span
+                                    className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                    style={{ backgroundColor: speakerColor }}
+                                />
+                                <SpeakerLabel
+                                    speaker={speaker}
+                                    label={speaker_label}
+                                    color={speakerColor!}
+                                    onUpdate={onUpdateSpeakerLabel}
+                                />
+                            </div>
+                        )}
                         {isStreaming ? (
-                            <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
+                            <div
+                                className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2"
+                                style={hasSpeaker ? { borderLeftColor: speakerColor, borderLeftWidth: 3 } : undefined}
+                            >
                                 <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                             </div>
                         ) : (
@@ -171,7 +261,12 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
                                     style={{ backgroundColor: speakerColor }}
                                 />
-                                <span className="text-xs font-medium text-gray-600">{speakerName}</span>
+                                <SpeakerLabel
+                                    speaker={speaker}
+                                    label={speaker_label}
+                                    color={speakerColor!}
+                                    onUpdate={onUpdateSpeakerLabel}
+                                />
                             </div>
                         )}
                         <div
@@ -191,12 +286,32 @@ const TranscriptSegment = memo(function TranscriptSegment({
         <div id={`segment-${id}`} className="mb-3">
             <div className="flex items-start gap-2 justify-end">
                 <div className="flex-1 max-w-[80%]">
+                    {hasSpeaker && (
+                        <div className="flex items-center gap-1.5 mb-1 mr-1 justify-end">
+                            <SpeakerLabel
+                                speaker={speaker}
+                                label={speaker_label}
+                                color={speakerColor!}
+                                onUpdate={onUpdateSpeakerLabel}
+                            />
+                            <span
+                                className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                style={{ backgroundColor: speakerColor }}
+                            />
+                        </div>
+                    )}
                     {isStreaming ? (
-                        <div className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                        <div
+                            className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2"
+                            style={hasSpeaker ? { borderRightColor: speakerColor, borderRightWidth: 3 } : undefined}
+                        >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                         </div>
                     ) : (
-                        <div className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                        <div
+                            className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2"
+                            style={hasSpeaker ? { borderRightColor: speakerColor, borderRightWidth: 3 } : undefined}
+                        >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                         </div>
                     )}
@@ -232,6 +347,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onUpdateSpeakerLabel,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -407,6 +523,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        onUpdateSpeakerLabel={onUpdateSpeakerLabel}
                                     />
                                 </div>
                             );
@@ -464,6 +581,9 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         source_device={segment.source_device}
+                                        speaker={segment.speaker}
+                                        speaker_label={segment.speaker_label}
+                                        onUpdateSpeakerLabel={onUpdateSpeakerLabel}
                                     />
                                 </motion.div>
                             );

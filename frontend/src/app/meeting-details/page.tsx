@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { useDiarizationProgress } from "@/hooks/useDiarizationProgress";
 
 interface MeetingDetailsResponse {
   id: string;
@@ -47,6 +48,17 @@ function MeetingDetailsContent() {
     refetch,
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
+
+  // Track diarization progress for this meeting
+  const handleDiarizationComplete = useCallback(() => {
+    refetch();
+  }, [refetch]);
+
+  const diarizationProgress = useDiarizationProgress({
+    meetingId: meetingId || '',
+    onComplete: handleDiarizationComplete,
+    onError: handleDiarizationComplete,
+  });
 
   // Check if gemma3:1b model is available in Ollama
   const checkForGemmaModel = useCallback(async (): Promise<boolean> => {
@@ -377,6 +389,7 @@ function MeetingDetailsContent() {
     totalCount={totalCount}
     loadedCount={loadedCount}
     onLoadMore={loadMore}
+    diarizationProgress={diarizationProgress}
   />;
 }
 

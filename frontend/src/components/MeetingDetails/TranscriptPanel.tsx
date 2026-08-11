@@ -1,10 +1,11 @@
 "use client";
 
 import { Transcript, TranscriptSegmentData } from '@/types';
-import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
-import { useMemo } from 'react';
+import { useMemo, useCallback } from 'react';
+import { recordingService } from '@/services/recordingService';
+import { toast } from 'sonner';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -28,6 +29,14 @@ interface TranscriptPanelProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+
+  // Diarization progress
+  diarizationProgress?: {
+    status: string | null;
+    progress: number;
+    message: string;
+    isProcessing: boolean;
+  } | null;
 }
 
 export function TranscriptPanel({
@@ -48,7 +57,22 @@ export function TranscriptPanel({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  diarizationProgress,
 }: TranscriptPanelProps) {
+  const handleUpdateSpeakerLabel = useCallback(async (speaker: string, label: string) => {
+    if (!meetingId) return;
+    try {
+      await recordingService.updateSpeakerLabel(meetingId, speaker, label);
+      toast.success('Speaker renamed', { duration: 2000 });
+      if (onRefetchTranscripts) {
+        await onRefetchTranscripts();
+      }
+    } catch (error) {
+      console.error('Failed to rename speaker:', error);
+      toast.error('Failed to rename speaker');
+    }
+  }, [meetingId, onRefetchTranscripts]);
+
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
     if (usePagination && segments) {
@@ -61,6 +85,9 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      source_device: t.source_device,
+      speaker: t.speaker,
+      speaker_label: t.speaker_label,
     }));
   }, [transcripts, usePagination, segments]);
 
@@ -78,6 +105,22 @@ export function TranscriptPanel({
         />
       </div>
 
+      {/* Diarization progress bar */}
+      {diarizationProgress?.isProcessing && (
+        <div className="px-4 py-2 border-b border-gray-200 bg-blue-50">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs font-medium text-blue-700">{diarizationProgress.message}</span>
+            <span className="text-xs font-semibold text-blue-700">{Math.round(diarizationProgress.progress)}%</span>
+          </div>
+          <div className="w-full h-1.5 bg-blue-100 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-600 rounded-full transition-all duration-300"
+              style={{ width: `${diarizationProgress.progress}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Transcript content - use virtualized view for better performance */}
       <div className="flex-1 overflow-hidden pb-4">
         <VirtualizedTranscriptView
@@ -94,6 +137,7 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          onUpdateSpeakerLabel={handleUpdateSpeakerLabel}
         />
       </div>
 

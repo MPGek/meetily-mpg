@@ -753,6 +753,8 @@ pub fn run() {
             audio::diarization::start_diarization,
             audio::diarization::get_diarization_status,
             audio::diarization::update_speaker_label_command,
+            audio::diarization::check_diarization_models,
+            audio::diarization::download_diarization_models,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

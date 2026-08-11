@@ -125,7 +125,7 @@ impl MeetingsRepository {
         }
 
         let meeting: Option<MeetingModel> =
-            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?")
+            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path, diarization_status, speaker_names FROM meetings WHERE id = ?")
                 .bind(meeting_id)
                 .fetch_optional(pool)
                 .await?;

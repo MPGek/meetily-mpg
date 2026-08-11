@@ -7,6 +7,7 @@ import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
 import { recordingService } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
+import { loadDiarizationSettings } from '@/lib/diarization';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
@@ -152,6 +153,25 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
               if (metadata && payload.folder_path) {
                 metadata.folderPath = payload.folder_path;
                 await indexedDBService.saveMeetingMetadata(metadata);
+              }
+
+              // Auto-trigger speaker diarization if enabled
+              const diarSettings = loadDiarizationSettings();
+              if (diarSettings.enabled && diarSettings.autoRun) {
+                try {
+                  const modelStatus = await recordingService.checkDiarizationModels();
+                  if (modelStatus.segmentation_ready && modelStatus.embedding_ready) {
+                    console.log('[Diarization] Auto-triggering speaker analysis for meeting:', currentMeetingId);
+                    await recordingService.startDiarization(
+                      currentMeetingId,
+                      diarSettings.maxSpeakers || undefined,
+                    );
+                  } else {
+                    console.log('[Diarization] Models not ready, skipping auto-trigger');
+                  }
+                } catch (diarError) {
+                  console.error('[Diarization] Auto-trigger failed:', diarError);
+                }
               }
             }
           } catch (error) {

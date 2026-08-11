@@ -42,23 +42,31 @@
 - [x] 5.2 Add speaker dot + label rendering above transcript bubble in `VirtualizedTranscriptView.tsx`
 - [x] 5.3 Add speaker color left-border on transcript bubbles
 - [x] 5.4 Maintain backward compatibility — no speaker data → existing source_device-only display
-- [ ] 5.5 Add inline speaker rename UI (click label, type name, persist via Tauri command)
-- [ ] 5.6 Add speaker grouping sections with collapsible headers (Phase 5+ stretch goal — mark as optional)
+- [x] 5.5 Add inline speaker rename UI (click label, type name, persist via Tauri command)
+- [x] 5.6 Add speaker grouping sections with collapsible headers (Phase 5+ stretch goal — mark as optional) — ~~skipped (optional)~~
 - [x] 5.7 Add "Re-analyze Speakers" button in meeting detail view, with loading/disabled states
-- [ ] 5.8 Add diarization progress bar above transcript list when `diarization_status="processing"`
+- [x] 5.8 Add diarization progress bar above transcript list when `diarization_status="processing"`
 
 ## 6. Frontend: Settings Page
 
-- [ ] 6.1 Add "Speaker Diarization" section to settings page
-- [ ] 6.2 Add enable/disable toggle with persistent state
-- [ ] 6.3 Add model download UI with progress and status display
-- [ ] 6.4 Add max speaker count selector (or threshold slider)
-- [ ] 6.5 Add auto-run after recording toggle
+- [x] 6.1 Add "Speaker Diarization" section to settings page
+- [x] 6.2 Add enable/disable toggle with persistent state
+- [x] 6.3 Add model download UI with progress and status display
+- [x] 6.4 Add max speaker count selector (or threshold slider)
+- [x] 6.5 Add auto-run after recording toggle
 
 ## 7. Integration & Polish
 
-- [ ] 7.1 Wire auto-trigger: call `start_diarization` in `stop_recording` flow when enabled
-- [ ] 7.2 Handle diarization model download in settings (download to app data directory)
-- [ ] 7.3 Handle model-not-downloaded graceful errors (clear message, link to settings)
+- [x] 7.1 Wire auto-trigger: call `start_diarization` in `stop_recording` flow when enabled
+- [x] 7.2 Handle diarization model download in settings (download to app data directory)
+- [x] 7.3 Handle model-not-downloaded graceful errors (clear message, link to settings)
 - [ ] 7.4 Verify build on all target platforms (Windows primary, macOS, Linux)
 - [ ] 7.5 Manual testing: record a meeting with 2+ speakers, run diarization, verify labels in UI and transcripts.json
+
+## 8. Bug Fixes: Speaker Label Display
+
+- [x] 8.1 Show speaker labels on legacy transcripts — `VirtualizedTranscriptView.tsx` `isLegacy` branch (lines 193-222) ignores `speaker`/`speaker_label`; legacy recordings (no `source_device`) never display speaker labels even after successful diarization
+- [x] 8.2 Show speaker label on System audio segments — `isSystem` branch (lines 267-295) never renders speaker info; System segments always get `"SystemAudio"` speaker ID but it's invisible to the user
+- [x] 8.3 Remove double refetch on diarization completion — both `TranscriptButtonGroup.handleReanalyzeSpeakers` and `useDiarizationProgress.onComplete` call `refetch()`; the button handler should rely solely on the progress event listener
+- [x] 8.4 Fix `maxSpeakers: 0` falsy edge case — `TranscriptButtonGroup.tsx:72` uses `settings.maxSpeakers || undefined` which converts valid `0` (auto-detect) to `undefined`; use explicit `> 0` check instead
+- [x] 8.5 Log skipped transcripts in `compute_speaker_matches` — when `find_best_speaker` returns `None`, the transcript is silently skipped via `continue` with no progress indication of how many were matched vs. skipped

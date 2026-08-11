@@ -2,5 +2,6 @@
 linker = "rust-lld"
 
 # Optional: Uncomment if you have sccache installed for faster rebuilds
-[build]
-rustc-wrapper = "sccache"
+# Disabled: sccache 0.17 has issues with CUDA 13.3 (fatbinary PTX) and MSVC (PDB locking)
+# [build]
+# rustc-wrapper = "sccache"

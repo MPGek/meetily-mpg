@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, FolderOpen, RefreshCw, Users } from 'lucide-react';
@@ -8,6 +8,9 @@ import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
 import { recordingService } from '@/services/recordingService';
+import { loadDiarizationSettings } from '@/lib/diarization';
+import { useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 
 
 interface TranscriptButtonGroupProps {
@@ -29,8 +32,26 @@ export function TranscriptButtonGroup({
   onRefetchTranscripts,
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
+  const router = useRouter();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
   const [isDiarizing, setIsDiarizing] = useState(false);
+  const [modelsReady, setModelsReady] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    recordingService.checkDiarizationModels()
+      .then((status) => {
+        if (!cancelled) {
+          setModelsReady(status.segmentation_ready && status.embedding_ready);
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to check diarization models:', error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleRetranscribeComplete = useCallback(async () => {
     if (onRefetchTranscripts) {
@@ -38,17 +59,32 @@ export function TranscriptButtonGroup({
     }
   }, [onRefetchTranscripts]);
 
+  const openSettings = () => {
+    router.push('/settings?tab=general');
+  };
+
   const handleReanalyzeSpeakers = async () => {
     if (!meetingId || isDiarizing) return;
     setIsDiarizing(true);
     try {
       Analytics.trackButtonClick('reanalyze_speakers', 'meeting_details');
-      await recordingService.startDiarization(meetingId);
-      if (onRefetchTranscripts) {
-        await onRefetchTranscripts();
-      }
+      const settings = loadDiarizationSettings();
+      const maxSpeakers = settings.maxSpeakers > 0 ? settings.maxSpeakers : undefined;
+      await recordingService.startDiarization(meetingId, maxSpeakers);
+      // Refetch handled by useDiarizationProgress onComplete event
     } catch (err: any) {
       console.error('Diarization failed:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      const isModelMissing = /model.*not found|download models/i.test(message);
+      toast.error('Speaker analysis failed', {
+        description: message,
+        action: isModelMissing
+          ? {
+              label: 'Open Settings',
+              onClick: openSettings,
+            }
+          : undefined,
+      });
     } finally {
       setIsDiarizing(false);
     }
@@ -101,7 +137,7 @@ export function TranscriptButtonGroup({
           </Button>
         )}
 
-        {meetingId && (
+        {meetingId && modelsReady && (
           <Button
             size="sm"
             variant="outline"
@@ -115,6 +151,18 @@ export function TranscriptButtonGroup({
               <Users className="xl:mr-2" size={18} />
             )}
             <span className="hidden lg:inline">{isDiarizing ? 'Analyzing...' : 'Speakers'}</span>
+          </Button>
+        )}
+
+        {meetingId && !modelsReady && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={openSettings}
+            title="Download diarization models in settings"
+          >
+            <Users className="xl:mr-2" size={18} />
+            <span className="hidden lg:inline">Setup Speakers</span>
           </Button>
         )}
       </ButtonGroup>

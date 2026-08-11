@@ -32,6 +32,7 @@ export default function PageContent({
   totalCount,
   loadedCount,
   onLoadMore,
+  diarizationProgress,
 }: {
   meeting: any;
   summaryData: Summary | null;
@@ -46,6 +47,12 @@ export default function PageContent({
   totalCount?: number;
   loadedCount?: number;
   onLoadMore?: () => void;
+  diarizationProgress?: {
+    status: string | null;
+    progress: number;
+    message: string;
+    isProcessing: boolean;
+  } | null;
 }) {
   console.log('📄 PAGE CONTENT: Initializing with data:', {
     meetingId: meeting.id,
@@ -191,6 +198,7 @@ export default function PageContent({
           meetingId={meeting.id}
           meetingFolderPath={meeting.folder_path}
           onRefetchTranscripts={onRefetchTranscripts}
+          diarizationProgress={diarizationProgress}
         />
         <SummaryPanel
           meeting={meeting}
