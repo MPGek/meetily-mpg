@@ -198,8 +198,35 @@ fn run_diarization_blocking<R: Runtime>(
         return Err("Diarization cancelled".to_string());
     }
 
-    let diar_segments = run_sherpa_diarization(&decoded.samples, decoded.sample_rate, models_dir, max_speakers)
+    // De-interleave stereo into (mic=left, sys=right); mono yields right == None.
+    let (left, right) = decoded.extract_channels();
+    let is_stereo = right.is_some();
+
+    let mic_stream = left.unwrap_or_default();
+    let sys_stream = right.unwrap_or_default();
+
+    // Load the diarizer once and reuse it for both channel runs.
+    let diarizer = create_diarizer(models_dir, max_speakers)
         .map_err(|e| format!("Diarization failed: {}", e))?;
+
+    let mic_segments = run_sherpa_diarization(&diarizer, &mic_stream, decoded.sample_rate)
+        .map_err(|e| format!("Diarization failed: {}", e))?;
+
+    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+        return Err("Diarization cancelled".to_string());
+    }
+
+    let sys_segments = if is_stereo {
+        info!(
+            "Running diarization on system channel ({} samples)",
+            sys_stream.len()
+        );
+        run_sherpa_diarization(&diarizer, &sys_stream, decoded.sample_rate)
+            .map_err(|e| format!("Diarization failed: {}", e))?
+    } else {
+        info!("Mono audio — treating as remote-only, skipping system-channel run");
+        Vec::new()
+    };
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
         return Err("Diarization cancelled".to_string());
@@ -207,8 +234,8 @@ fn run_diarization_blocking<R: Runtime>(
 
     emit_progress(app, meeting_id, "matching", 70, "Matching speakers to transcripts...");
 
-    let speakers_found = count_unique_speakers(&diar_segments);
-    let speaker_updates = compute_speaker_matches(&diar_segments, transcripts, app, meeting_id)?;
+    let speakers_found = count_unique_speakers(&mic_segments) + count_unique_speakers(&sys_segments);
+    let speaker_updates = compute_speaker_matches(&mic_segments, &sys_segments, is_stereo, transcripts, app, meeting_id)?;
 
     Ok((
         DiarizationResult {
@@ -227,36 +254,14 @@ struct DiarizationSegment {
     speaker: i32,
 }
 
-fn run_sherpa_diarization(
-    samples: &[f32],
-    sample_rate: u32,
+fn create_diarizer(
     models_dir: &PathBuf,
     max_speakers: Option<i32>,
-) -> Result<Vec<DiarizationSegment>, String> {
+) -> Result<sherpa_onnx::OfflineSpeakerDiarization, String> {
     use sherpa_onnx::{
         FastClusteringConfig, OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
         OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
         SpeakerEmbeddingExtractorConfig,
-    };
-
-    const DIARIZATION_SAMPLE_RATE: u32 = 16000;
-
-    // The pyannote segmentation model expects 16kHz mono audio.
-    let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
-        log::info!(
-            "Resampling audio from {}Hz to {}Hz for diarization",
-            sample_rate,
-            DIARIZATION_SAMPLE_RATE
-        );
-        let resampled = crate::audio::audio_processing::resample(
-            samples,
-            sample_rate as u32,
-            DIARIZATION_SAMPLE_RATE,
-        )
-        .map_err(|e| format!("Resampling failed: {}", e))?;
-        std::borrow::Cow::Owned(resampled)
-    } else {
-        std::borrow::Cow::Borrowed(samples)
     };
 
     let seg_model = models_dir
@@ -301,8 +306,34 @@ fn run_sherpa_diarization(
         min_duration_off: 0.5,
     };
 
-    let diarizer = OfflineSpeakerDiarization::create(&config)
-        .ok_or_else(|| "Failed to create diarizer — check model paths".to_string())?;
+    OfflineSpeakerDiarization::create(&config)
+        .ok_or_else(|| "Failed to create diarizer — check model paths".to_string())
+}
+
+fn run_sherpa_diarization(
+    diarizer: &sherpa_onnx::OfflineSpeakerDiarization,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<Vec<DiarizationSegment>, String> {
+    const DIARIZATION_SAMPLE_RATE: u32 = 16000;
+
+    // The pyannote segmentation model expects 16kHz mono audio.
+    let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
+        log::info!(
+            "Resampling audio from {}Hz to {}Hz for diarization",
+            sample_rate,
+            DIARIZATION_SAMPLE_RATE
+        );
+        let resampled = crate::audio::audio_processing::resample(
+            samples,
+            sample_rate as u32,
+            DIARIZATION_SAMPLE_RATE,
+        )
+        .map_err(|e| format!("Resampling failed: {}", e))?;
+        std::borrow::Cow::Owned(resampled)
+    } else {
+        std::borrow::Cow::Borrowed(samples)
+    };
 
     let result = diarizer.process(&diar_samples)
         .ok_or_else(|| "Diarization processing failed — no result returned".to_string())?;
@@ -332,14 +363,15 @@ fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
 }
 
 fn compute_speaker_matches<R: Runtime>(
-    diar_segments: &[DiarizationSegment],
+    mic_segments: &[DiarizationSegment],
+    sys_segments: &[DiarizationSegment],
+    is_stereo: bool,
     transcripts: &[crate::database::models::Transcript],
     app: &AppHandle<R>,
     meeting_id: &str,
 ) -> Result<Vec<(String, String)>, String> {
     let mut updates: Vec<(String, String)> = Vec::new();
     let total = transcripts.len();
-    let mut skipped_system = 0usize;
     let mut skipped_no_match = 0usize;
 
     for (idx, transcript) in transcripts.iter().enumerate() {
@@ -355,16 +387,24 @@ fn compute_speaker_matches<R: Runtime>(
         let t_start = transcript.audio_start_time.unwrap_or(0.0) as f32;
         let t_end = transcript.audio_end_time.unwrap_or(0.0) as f32;
 
-        let speaker_id = if transcript.source_device.as_deref() == Some("System") {
-            skipped_system += 1;
-            "SystemAudio".to_string()
+        // Stereo: system-source transcripts match system-channel segments
+        // (SPEAKER_NN); all others match mic-channel segments (MIC_SPEAKER_NN).
+        // Mono fallback: everything matches the single run as remote (SPEAKER_NN).
+        let (segments, prefix) = if is_stereo {
+            if transcript.source_device.as_deref() == Some("System") {
+                (sys_segments, "SPEAKER")
+            } else {
+                (mic_segments, "MIC_SPEAKER")
+            }
         } else {
-            match find_best_speaker(diar_segments, t_start, t_end) {
-                Some(spk) => format!("SPEAKER_{:02}", spk),
-                None => {
-                    skipped_no_match += 1;
-                    continue;
-                }
+            (mic_segments, "SPEAKER")
+        };
+
+        let speaker_id = match find_best_speaker(segments, t_start, t_end) {
+            Some(spk) => format!("{}_{:02}", prefix, spk),
+            None => {
+                skipped_no_match += 1;
+                continue;
             }
         };
 
@@ -372,10 +412,9 @@ fn compute_speaker_matches<R: Runtime>(
     }
 
     info!(
-        "Speaker matching: {} total, {} matched, {} system-audio, {} no-match skipped",
+        "Speaker matching: {} total, {} matched, {} no-match skipped",
         total,
         updates.len(),
-        skipped_system,
         skipped_no_match,
     );
 

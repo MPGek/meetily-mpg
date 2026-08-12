@@ -66,14 +66,23 @@ const SPEAKER_COLORS = [
     "#14B8A6", // teal
 ];
 
+// Stable color for IDs without a numeric index (e.g. legacy "SystemAudio")
+const FALLBACK_SPEAKER_COLOR = "#6B7280"; // gray
+
 function getSpeakerColor(speaker: string): string {
-    const idx = parseInt(speaker.replace("SPEAKER_", ""), 10);
+    const idx = parseInt(speaker.replace("MIC_SPEAKER_", "").replace("SPEAKER_", ""), 10);
+    if (isNaN(idx)) return FALLBACK_SPEAKER_COLOR;
     return SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
 }
 
 function formatSpeakerId(speaker: string): string {
+    if (speaker === "SystemAudio") return "System Audio";
+    if (speaker.startsWith("MIC_SPEAKER_")) {
+        const idx = parseInt(speaker.replace("MIC_SPEAKER_", ""), 10);
+        return `Mic Speaker ${idx + 1}`;
+    }
     const idx = parseInt(speaker.replace("SPEAKER_", ""), 10);
-    return `Speaker ${idx + 1}`;
+    return isNaN(idx) ? speaker : `Speaker ${idx + 1}`;
 }
 
 // Inline editable speaker label
