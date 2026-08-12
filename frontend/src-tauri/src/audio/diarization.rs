@@ -1,7 +1,6 @@
 use crate::audio::decoder::decode_audio_file;
 use crate::database::repositories::meeting::MeetingsRepository;
 use crate::state::AppState;
-use futures_util::StreamExt;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -206,10 +205,10 @@ fn run_diarization_blocking<R: Runtime>(
     let sys_stream = right.unwrap_or_default();
 
     // Load the diarizer once and reuse it for both channel runs.
-    let diarizer = create_diarizer(models_dir, max_speakers)
+    let diarizer = create_polyvoice_diarizer(models_dir, max_speakers)
         .map_err(|e| format!("Diarization failed: {}", e))?;
 
-    let mic_segments = run_sherpa_diarization(&diarizer, &mic_stream, decoded.sample_rate)
+    let mic_segments = run_polyvoice_diarization(&diarizer, &mic_stream, decoded.sample_rate)
         .map_err(|e| format!("Diarization failed: {}", e))?;
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
@@ -221,7 +220,7 @@ fn run_diarization_blocking<R: Runtime>(
             "Running diarization on system channel ({} samples)",
             sys_stream.len()
         );
-        run_sherpa_diarization(&diarizer, &sys_stream, decoded.sample_rate)
+        run_polyvoice_diarization(&diarizer, &sys_stream, decoded.sample_rate)
             .map_err(|e| format!("Diarization failed: {}", e))?
     } else {
         info!("Mono audio — treating as remote-only, skipping system-channel run");
@@ -254,21 +253,23 @@ struct DiarizationSegment {
     speaker: i32,
 }
 
-fn create_diarizer(
+/// Polyvoice diarization engine: powerset segmentation + ResNet34 embedding +
+/// AHC clustering, loaded once per run and reused for both channel streams.
+struct PolyvoiceDiarizer {
+    segmenter: polyvoice::PowersetSegmenter,
+    embedder: polyvoice::embedder::ResNet34Adapter,
+    clusterer: polyvoice::clusterer::AhcClusterer,
+}
+
+fn create_polyvoice_diarizer(
     models_dir: &PathBuf,
     max_speakers: Option<i32>,
-) -> Result<sherpa_onnx::OfflineSpeakerDiarization, String> {
-    use sherpa_onnx::{
-        FastClusteringConfig, OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
-        OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
-        SpeakerEmbeddingExtractorConfig,
-    };
+) -> Result<PolyvoiceDiarizer, String> {
+    use polyvoice::models::metadata::{ModelConfigMeta, load_model_config};
+    use polyvoice::models::default_manifest;
+    use polyvoice::onnx::ExecutionProvider;
 
-    let seg_model = models_dir
-        .join("sherpa-onnx-pyannote-segmentation-3-0")
-        .join("model.int8.onnx");
-    let emb_model = models_dir
-        .join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx");
+    let (seg_model, emb_model) = diarization_model_paths(models_dir);
 
     if !seg_model.exists() {
         return Err(format!(
@@ -283,41 +284,58 @@ fn create_diarizer(
         ));
     }
 
-    let config = OfflineSpeakerDiarizationConfig {
-        segmentation: OfflineSpeakerSegmentationModelConfig {
-            pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
-                model: Some(seg_model.to_string_lossy().to_string()),
-            },
-            num_threads: 2,
-            debug: false,
-            provider: Some("cpu".to_string()),
-        },
-        embedding: SpeakerEmbeddingExtractorConfig {
-            model: Some(emb_model.to_string_lossy().to_string()),
-            num_threads: 2,
-            debug: false,
-            provider: Some("cpu".to_string()),
-        },
-        clustering: FastClusteringConfig {
-            num_clusters: max_speakers.unwrap_or(-1),
-            threshold: 0.5,
-        },
-        min_duration_on: 0.3,
-        min_duration_off: 0.5,
+    // Resolve the balanced profile's model ids from the embedded manifest so
+    // the geometry overlay stays in sync with the shipped model files.
+    let manifest = default_manifest();
+    let profile = manifest
+        .profile(polyvoice::Profile::Balanced.manifest_id())
+        .ok_or_else(|| "polyvoice manifest is missing the balanced profile".to_string())?;
+    let seg_entry = manifest
+        .model(&profile.segmenter)
+        .ok_or_else(|| "polyvoice manifest is missing the segmenter model".to_string())?;
+
+    let meta = load_model_config(Some(&seg_model), Some(seg_entry), &ModelConfigMeta::default());
+    let mut config = polyvoice::PowersetConfig::default().with_model_meta(&meta);
+
+    // Override geometry from the manifest entry: polyvoice maps the ONNX
+    // "window_size" key (samples, e.g. 160000) to "window_secs" (seconds),
+    // producing a unit mismatch. The manifest entry carries the authoritative
+    // geometry values in the correct units.
+    config.window_secs = seg_entry.window_secs.unwrap_or(10.0);
+    config.hop_secs = seg_entry.hop_secs.unwrap_or(2.0);
+    config.sample_rate = seg_entry.sample_rate.unwrap_or(16000);
+
+    let segmenter = polyvoice::PowersetSegmenter::with_config(&seg_model, config, ExecutionProvider::Cpu)
+        .map_err(|e| format!("Failed to create segmenter: {}", e))?;
+
+    let embedder = polyvoice::embedder::ResNet34Adapter::new(&emb_model, 1, ExecutionProvider::Cpu)
+        .map_err(|e| format!("Failed to create embedder: {}", e))?;
+
+    let clusterer = if max_speakers.is_some_and(|m| m > 0) {
+        polyvoice::clusterer::AhcClusterer::new(max_speakers.unwrap() as usize)
+    } else {
+        polyvoice::clusterer::AhcClusterer::default()
     };
 
-    OfflineSpeakerDiarization::create(&config)
-        .ok_or_else(|| "Failed to create diarizer — check model paths".to_string())
+    Ok(PolyvoiceDiarizer {
+        segmenter,
+        embedder,
+        clusterer,
+    })
 }
 
-fn run_sherpa_diarization(
-    diarizer: &sherpa_onnx::OfflineSpeakerDiarization,
+fn run_polyvoice_diarization(
+    diarizer: &PolyvoiceDiarizer,
     samples: &[f32],
     sample_rate: u32,
 ) -> Result<Vec<DiarizationSegment>, String> {
+    use polyvoice::clusterer::Clusterer as _;
+    use polyvoice::embedder::Embedder as _;
+    use polyvoice::segmentation::Segmenter as _;
+
     const DIARIZATION_SAMPLE_RATE: u32 = 16000;
 
-    // The pyannote segmentation model expects 16kHz mono audio.
+    // The powerset segmentation model expects 16kHz mono audio.
     let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
         log::info!(
             "Resampling audio from {}Hz to {}Hz for diarization",
@@ -335,18 +353,58 @@ fn run_sherpa_diarization(
         std::borrow::Cow::Borrowed(samples)
     };
 
-    let result = diarizer.process(&diar_samples)
-        .ok_or_else(|| "Diarization processing failed — no result returned".to_string())?;
+    // Segment the channel into speaker-attributed spans (powerset-3.0).
+    let raw_segments = match diarizer.segmenter.segment(&diar_samples) {
+        Ok(segments) => segments,
+        Err(e) => {
+            log::warn!("Segmentation failed ({}), treating channel as silent", e);
+            return Ok(Vec::new());
+        }
+    };
 
-    let segments: Vec<DiarizationSegment> = result
-        .sort_by_start_time()
-        .into_iter()
-        .map(|s| DiarizationSegment {
-            start: s.start,
-            end: s.end,
-            speaker: s.speaker,
-        })
-        .collect();
+    if raw_segments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Embed each segment's audio slice, then cluster into speakers.
+    let mut segments: Vec<DiarizationSegment> = Vec::new();
+    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    for seg in &raw_segments {
+        let start = (seg.time.start * DIARIZATION_SAMPLE_RATE as f64) as usize;
+        let end =
+            ((seg.time.end * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
+        if end <= start {
+            continue;
+        }
+        match diarizer.embedder.embed(&diar_samples[start..end]) {
+            Ok(embedding) => {
+                embeddings.push(embedding);
+                segments.push(DiarizationSegment {
+                    start: seg.time.start as f32,
+                    end: seg.time.end as f32,
+                    speaker: -1,
+                });
+            }
+            Err(e) => {
+                log::warn!("Embedding extraction failed for a segment ({}), skipping it", e);
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let labels = diarizer
+        .clusterer
+        .cluster(&embeddings)
+        .map_err(|e| format!("Speaker clustering failed: {}", e))?;
+
+    for (segment, label) in segments.iter_mut().zip(labels) {
+        segment.speaker = label as i32;
+    }
+
+    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
 
     info!("Diarization found {} segments with {} unique speakers",
         segments.len(),
@@ -479,24 +537,53 @@ fn emit_progress<R: Runtime>(
     );
 }
 
-// ===== Model download helpers =====
+// ===== Model management (polyvoice ModelRegistry) =====
 
-const SEGMENTATION_ARCHIVE_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
-const EMBEDDING_MODEL_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
-
-fn diarization_model_paths(models_dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let segmentation_dir = models_dir.join("sherpa-onnx-pyannote-segmentation-3-0");
-    let segmentation_model = segmentation_dir.join("model.int8.onnx");
-    let embedding_model = models_dir.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx");
-    (segmentation_model, embedding_model)
+/// Resolve the balanced profile's model file paths under `models_dir`.
+/// The registry caches downloads directly in this directory.
+pub(crate) fn diarization_model_paths(
+    models_dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let manifest = polyvoice::models::default_manifest();
+    let profile = manifest
+        .profile(polyvoice::Profile::Balanced.manifest_id())
+        .expect("balanced profile is present in the polyvoice manifest");
+    let segmenter = manifest
+        .model(&profile.segmenter)
+        .expect("balanced segmenter model is present in the polyvoice manifest");
+    let embedder = manifest
+        .model(&profile.embedder)
+        .expect("balanced embedder model is present in the polyvoice manifest");
+    (
+        models_dir.join(&segmenter.filename),
+        models_dir.join(&embedder.filename),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizationModelStatus {
     pub segmentation_ready: bool,
     pub embedding_ready: bool,
+}
+
+/// Removes stale sherpa-era model files that are no longer used.
+fn cleanup_legacy_models(models_dir: &std::path::Path) {
+    let legacy: Vec<PathBuf> = [
+        models_dir.join("sherpa-onnx-pyannote-segmentation-3-0"),
+        models_dir.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
+    ]
+    .into_iter()
+    .filter(|p| p.exists())
+    .collect();
+
+    for path in legacy {
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        info!("Removed stale diarization model file: {}", path.display());
+    }
 }
 
 #[tauri::command]
@@ -508,6 +595,8 @@ pub async fn check_diarization_models<R: Runtime>(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?
         .join("models");
+
+    cleanup_legacy_models(&models_dir);
 
     let (segmentation, embedding) = diarization_model_paths(&models_dir);
     Ok(DiarizationModelStatus {
@@ -522,92 +611,6 @@ pub struct DiarizationDownloadProgress {
     pub message: String,
 }
 
-async fn download_with_progress<R: Runtime>(
-    app: &AppHandle<R>,
-    url: &str,
-    dest: &std::path::Path,
-    start_pct: u32,
-    end_pct: u32,
-    message: &str,
-) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-
-    let response = reqwest::get(url)
-        .await
-        .map_err(|e| format!("Failed to start download from {}: {}", url, e))?;
-    let total = response.content_length().unwrap_or(0);
-    let mut downloaded: u64 = 0;
-    let mut last_emitted_pct = start_pct;
-
-    let parent = dest.parent().ok_or_else(|| "Invalid destination path".to_string())?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|e| format!("Failed to create model directory: {}", e))?;
-
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| format!("Failed to create file {}: {}", dest.display(), e))?;
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download error from {}: {}", url, e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("Failed to write file {}: {}", dest.display(), e))?;
-        downloaded += chunk.len() as u64;
-
-        if total > 0 {
-            let pct = start_pct + ((downloaded as f64 / total as f64) * (end_pct - start_pct) as f64) as u32;
-            if pct > last_emitted_pct {
-                last_emitted_pct = pct;
-                let _ = app.emit(
-                    "diarization-model-download-progress",
-                    DiarizationDownloadProgress {
-                        progress: pct,
-                        message: message.to_string(),
-                    },
-                );
-            }
-        }
-    }
-
-    file.flush().await.map_err(|e| format!("Failed to flush file: {}", e))?;
-    Ok(())
-}
-
-fn extract_segmentation_model<R: Runtime>(
-    app: &AppHandle<R>,
-    archive_path: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("Failed to open segmentation archive: {}", e))?;
-    let decompressor = bzip2::read::BzDecoder::new(file);
-    let mut archive = tar::Archive::new(decompressor);
-
-    let dest_dir = dest.parent().ok_or_else(|| "Invalid segmentation destination".to_string())?;
-
-    for entry in archive.entries().map_err(|e| format!("Failed to read archive entries: {}", e))? {
-        let mut entry = entry.map_err(|e| format!("Archive entry error: {}", e))?;
-        let path = entry.path().map_err(|e| format!("Archive path error: {}", e))?;
-        if path.file_name().map(|n| n == "model.int8.onnx").unwrap_or(false) {
-            std::fs::create_dir_all(dest_dir)
-                .map_err(|e| format!("Failed to create segmentation directory: {}", e))?;
-            entry.unpack(dest).map_err(|e| format!("Failed to extract segmentation model: {}", e))?;
-            let _ = app.emit(
-                "diarization-model-download-progress",
-                DiarizationDownloadProgress {
-                    progress: 75,
-                    message: "Extracted segmentation model".to_string(),
-                },
-            );
-            return Ok(());
-        }
-    }
-
-    Err("Segmentation archive did not contain model.int8.onnx".to_string())
-}
-
 #[tauri::command]
 pub async fn download_diarization_models<R: Runtime>(
     app: AppHandle<R>,
@@ -617,50 +620,55 @@ pub async fn download_diarization_models<R: Runtime>(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?
         .join("models");
-    let (segmentation_model, embedding_model) = diarization_model_paths(&models_dir);
 
-    let _ = app.emit(
-        "diarization-model-download-progress",
-        DiarizationDownloadProgress {
-            progress: 0,
-            message: "Starting diarization model download...".to_string(),
-        },
-    );
-
-    // Download and extract segmentation archive to a temp file.
-    let temp_archive = models_dir.join("sherpa-onnx-pyannote-segmentation-3-0.tar.bz2.tmp");
-    download_with_progress(
-        &app,
-        SEGMENTATION_ARCHIVE_URL,
-        &temp_archive,
-        0,
-        40,
-        "Downloading segmentation model...",
-    )
-    .await?;
-
-    let app_for_extract = app.clone();
-    let temp_archive_clone = temp_archive.clone();
-    let segmentation_model_clone = segmentation_model.clone();
+    let app_for_progress = app.clone();
     tokio::task::spawn_blocking(move || {
-        extract_segmentation_model(&app_for_extract, &temp_archive_clone, &segmentation_model_clone)
+        let registry = polyvoice::models::ModelRegistry::with_cache_dir(&models_dir)
+            .map_err(|e| format!("Failed to initialize model registry: {}", e))?;
+
+        let manifest = polyvoice::models::default_manifest();
+        let profile = manifest
+            .profile(polyvoice::Profile::Balanced.manifest_id())
+            .ok_or_else(|| "polyvoice manifest is missing the balanced profile".to_string())?;
+        let segmenter = manifest
+            .model(&profile.segmenter)
+            .ok_or_else(|| "polyvoice manifest is missing the segmenter model".to_string())?;
+        let embedder = manifest
+            .model(&profile.embedder)
+            .ok_or_else(|| "polyvoice manifest is missing the embedder model".to_string())?;
+
+        let _ = app_for_progress.emit(
+            "diarization-model-download-progress",
+            DiarizationDownloadProgress {
+                progress: 0,
+                message: format!(
+                    "Downloading segmentation model ({} MB)...",
+                    segmenter.size.unwrap_or(0) / 1_000_000
+                ),
+            },
+        );
+        registry
+            .ensure(&profile.segmenter)
+            .map_err(|e| format!("Failed to download segmentation model: {}", e))?;
+
+        let _ = app_for_progress.emit(
+            "diarization-model-download-progress",
+            DiarizationDownloadProgress {
+                progress: 50,
+                message: format!(
+                    "Downloading speaker embedding model ({} MB)...",
+                    embedder.size.unwrap_or(0) / 1_000_000
+                ),
+            },
+        );
+        registry
+            .ensure(&profile.embedder)
+            .map_err(|e| format!("Failed to download embedding model: {}", e))?;
+
+        Ok::<(), String>(())
     })
     .await
-    .map_err(|e| format!("Extraction task panicked: {}", e))??;
-
-    // Clean up archive
-    let _ = tokio::fs::remove_file(&temp_archive).await;
-
-    // Download embedding model
-    download_with_progress(
-        &app,
-        EMBEDDING_MODEL_URL,
-        &embedding_model,
-        75,
-        100,
-        "Downloading speaker embedding model...",
-    )
-    .await?;
+    .map_err(|e| format!("Model download task panicked: {}", e))??;
 
     let _ = app.emit(
         "diarization-model-download-complete",
@@ -668,4 +676,199 @@ pub async fn download_diarization_models<R: Runtime>(
     );
 
     Ok(())
+}
+
+// ===== Spike: polyvoice diarization engine verification (change: switch-to-polyvoice-diarization) =====
+//
+// polyvoice is the sole diarization engine: powerset segmentation +
+// ResNet34 INT8 embedding + AHC clustering (offline), and StreamingPipeline
+// with the same embedder (online). Tests skip gracefully when the models are
+// not present (e.g. offline CI).
+
+#[cfg(test)]
+mod spike_tests {
+    use super::*;
+    use polyvoice::clusterer::Clusterer as _;
+    use polyvoice::embedder::Embedder as _;
+
+    fn find_models_dir() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("MEETILY_MODELS_DIR") {
+            let p = PathBuf::from(dir);
+            if p.join("powerset_int8.onnx").exists() && p.join("resnet34_int8.onnx").exists() {
+                return Some(p);
+            }
+        }
+        let candidates: Vec<PathBuf> = [
+            std::env::var("APPDATA").ok().map(|d| PathBuf::from(d).join("com.meetily.ai").join("models")),
+            std::env::var("HOME").ok().map(|d| PathBuf::from(d).join("Library").join("Application Support").join("com.meetily.ai").join("models")),
+            std::env::var("XDG_DATA_HOME").ok().map(|d| PathBuf::from(d).join("com.meetily.ai").join("models")),
+            std::env::var("HOME").ok().map(|d| PathBuf::from(d).join(".local").join("share").join("com.meetily.ai").join("models")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        candidates
+            .into_iter()
+            .find(|p| p.join("powerset_int8.onnx").exists() && p.join("resnet34_int8.onnx").exists())
+    }
+
+    fn synthetic_speech_16k() -> Vec<f32> {
+        // 4 seconds of 16 kHz tone bursts (amplitude-modulated) as stand-in audio.
+        let mut samples = Vec::with_capacity(16000 * 4);
+        for i in 0..16000 * 4 {
+            let t = i as f32 / 16000.0;
+            let tone = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+            let burst = if (t % 1.0) < 0.6 { 1.0 } else { 0.0 };
+            samples.push(tone * 0.3 * burst);
+        }
+        samples
+    }
+
+    #[test]
+    #[ignore = "spike: requires polyvoice diarization models (see standalone probe)"]
+    fn spike_polyvoice_offline_pipeline() {
+        let Some(models_dir) = find_models_dir() else {
+            eprintln!("SKIP: diarization models not found on this machine");
+            return;
+        };
+        let diarizer = create_polyvoice_diarizer(&models_dir, None)
+            .expect("polyvoice diarizer should initialize with the INT8 models");
+        let samples = synthetic_speech_16k();
+        let segments = run_polyvoice_diarization(&diarizer, &samples, 16000)
+            .expect("offline diarization should return a result");
+        info!(
+            "spike: polyvoice offline diarization produced {} segments on synthetic audio",
+            segments.len()
+        );
+        for pair in segments.windows(2) {
+            assert!(pair[0].start <= pair[1].start, "segments must be sorted by start time");
+        }
+    }
+
+    #[test]
+    #[ignore = "spike: requires polyvoice diarization models (see standalone probe)"]
+    fn spike_polyvoice_short_window_embedding() {
+        let Some(models_dir) = find_models_dir() else {
+            eprintln!("SKIP: diarization models not found on this machine");
+            return;
+        };
+        let (_, emb_model) = diarization_model_paths(&models_dir);
+        let embedder = polyvoice::embedder::ResNet34Adapter::new(
+            &emb_model,
+            1,
+            polyvoice::onnx::ExecutionProvider::Cpu,
+        )
+        .expect("ResNet34Adapter should initialize with the INT8 model");
+        assert_eq!(embedder.dim(), 256, "resnet34_int8 embeds to 256 dims");
+
+        // Probe embeddings from short windows — the Fast-mode streaming geometry.
+        let samples = synthetic_speech_16k();
+        for secs in [0.25f32, 0.5, 1.0, 1.5] {
+            let n = (16000.0 * secs) as usize;
+            let emb = embedder.embed(&samples[..n]);
+            info!(
+                "spike: embed at {:.2}s -> {:?}",
+                secs,
+                emb.as_ref()
+                    .map(|e| format!("{} dims", e.len()))
+                    .unwrap_or_else(|e| format!("error: {e}"))
+            );
+            if let Ok(e) = emb {
+                assert_eq!(e.len(), 256);
+                let norm: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!((norm - 1.0).abs() < 1e-2, "embedding must be L2-normalized (got {norm})");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "spike: requires polyvoice diarization models (see standalone probe)"]
+    fn spike_polyvoice_streaming_pipeline() {
+        use polyvoice::streaming::{LatencyPreset, StreamingPipeline};
+
+        let Some(models_dir) = find_models_dir() else {
+            eprintln!("SKIP: diarization models not found on this machine");
+            return;
+        };
+        let (_, emb_model) = diarization_model_paths(&models_dir);
+        let extractor = polyvoice::embedder::ResNet34Adapter::new(
+            &emb_model,
+            1,
+            polyvoice::onnx::ExecutionProvider::Cpu,
+        )
+        .expect("ResNet34Adapter should initialize");
+
+        let vad = polyvoice::vad::EnergyVad::new(-100.0, 16000, 512);
+        let mut pipeline = StreamingPipeline::with_latency_preset(
+            vad,
+            extractor,
+            LatencyPreset::Balanced,
+            polyvoice::vad::VadConfig::default(),
+        )
+        .expect("StreamingPipeline should build with balanced preset");
+
+        let samples = synthetic_speech_16k();
+        for chunk in samples.chunks(16000) {
+            let turns = pipeline
+                .feed(chunk)
+                .expect("feed should accept arbitrary 16 kHz chunks");
+            info!("spike: streaming feed produced {} turns", turns.len());
+        }
+        let flushed = pipeline
+            .flush()
+            .expect("flush should return remaining turns");
+        info!(
+            "spike: streaming flush produced {} turns, {} total buffered, {} speakers",
+            flushed.len(),
+            pipeline.turns().len(),
+            pipeline.num_speakers()
+        );
+    }
+
+    #[test]
+    #[ignore = "spike: requires polyvoice diarization models (see standalone probe)"]
+    fn spike_polyvoice_efficient_path() {
+        let Some(models_dir) = find_models_dir() else {
+            eprintln!("SKIP: diarization models not found on this machine");
+            return;
+        };
+        let (_, emb_model) = diarization_model_paths(&models_dir);
+        let extractor = polyvoice::embedder::ResNet34Adapter::new(
+            &emb_model,
+            1,
+            polyvoice::onnx::ExecutionProvider::Cpu,
+        )
+        .expect("ResNet34Adapter should initialize");
+
+        // Two distinct tone-burst signals simulate two speakers; embed per segment.
+        let samples_a = synthetic_speech_16k();
+        let samples_b: Vec<f32> = samples_a
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let t = i as f32 / 16000.0;
+                s + (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2
+            })
+            .collect();
+
+        let mut embeddings: Vec<(f32, f32, Vec<f32>)> = Vec::new();
+        for (start, seg) in [(0.0, &samples_a[..]), (2.0, &samples_b[..])] {
+            let emb = extractor
+                .embed(seg)
+                .expect("embed should return a 256-dim embedding");
+            assert_eq!(emb.len(), 256);
+            embeddings.push((start, start + seg.len() as f32 / 16000.0, emb));
+        }
+
+        let clusterer = polyvoice::clusterer::AhcClusterer::new(8);
+        let labels = clusterer
+            .cluster(&embeddings.iter().map(|e| e.2.clone()).collect::<Vec<_>>())
+            .expect("AhcClusterer should cluster buffered embeddings");
+        assert_eq!(labels.len(), embeddings.len());
+        info!("spike: efficient-path clustering produced labels {:?}", labels);
+        assert!(
+            labels.iter().all(|&l| l < 8),
+            "labels must respect the max-speakers ceiling"
+        );
+    }
 }

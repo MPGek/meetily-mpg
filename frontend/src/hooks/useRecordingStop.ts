@@ -77,6 +77,10 @@ export function useRecordingStop(
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
 
+  // Online diarization results carried in the recording-stopped event
+  const speakerAssignmentsRef = useRef<{ sequence_id: number; speaker: string }[]>([]);
+  const onlineDiarizationUsedRef = useRef(false);
+
   // Set up recording-stopped listener for meeting navigation
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
@@ -88,10 +92,12 @@ export function useRecordingStop(
           message: string;
           folder_path?: string;
           meeting_name?: string;
+          online_diarization_used?: boolean;
+          speaker_assignments?: { sequence_id: number; speaker: string }[];
         }>('recording-stopped', async (event) => {
           // Create promise that resolves when sessionStorage is set (prevents race condition)
           recordingStoppedDataRef.current = (async () => {
-            const { folder_path, meeting_name } = event.payload;
+            const { folder_path, meeting_name, online_diarization_used, speaker_assignments } = event.payload;
 
             // Store folder_path and meeting_name for later use in handleRecordingStop
             if (folder_path) {
@@ -100,6 +106,14 @@ export function useRecordingStop(
             if (meeting_name) {
               sessionStorage.setItem('last_recording_meeting_name', meeting_name);
             }
+
+            // Store online diarization results for the save step
+            onlineDiarizationUsedRef.current = online_diarization_used === true;
+            speakerAssignmentsRef.current = speaker_assignments || [];
+            console.log('Recording stopped payload:', {
+              online_diarization_used: onlineDiarizationUsedRef.current,
+              speaker_assignments: speakerAssignmentsRef.current.length
+            });
           })();
 
         });
@@ -121,6 +135,11 @@ export function useRecordingStop(
 
   // Main recording stop handler
   const handleRecordingStop = useCallback(async (isCallApi: boolean) => {
+    // Reset per-recording online diarization state (before the listener's
+    // recording-stopped data is awaited, which repopulates these refs)
+    onlineDiarizationUsedRef.current = false;
+    speakerAssignmentsRef.current = [];
+
     if (recordingStoppedDataRef.current) {
       await recordingStoppedDataRef.current;
     }
@@ -242,6 +261,21 @@ export function useRecordingStop(
         // Get fresh transcript state (ALL transcripts including late ones)
         const freshTranscripts = [...transcriptsRef.current];
 
+        // Apply online diarization speaker labels (computed at stop in Rust)
+        // before the DB save, keyed by sequence_id
+        if (speakerAssignmentsRef.current.length > 0) {
+          const assignmentBySequence = new Map(
+            speakerAssignmentsRef.current.map(a => [a.sequence_id, a.speaker])
+          );
+          for (const transcript of freshTranscripts) {
+            const speaker = assignmentBySequence.get(transcript.sequence_id ?? -1);
+            if (speaker) {
+              transcript.speaker = speaker;
+            }
+          }
+          console.log('Applied online diarization labels to', freshTranscripts.length, 'transcripts');
+        }
+
         // Get folder_path and meeting_name from recording-stopped event
         const folderPath = sessionStorage.getItem('last_recording_folder_path');
         const savedMeetingName = sessionStorage.getItem('last_recording_meeting_name');
@@ -325,8 +359,10 @@ export function useRecordingStop(
           setStatus(RecordingStatus.COMPLETED);
 
           // Auto-trigger speaker diarization when enabled
+          // Online modes already applied speaker labels at stop (Rust side),
+          // so only the offline path (mode "off" or online failure) triggers here.
           const diarizationSettings = loadDiarizationSettings();
-          if (diarizationSettings.enabled && diarizationSettings.autoRun) {
+          if (diarizationSettings.enabled && diarizationSettings.autoRun && !onlineDiarizationUsedRef.current) {
             (async () => {
               try {
                 const modelStatus = await recordingService.checkDiarizationModels();

@@ -44,11 +44,12 @@ impl TranscriptsRepository {
         info!("Successfully created meeting with id: {}", meeting_id);
 
         // 2. Save each transcript segment with audio timing fields
+        let mut has_speakers = false;
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&transcript_id)
             .bind(&meeting_id)
@@ -58,6 +59,7 @@ impl TranscriptsRepository {
             .bind(segment.audio_end_time)
             .bind(segment.duration)
             .bind(&segment.source_device)
+            .bind(&segment.speaker)
             .execute(&mut *transaction)
             .await;
 
@@ -69,6 +71,18 @@ impl TranscriptsRepository {
                 transaction.rollback().await?;
                 return Err(e);
             }
+            if segment.speaker.is_some() {
+                has_speakers = true;
+            }
+        }
+
+        // 3. Mark the meeting as diarized when online/offline speaker labels
+        // were provided with the save (online diarization writes at stop).
+        if has_speakers {
+            sqlx::query("UPDATE meetings SET diarization_status = 'complete' WHERE id = ?")
+                .bind(&meeting_id)
+                .execute(&mut *transaction)
+                .await?;
         }
 
         info!(

@@ -103,11 +103,14 @@ futures-util = "0.3"
 # VAD engine: replaced with direct ort integration (Silero VAD v6)
 # silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", package = "silero" }
 
-# Speaker diarization via sherpa-onnx (shared libs to avoid ONNX Runtime conflict with ort crate)
-sherpa-onnx = { version = "1.13.4", default-features = false, features = ["shared"] }
+# Speaker diarization via polyvoice (Rust-native, MIT): powerset segmentation,
+# ONNX embedding, and AHC clustering for both offline and online paths.
+# The `onnx` feature pins ort to >= 2.0.0-rc.12 (see ort below).
+polyvoice = { version = "=0.17.0", default-features = false, features = ["onnx", "download", "segmentation", "embedder", "clusterer"] }
 
 # Parakeet (ONNX-based fast transcription) dependencies
-ort = { version = "2.0.0-rc.10" }  # ONNX Runtime for Parakeet models
+# ort pinned to exactly 2.0.0-rc.12 (polyvoice's tested version; rc.13+ breaks the rc.10 API usage)
+ort = { version = "=2.0.0-rc.12" }  # ONNX Runtime for Parakeet models
 thiserror = "2.0.16"                # Error handling for Parakeet
 
 # Async
@@ -116,10 +119,6 @@ tokio-util = "0.7"  # Utilities for tokio including CancellationToken
 async-trait = "0.1"  # Trait abstraction for async methods
 
 reqwest = { version = "0.11", features = ["blocking", "multipart", "json", "stream"] }
-
-# Archive extraction for diarization model download
-tar = "0.4"
-bzip2 = "0.5"
 
 # crossbeam
 crossbeam = "0.8.4"
@@ -138,7 +137,7 @@ sysinfo = "0.32"
 lazy_static = { version = "1.4.0" }
 realfft = "3.4.0"
 regex = "1.11.0"
-ndarray = "0.16"
+ndarray = "0.17"
 bytes = { version = "1.9.0", features = ["serde"] }
 
 esaxx-rs = "0.1.10"

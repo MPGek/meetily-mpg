@@ -5,6 +5,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
+import { loadDiarizationSettings } from '@/lib/diarization';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
@@ -19,7 +20,7 @@ interface UseRecordingStartReturn {
  * Handles both manual start (button click) and auto-start (from sidebar navigation).
  *
  * Features:
- * - Meeting title generation (format: Meeting DD_MM_YY_HH_MM_SS)
+ * - Meeting title generation (format: Meeting YYYY-MM-DD_HH-MM)
  * - Transcript clearing on start
  * - Analytics tracking
  * - Recording notification display
@@ -40,13 +41,12 @@ export function useRecordingStart(
   // Generate meeting title with timestamp
   const generateMeetingTitle = useCallback(() => {
     const now = new Date();
-    const day = String(now.getDate()).padStart(2, '0');
+    const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
-    const year = String(now.getFullYear()).slice(-2);
+    const day = String(now.getDate()).padStart(2, '0');
     const hours = String(now.getHours()).padStart(2, '0');
     const minutes = String(now.getMinutes()).padStart(2, '0');
-    const seconds = String(now.getSeconds()).padStart(2, '0');
-    return `Meeting ${day}_${month}_${year}_${hours}_${minutes}_${seconds}`;
+    return `Meeting ${year}-${month}-${day}_${hours}-${minutes}`;
   }, []);
 
   // Check if the active transcription provider's model is ready
@@ -98,10 +98,13 @@ export function useRecordingStart(
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
+      const diarizationSettings = loadDiarizationSettings();
+      const diarizationMode = diarizationSettings.enabled ? diarizationSettings.diarizationMode : "off";
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
-        randomTitle
+        randomTitle,
+        diarizationMode
       );
       console.log('Backend recording started successfully');
 
@@ -169,7 +172,8 @@ export function useRecordingStart(
             const result = await recordingService.startRecordingWithDevices(
               selectedDevices?.micDevice || null,
               selectedDevices?.systemDevice || null,
-              generatedMeetingTitle
+              generatedMeetingTitle,
+              loadDiarizationSettings().enabled ? loadDiarizationSettings().diarizationMode : "off"
             );
             console.log('Auto-start backend recording result:', result);
 
@@ -254,7 +258,8 @@ export function useRecordingStart(
         const result = await recordingService.startRecordingWithDevices(
           selectedDevices?.micDevice || null,
           selectedDevices?.systemDevice || null,
-          generatedMeetingTitle
+          generatedMeetingTitle,
+          loadDiarizationSettings().enabled ? loadDiarizationSettings().diarizationMode : "off"
         );
         console.log('Backend recording result:', result);
 

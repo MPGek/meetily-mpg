@@ -3,6 +3,7 @@ import { Switch } from '@/components/ui/switch';
 import { FolderOpen } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
+import { useConfig } from '@/contexts/ConfigContext';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 
@@ -29,6 +30,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showRecordingNotification, setShowRecordingNotification] = useState(true);
+  const { setSelectedDevices } = useConfig();
 
   // Load recording preferences on component mount
   useEffect(() => {
@@ -86,6 +88,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       preferred_system_device: devices.systemDevice
     };
     setPreferences(newPreferences);
+    setSelectedDevices(devices);
     await savePreferences(newPreferences);
 
     // Track default device preference changes

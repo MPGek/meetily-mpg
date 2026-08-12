@@ -22,6 +22,8 @@ use super::{
     DeviceMonitorType
 };
 
+use super::online_diarization::{DiarizationMode, OnlineDiarizationProcessor, SpeakerAssignment};
+
 // Import transcription modules
 use super::transcription::{
     self,
@@ -41,6 +43,11 @@ static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+// Online diarization worker: consumes embedding chunks and returns the
+// processor (for finalize) when the channel closes
+static ONLINE_DIARIZATION_TASK: Mutex<Option<JoinHandle<Result<Option<OnlineDiarizationProcessor>, String>>>> =
+    Mutex::new(None);
 
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
@@ -217,11 +224,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
-        // Example: Meeting 2025-10-03_08-25-23
+        // Example: Meeting 2025-10-03_08-25
         let now = chrono::Local::now();
         format!(
             "Meeting {}",
-            now.format("%Y-%m-%d_%H-%M-%S")
+            now.format("%Y-%m-%d_%H-%M")
         )
     });
     manager.set_meeting_name(Some(effective_meeting_name));
@@ -312,7 +319,7 @@ pub async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
 }
 
 /// Start recording with specific devices and optional meeting name
@@ -321,10 +328,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    diarization_mode: Option<String>,
 ) -> Result<(), String> {
     info!(
-        "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
-        mic_device_name, system_device_name, meeting_name
+        "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}, diarization_mode={:?}",
+        mic_device_name, system_device_name, meeting_name, diarization_mode
     );
 
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
@@ -353,22 +361,28 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Parse devices
-    let mic_device = if let Some(ref name) = mic_device_name {
-        Some(Arc::new(parse_audio_device(name).map_err(|e| {
-            format!("Invalid microphone device '{}': {}", name, e)
-        })?))
-    } else {
-        None
-    };
+    // Load recording preferences to resolve devices and the auto-save setting.
+    // The settings page persists the user's device choices here; they serve as
+    // the fallback when the frontend does not send an explicit device name.
+    let (auto_save, preferred_mic_name, preferred_system_name) =
+        match super::recording_preferences::load_recording_preferences(&app).await {
+            Ok(prefs) => {
+                info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
+                      prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
+                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
+            }
+            Err(e) => {
+                warn!("Failed to load recording preferences, using defaults: {}", e);
+                (true, None, None)
+            }
+        };
 
-    let system_device = if let Some(ref name) = system_device_name {
-        Some(Arc::new(parse_audio_device(name).map_err(|e| {
-            format!("Invalid system device '{}': {}", name, e)
-        })?))
-    } else {
-        None
-    };
+    // Resolve devices with fallback: explicit name → saved preference → system default.
+    // Microphone is required; system audio is optional (skipped only when no
+    // default output device exists).
+    let mic_device = Some(resolve_microphone_device(mic_device_name.as_deref(), preferred_mic_name.as_deref())?);
+
+    let system_device = resolve_system_audio_device(system_device_name.as_deref(), preferred_system_name.as_deref());
 
     // Async-first approach for custom devices - no more blocking operations!
     info!("🚀 Starting async recording initialization with custom devices");
@@ -376,24 +390,57 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Create new recording manager
     let mut manager = RecordingManager::new();
 
-    // Load recording preferences to check auto_save setting
-    let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
-        Ok(prefs) => {
-            info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
-            prefs.auto_save
+    // Online diarization: create the embedding channel and spawn the consumer.
+    // The processor downloads models on first use (blocking) and then drains
+    // VAD-filtered speech chunks; it is returned when the channel closes.
+    let online_mode = DiarizationMode::parse(diarization_mode.as_deref());
+    if online_mode.is_online() {
+        let (embedding_sender, embedding_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<super::recording_state::AudioChunk>();
+        manager.set_embedding_sender(Some(embedding_sender));
+
+        let models_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to get app data dir: {}", e))?
+            .join("models");
+        let app_for_event = app.clone();
+        let task = tokio::task::spawn_blocking(
+            move || -> Result<Option<OnlineDiarizationProcessor>, String> {
+                let mut processor = match OnlineDiarizationProcessor::new(online_mode, 0, &models_dir)
+                {
+                    Ok(processor) => processor,
+                    Err(e) => {
+                        warn!("Online diarization unavailable: {}", e);
+                        let _ = app_for_event.emit(
+                            "online-diarization-unavailable",
+                            serde_json::json!({ "error": e }),
+                        );
+                        return Err(e);
+                    }
+                };
+                let mut receiver = embedding_receiver;
+                while let Some(chunk) = receiver.blocking_recv() {
+                    processor.process_chunk(chunk);
+                }
+                Ok(Some(processor))
+            },
+        );
+        {
+            let mut global_task = ONLINE_DIARIZATION_TASK.lock().unwrap();
+            *global_task = Some(task);
         }
-        Err(e) => {
-            warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
-            true // Default to saving if preferences can't be loaded
-        }
-    };
+        info!("🎙️ Online diarization processor spawned (mode: {:?})", online_mode);
+    } else {
+        info!("ℹ️ Online diarization disabled (mode: {:?})", online_mode);
+    }
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         let now = chrono::Local::now();
         format!(
             "Meeting {}",
-            now.format("%Y-%m-%d_%H-%M-%S")
+            now.format("%Y-%m-%d_%H-%M")
         )
     });
     manager.set_meeting_name(Some(effective_meeting_name));
@@ -479,6 +526,60 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     info!("✅ Recording started with custom devices using async-first approach");
 
     Ok(())
+}
+
+/// Resolve the microphone device: explicit name → saved preference → system default.
+/// Microphone is required; returns an error when no device resolves.
+fn resolve_microphone_device(
+    explicit_name: Option<&str>,
+    preferred_name: Option<&str>,
+) -> Result<Arc<super::devices::AudioDevice>, String> {
+    if let Some(name) = explicit_name {
+        match parse_audio_device(name) {
+            Ok(device) => return Ok(Arc::new(device)),
+            Err(e) => warn!("⚠️ Invalid microphone device '{}': {}, falling back...", name, e),
+        }
+    }
+
+    if let Some(pref_name) = preferred_name {
+        match parse_audio_device(pref_name) {
+            Ok(device) => return Ok(Arc::new(device)),
+            Err(e) => warn!("⚠️ Preferred microphone '{}' not available: {}, falling back...", pref_name, e),
+        }
+    }
+
+    default_input_device()
+        .map(Arc::new)
+        .map_err(|e| format!("No microphone device available: {}", e))
+}
+
+/// Resolve the system audio device: explicit name → saved preference → system default.
+/// System audio is optional; returns None only when no default output device exists.
+fn resolve_system_audio_device(
+    explicit_name: Option<&str>,
+    preferred_name: Option<&str>,
+) -> Option<Arc<super::devices::AudioDevice>> {
+    if let Some(name) = explicit_name {
+        match parse_audio_device(name) {
+            Ok(device) => return Some(Arc::new(device)),
+            Err(e) => warn!("⚠️ Invalid system device '{}': {}, falling back...", name, e),
+        }
+    }
+
+    if let Some(pref_name) = preferred_name {
+        match parse_audio_device(pref_name) {
+            Ok(device) => return Some(Arc::new(device)),
+            Err(e) => warn!("⚠️ Preferred system audio '{}' not available: {}, falling back...", pref_name, e),
+        }
+    }
+
+    match default_output_device() {
+        Ok(device) => Some(Arc::new(device)),
+        Err(e) => {
+            warn!("⚠️ No default system audio available: {}, continuing with microphone only", e);
+            None
+        }
+    }
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
@@ -611,6 +712,63 @@ pub async fn stop_recording<R: Runtime>(
     } else {
         info!("ℹ️ No transcription task found to wait for");
     }
+
+    // Step 2.5: Finalize online diarization (if active) and collect speaker assignments.
+    // The embedding channel was closed when the pipeline stopped, so the consumer
+    // task has drained all speech chunks and returned the processor.
+    let online_task = {
+        let mut global_task = ONLINE_DIARIZATION_TASK.lock().unwrap();
+        global_task.take()
+    };
+
+    let speaker_assignments: Option<Vec<SpeakerAssignment>> = if let Some(task_handle) = online_task {
+        info!("⏳ Finalizing online diarization...");
+        let processor = match task_handle.await {
+            Ok(Ok(Some(processor))) => Some(processor),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
+                warn!("⚠️ Online diarization unavailable: {}", e);
+                None
+            }
+            Err(e) => {
+                warn!("⚠️ Online diarization task panicked: {:?}", e);
+                None
+            }
+        };
+
+        // Extract the in-memory transcript segments synchronously; the
+        // RecordingManager is !Sync (cpal streams), so no reference may be
+        // held across an await.
+        let transcripts = manager_for_cleanup
+            .as_ref()
+            .map(|manager| manager.get_transcript_segments());
+
+        if let (Some(mut processor), Some(transcripts)) = (processor, transcripts) {
+            match tokio::task::spawn_blocking(move || processor.finalize(&transcripts)).await {
+                Ok(Ok(assignments)) => {
+                    info!(
+                        "✅ Online diarization finalized: {} speaker assignments",
+                        assignments.len()
+                    );
+                    Some(assignments)
+                }
+                Ok(Err(e)) => {
+                    warn!("⚠️ Online diarization finalize failed: {}", e);
+                    None
+                }
+                Err(e) => {
+                    warn!("⚠️ Online diarization finalize panicked: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            info!("ℹ️ Online diarization processor not available");
+            None
+        }
+    } else {
+        info!("ℹ️ No online diarization task was active");
+        None
+    };
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(
@@ -881,15 +1039,23 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Emit final stop event with folder_path and meeting_name for frontend to save
-    app.emit(
-        "recording-stopped",
-        serde_json::json!({
-            "message": "Recording stopped - frontend will save after all transcripts received",
-            "folder_path": folder_path_str,
-            "meeting_name": meeting_name_str
-        }),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut stopped_payload = serde_json::json!({
+        "message": "Recording stopped - frontend will save after all transcripts received",
+        "folder_path": folder_path_str,
+        "meeting_name": meeting_name_str
+    });
+    match &speaker_assignments {
+        Some(assignments) => {
+            stopped_payload["online_diarization_used"] = serde_json::json!(true);
+            stopped_payload["speaker_assignments"] =
+                serde_json::to_value(assignments).unwrap_or_else(|_| serde_json::json!([]));
+        }
+        None => {
+            stopped_payload["online_diarization_used"] = serde_json::json!(false);
+        }
+    }
+    app.emit("recording-stopped", stopped_payload)
+        .map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect stopped state
     crate::tray::update_tray_menu(&app);

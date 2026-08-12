@@ -113,24 +113,29 @@ impl ParakeetModel {
         };
 
         let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers(providers)?
-            .with_parallel_execution(true)?;
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| ParakeetError::Ort(e.into()))?
+            .with_execution_providers(providers)
+            .map_err(|e| ParakeetError::Ort(e.into()))?
+            .with_parallel_execution(true)
+            .map_err(|e| ParakeetError::Ort(e.into()))?;
 
         if let Some(threads) = intra_threads {
             builder = builder
-                .with_intra_threads(threads)?
-                .with_inter_threads(threads)?;
+                .with_intra_threads(threads)
+                .map_err(|e| ParakeetError::Ort(e.into()))?
+                .with_inter_threads(threads)
+                .map_err(|e| ParakeetError::Ort(e.into()))?;
         }
 
         let session = builder.commit_from_file(model_dir.as_ref().join(&model_filename))?;
 
-        for input in &session.inputs {
+        for input in session.inputs() {
             log::info!(
                 "Parakeet Model '{}' input: name={}, type={:?}",
                 model_filename,
-                input.name,
-                input.input_type
+                input.name(),
+                input.dtype()
             );
         }
 
@@ -227,21 +232,21 @@ impl ParakeetModel {
 
     pub fn create_decoder_state(&self) -> Result<DecoderState, ParakeetError> {
         // Get input shapes from decoder model
-        let inputs = &self.decoder_joint.inputs;
+        let inputs = self.decoder_joint.inputs();
 
         let state1_shape = inputs
             .iter()
-            .find(|input| input.name == "input_states_1")
+            .find(|input| input.name() == "input_states_1")
             .ok_or_else(|| ParakeetError::InputNotFound("input_states_1".to_string()))?
-            .input_type
+            .dtype()
             .tensor_shape()
             .ok_or_else(|| ParakeetError::TensorShape("input_states_1".to_string()))?;
 
         let state2_shape = inputs
             .iter()
-            .find(|input| input.name == "input_states_2")
+            .find(|input| input.name() == "input_states_2")
             .ok_or_else(|| ParakeetError::InputNotFound("input_states_2".to_string()))?
-            .input_type
+            .dtype()
             .tensor_shape()
             .ok_or_else(|| ParakeetError::TensorShape("input_states_2".to_string()))?;
 

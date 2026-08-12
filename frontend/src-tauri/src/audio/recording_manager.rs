@@ -29,6 +29,7 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -49,6 +50,7 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            embedding_sender: None,
         }
     }
 
@@ -70,7 +72,6 @@ impl RecordingManager {
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
-
         // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
         // Pipeline will mix mic + system audio professionally and send to this channel
         // Pass auto_save to control whether audio checkpoints are created
@@ -106,9 +107,11 @@ impl RecordingManager {
         // Start the audio processing pipeline with FFmpeg adaptive mixer
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
+        let embedding_sender = self.embedding_sender.clone();
         self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
+            embedding_sender,
             0, // Ignored - using dynamic sizing internally
             48000, // 48kHz sample rate
             Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
@@ -276,6 +279,10 @@ impl RecordingManager {
             error!("Error during force flush: {}", e);
         }
 
+        // Close the embedding channel so the online diarization task can finish
+        self.embedding_sender = None;
+        self.pipeline_manager.clear_embedding_sender();
+
         // CRITICAL: Full cleanup to release all Arc references and resources
         // This ensures microphone is released even if Drop is delayed
         self.state.cleanup();
@@ -432,6 +439,16 @@ impl RecordingManager {
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.recording_saver.set_meeting_name(name);
+    }
+
+    /// Attach the online diarization embedding channel (created by the caller)
+    pub fn set_embedding_sender(&mut self, sender: Option<mpsc::UnboundedSender<AudioChunk>>) {
+        self.embedding_sender = sender;
+    }
+
+    /// Drop the embedding channel so the online diarization task can finish
+    pub fn take_embedding_sender(&mut self) -> Option<mpsc::UnboundedSender<AudioChunk>> {
+        self.embedding_sender.take()
     }
 
     /// Add a structured transcript segment to be saved later

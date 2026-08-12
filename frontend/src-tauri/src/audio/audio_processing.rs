@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use log::{debug, info, warn};
 use realfft::num_complex::{Complex32, ComplexFloat};
 use realfft::RealFftPlanner;
@@ -24,6 +24,24 @@ pub fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
+/// Check whether a (sanitized) meeting name already ends with a `YYYY-MM-DD_HH-MM`
+/// timestamp, so `create_meeting_folder` does not append a second one.
+fn ends_with_timestamp(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 16 {
+        return false;
+    }
+    let suffix = &bytes[bytes.len() - 16..];
+    suffix[4] == b'-'
+        && suffix[7] == b'-'
+        && suffix[10] == b'_'
+        && suffix[13] == b'-'
+        && (0..16).all(|i| match i {
+            4 | 7 | 10 | 13 => true,
+            _ => suffix[i].is_ascii_digit(),
+        })
+}
+
 /// Create a meeting folder with timestamp and return the path
 /// Creates structure: base_path/MeetingName_YYYY-MM-DD_HH-MM/
 ///                    ├── .checkpoints/  (for incremental saves, optional)
@@ -37,10 +55,28 @@ pub fn create_meeting_folder(
     meeting_name: &str,
     create_checkpoints_dir: bool,
 ) -> Result<PathBuf> {
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M").to_string();
     let sanitized_name = sanitize_filename(meeting_name);
-    let folder_name = format!("{}_{}", sanitized_name, timestamp);
-    let meeting_folder = base_path.join(folder_name);
+    let folder_name = if ends_with_timestamp(&sanitized_name) {
+        sanitized_name
+    } else {
+        let timestamp = Local::now().format("%Y-%m-%d_%H-%M").to_string();
+        format!("{}_{}", sanitized_name, timestamp)
+    };
+    let mut meeting_folder = base_path.join(&folder_name);
+
+    // Ensure uniqueness when a folder with the same name already exists (e.g. two
+    // recordings started in the same minute) by appending a numeric counter.
+    if meeting_folder.exists() {
+        let mut counter = 1;
+        loop {
+            let candidate = base_path.join(format!("{}_{}", folder_name, counter));
+            if !candidate.exists() {
+                meeting_folder = candidate;
+                break;
+            }
+            counter += 1;
+        }
+    }
 
     // Create main meeting folder
     std::fs::create_dir_all(&meeting_folder)?;
@@ -736,4 +772,78 @@ pub fn write_transcript_json_to_file(
     std::fs::write(&file_path, json_string)?;
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_meeting_folder, ends_with_timestamp};
+    use std::path::PathBuf;
+
+    #[test]
+    fn ends_with_timestamp_matches_expected_format() {
+        assert!(ends_with_timestamp("Meeting 2026-08-12_18-44"));
+        assert!(ends_with_timestamp("Retro 2026-08-12_18-44"));
+        assert!(ends_with_timestamp("2026-08-12_18-44"));
+    }
+
+    #[test]
+    fn ends_with_timestamp_rejects_other_names() {
+        assert!(!ends_with_timestamp("Team sync"));
+        assert!(!ends_with_timestamp("Meeting 12_08_26_16_30_12"));
+        assert!(!ends_with_timestamp("Meeting 2026-08-12"));
+        assert!(!ends_with_timestamp("Meeting 2026-08-12_18-4"));
+        assert!(!ends_with_timestamp("Meeting 2026-08-12_18-44x"));
+    }
+
+    #[test]
+    fn create_meeting_folder_keeps_single_timestamp_name() {
+        let base = temp_dir_path();
+        let folder =
+            create_meeting_folder(&base, "Meeting 2026-08-12_18-44", false).expect("create ok");
+        assert_eq!(
+            folder.file_name().unwrap().to_str().unwrap(),
+            "Meeting 2026-08-12_18-44"
+        );
+    }
+
+    #[test]
+    fn create_meeting_folder_appends_suffix_to_plain_name() {
+        let base = temp_dir_path();
+        let folder = create_meeting_folder(&base, "Team sync", false).expect("create ok");
+        let name = folder.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("Team sync_"), "unexpected name: {name}");
+        assert!(ends_with_timestamp(name), "missing timestamp suffix: {name}");
+    }
+
+    #[test]
+    fn create_meeting_folder_uses_counter_on_collision() {
+        let base = temp_dir_path();
+        let first = create_meeting_folder(&base, "Meeting 2026-08-12_18-44", false).expect("ok");
+        let second =
+            create_meeting_folder(&base, "Meeting 2026-08-12_18-44", false).expect("ok");
+        let third = create_meeting_folder(&base, "Meeting 2026-08-12_18-44", false).expect("ok");
+        assert_eq!(
+            first.file_name().unwrap().to_str().unwrap(),
+            "Meeting 2026-08-12_18-44"
+        );
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            "Meeting 2026-08-12_18-44_1"
+        );
+        assert_eq!(
+            third.file_name().unwrap().to_str().unwrap(),
+            "Meeting 2026-08-12_18-44_2"
+        );
+    }
+
+    fn temp_dir_path() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "meetily_folder_test_{}_{unique}",
+            std::process::id()
+        ))
+    }
 }

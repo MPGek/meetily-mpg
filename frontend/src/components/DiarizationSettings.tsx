@@ -8,17 +8,20 @@ import { Label } from "./ui/label";
 import { recordingService } from "@/services/recordingService";
 import { toast } from "sonner";
 import { Download, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
+import type { DiarizationMode } from "@/lib/diarization";
 
 const STORAGE_KEYS = {
   enabled: "diarizationEnabled",
   autoRun: "diarizationAutoRun",
   maxSpeakers: "diarizationMaxSpeakers",
+  mode: "diarizationMode",
 };
 
 export interface DiarizationSettingsState {
   enabled: boolean;
   autoRun: boolean;
   maxSpeakers: number;
+  diarizationMode: DiarizationMode;
 }
 
 function loadBoolean(key: string, defaultValue: boolean): boolean {
@@ -35,6 +38,12 @@ function loadNumber(key: string, defaultValue: number): number {
   return Number.isNaN(parsed) ? defaultValue : parsed;
 }
 
+function loadMode(defaultValue: DiarizationMode): DiarizationMode {
+  if (typeof window === "undefined") return defaultValue;
+  const raw = localStorage.getItem(STORAGE_KEYS.mode);
+  return raw === "off" || raw === "efficient" || raw === "fast" ? raw : defaultValue;
+}
+
 function saveSetting(key: string, value: string) {
   if (typeof window === "undefined") return;
   localStorage.setItem(key, value);
@@ -44,6 +53,9 @@ export function DiarizationSettings() {
   const [enabled, setEnabled] = useState(() => loadBoolean(STORAGE_KEYS.enabled, false));
   const [autoRun, setAutoRun] = useState(() => loadBoolean(STORAGE_KEYS.autoRun, false));
   const [maxSpeakers, setMaxSpeakers] = useState(() => loadNumber(STORAGE_KEYS.maxSpeakers, 0));
+  const [diarizationMode, setDiarizationMode] = useState<DiarizationMode>(() =>
+    loadMode("efficient")
+  );
   const [modelsReady, setModelsReady] = useState<{ segmentation: boolean; embedding: boolean } | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -172,6 +184,33 @@ export function DiarizationSettings() {
             saveSetting(STORAGE_KEYS.autoRun, checked.toString());
           }}
         />
+      </div>
+
+      {/* Diarization mode */}
+      <div>
+        <Label className="text-sm font-medium text-gray-900 mb-1 block">Diarization mode</Label>
+        <select
+          disabled={!enabled}
+          value={diarizationMode}
+          onChange={(e) => {
+            const mode = e.target.value as DiarizationMode;
+            setDiarizationMode(mode);
+            saveSetting(STORAGE_KEYS.mode, mode);
+          }}
+          className="w-full sm:w-64 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+        >
+          <option value="efficient">Efficient (recommended)</option>
+          <option value="fast">Fast</option>
+          <option value="off">Off</option>
+        </select>
+        <p className="text-xs text-gray-500 mt-2">
+          {diarizationMode === "efficient" &&
+            "Extracts speaker embeddings during recording and labels speakers at the end. Low CPU usage, labels appear as soon as the recording stops."}
+          {diarizationMode === "fast" &&
+            "Runs full streaming diarization during recording for the highest accuracy. Higher CPU usage during the meeting."}
+          {diarizationMode === "off" &&
+            "No diarization during recording. Use “Re-analyze Speakers” after the meeting to run offline speaker analysis."}
+        </p>
       </div>
 
       {/* Max speakers */}

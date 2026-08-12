@@ -106,8 +106,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             // Get meeting name
             const meetingName = await recordingService.getRecordingMeetingName();
 
-            // Use a better fallback that matches the backend's naming pattern
-            const effectiveTitle = meetingName || `Meeting ${new Date().toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-')}`;
+            // Fallback matching the local YYYY-MM-DD_HH-MM naming format
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const day = String(now.getDate()).padStart(2, '0');
+            const hours = String(now.getHours()).padStart(2, '0');
+            const minutes = String(now.getMinutes()).padStart(2, '0');
+            const effectiveTitle = meetingName || `Meeting ${year}-${month}-${day}_${hours}-${minutes}`;
 
             // Initialize meeting metadata in IndexedDB
             await indexedDBService.saveMeetingMetadata({
@@ -155,9 +161,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
                 await indexedDBService.saveMeetingMetadata(metadata);
               }
 
-              // Auto-trigger speaker diarization if enabled
+              // Auto-trigger speaker diarization if enabled.
+              // Online modes ("fast"/"efficient") apply speaker labels at
+              // recording stop on the Rust side, so offline diarization is
+              // only triggered for mode "off" or when online processing failed.
               const diarSettings = loadDiarizationSettings();
-              if (diarSettings.enabled && diarSettings.autoRun) {
+              const onlineDiarizationUsed = payload.online_diarization_used === true;
+              if (diarSettings.enabled && diarSettings.autoRun && !onlineDiarizationUsed) {
                 try {
                   const modelStatus = await recordingService.checkDiarizationModels();
                   if (modelStatus.segmentation_ready && modelStatus.embedding_ready) {

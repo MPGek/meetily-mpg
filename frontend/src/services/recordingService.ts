@@ -16,10 +16,17 @@ export interface RecordingState {
   active_duration: number | null;
 }
 
+export interface SpeakerAssignment {
+  sequence_id: number;
+  speaker: string;
+}
+
 export interface RecordingStoppedPayload {
   message: string;
   folder_path?: string;
   meeting_name?: string;
+  online_diarization_used?: boolean;
+  speaker_assignments?: SpeakerAssignment[];
 }
 
 export interface DiarizationProgressPayload {
@@ -77,17 +84,20 @@ export class RecordingService {
    * @param micDeviceName - Microphone device name (null for default)
    * @param systemDeviceName - System audio device name (null for none)
    * @param meetingName - Meeting name/title
+   * @param diarizationMode - Online diarization mode: "off" | "efficient" | "fast"
    * @returns Promise<void>
    */
   async startRecordingWithDevices(
     micDeviceName: string | null,
     systemDeviceName: string | null,
-    meetingName: string
+    meetingName: string,
+    diarizationMode: string = "off"
   ): Promise<void> {
     return invoke('start_recording_with_devices_and_meeting', {
-      mic_device_name: micDeviceName,
-      system_device_name: systemDeviceName,
-      meeting_name: meetingName
+      micDeviceName: micDeviceName,
+      systemDeviceName: systemDeviceName,
+      meetingName: meetingName,
+      diarizationMode: diarizationMode,
     });
   }
 

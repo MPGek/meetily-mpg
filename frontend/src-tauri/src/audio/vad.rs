@@ -240,8 +240,10 @@ impl VadSessionV6 {
         ));
 
         let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("ORT optimization level error: {e}"))?
+            .with_intra_threads(4)
+            .map_err(|e| anyhow::anyhow!("ORT intra threads error: {e}"))?
             .commit_from_memory(model_bytes)?;
 
         let state = Array3::<f32>::zeros(Self::STATE_SHAPE);

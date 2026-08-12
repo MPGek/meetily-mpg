@@ -647,6 +647,7 @@ impl AudioCapture {
 pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+    embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
     state: Arc<RecordingState>,
     vad_processor_mic: ContinuousVadProcessor,
     vad_processor_sys: ContinuousVadProcessor,
@@ -675,6 +676,7 @@ impl AudioPipeline {
     pub fn new(
         receiver: mpsc::UnboundedReceiver<AudioChunk>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
@@ -735,6 +737,7 @@ impl AudioPipeline {
         Self {
             receiver,
             transcription_sender,
+            embedding_sender,
             state,
             vad_processor_mic,
             vad_processor_sys,
@@ -788,10 +791,15 @@ impl AudioPipeline {
                 channels: 1,
             };
 
-            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+            if let Err(e) = self.transcription_sender.send(transcription_chunk.clone()) {
                 warn!("Failed to send merged segment: {}", e);
             } else {
                 self.chunk_id_counter += 1;
+                if let Some(ref embedding_sender) = self.embedding_sender {
+                    if let Err(e) = embedding_sender.send(transcription_chunk) {
+                        debug!("Failed to send segment to embedding channel: {}", e);
+                    }
+                }
             }
         }
         pending.clear();
@@ -1009,6 +1017,7 @@ impl AudioPipeline {
 pub struct AudioPipelineManager {
     pipeline_handle: Option<JoinHandle<Result<()>>>,
     audio_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
 
 impl AudioPipelineManager {
@@ -1016,6 +1025,7 @@ impl AudioPipelineManager {
         Self {
             pipeline_handle: None,
             audio_sender: None,
+            embedding_sender: None,
         }
     }
 
@@ -1024,6 +1034,7 @@ impl AudioPipelineManager {
         &mut self,
         state: Arc<RecordingState>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
@@ -1047,6 +1058,7 @@ impl AudioPipelineManager {
         let mut pipeline = AudioPipeline::new(
             audio_receiver,
             transcription_sender,
+            embedding_sender.clone(),
             state.clone(),
             target_chunk_duration_ms,
             sample_rate,
@@ -1066,6 +1078,7 @@ impl AudioPipelineManager {
 
         self.pipeline_handle = Some(handle);
         self.audio_sender = Some(audio_sender);
+        self.embedding_sender = embedding_sender;
 
         info!("Audio pipeline manager started with mixed audio recording");
         Ok(())
@@ -1090,10 +1103,14 @@ impl AudioPipelineManager {
         }
     }
 
+    /// Drop the embedding channel so the online diarization consumer can finish
+    pub fn clear_embedding_sender(&mut self) {
+        self.embedding_sender = None;
+    }
+
     /// Force immediate flush of accumulated audio and stop pipeline
     /// PERFORMANCE CRITICAL: Eliminates 30+ second shutdown delays
-    pub async fn force_flush_and_stop(&mut self) -> Result<()> {
-        info!("🚀 Force flushing pipeline - processing ALL accumulated audio immediately");
+    pub async fn force_flush_and_stop(&mut self) -> Result<()> {        info!("🚀 Force flushing pipeline - processing ALL accumulated audio immediately");
 
         // If we have a sender, send a special flush signal first
         if let Some(sender) = &self.audio_sender {

@@ -105,6 +105,7 @@ async fn start_recording<R: Runtime>(
         mic_device_name,
         system_device_name,
         meeting_name.clone(),
+        None,
     )
     .await
     {
@@ -300,7 +301,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
 }
 
 #[tauri::command]
@@ -309,9 +310,10 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    diarization_mode: Option<String>,
 ) -> Result<(), String> {
-    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
-             mic_device_name, system_device_name, meeting_name);
+    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}, DiarizationMode: {:?}",
+             mic_device_name, system_device_name, meeting_name, diarization_mode);
 
     // Clone meeting_name for notification use later
     let meeting_name_for_notification = meeting_name.clone();
@@ -338,6 +340,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 mic_device_name,
                 system_device_name,
                 meeting_name,
+                diarization_mode,
             )
             .await
         }
