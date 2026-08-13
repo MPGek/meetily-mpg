@@ -258,7 +258,7 @@ struct DiarizationSegment {
 struct PolyvoiceDiarizer {
     segmenter: polyvoice::PowersetSegmenter,
     embedder: polyvoice::embedder::ResNet34Adapter,
-    clusterer: polyvoice::clusterer::AhcClusterer,
+    clusterer: Box<dyn polyvoice::clusterer::Clusterer>,
 }
 
 fn create_polyvoice_diarizer(
@@ -311,11 +311,16 @@ fn create_polyvoice_diarizer(
     let embedder = polyvoice::embedder::ResNet34Adapter::new(&emb_model, 1, ExecutionProvider::Cpu)
         .map_err(|e| format!("Failed to create embedder: {}", e))?;
 
-    let clusterer = if max_speakers.is_some_and(|m| m > 0) {
-        polyvoice::clusterer::AhcClusterer::new(max_speakers.unwrap() as usize)
-    } else {
-        polyvoice::clusterer::AhcClusterer::default()
-    };
+    let max_clusters = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
+    let clusterer: Box<dyn polyvoice::clusterer::Clusterer> = Box::new(
+        polyvoice::clusterer::MinClusterSizeClusterer::new(
+            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
+                max_clusters,
+                polyvoice::DEFAULT_AHC_THRESHOLD,
+            )),
+            2,
+        ),
+    );
 
     Ok(PolyvoiceDiarizer {
         segmenter,
@@ -329,7 +334,6 @@ fn run_polyvoice_diarization(
     samples: &[f32],
     sample_rate: u32,
 ) -> Result<Vec<DiarizationSegment>, String> {
-    use polyvoice::clusterer::Clusterer as _;
     use polyvoice::embedder::Embedder as _;
     use polyvoice::segmentation::Segmenter as _;
 
@@ -496,7 +500,36 @@ fn find_best_speaker(segments: &[DiarizationSegment], t_start: f32, t_end: f32) 
         }
     }
 
-    best_speaker
+    if best_speaker.is_some() {
+        return best_speaker;
+    }
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Gap-fill: short utterances the segmenter missed get the nearest speaker.
+    // A single-speaker channel can be filled unconditionally; a multi-speaker
+    // channel is bounded so we never assign across long silences.
+    let first = segments[0].speaker;
+    if segments.iter().all(|s| s.speaker == first) {
+        return Some(first);
+    }
+
+    const MAX_GAP_SECS: f32 = 30.0;
+    let mut nearest: Option<(f32, i32)> = None;
+    for seg in segments {
+        let gap = if seg.end < t_start {
+            t_start - seg.end
+        } else if seg.start > t_end {
+            seg.start - t_end
+        } else {
+            0.0
+        };
+        if gap <= MAX_GAP_SECS && nearest.map_or(true, |(g, _)| gap < g) {
+            nearest = Some((gap, seg.speaker));
+        }
+    }
+    nearest.map(|(_, spk)| spk)
 }
 
 fn find_audio_file(folder_path: &str) -> Result<std::path::PathBuf, String> {

@@ -104,7 +104,8 @@ export function useRecordingStart(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
         randomTitle,
-        diarizationMode
+        diarizationMode,
+        diarizationSettings.maxSpeakers > 0 ? diarizationSettings.maxSpeakers : null
       );
       console.log('Backend recording started successfully');
 
@@ -169,11 +170,13 @@ export function useRecordingStart(
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
             console.log('Auto-starting backend recording with meeting:', generatedMeetingTitle);
+            const diarizationSettings = loadDiarizationSettings();
             const result = await recordingService.startRecordingWithDevices(
               selectedDevices?.micDevice || null,
               selectedDevices?.systemDevice || null,
               generatedMeetingTitle,
-              loadDiarizationSettings().enabled ? loadDiarizationSettings().diarizationMode : "off"
+              diarizationSettings.enabled ? diarizationSettings.diarizationMode : "off",
+              diarizationSettings.maxSpeakers > 0 ? diarizationSettings.maxSpeakers : null
             );
             console.log('Auto-start backend recording result:', result);
 
@@ -255,11 +258,13 @@ export function useRecordingStart(
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
         console.log('Starting backend recording with meeting:', generatedMeetingTitle);
+        const diarizationSettings = loadDiarizationSettings();
         const result = await recordingService.startRecordingWithDevices(
           selectedDevices?.micDevice || null,
           selectedDevices?.systemDevice || null,
           generatedMeetingTitle,
-          loadDiarizationSettings().enabled ? loadDiarizationSettings().diarizationMode : "off"
+          diarizationSettings.enabled ? diarizationSettings.diarizationMode : "off",
+          diarizationSettings.maxSpeakers > 0 ? diarizationSettings.maxSpeakers : null
         );
         console.log('Backend recording result:', result);
 

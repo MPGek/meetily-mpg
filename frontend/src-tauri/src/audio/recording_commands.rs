@@ -319,7 +319,7 @@ pub async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None).await
 }
 
 /// Start recording with specific devices and optional meeting name
@@ -329,10 +329,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
     diarization_mode: Option<String>,
+    max_speakers: Option<i32>,
 ) -> Result<(), String> {
     info!(
-        "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}, diarization_mode={:?}",
-        mic_device_name, system_device_name, meeting_name, diarization_mode
+        "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}, diarization_mode={:?}, max_speakers={:?}",
+        mic_device_name, system_device_name, meeting_name, diarization_mode, max_speakers
     );
 
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
@@ -407,7 +408,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         let app_for_event = app.clone();
         let task = tokio::task::spawn_blocking(
             move || -> Result<Option<OnlineDiarizationProcessor>, String> {
-                let mut processor = match OnlineDiarizationProcessor::new(online_mode, 0, &models_dir)
+                let max_speakers_usize = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
+                let mut processor = match OnlineDiarizationProcessor::new(online_mode, max_speakers_usize, &models_dir)
                 {
                     Ok(processor) => processor,
                     Err(e) => {

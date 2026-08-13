@@ -132,11 +132,13 @@ impl EmbeddingBuffer {
         }
 
         let embeddings: Vec<Vec<f32>> = self.entries.iter().map(|e| e.2.clone()).collect();
-        let clusterer = if max_speakers > 0 {
-            polyvoice::clusterer::AhcClusterer::new(max_speakers)
-        } else {
-            polyvoice::clusterer::AhcClusterer::default()
-        };
+        let clusterer = polyvoice::clusterer::MinClusterSizeClusterer::new(
+            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
+                max_speakers,
+                polyvoice::DEFAULT_AHC_THRESHOLD,
+            )),
+            2,
+        );
 
         match clusterer.cluster(&embeddings) {
             Ok(labels) => self
@@ -483,5 +485,31 @@ fn find_best_speaker(segments: &[SpeakerSegment], t_start: f32, t_end: f32) -> O
         }
     }
 
-    best_speaker
+    if best_speaker.is_some() {
+        return best_speaker;
+    }
+    if segments.is_empty() {
+        return None;
+    }
+
+    let first = segments[0].speaker;
+    if segments.iter().all(|s| s.speaker == first) {
+        return Some(first);
+    }
+
+    const MAX_GAP_SECS: f32 = 30.0;
+    let mut nearest: Option<(f32, usize)> = None;
+    for seg in segments {
+        let gap = if seg.end < t_start {
+            t_start - seg.end
+        } else if seg.start > t_end {
+            seg.start - t_end
+        } else {
+            0.0
+        };
+        if gap <= MAX_GAP_SECS && nearest.map_or(true, |(g, _)| gap < g) {
+            nearest = Some((gap, seg.speaker));
+        }
+    }
+    nearest.map(|(_, spk)| spk)
 }

@@ -91,13 +91,15 @@ export class RecordingService {
     micDeviceName: string | null,
     systemDeviceName: string | null,
     meetingName: string,
-    diarizationMode: string = "off"
+    diarizationMode: string = "off",
+    maxSpeakers: number | null = null
   ): Promise<void> {
     return invoke('start_recording_with_devices_and_meeting', {
       micDeviceName: micDeviceName,
       systemDeviceName: systemDeviceName,
       meetingName: meetingName,
       diarizationMode: diarizationMode,
+      maxSpeakers: maxSpeakers,
     });
   }
 

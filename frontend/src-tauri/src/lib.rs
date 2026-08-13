@@ -106,6 +106,7 @@ async fn start_recording<R: Runtime>(
         system_device_name,
         meeting_name.clone(),
         None,
+        None,
     )
     .await
     {
@@ -301,7 +302,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None).await
 }
 
 #[tauri::command]
@@ -311,9 +312,10 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
     diarization_mode: Option<String>,
+    max_speakers: Option<i32>,
 ) -> Result<(), String> {
-    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}, DiarizationMode: {:?}",
-             mic_device_name, system_device_name, meeting_name, diarization_mode);
+    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}, DiarizationMode: {:?}, MaxSpeakers: {:?}",
+             mic_device_name, system_device_name, meeting_name, diarization_mode, max_speakers);
 
     // Clone meeting_name for notification use later
     let meeting_name_for_notification = meeting_name.clone();
@@ -341,6 +343,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 system_device_name,
                 meeting_name,
                 diarization_mode,
+                max_speakers,
             )
             .await
         }
