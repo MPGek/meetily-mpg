@@ -301,7 +301,7 @@ pub fn normalize_audio_samples(mut samples: Vec<f32>) -> Vec<f32> {
 }
 
 /// Check if a file extension requires ffmpeg pre-conversion
-fn needs_ffmpeg_conversion(path: &Path) -> bool {
+pub(crate) fn needs_ffmpeg_conversion(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|ext| FFMPEG_ONLY_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
@@ -312,7 +312,7 @@ fn needs_ffmpeg_conversion(path: &Path) -> bool {
 ///
 /// Returns a `TempPath` that auto-deletes the temporary WAV file when dropped.
 /// The caller must keep the `TempPath` alive until decoding of the WAV is complete.
-fn convert_to_wav_with_ffmpeg(
+pub(crate) fn convert_to_wav_with_ffmpeg(
     input_path: &Path,
     progress_callback: Option<&ProgressCallback>,
 ) -> Result<tempfile::TempPath> {
@@ -614,6 +614,49 @@ pub fn decode_audio_file_with_progress(
         channels,
         duration_seconds,
     })
+}
+
+/// Probe an audio file's sample rate and channel count using Symphonia's header
+/// reader without decoding any packets. Used by the ffmpeg streaming
+/// diarization path to decide mono vs stereo channel splitting.
+pub fn probe_audio_metadata(path: &Path) -> Result<(u32, u16)> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("Failed to open audio file '{}': {}", path.display(), e))?;
+
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| anyhow!("Failed to probe audio format: {}", e))?;
+
+    let format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| anyhow!("No audio track found in file"))?;
+
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| anyhow!("Unknown sample rate"))?;
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(1);
+
+    Ok((sample_rate, channels))
 }
 
 #[cfg(test)]
@@ -937,5 +980,51 @@ mod tests {
         let right = right.unwrap();
         assert_eq!(left.len(), 0, "Left channel should be empty");
         assert_eq!(right.len(), 0, "Right channel should be empty");
+    }
+
+    fn write_pcm_wav(path: &std::path::Path, channels: u16, sample_rate: u32, num_frames: usize) {
+        let data_size = (num_frames * channels as usize * 2) as u32;
+        let byte_rate = sample_rate * channels as u32 * 2;
+        let block_align: u16 = channels * 2;
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        for _ in 0..num_frames * channels as usize {
+            bytes.extend_from_slice(&0i16.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn test_probe_audio_metadata_returns_channels() {
+        let dir = std::env::temp_dir().join(format!("meetily_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stereo = dir.join("stereo.wav");
+        let mono = dir.join("mono.wav");
+        write_pcm_wav(&stereo, 2, 48000, 48000);
+        write_pcm_wav(&mono, 1, 16000, 16000);
+
+        let (sr_s, ch_s) = probe_audio_metadata(&stereo).expect("stereo probe");
+        assert_eq!(sr_s, 48000);
+        assert_eq!(ch_s, 2);
+
+        let (sr_m, ch_m) = probe_audio_metadata(&mono).expect("mono probe");
+        assert_eq!(sr_m, 16000);
+        assert_eq!(ch_m, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

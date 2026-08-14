@@ -379,9 +379,7 @@ export function useRecordingStop(
                 }
                 await recordingService.startDiarization(
                   meetingId,
-                  diarizationSettings.maxSpeakers || undefined,
-                  diarizationSettings.memoryMode,
-                  diarizationSettings.maxSessions || undefined
+                  diarizationSettings.maxSpeakers || undefined
                 );
               } catch (diarizationError) {
                 console.error('Auto diarization failed:', diarizationError);

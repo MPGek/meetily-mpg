@@ -1,16 +1,20 @@
 use crate::audio::audio_file::find_audio_file;
-use crate::audio::decoder::decode_audio_file;
+use crate::audio::decoder::{
+    convert_to_wav_with_ffmpeg, decode_audio_file, needs_ffmpeg_conversion, probe_audio_metadata,
+};
+use crate::audio::ffmpeg::find_ffmpeg_path;
 use crate::database::repositories::meeting::MeetingsRepository;
 use crate::state::AppState;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tauri_plugin_store::StoreExt;
 
 static DIARIZATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DIARIZATION_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -50,12 +54,6 @@ pub struct DiarizationResult {
     pub speakers_found: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiarizationSettingsPayload {
-    pub memory_mode: String,
-    pub max_sessions: i32,
-}
-
 pub fn is_diarization_in_progress() -> bool {
     DIARIZATION_IN_PROGRESS.load(Ordering::SeqCst)
 }
@@ -63,35 +61,6 @@ pub fn is_diarization_in_progress() -> bool {
 pub fn cancel_diarization() {
     DIARIZATION_CANCELLED.store(true, Ordering::SeqCst);
     info!("Diarization cancellation requested");
-}
-
-#[tauri::command]
-pub async fn get_diarization_settings<R: Runtime>(
-    app: AppHandle<R>,
-) -> Result<DiarizationSettingsPayload, String> {
-    let cfg = load_diarization_config(&app)
-        .await
-        .map_err(|e| format!("Failed to load diarization settings: {}", e))?;
-    Ok(DiarizationSettingsPayload {
-        memory_mode: cfg.memory_mode.as_str().to_string(),
-        max_sessions: cfg.max_sessions as i32,
-    })
-}
-
-#[tauri::command]
-pub async fn set_diarization_settings<R: Runtime>(
-    app: AppHandle<R>,
-    memory_mode: String,
-    max_sessions: i32,
-) -> Result<(), String> {
-    let mut cfg = load_diarization_config(&app)
-        .await
-        .map_err(|e| format!("Failed to load diarization settings: {}", e))?;
-    cfg.memory_mode = DiarizationMemoryMode::parse(&memory_mode);
-    cfg.max_sessions = max_sessions.max(0) as usize;
-    save_diarization_config(&app, &cfg)
-        .await
-        .map_err(|e| format!("Failed to save diarization settings: {}", e))
 }
 
 #[tauri::command]
@@ -132,22 +101,12 @@ pub async fn start_diarization<R: Runtime>(
     app: AppHandle<R>,
     meeting_id: String,
     max_speakers: Option<i32>,
-    memory_mode: Option<String>,
-    max_sessions: Option<i32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DiarizationResult, String> {
     let _guard = DiarizationGuard::acquire()?;
     DIARIZATION_CANCELLED.store(false, Ordering::SeqCst);
 
-    let mut config = load_diarization_config(&app)
-        .await
-        .map_err(|e| format!("Failed to load diarization config: {}", e))?;
-    if let Some(mode) = memory_mode {
-        config.memory_mode = DiarizationMemoryMode::parse(&mode);
-    }
-    if let Some(sessions) = max_sessions {
-        config.max_sessions = sessions.max(0) as usize;
-    }
+    let config = DiarizationConfig::default();
 
     let pool = state.db_manager.pool();
 
@@ -236,52 +195,31 @@ pub async fn start_diarization<R: Runtime>(
 
 // ===== Configuration =====
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiarizationMemoryMode {
-    Auto,
-    Fast,
-    LowMemory,
+/// Fixed chunk duration for offline diarization (seconds). Diarization always
+/// processes recordings in chunks to keep peak memory bounded.
+const DIARIZATION_CHUNK_DURATION_SECS: f32 = 600.0;
+
+/// Fixed concurrency profile: the ONNX session pool size is the smaller of 8
+/// or 75% of the logical CPU core count (rounded up, minimum 1). There is no
+/// user-facing memory-mode or session-count setting.
+fn fixed_pool_size() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let seventy_five_percent = ((cores as f64) * 0.75).ceil() as usize;
+    seventy_five_percent.min(8).max(1)
 }
 
-impl DiarizationMemoryMode {
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "fast" => DiarizationMemoryMode::Fast,
-            "low_memory" | "low-memory" | "low memory" | "low" => DiarizationMemoryMode::LowMemory,
-            _ => DiarizationMemoryMode::Auto,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            DiarizationMemoryMode::Auto => "auto",
-            DiarizationMemoryMode::Fast => "fast",
-            DiarizationMemoryMode::LowMemory => "low_memory",
-        }
-    }
-}
-
-impl Default for DiarizationMemoryMode {
-    fn default() -> Self {
-        DiarizationMemoryMode::Auto
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct DiarizationConfig {
-    pub memory_mode: DiarizationMemoryMode,
     pub max_sessions: usize,
-    pub chunk_threshold_secs: f32,
     pub chunk_overlap_secs: f32,
 }
 
 impl Default for DiarizationConfig {
     fn default() -> Self {
         Self {
-            memory_mode: DiarizationMemoryMode::Auto,
-            max_sessions: default_embedder_pool_size(),
-            chunk_threshold_secs: 600.0,
+            max_sessions: fixed_pool_size(),
             chunk_overlap_secs: 5.0,
         }
     }
@@ -289,20 +227,7 @@ impl Default for DiarizationConfig {
 
 impl DiarizationConfig {
     fn chunk_duration_secs(&self) -> f32 {
-        match self.memory_mode {
-            DiarizationMemoryMode::LowMemory => 600.0,
-            DiarizationMemoryMode::Auto => self.chunk_threshold_secs,
-            DiarizationMemoryMode::Fast => self.chunk_threshold_secs,
-        }
-    }
-
-    fn should_chunk(&self, duration_seconds: f32) -> bool {
-        match self.memory_mode {
-            DiarizationMemoryMode::LowMemory => true,
-            DiarizationMemoryMode::Auto | DiarizationMemoryMode::Fast => {
-                duration_seconds >= self.chunk_threshold_secs
-            }
-        }
+        DIARIZATION_CHUNK_DURATION_SECS
     }
 
     fn embedder_pool_size(&self) -> usize {
@@ -312,89 +237,6 @@ impl DiarizationConfig {
     fn segmenter_pool_size(&self) -> usize {
         self.max_sessions.clamp(1, 16)
     }
-}
-
-fn default_embedder_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 4)
-}
-
-pub async fn load_diarization_config<R: Runtime>(
-    app: &AppHandle<R>,
-) -> anyhow::Result<DiarizationConfig> {
-    let store = match app.store("diarization-settings.json") {
-        Ok(store) => store,
-        Err(e) => {
-            warn!("Failed to access diarization store: {}, using defaults", e);
-            return Ok(DiarizationConfig::default());
-        }
-    };
-
-    let mut cfg = DiarizationConfig::default();
-    if let Some(value) = store.get("memory_mode") {
-        if let Some(s) = value.as_str() {
-            cfg.memory_mode = DiarizationMemoryMode::parse(s);
-        }
-    }
-    if let Some(value) = store.get("max_sessions") {
-        if let Some(n) = value.as_i64() {
-            cfg.max_sessions = (n as usize).clamp(1, 16);
-        }
-    }
-
-    // Derive mode-specific defaults when the stored values are absent or
-    // explicitly indicate automatic selection.
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    match cfg.memory_mode {
-        DiarizationMemoryMode::Auto => {
-            if store.get("max_sessions").is_none() {
-                cfg.max_sessions = num_cpus.clamp(1, 4);
-            }
-            cfg.chunk_threshold_secs = 600.0;
-        }
-        DiarizationMemoryMode::Fast => {
-            if store.get("max_sessions").is_none() {
-                cfg.max_sessions = num_cpus.clamp(1, 8);
-            }
-            // Fast mode disables chunking unless the recording exceeds a hard
-            // safety threshold.
-            cfg.chunk_threshold_secs = 3600.0;
-        }
-        DiarizationMemoryMode::LowMemory => {
-            if store.get("max_sessions").is_none() {
-                cfg.max_sessions = 2;
-            }
-            cfg.chunk_threshold_secs = 0.0;
-        }
-    }
-
-    Ok(cfg)
-}
-
-pub async fn save_diarization_config<R: Runtime>(
-    app: &AppHandle<R>,
-    config: &DiarizationConfig,
-) -> anyhow::Result<()> {
-    let store = app
-        .store("diarization-settings.json")
-        .map_err(|e| anyhow::anyhow!("Failed to access diarization store: {}", e))?;
-
-    store.set(
-        "memory_mode",
-        serde_json::Value::String(config.memory_mode.as_str().to_string()),
-    );
-    store.set(
-        "max_sessions",
-        serde_json::Value::Number(serde_json::Number::from(config.max_sessions as i64)),
-    );
-    store
-        .save()
-        .map_err(|e| anyhow::anyhow!("Failed to save diarization store: {}", e))?;
-    Ok(())
 }
 
 // ===== Blocking diarization orchestration =====
@@ -428,10 +270,23 @@ fn run_diarization_blocking<R: Runtime>(
     let decode_start = Instant::now();
     let audio_path = find_audio_file(std::path::Path::new(folder_path))?;
 
-    emit_progress(app, meeting_id, "decoding", 15, "Decoding audio...");
+    // Resolve a streamable source path: mkv/webm/wma are pre-converted to a
+    // temporary WAV that ffmpeg (and the Symphonia fallback) can read.
+    let (_temp_wav_guard, source_path): (Option<tempfile::TempPath>, PathBuf) =
+        if needs_ffmpeg_conversion(&audio_path) {
+            let temp_path = convert_to_wav_with_ffmpeg(&audio_path, None)
+                .map_err(|e| format!("Failed to convert audio for streaming: {}", e))?;
+            let wav_path = temp_path.to_path_buf();
+            (Some(temp_path), wav_path)
+        } else {
+            (None, audio_path.clone())
+        };
 
-    let decoded = decode_audio_file(&audio_path)
-        .map_err(|e| format!("Failed to decode audio: {}", e))?;
+    // Probe channel count (Symphonia header read, no full decode).
+    emit_progress(app, meeting_id, "decoding", 15, "Streaming audio...");
+    let (_, channels) = probe_audio_metadata(&source_path)
+        .map_err(|e| format!("Failed to probe audio metadata: {}", e))?;
+    let is_stereo = channels == 2;
     timings.decode_secs = decode_start.elapsed().as_secs_f64();
 
     emit_progress(app, meeting_id, "diarizing", 20, "Running speaker diarization...");
@@ -440,27 +295,46 @@ fn run_diarization_blocking<R: Runtime>(
         return Err("Diarization cancelled".to_string());
     }
 
-    // De-interleave stereo into (mic=left, sys=right); mono yields right == None.
-    let (left, right) = decoded.extract_channels();
-    let is_stereo = right.is_some();
-
-    let mic_stream = left.unwrap_or_default();
-    let sys_stream = right.unwrap_or_default();
-
     // Load the diarizer once and reuse it for both channel runs.
     let diarizer = create_polyvoice_diarizer(models_dir, max_speakers, config)
         .map_err(|e| format!("Diarization failed: {}", e))?;
 
     let channel_start = Instant::now();
-    let (mic_result, sys_result) = if is_stereo {
-        let (mic, sys) = rayon::join(
-            || run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic"),
-            || run_channel_diarization(&diarizer, &sys_stream, decoded.sample_rate, config, "sys"),
-        );
-        (mic, sys)
-    } else {
-        let mic = run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic");
-        (mic, Ok((Vec::new(), StageTimings::default())))
+    let (mic_result, sys_result): (
+        Result<(Vec<DiarizationSegment>, StageTimings), String>,
+        Result<(Vec<DiarizationSegment>, StageTimings), String>,
+    ) = match find_ffmpeg_path() {
+        Some(ffmpeg) => {
+            if is_stereo {
+                let left = spawn_ffmpeg_pcm(&ffmpeg, &source_path, Some(0))?;
+                let right = spawn_ffmpeg_pcm(&ffmpeg, &source_path, Some(1))?;
+                rayon::join(
+                    || run_channel_diarization_stream(&diarizer, left, config),
+                    || run_channel_diarization_stream(&diarizer, right, config),
+                )
+            } else {
+                let mono = spawn_ffmpeg_pcm(&ffmpeg, &source_path, None)?;
+                let mic = run_channel_diarization_stream(&diarizer, mono, config);
+                (mic, Ok((Vec::new(), StageTimings::default())))
+            }
+        }
+        None => {
+            // ffmpeg unavailable: fall back to full Symphonia decode (higher peak memory).
+            warn!("ffmpeg not found; falling back to in-memory Symphonia decode for diarization");
+            let decoded = decode_audio_file(&source_path)
+                .map_err(|e| format!("Failed to decode audio: {}", e))?;
+            let (left, right) = decoded.extract_channels();
+            let mic_stream = left.unwrap_or_default();
+            if let Some(sys_stream) = right {
+                rayon::join(
+                    || run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic"),
+                    || run_channel_diarization(&diarizer, &sys_stream, decoded.sample_rate, config, "sys"),
+                )
+            } else {
+                let mic = run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic");
+                (mic, Ok((Vec::new(), StageTimings::default())))
+            }
+        }
     };
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
@@ -532,12 +406,8 @@ fn run_channel_diarization(
         samples.len(),
         sample_rate
     );
-    let duration_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
-    if config.should_chunk(duration_seconds) {
-        run_chunked_polyvoice_diarization(diarizer, samples, sample_rate, config)
-    } else {
-        run_polyvoice_diarization(diarizer, samples, sample_rate, config)
-    }
+    // Fallback path: diarization always processes recordings in chunks.
+    run_chunked_polyvoice_diarization(diarizer, samples, sample_rate, config)
 }
 
 #[derive(Debug, Clone)]
@@ -630,92 +500,6 @@ fn create_polyvoice_diarizer(
 }
 
 const DIARIZATION_SAMPLE_RATE: u32 = 16000;
-
-fn run_polyvoice_diarization(
-    diarizer: &PolyvoiceDiarizer,
-    samples: &[f32],
-    sample_rate: u32,
-    config: &DiarizationConfig,
-) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
-    use polyvoice::segmentation::Segmenter as _;
-
-    let mut timings = StageTimings::default();
-
-    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-        return Err("Diarization cancelled".to_string());
-    }
-
-    // The powerset segmentation model expects 16kHz mono audio.
-    let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
-        info!(
-            "Resampling audio from {}Hz to {}Hz for diarization",
-            sample_rate, DIARIZATION_SAMPLE_RATE
-        );
-        let resampled = crate::audio::audio_processing::resample(
-            samples,
-            sample_rate as u32,
-            DIARIZATION_SAMPLE_RATE,
-        )
-        .map_err(|e| format!("Resampling failed: {}", e))?;
-        std::borrow::Cow::Owned(resampled)
-    } else {
-        std::borrow::Cow::Borrowed(samples)
-    };
-
-    // Segment the channel into speaker-attributed spans (powerset-3.0).
-    let seg_start = Instant::now();
-    let raw_segments = match diarizer.segmenter.segment(&diar_samples) {
-        Ok(segments) => segments,
-        Err(e) => {
-            log::warn!("Segmentation failed ({}), treating channel as silent", e);
-            return Ok((Vec::new(), timings));
-        }
-    };
-    timings.segmentation_secs = seg_start.elapsed().as_secs_f64();
-
-    if raw_segments.is_empty() {
-        return Ok((Vec::new(), timings));
-    }
-
-    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-        return Err("Diarization cancelled".to_string());
-    }
-
-    // Extract embeddings for all segments in one coordinated batch call.
-    let embed_start = Instant::now();
-    let (mut segments, embeddings) =
-        embed_segments(&diarizer.embedder, &diar_samples, &raw_segments, config);
-    timings.embedding_secs = embed_start.elapsed().as_secs_f64();
-
-    if segments.is_empty() {
-        return Ok((Vec::new(), timings));
-    }
-
-    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-        return Err("Diarization cancelled".to_string());
-    }
-
-    let cluster_start = Instant::now();
-    let labels = diarizer
-        .clusterer
-        .cluster(&embeddings)
-        .map_err(|e| format!("Speaker clustering failed: {}", e))?;
-    timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
-
-    for (segment, label) in segments.iter_mut().zip(labels) {
-        segment.speaker = label as i32;
-    }
-
-    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-
-    info!(
-        "Diarization found {} segments with {} unique speakers",
-        segments.len(),
-        count_unique_speakers(&segments)
-    );
-
-    Ok((segments, timings))
-}
 
 fn embed_segments(
     embedder: &polyvoice::embedder::ResNet34Adapter,
@@ -909,6 +693,308 @@ fn channel_chunks(
         }
     }
     chunks
+}
+
+// ===== ffmpeg streaming decode =====
+
+/// A spawned ffmpeg process streaming 16 kHz mono f32le PCM on stdout.
+struct PcmStream {
+    child: Child,
+    stdout: ChildStdout,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PcmStream {
+    /// Wait for the process to exit and return an error if it failed.
+    fn finish(mut self) -> Result<(), String> {
+        let status = self
+            .child
+            .wait()
+            .map_err(|e| format!("Failed to wait for ffmpeg: {}", e))?;
+        if !status.success() {
+            let stderr = self.stderr.lock().unwrap();
+            return Err(format!(
+                "ffmpeg exited with {}: {}",
+                status,
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Kill the process (used on cancellation).
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for PcmStream {
+    fn drop(&mut self) {
+        let still_running = self.child.try_wait().map(|o| o.is_none()).unwrap_or(false);
+        if still_running {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Read up to `count` little-endian f32 samples from `reader`, appending them
+/// to `out`. Returns the number of samples appended (0 means EOF).
+fn read_f32_le(
+    reader: &mut impl Read,
+    out: &mut Vec<f32>,
+    count: usize,
+) -> Result<usize, String> {
+    let start = out.len();
+    let mut byte_buf = [0u8; 16384];
+    while out.len() - start < count {
+        let remaining = count - (out.len() - start);
+        let max_bytes = (remaining * 4).min(byte_buf.len());
+        let n = reader
+            .read(&mut byte_buf[..max_bytes])
+            .map_err(|e| format!("Failed to read PCM stream: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        for b in byte_buf[..n].chunks_exact(4) {
+            out.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+    }
+    Ok(out.len() - start)
+}
+
+/// Spawn ffmpeg to decode `input_path` to 16 kHz mono f32le PCM on stdout.
+/// `channel: Some(0)` selects the left channel, `Some(1)` the right channel,
+/// and `None` downmixes to mono.
+fn spawn_ffmpeg_pcm(
+    ffmpeg_path: &Path,
+    input_path: &Path,
+    channel: Option<u32>,
+) -> Result<PcmStream, String> {
+    let input_str = input_path
+        .to_str()
+        .ok_or_else(|| "Invalid audio path (non-UTF8)".to_string())?;
+
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(["-hide_banner", "-nostats", "-loglevel", "error"])
+        .arg("-i")
+        .arg(input_str)
+        .arg("-vn");
+    match channel {
+        Some(0) => {
+            cmd.args(["-af", "pan=mono|c0=c0"]);
+        }
+        Some(1) => {
+            cmd.args(["-af", "pan=mono|c0=c1"]);
+        }
+        Some(_) => {
+            return Err("Invalid channel index for ffmpeg streaming".to_string());
+        }
+        None => {
+            cmd.args(["-ac", "1"]);
+        }
+    }
+    cmd.args(["-ar", "16000", "-f", "f32le", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg stdout was not captured".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ffmpeg stderr was not captured".to_string())?;
+
+    // Drain stderr in a background thread so the pipe cannot fill and deadlock
+    // the ffmpeg process.
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf_clone = Arc::clone(&stderr_buf);
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        *stderr_buf_clone.lock().unwrap() = buf;
+    });
+
+    Ok(PcmStream {
+        child,
+        stdout,
+        stderr: stderr_buf,
+    })
+}
+
+/// Yields overlapping in-memory windows of 16 kHz f32 PCM read from a stream.
+/// Windows overlap by `overlap_samples`, and the final (partial) window ends at
+/// the stream's end. Only the trailing overlap is retained between calls, so
+/// peak memory stays at one window plus the overlap carry.
+struct StreamWindows {
+    chunk_samples: usize,
+    overlap_samples: usize,
+    step_samples: usize,
+    carry: Vec<f32>,
+    start_seconds: f32,
+    first: bool,
+    done: bool,
+}
+
+impl StreamWindows {
+    fn new(chunk_samples: usize, overlap_samples: usize) -> Self {
+        Self {
+            chunk_samples,
+            overlap_samples,
+            step_samples: chunk_samples.saturating_sub(overlap_samples).max(1),
+            carry: Vec::new(),
+            start_seconds: 0.0,
+            first: true,
+            done: false,
+        }
+    }
+
+    fn next_from(&mut self, reader: &mut impl Read) -> Result<Option<(f32, Vec<f32>)>, String> {
+        if self.done {
+            return Ok(None);
+        }
+
+        let mut window;
+        if self.first {
+            window = Vec::with_capacity(self.chunk_samples);
+            read_f32_le(reader, &mut window, self.chunk_samples)?;
+            self.first = false;
+        } else {
+            window = std::mem::take(&mut self.carry);
+            let before = window.len();
+            read_f32_le(reader, &mut window, self.step_samples)?;
+            self.start_seconds += self.step_samples as f32 / DIARIZATION_SAMPLE_RATE as f32;
+            if window.len() == before {
+                self.done = true;
+                return Ok(None);
+            }
+        }
+
+        if window.is_empty() {
+            self.done = true;
+            return Ok(None);
+        }
+
+        // Retain the trailing overlap for the next window.
+        let carry_start = window.len().saturating_sub(self.overlap_samples);
+        self.carry = window[carry_start..].to_vec();
+
+        if window.len() < self.chunk_samples {
+            self.done = true;
+        }
+        Ok(Some((self.start_seconds, window)))
+    }
+}
+
+/// Diarize a channel streamed from ffmpeg (already 16 kHz), reading overlapping
+/// in-memory windows and clustering all accumulated embeddings globally.
+fn run_channel_diarization_stream(
+    diarizer: &PolyvoiceDiarizer,
+    mut pcm: PcmStream,
+    config: &DiarizationConfig,
+) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
+    use polyvoice::segmentation::Segmenter as _;
+
+    let mut timings = StageTimings::default();
+    let chunk_samples = (config.chunk_duration_secs() * DIARIZATION_SAMPLE_RATE as f32) as usize;
+    let overlap_samples = (config.chunk_overlap_secs * DIARIZATION_SAMPLE_RATE as f32) as usize;
+
+    let mut all_segments: Vec<DiarizationSegment> = Vec::new();
+    let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+
+    let mut windows = StreamWindows::new(chunk_samples, overlap_samples);
+
+    loop {
+        if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+            pcm.kill();
+            return Err("Diarization cancelled".to_string());
+        }
+
+        let (window_start_seconds, window) = match windows.next_from(&mut pcm.stdout) {
+            Ok(Some(w)) => w,
+            Ok(None) => break,
+            Err(e) => {
+                pcm.kill();
+                return Err(e);
+            }
+        };
+
+        if window.is_empty() {
+            continue;
+        }
+
+        let seg_start = Instant::now();
+        let raw_segments = match diarizer.segmenter.segment(&window) {
+            Ok(segments) => segments,
+            Err(e) => {
+                warn!("Segmentation failed for a stream window ({}), skipping it", e);
+                continue;
+            }
+        };
+        timings.segmentation_secs += seg_start.elapsed().as_secs_f64();
+
+        if !raw_segments.is_empty() {
+            let embed_start = Instant::now();
+            let (mut chunk_segments, chunk_embeddings) =
+                embed_segments(&diarizer.embedder, &window, &raw_segments, config);
+            timings.embedding_secs += embed_start.elapsed().as_secs_f64();
+
+            for seg in &mut chunk_segments {
+                seg.start += window_start_seconds;
+                seg.end += window_start_seconds;
+            }
+
+            all_segments.extend(chunk_segments);
+            all_embeddings.extend(chunk_embeddings);
+        }
+    }
+
+    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+        pcm.kill();
+        return Err("Diarization cancelled".to_string());
+    }
+
+    pcm.finish()?;
+
+    if all_segments.is_empty() {
+        return Ok((Vec::new(), timings));
+    }
+
+    let cluster_start = Instant::now();
+    let labels = diarizer
+        .clusterer
+        .cluster(&all_embeddings)
+        .map_err(|e| format!("Speaker clustering failed: {}", e))?;
+    timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
+
+    for (segment, label) in all_segments.iter_mut().zip(labels) {
+        segment.speaker = label as i32;
+    }
+
+    all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    info!(
+        "Streamed diarization found {} segments with {} unique speakers",
+        all_segments.len(),
+        count_unique_speakers(&all_segments)
+    );
+
+    Ok((all_segments, timings))
 }
 
 fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
@@ -1319,8 +1405,9 @@ mod spike_tests {
         let diarizer = create_polyvoice_diarizer(&models_dir, None, &default_config())
             .expect("polyvoice diarizer should initialize with the INT8 models");
         let samples = synthetic_speech_16k();
-        let (segments, _) = run_polyvoice_diarization(&diarizer, &samples, 16000, &default_config())
-            .expect("offline diarization should return a result");
+        let (segments, _) =
+            run_chunked_polyvoice_diarization(&diarizer, &samples, 16000, &default_config())
+                .expect("offline diarization should return a result");
         info!(
             "spike: polyvoice offline diarization produced {} segments on synthetic audio",
             segments.len()
@@ -1535,19 +1622,92 @@ mod spike_tests {
     }
 
     #[test]
-    fn diarization_config_mode_defaults() {
+    fn diarization_config_uses_fixed_profile() {
         let cfg = DiarizationConfig::default();
-        assert_eq!(cfg.memory_mode, DiarizationMemoryMode::Auto);
-        assert!(cfg.max_sessions >= 1 && cfg.max_sessions <= 16);
+        assert!(cfg.max_sessions >= 1 && cfg.max_sessions <= 8);
         assert_eq!(cfg.chunk_overlap_secs, 5.0);
+        assert_eq!(cfg.chunk_duration_secs(), 600.0);
+    }
 
-        let mut low = cfg.clone();
-        low.memory_mode = DiarizationMemoryMode::LowMemory;
-        assert!(low.should_chunk(1.0));
+    #[test]
+    fn fixed_pool_size_respects_floor_and_cap() {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let expected = (((cores as f64) * 0.75).ceil() as usize).min(8).max(1);
+        assert_eq!(fixed_pool_size(), expected);
+        assert!(fixed_pool_size() >= 1);
+        assert!(fixed_pool_size() <= 8);
+    }
 
-        let mut fast = cfg.clone();
-        fast.memory_mode = DiarizationMemoryMode::Fast;
-        assert!(!fast.should_chunk(300.0));
-        assert!(fast.should_chunk(4000.0));
+    #[test]
+    fn read_f32_le_converts_little_endian_samples() {
+        let mut data: Vec<u8> = Vec::new();
+        for v in [1.0f32, -2.5, 0.0, 3.25] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut cursor = std::io::Cursor::new(data);
+        let mut out = Vec::new();
+        let n = read_f32_le(&mut cursor, &mut out, 10).expect("read");
+        assert_eq!(n, 4);
+        assert_eq!(out, vec![1.0, -2.5, 0.0, 3.25]);
+    }
+
+    #[test]
+    fn read_f32_le_stops_at_eof() {
+        let data = 0.5f32.to_le_bytes().to_vec();
+        let mut cursor = std::io::Cursor::new(data);
+        let mut out = Vec::new();
+        let n = read_f32_le(&mut cursor, &mut out, 10).expect("read");
+        assert_eq!(n, 1);
+        assert_eq!(out, vec![0.5]);
+        let n2 = read_f32_le(&mut cursor, &mut out, 10).expect("read");
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn stream_windows_overlap_and_advance() {
+        // 30 seconds of 16 kHz mono f32 = 480000 samples (value == sample index).
+        let total = 480_000usize;
+        let mut data = Vec::with_capacity(total * 4);
+        for i in 0..total {
+            data.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        let mut cursor = std::io::Cursor::new(data);
+
+        let mut windows = StreamWindows::new(160_000, 80_000);
+        let mut collected: Vec<(f32, Vec<f32>)> = Vec::new();
+        while let Some(w) = windows.next_from(&mut cursor).expect("read") {
+            collected.push(w);
+        }
+
+        // 10s chunks with 5s overlap -> 5s step over 30s: 5 full windows.
+        assert_eq!(collected.len(), 5);
+        let starts: Vec<f32> = collected.iter().map(|(s, _)| *s).collect();
+        assert_eq!(starts, vec![0.0, 5.0, 10.0, 15.0, 20.0]);
+        assert!(collected.iter().all(|(_, s)| s.len() == 160_000));
+        // The second window begins in the overlap region, i.e. at the tail of
+        // the first window (sample value == global sample index).
+        assert_eq!(collected[0].1[80_000], 80_000.0);
+        assert_eq!(collected[1].1[0], 80_000.0);
+    }
+
+    #[test]
+    fn stream_windows_final_partial_window() {
+        // 22 seconds = 352000 samples, not a multiple of the 5s step.
+        let total = 352_000usize;
+        let mut data = Vec::with_capacity(total * 4);
+        for _ in 0..total {
+            data.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        let mut cursor = std::io::Cursor::new(data);
+
+        let mut windows = StreamWindows::new(160_000, 80_000);
+        let mut collected = Vec::new();
+        while let Some(w) = windows.next_from(&mut cursor).expect("read") {
+            collected.push(w);
+        }
+
+        assert_eq!(collected.len(), 4);
+        assert_eq!(collected[3].0, 15.0);
+        assert_eq!(collected[3].1.len(), 112_000);
     }
 }

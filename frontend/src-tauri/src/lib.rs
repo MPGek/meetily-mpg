@@ -760,8 +760,6 @@ pub fn run() {
             // Diarization commands
             audio::diarization::start_diarization,
             audio::diarization::get_diarization_status,
-            audio::diarization::get_diarization_settings,
-            audio::diarization::set_diarization_settings,
             audio::diarization::update_speaker_label_command,
             audio::diarization::check_diarization_models,
             audio::diarization::download_diarization_models,

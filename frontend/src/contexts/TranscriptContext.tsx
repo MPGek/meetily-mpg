@@ -174,9 +174,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
                     console.log('[Diarization] Auto-triggering speaker analysis for meeting:', currentMeetingId);
                     await recordingService.startDiarization(
                       currentMeetingId,
-                      diarSettings.maxSpeakers || undefined,
-                      diarSettings.memoryMode,
-                      diarSettings.maxSessions || undefined
+                      diarSettings.maxSpeakers || undefined
                     );
                   } else {
                     console.log('[Diarization] Models not ready, skipping auto-trigger');
