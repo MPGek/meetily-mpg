@@ -196,12 +196,38 @@ export class RecordingService {
    * Start speaker diarization on a meeting's audio
    * @param meetingId - Meeting ID to diarize
    * @param maxSpeakers - Optional maximum number of speakers (0/null for auto-detect)
+   * @param memoryMode - Optional offline memory mode override ("auto" | "fast" | "low_memory")
+   * @param maxSessions - Optional maximum ONNX session count override (0 for auto)
    * @returns Promise with result
    */
-  async startDiarization(meetingId: string, maxSpeakers?: number): Promise<DiarizationResultPayload> {
+  async startDiarization(
+    meetingId: string,
+    maxSpeakers?: number,
+    memoryMode?: string,
+    maxSessions?: number
+  ): Promise<DiarizationResultPayload> {
     return invoke<DiarizationResultPayload>('start_diarization', {
       meetingId: meetingId,
       max_speakers: maxSpeakers ?? 0,
+      memory_mode: memoryMode ?? null,
+      max_sessions: maxSessions ?? null,
+    });
+  }
+
+  /**
+   * Get offline diarization performance settings from the backend store.
+   */
+  async getDiarizationSettings(): Promise<{ memory_mode: string; max_sessions: number }> {
+    return invoke('get_diarization_settings');
+  }
+
+  /**
+   * Save offline diarization performance settings to the backend store.
+   */
+  async setDiarizationSettings(memoryMode: string, maxSessions: number): Promise<void> {
+    return invoke('set_diarization_settings', {
+      memory_mode: memoryMode,
+      max_sessions: maxSessions,
     });
   }
 

@@ -175,6 +175,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
                     await recordingService.startDiarization(
                       currentMeetingId,
                       diarSettings.maxSpeakers || undefined,
+                      diarSettings.memoryMode,
+                      diarSettings.maxSessions || undefined
                     );
                   } else {
                     console.log('[Diarization] Models not ready, skipping auto-trigger');

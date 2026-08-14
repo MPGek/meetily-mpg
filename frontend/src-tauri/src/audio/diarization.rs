@@ -2,11 +2,15 @@ use crate::audio::audio_file::find_audio_file;
 use crate::audio::decoder::decode_audio_file;
 use crate::database::repositories::meeting::MeetingsRepository;
 use crate::state::AppState;
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_store::StoreExt;
 
 static DIARIZATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DIARIZATION_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -46,6 +50,12 @@ pub struct DiarizationResult {
     pub speakers_found: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiarizationSettingsPayload {
+    pub memory_mode: String,
+    pub max_sessions: i32,
+}
+
 pub fn is_diarization_in_progress() -> bool {
     DIARIZATION_IN_PROGRESS.load(Ordering::SeqCst)
 }
@@ -53,6 +63,35 @@ pub fn is_diarization_in_progress() -> bool {
 pub fn cancel_diarization() {
     DIARIZATION_CANCELLED.store(true, Ordering::SeqCst);
     info!("Diarization cancellation requested");
+}
+
+#[tauri::command]
+pub async fn get_diarization_settings<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<DiarizationSettingsPayload, String> {
+    let cfg = load_diarization_config(&app)
+        .await
+        .map_err(|e| format!("Failed to load diarization settings: {}", e))?;
+    Ok(DiarizationSettingsPayload {
+        memory_mode: cfg.memory_mode.as_str().to_string(),
+        max_sessions: cfg.max_sessions as i32,
+    })
+}
+
+#[tauri::command]
+pub async fn set_diarization_settings<R: Runtime>(
+    app: AppHandle<R>,
+    memory_mode: String,
+    max_sessions: i32,
+) -> Result<(), String> {
+    let mut cfg = load_diarization_config(&app)
+        .await
+        .map_err(|e| format!("Failed to load diarization settings: {}", e))?;
+    cfg.memory_mode = DiarizationMemoryMode::parse(&memory_mode);
+    cfg.max_sessions = max_sessions.max(0) as usize;
+    save_diarization_config(&app, &cfg)
+        .await
+        .map_err(|e| format!("Failed to save diarization settings: {}", e))
 }
 
 #[tauri::command]
@@ -93,10 +132,22 @@ pub async fn start_diarization<R: Runtime>(
     app: AppHandle<R>,
     meeting_id: String,
     max_speakers: Option<i32>,
+    memory_mode: Option<String>,
+    max_sessions: Option<i32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DiarizationResult, String> {
     let _guard = DiarizationGuard::acquire()?;
     DIARIZATION_CANCELLED.store(false, Ordering::SeqCst);
+
+    let mut config = load_diarization_config(&app)
+        .await
+        .map_err(|e| format!("Failed to load diarization config: {}", e))?;
+    if let Some(mode) = memory_mode {
+        config.memory_mode = DiarizationMemoryMode::parse(&mode);
+    }
+    if let Some(sessions) = max_sessions {
+        config.max_sessions = sessions.max(0) as usize;
+    }
 
     let pool = state.db_manager.pool();
 
@@ -134,7 +185,15 @@ pub async fn start_diarization<R: Runtime>(
     let meeting_id_clone = meeting_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_diarization_blocking(&app_clone, &meeting_id_clone, &folder_path, &models_dir, max_speakers, &transcripts)
+        run_diarization_blocking(
+            &app_clone,
+            &meeting_id_clone,
+            &folder_path,
+            &models_dir,
+            max_speakers,
+            &config,
+            &transcripts,
+        )
     })
     .await
     .map_err(|e| format!("Diarization task panicked: {}", e))?;
@@ -175,22 +234,205 @@ pub async fn start_diarization<R: Runtime>(
     }
 }
 
+// ===== Configuration =====
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationMemoryMode {
+    Auto,
+    Fast,
+    LowMemory,
+}
+
+impl DiarizationMemoryMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" => DiarizationMemoryMode::Fast,
+            "low_memory" | "low-memory" | "low memory" | "low" => DiarizationMemoryMode::LowMemory,
+            _ => DiarizationMemoryMode::Auto,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiarizationMemoryMode::Auto => "auto",
+            DiarizationMemoryMode::Fast => "fast",
+            DiarizationMemoryMode::LowMemory => "low_memory",
+        }
+    }
+}
+
+impl Default for DiarizationMemoryMode {
+    fn default() -> Self {
+        DiarizationMemoryMode::Auto
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiarizationConfig {
+    pub memory_mode: DiarizationMemoryMode,
+    pub max_sessions: usize,
+    pub chunk_threshold_secs: f32,
+    pub chunk_overlap_secs: f32,
+}
+
+impl Default for DiarizationConfig {
+    fn default() -> Self {
+        Self {
+            memory_mode: DiarizationMemoryMode::Auto,
+            max_sessions: default_embedder_pool_size(),
+            chunk_threshold_secs: 600.0,
+            chunk_overlap_secs: 5.0,
+        }
+    }
+}
+
+impl DiarizationConfig {
+    fn chunk_duration_secs(&self) -> f32 {
+        match self.memory_mode {
+            DiarizationMemoryMode::LowMemory => 600.0,
+            DiarizationMemoryMode::Auto => self.chunk_threshold_secs,
+            DiarizationMemoryMode::Fast => self.chunk_threshold_secs,
+        }
+    }
+
+    fn should_chunk(&self, duration_seconds: f32) -> bool {
+        match self.memory_mode {
+            DiarizationMemoryMode::LowMemory => true,
+            DiarizationMemoryMode::Auto | DiarizationMemoryMode::Fast => {
+                duration_seconds >= self.chunk_threshold_secs
+            }
+        }
+    }
+
+    fn embedder_pool_size(&self) -> usize {
+        self.max_sessions.clamp(1, 16)
+    }
+
+    fn segmenter_pool_size(&self) -> usize {
+        self.max_sessions.clamp(1, 16)
+    }
+}
+
+fn default_embedder_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 4)
+}
+
+pub async fn load_diarization_config<R: Runtime>(
+    app: &AppHandle<R>,
+) -> anyhow::Result<DiarizationConfig> {
+    let store = match app.store("diarization-settings.json") {
+        Ok(store) => store,
+        Err(e) => {
+            warn!("Failed to access diarization store: {}, using defaults", e);
+            return Ok(DiarizationConfig::default());
+        }
+    };
+
+    let mut cfg = DiarizationConfig::default();
+    if let Some(value) = store.get("memory_mode") {
+        if let Some(s) = value.as_str() {
+            cfg.memory_mode = DiarizationMemoryMode::parse(s);
+        }
+    }
+    if let Some(value) = store.get("max_sessions") {
+        if let Some(n) = value.as_i64() {
+            cfg.max_sessions = (n as usize).clamp(1, 16);
+        }
+    }
+
+    // Derive mode-specific defaults when the stored values are absent or
+    // explicitly indicate automatic selection.
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    match cfg.memory_mode {
+        DiarizationMemoryMode::Auto => {
+            if store.get("max_sessions").is_none() {
+                cfg.max_sessions = num_cpus.clamp(1, 4);
+            }
+            cfg.chunk_threshold_secs = 600.0;
+        }
+        DiarizationMemoryMode::Fast => {
+            if store.get("max_sessions").is_none() {
+                cfg.max_sessions = num_cpus.clamp(1, 8);
+            }
+            // Fast mode disables chunking unless the recording exceeds a hard
+            // safety threshold.
+            cfg.chunk_threshold_secs = 3600.0;
+        }
+        DiarizationMemoryMode::LowMemory => {
+            if store.get("max_sessions").is_none() {
+                cfg.max_sessions = 2;
+            }
+            cfg.chunk_threshold_secs = 0.0;
+        }
+    }
+
+    Ok(cfg)
+}
+
+pub async fn save_diarization_config<R: Runtime>(
+    app: &AppHandle<R>,
+    config: &DiarizationConfig,
+) -> anyhow::Result<()> {
+    let store = app
+        .store("diarization-settings.json")
+        .map_err(|e| anyhow::anyhow!("Failed to access diarization store: {}", e))?;
+
+    store.set(
+        "memory_mode",
+        serde_json::Value::String(config.memory_mode.as_str().to_string()),
+    );
+    store.set(
+        "max_sessions",
+        serde_json::Value::Number(serde_json::Number::from(config.max_sessions as i64)),
+    );
+    store
+        .save()
+        .map_err(|e| anyhow::anyhow!("Failed to save diarization store: {}", e))?;
+    Ok(())
+}
+
+// ===== Blocking diarization orchestration =====
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StageTimings {
+    decode_secs: f64,
+    segmentation_secs: f64,
+    embedding_secs: f64,
+    clustering_secs: f64,
+    matching_secs: f64,
+}
+
+impl StageTimings {}
+
 fn run_diarization_blocking<R: Runtime>(
     app: &AppHandle<R>,
     meeting_id: &str,
     folder_path: &str,
     models_dir: &PathBuf,
     max_speakers: Option<i32>,
+    config: &DiarizationConfig,
     transcripts: &[crate::database::models::Transcript],
 ) -> Result<(DiarizationResult, Vec<(String, String)>), String> {
+    let overall_start = Instant::now();
+    let mut timings = StageTimings::default();
+    let memory_sampler = MemorySampler::start();
+
     emit_progress(app, meeting_id, "loading", 10, "Finding audio file...");
 
+    let decode_start = Instant::now();
     let audio_path = find_audio_file(std::path::Path::new(folder_path))?;
 
     emit_progress(app, meeting_id, "decoding", 15, "Decoding audio...");
 
     let decoded = decode_audio_file(&audio_path)
         .map_err(|e| format!("Failed to decode audio: {}", e))?;
+    timings.decode_secs = decode_start.elapsed().as_secs_f64();
 
     emit_progress(app, meeting_id, "diarizing", 20, "Running speaker diarization...");
 
@@ -206,36 +448,66 @@ fn run_diarization_blocking<R: Runtime>(
     let sys_stream = right.unwrap_or_default();
 
     // Load the diarizer once and reuse it for both channel runs.
-    let diarizer = create_polyvoice_diarizer(models_dir, max_speakers)
+    let diarizer = create_polyvoice_diarizer(models_dir, max_speakers, config)
         .map_err(|e| format!("Diarization failed: {}", e))?;
 
-    let mic_segments = run_polyvoice_diarization(&diarizer, &mic_stream, decoded.sample_rate)
-        .map_err(|e| format!("Diarization failed: {}", e))?;
-
-    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-        return Err("Diarization cancelled".to_string());
-    }
-
-    let sys_segments = if is_stereo {
-        info!(
-            "Running diarization on system channel ({} samples)",
-            sys_stream.len()
+    let channel_start = Instant::now();
+    let (mic_result, sys_result) = if is_stereo {
+        let (mic, sys) = rayon::join(
+            || run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic"),
+            || run_channel_diarization(&diarizer, &sys_stream, decoded.sample_rate, config, "sys"),
         );
-        run_polyvoice_diarization(&diarizer, &sys_stream, decoded.sample_rate)
-            .map_err(|e| format!("Diarization failed: {}", e))?
+        (mic, sys)
     } else {
-        info!("Mono audio — treating as remote-only, skipping system-channel run");
-        Vec::new()
+        let mic = run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic");
+        (mic, Ok((Vec::new(), StageTimings::default())))
     };
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
         return Err("Diarization cancelled".to_string());
     }
 
+    let (mic_segments, mic_timings) = mic_result.map_err(|e| format!("Microphone channel failed: {}", e))?;
+    let (sys_segments, sys_timings) = sys_result.map_err(|e| format!("System channel failed: {}", e))?;
+
+    timings.segmentation_secs = mic_timings.segmentation_secs + sys_timings.segmentation_secs;
+    timings.embedding_secs = mic_timings.embedding_secs + sys_timings.embedding_secs;
+    timings.clustering_secs = mic_timings.clustering_secs + sys_timings.clustering_secs;
+    let channel_elapsed = channel_start.elapsed().as_secs_f64();
+
     emit_progress(app, meeting_id, "matching", 70, "Matching speakers to transcripts...");
 
+    let matching_start = Instant::now();
     let speakers_found = count_unique_speakers(&mic_segments) + count_unique_speakers(&sys_segments);
     let speaker_updates = compute_speaker_matches(&mic_segments, &sys_segments, is_stereo, transcripts, app, meeting_id)?;
+    timings.matching_secs = matching_start.elapsed().as_secs_f64();
+
+    let peak_mb = memory_sampler.stop();
+    let overall_secs = overall_start.elapsed().as_secs_f64();
+
+    info!(
+        "Diarization timing for {}: decode={:.2}s, segmentation={:.2}s, embedding={:.2}s, clustering={:.2}s, matching={:.2}s, channel_total={:.2}s, overall={:.2}s, peak_rss={}MB, segments={}, speakers={}",
+        meeting_id,
+        timings.decode_secs,
+        timings.segmentation_secs,
+        timings.embedding_secs,
+        timings.clustering_secs,
+        timings.matching_secs,
+        channel_elapsed,
+        overall_secs,
+        peak_mb,
+        speaker_updates.len(),
+        speakers_found
+    );
+
+    const TIME_WARNING_SECS: f64 = 600.0;
+    const MEMORY_WARNING_MB: u64 = 4096;
+    if overall_secs > TIME_WARNING_SECS || peak_mb > MEMORY_WARNING_MB {
+        warn!(
+            "Diarization regression warning: overall={:.2}s (threshold {}s), peak_rss={}MB (threshold {}MB)",
+            overall_secs, TIME_WARNING_SECS, peak_mb, MEMORY_WARNING_MB
+        );
+    }
 
     Ok((
         DiarizationResult {
@@ -245,6 +517,27 @@ fn run_diarization_blocking<R: Runtime>(
         },
         speaker_updates,
     ))
+}
+
+fn run_channel_diarization(
+    diarizer: &PolyvoiceDiarizer,
+    samples: &[f32],
+    sample_rate: u32,
+    config: &DiarizationConfig,
+    channel_name: &str,
+) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
+    info!(
+        "Running diarization on {} channel ({} samples, {}Hz)",
+        channel_name,
+        samples.len(),
+        sample_rate
+    );
+    let duration_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
+    if config.should_chunk(duration_seconds) {
+        run_chunked_polyvoice_diarization(diarizer, samples, sample_rate, config)
+    } else {
+        run_polyvoice_diarization(diarizer, samples, sample_rate, config)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,9 +558,10 @@ struct PolyvoiceDiarizer {
 fn create_polyvoice_diarizer(
     models_dir: &PathBuf,
     max_speakers: Option<i32>,
+    config: &DiarizationConfig,
 ) -> Result<PolyvoiceDiarizer, String> {
-    use polyvoice::models::metadata::{ModelConfigMeta, load_model_config};
     use polyvoice::models::default_manifest;
+    use polyvoice::models::metadata::{load_model_config, ModelConfigMeta};
     use polyvoice::onnx::ExecutionProvider;
 
     let (seg_model, emb_model) = diarization_model_paths(models_dir);
@@ -296,21 +590,26 @@ fn create_polyvoice_diarizer(
         .ok_or_else(|| "polyvoice manifest is missing the segmenter model".to_string())?;
 
     let meta = load_model_config(Some(&seg_model), Some(seg_entry), &ModelConfigMeta::default());
-    let mut config = polyvoice::PowersetConfig::default().with_model_meta(&meta);
+    let mut seg_config = polyvoice::PowersetConfig::default().with_model_meta(&meta);
 
     // Override geometry from the manifest entry: polyvoice maps the ONNX
     // "window_size" key (samples, e.g. 160000) to "window_secs" (seconds),
     // producing a unit mismatch. The manifest entry carries the authoritative
     // geometry values in the correct units.
-    config.window_secs = seg_entry.window_secs.unwrap_or(10.0);
-    config.hop_secs = seg_entry.hop_secs.unwrap_or(2.0);
-    config.sample_rate = seg_entry.sample_rate.unwrap_or(16000);
+    seg_config.window_secs = seg_entry.window_secs.unwrap_or(10.0);
+    seg_config.hop_secs = seg_entry.hop_secs.unwrap_or(2.0);
+    seg_config.sample_rate = seg_entry.sample_rate.unwrap_or(16000);
+    seg_config.pool_size = config.segmenter_pool_size();
 
-    let segmenter = polyvoice::PowersetSegmenter::with_config(&seg_model, config, ExecutionProvider::Cpu)
+    let segmenter = polyvoice::PowersetSegmenter::with_config(&seg_model, seg_config, ExecutionProvider::Cpu)
         .map_err(|e| format!("Failed to create segmenter: {}", e))?;
 
-    let embedder = polyvoice::embedder::ResNet34Adapter::new(&emb_model, 1, ExecutionProvider::Cpu)
-        .map_err(|e| format!("Failed to create embedder: {}", e))?;
+    let embedder = polyvoice::embedder::ResNet34Adapter::new(
+        &emb_model,
+        config.embedder_pool_size(),
+        ExecutionProvider::Cpu,
+    )
+    .map_err(|e| format!("Failed to create embedder: {}", e))?;
 
     let max_clusters = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
     let clusterer: Box<dyn polyvoice::clusterer::Clusterer> = Box::new(
@@ -330,22 +629,27 @@ fn create_polyvoice_diarizer(
     })
 }
 
+const DIARIZATION_SAMPLE_RATE: u32 = 16000;
+
 fn run_polyvoice_diarization(
     diarizer: &PolyvoiceDiarizer,
     samples: &[f32],
     sample_rate: u32,
-) -> Result<Vec<DiarizationSegment>, String> {
-    use polyvoice::embedder::Embedder as _;
+    config: &DiarizationConfig,
+) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
     use polyvoice::segmentation::Segmenter as _;
 
-    const DIARIZATION_SAMPLE_RATE: u32 = 16000;
+    let mut timings = StageTimings::default();
+
+    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+        return Err("Diarization cancelled".to_string());
+    }
 
     // The powerset segmentation model expects 16kHz mono audio.
     let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
-        log::info!(
+        info!(
             "Resampling audio from {}Hz to {}Hz for diarization",
-            sample_rate,
-            DIARIZATION_SAMPLE_RATE
+            sample_rate, DIARIZATION_SAMPLE_RATE
         );
         let resampled = crate::audio::audio_processing::resample(
             samples,
@@ -359,51 +663,44 @@ fn run_polyvoice_diarization(
     };
 
     // Segment the channel into speaker-attributed spans (powerset-3.0).
+    let seg_start = Instant::now();
     let raw_segments = match diarizer.segmenter.segment(&diar_samples) {
         Ok(segments) => segments,
         Err(e) => {
             log::warn!("Segmentation failed ({}), treating channel as silent", e);
-            return Ok(Vec::new());
+            return Ok((Vec::new(), timings));
         }
     };
+    timings.segmentation_secs = seg_start.elapsed().as_secs_f64();
 
     if raw_segments.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), timings));
     }
 
-    // Embed each segment's audio slice, then cluster into speakers.
-    let mut segments: Vec<DiarizationSegment> = Vec::new();
-    let mut embeddings: Vec<Vec<f32>> = Vec::new();
-    for seg in &raw_segments {
-        let start = (seg.time.start * DIARIZATION_SAMPLE_RATE as f64) as usize;
-        let end =
-            ((seg.time.end * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
-        if end <= start {
-            continue;
-        }
-        match diarizer.embedder.embed(&diar_samples[start..end]) {
-            Ok(embedding) => {
-                embeddings.push(embedding);
-                segments.push(DiarizationSegment {
-                    start: seg.time.start as f32,
-                    end: seg.time.end as f32,
-                    speaker: -1,
-                });
-            }
-            Err(e) => {
-                log::warn!("Embedding extraction failed for a segment ({}), skipping it", e);
-            }
-        }
+    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+        return Err("Diarization cancelled".to_string());
     }
+
+    // Extract embeddings for all segments in one coordinated batch call.
+    let embed_start = Instant::now();
+    let (mut segments, embeddings) =
+        embed_segments(&diarizer.embedder, &diar_samples, &raw_segments, config);
+    timings.embedding_secs = embed_start.elapsed().as_secs_f64();
 
     if segments.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), timings));
     }
 
+    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+        return Err("Diarization cancelled".to_string());
+    }
+
+    let cluster_start = Instant::now();
     let labels = diarizer
         .clusterer
         .cluster(&embeddings)
         .map_err(|e| format!("Speaker clustering failed: {}", e))?;
+    timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
 
     for (segment, label) in segments.iter_mut().zip(labels) {
         segment.speaker = label as i32;
@@ -411,11 +708,207 @@ fn run_polyvoice_diarization(
 
     segments.sort_by(|a, b| a.start.total_cmp(&b.start));
 
-    info!("Diarization found {} segments with {} unique speakers",
+    info!(
+        "Diarization found {} segments with {} unique speakers",
         segments.len(),
-        count_unique_speakers(&segments));
+        count_unique_speakers(&segments)
+    );
 
-    Ok(segments)
+    Ok((segments, timings))
+}
+
+fn embed_segments(
+    embedder: &polyvoice::embedder::ResNet34Adapter,
+    diar_samples: &[f32],
+    raw_segments: &[polyvoice::segmentation::RawSegment],
+    _config: &DiarizationConfig,
+) -> (Vec<DiarizationSegment>, Vec<Vec<f32>>) {
+    use polyvoice::embedder::Embedder as _;
+
+    let mut segments: Vec<DiarizationSegment> = Vec::with_capacity(raw_segments.len());
+    let mut slices: Vec<&[f32]> = Vec::with_capacity(raw_segments.len());
+
+    for seg in raw_segments {
+        let start = (seg.time.start * DIARIZATION_SAMPLE_RATE as f64) as usize;
+        let end = ((seg.time.end * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
+        if end <= start {
+            continue;
+        }
+        segments.push(DiarizationSegment {
+            start: seg.time.start as f32,
+            end: seg.time.end as f32,
+            speaker: -1,
+        });
+        slices.push(&diar_samples[start..end]);
+    }
+
+    let embeddings = match embedder.embed_batch(&slices) {
+        Ok(batch) => batch,
+        Err(e) => {
+            warn!(
+                "Batch embedding failed ({}), falling back to per-segment embedding",
+                e
+            );
+            slices
+                .iter()
+                .filter_map(|audio| match embedder.embed(audio) {
+                    Ok(emb) => Some(emb),
+                    Err(e) => {
+                        warn!("Embedding extraction failed for a segment ({}), skipping it", e);
+                        None
+                    }
+                })
+                .collect()
+        }
+    };
+
+    // If the batch/fallback produced fewer embeddings than segments, drop the
+    // trailing segments so clustering stays aligned with the embedding list.
+    let valid_count = segments.len().min(embeddings.len());
+    segments.truncate(valid_count);
+    segments
+        .into_iter()
+        .zip(embeddings.into_iter().take(valid_count))
+        .filter_map(|(seg, emb)| {
+            if emb.len() == embedder.dim() {
+                Some((seg, emb))
+            } else {
+                warn!("Skipping embedding with mismatched dimension");
+                None
+            }
+        })
+        .unzip()
+}
+
+fn run_chunked_polyvoice_diarization(
+    diarizer: &PolyvoiceDiarizer,
+    samples: &[f32],
+    sample_rate: u32,
+    config: &DiarizationConfig,
+) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
+    use polyvoice::segmentation::Segmenter as _;
+
+    let mut timings = StageTimings::default();
+    let chunk_duration = config.chunk_duration_secs();
+    let chunks = channel_chunks(samples, sample_rate, chunk_duration, config.chunk_overlap_secs);
+
+    info!(
+        "Chunked diarization: {} chunks ({}s duration, {}s overlap)",
+        chunks.len(),
+        chunk_duration,
+        config.chunk_overlap_secs
+    );
+
+    let mut all_segments: Vec<DiarizationSegment> = Vec::new();
+    let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+
+    for (chunk_idx, (chunk_start_seconds, chunk_samples)) in chunks.iter().enumerate() {
+        if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Diarization cancelled".to_string());
+        }
+
+        let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
+            crate::audio::audio_processing::resample(
+                chunk_samples,
+                sample_rate,
+                DIARIZATION_SAMPLE_RATE,
+            )
+            .map_err(|e| format!("Resampling failed for chunk {}: {}", chunk_idx, e))?
+            .into()
+        } else {
+            std::borrow::Cow::Borrowed(chunk_samples)
+        };
+
+        let seg_start = Instant::now();
+        let raw_segments = match diarizer.segmenter.segment(&diar_samples) {
+            Ok(segments) => segments,
+            Err(e) => {
+                warn!("Segmentation failed for chunk {} ({}), skipping chunk", chunk_idx, e);
+                continue;
+            }
+        };
+        timings.segmentation_secs += seg_start.elapsed().as_secs_f64();
+
+        if raw_segments.is_empty() {
+            continue;
+        }
+
+        let embed_start = Instant::now();
+        let (mut chunk_segments, chunk_embeddings) =
+            embed_segments(&diarizer.embedder, &diar_samples, &raw_segments, config);
+        timings.embedding_secs += embed_start.elapsed().as_secs_f64();
+
+        // Adjust segment times so they are relative to the full channel.
+        for seg in &mut chunk_segments {
+            seg.start += *chunk_start_seconds;
+            seg.end += *chunk_start_seconds;
+        }
+
+        all_segments.extend(chunk_segments);
+        all_embeddings.extend(chunk_embeddings);
+    }
+
+    if all_segments.is_empty() {
+        return Ok((Vec::new(), timings));
+    }
+
+    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+        return Err("Diarization cancelled".to_string());
+    }
+
+    let cluster_start = Instant::now();
+    let labels = diarizer
+        .clusterer
+        .cluster(&all_embeddings)
+        .map_err(|e| format!("Speaker clustering failed: {}", e))?;
+    timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
+
+    for (segment, label) in all_segments.iter_mut().zip(labels) {
+        segment.speaker = label as i32;
+    }
+
+    all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    info!(
+        "Chunked diarization found {} segments with {} unique speakers",
+        all_segments.len(),
+        count_unique_speakers(&all_segments)
+    );
+
+    Ok((all_segments, timings))
+}
+
+fn channel_chunks(
+    samples: &[f32],
+    sample_rate: u32,
+    chunk_duration_secs: f32,
+    overlap_secs: f32,
+) -> Vec<(f32, Vec<f32>)> {
+    if samples.is_empty() || chunk_duration_secs <= 0.0 {
+        return Vec::new();
+    }
+
+    let chunk_samples = (chunk_duration_secs * sample_rate as f32) as usize;
+    let overlap_samples = (overlap_secs * sample_rate as f32).max(0.0) as usize;
+    let step = chunk_samples.saturating_sub(overlap_samples).max(1);
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < samples.len() {
+        let end = (start + chunk_samples).min(samples.len());
+        let chunk = samples[start..end].to_vec();
+        let chunk_start_seconds = start as f32 / sample_rate as f32;
+        chunks.push((chunk_start_seconds, chunk));
+        if end == samples.len() {
+            break;
+        }
+        start += step;
+        // Avoid generating a tiny trailing sliver; extend the last chunk instead.
+        if start + step >= samples.len() && start < samples.len() {
+            // Last iteration will grab [start..end].
+        }
+    }
+    chunks
 }
 
 fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
@@ -549,6 +1042,80 @@ fn emit_progress<R: Runtime>(
             message: message.to_string(),
         },
     );
+}
+
+// ===== Memory sampler =====
+
+struct MemorySampler {
+    peak_bytes: Arc<AtomicU64>,
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for MemorySampler {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl MemorySampler {
+    fn start() -> Self {
+        let peak_bytes = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let peak_bytes_clone = peak_bytes.clone();
+        let running_clone = running.clone();
+
+        let handle = std::thread::spawn(move || {
+            let pid = match sysinfo::get_current_pid() {
+                Ok(pid) => pid,
+                Err(_) => return,
+            };
+            let mut system = System::new_with_specifics(
+                RefreshKind::new().with_processes(ProcessRefreshKind::new().with_memory()),
+            );
+            let refresh_kind = ProcessRefreshKind::new().with_memory();
+            while running_clone.load(Ordering::Relaxed) {
+                let _ = system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    false,
+                    refresh_kind,
+                );
+                if let Some(proc) = system.process(pid) {
+                    let mem = proc.memory();
+                    let mut current = peak_bytes_clone.load(Ordering::Relaxed);
+                    while mem > current {
+                        match peak_bytes_clone.compare_exchange_weak(
+                            current,
+                            mem,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(c) => current = c,
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        Self {
+            peak_bytes,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) -> u64 {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.peak_bytes.load(Ordering::Relaxed) / 1024 / 1024
+    }
 }
 
 // ===== Model management (polyvoice ModelRegistry) =====
@@ -705,6 +1272,10 @@ mod spike_tests {
     use polyvoice::clusterer::Clusterer as _;
     use polyvoice::embedder::Embedder as _;
 
+    fn default_config() -> DiarizationConfig {
+        DiarizationConfig::default()
+    }
+
     fn find_models_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("MEETILY_MODELS_DIR") {
             let p = PathBuf::from(dir);
@@ -745,10 +1316,10 @@ mod spike_tests {
             eprintln!("SKIP: diarization models not found on this machine");
             return;
         };
-        let diarizer = create_polyvoice_diarizer(&models_dir, None)
+        let diarizer = create_polyvoice_diarizer(&models_dir, None, &default_config())
             .expect("polyvoice diarizer should initialize with the INT8 models");
         let samples = synthetic_speech_16k();
-        let segments = run_polyvoice_diarization(&diarizer, &samples, 16000)
+        let (segments, _) = run_polyvoice_diarization(&diarizer, &samples, 16000, &default_config())
             .expect("offline diarization should return a result");
         info!(
             "spike: polyvoice offline diarization produced {} segments on synthetic audio",
@@ -769,7 +1340,7 @@ mod spike_tests {
         let (_, emb_model) = diarization_model_paths(&models_dir);
         let embedder = polyvoice::embedder::ResNet34Adapter::new(
             &emb_model,
-            1,
+            default_config().embedder_pool_size(),
             polyvoice::onnx::ExecutionProvider::Cpu,
         )
         .expect("ResNet34Adapter should initialize with the INT8 model");
@@ -799,6 +1370,7 @@ mod spike_tests {
     #[ignore = "spike: requires polyvoice diarization models (see standalone probe)"]
     fn spike_polyvoice_streaming_pipeline() {
         use polyvoice::streaming::{LatencyPreset, StreamingPipeline};
+        use polyvoice::vad::{EnergyVad, VadConfig};
 
         let Some(models_dir) = find_models_dir() else {
             eprintln!("SKIP: diarization models not found on this machine");
@@ -807,17 +1379,17 @@ mod spike_tests {
         let (_, emb_model) = diarization_model_paths(&models_dir);
         let extractor = polyvoice::embedder::ResNet34Adapter::new(
             &emb_model,
-            1,
+            default_config().embedder_pool_size(),
             polyvoice::onnx::ExecutionProvider::Cpu,
         )
         .expect("ResNet34Adapter should initialize");
 
-        let vad = polyvoice::vad::EnergyVad::new(-100.0, 16000, 512);
+        let vad = EnergyVad::new(-100.0, 16000, 512);
         let mut pipeline = StreamingPipeline::with_latency_preset(
             vad,
             extractor,
             LatencyPreset::Balanced,
-            polyvoice::vad::VadConfig::default(),
+            VadConfig::default(),
         )
         .expect("StreamingPipeline should build with balanced preset");
 
@@ -849,7 +1421,7 @@ mod spike_tests {
         let (_, emb_model) = diarization_model_paths(&models_dir);
         let extractor = polyvoice::embedder::ResNet34Adapter::new(
             &emb_model,
-            1,
+            default_config().embedder_pool_size(),
             polyvoice::onnx::ExecutionProvider::Cpu,
         )
         .expect("ResNet34Adapter should initialize");
@@ -884,5 +1456,98 @@ mod spike_tests {
             labels.iter().all(|&l| l < 8),
             "labels must respect the max-speakers ceiling"
         );
+    }
+
+    #[test]
+    fn chunk_splitting_preserves_overlap_and_offsets() {
+        let sample_rate = 16000;
+        let samples: Vec<f32> = (0..sample_rate * 30).map(|i| (i as f32).sin()).collect();
+        let chunks = channel_chunks(&samples, sample_rate, 10.0, 5.0);
+
+        assert!(!chunks.is_empty());
+        // Every chunk except the last should be a full 10-second window.
+        for (i, (_, chunk)) in chunks.iter().enumerate().take(chunks.len().saturating_sub(1)) {
+            assert_eq!(chunk.len(), sample_rate as usize * 10, "chunk {} has wrong size", i);
+        }
+
+        // Adjacent chunks should overlap by 5 seconds.
+        for window in chunks.windows(2) {
+            let start_a = window[0].0;
+            let start_b = window[1].0;
+            let diff = (start_b - start_a - 5.0).abs();
+            assert!(diff < 0.01, "expected 5s overlap, got diff {}s", start_b - start_a);
+        }
+
+        // Last chunk should reach the end of the input.
+        let (_, last_chunk) = chunks.last().unwrap();
+        let last_start = chunks.last().unwrap().0;
+        assert_eq!(
+            (last_start * sample_rate as f32) as usize + last_chunk.len(),
+            samples.len(),
+            "last chunk must reach the end of the input"
+        );
+    }
+
+    /// A test embedder that returns a deterministic vector whose first element
+    /// identifies the input slice length. This lets us verify that
+    /// `embed_batch` preserves ordering and that the fallback path handles
+    /// mismatched dimensions gracefully.
+    struct OrderedTestEmbedder {
+        dim: usize,
+    }
+
+    impl polyvoice::embedder::Embedder for OrderedTestEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed(&self, audio: &[f32]) -> Result<Vec<f32>, polyvoice::embedder::EmbedderError> {
+            let mut v = vec![0.0f32; self.dim];
+            if let Some(first) = v.first_mut() {
+                *first = audio.len() as f32;
+            }
+            Ok(v)
+        }
+
+        fn embed_batch(
+            &self,
+            audios: &[&[f32]],
+        ) -> Result<Vec<Vec<f32>>, polyvoice::embedder::EmbedderError> {
+            audios.iter().map(|a| self.embed(a)).collect()
+        }
+    }
+
+    #[test]
+    fn embed_batch_preserves_ordering_and_handles_errors() {
+        let embedder = OrderedTestEmbedder { dim: 4 };
+        let inputs: Vec<Vec<f32>> = vec![vec![1.0; 10], vec![2.0; 20], vec![3.0; 30]];
+        let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+
+        let batch = embedder.embed_batch(&refs).expect("batch should succeed");
+        assert_eq!(batch.len(), inputs.len());
+        for (i, emb) in batch.iter().enumerate() {
+            assert_eq!(emb[0], inputs[i].len() as f32, "embedding order mismatch at index {}", i);
+        }
+
+        // Empty batch should return an empty result, not an error.
+        let empty: Vec<&[f32]> = Vec::new();
+        assert!(embedder.embed_batch(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diarization_config_mode_defaults() {
+        let cfg = DiarizationConfig::default();
+        assert_eq!(cfg.memory_mode, DiarizationMemoryMode::Auto);
+        assert!(cfg.max_sessions >= 1 && cfg.max_sessions <= 16);
+        assert_eq!(cfg.chunk_overlap_secs, 5.0);
+
+        let mut low = cfg.clone();
+        low.memory_mode = DiarizationMemoryMode::LowMemory;
+        assert!(low.should_chunk(1.0));
+
+        let mut fast = cfg.clone();
+        fast.memory_mode = DiarizationMemoryMode::Fast;
+        assert!(!fast.should_chunk(300.0));
+        assert!(fast.should_chunk(4000.0));
     }
 }

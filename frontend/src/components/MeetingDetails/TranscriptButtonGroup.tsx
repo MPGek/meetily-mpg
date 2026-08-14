@@ -70,7 +70,13 @@ export function TranscriptButtonGroup({
       Analytics.trackButtonClick('reanalyze_speakers', 'meeting_details');
       const settings = loadDiarizationSettings();
       const maxSpeakers = settings.maxSpeakers > 0 ? settings.maxSpeakers : undefined;
-      await recordingService.startDiarization(meetingId, maxSpeakers);
+      const maxSessions = settings.maxSessions > 0 ? settings.maxSessions : undefined;
+      await recordingService.startDiarization(
+        meetingId,
+        maxSpeakers,
+        settings.memoryMode,
+        maxSessions
+      );
       // Refetch handled by useDiarizationProgress onComplete event
     } catch (err: any) {
       console.error('Diarization failed:', err);

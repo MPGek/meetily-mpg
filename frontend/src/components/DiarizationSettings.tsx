@@ -8,13 +8,16 @@ import { Label } from "./ui/label";
 import { recordingService } from "@/services/recordingService";
 import { toast } from "sonner";
 import { Download, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
-import type { DiarizationMode } from "@/lib/diarization";
+import type { DiarizationMode, DiarizationMemoryMode } from "@/lib/diarization";
+import { saveDiarizationMemorySettings } from "@/lib/diarization";
 
 const STORAGE_KEYS = {
   enabled: "diarizationEnabled",
   autoRun: "diarizationAutoRun",
   maxSpeakers: "diarizationMaxSpeakers",
   mode: "diarizationMode",
+  memoryMode: "diarizationMemoryMode",
+  maxSessions: "diarizationMaxSessions",
 };
 
 export interface DiarizationSettingsState {
@@ -22,6 +25,8 @@ export interface DiarizationSettingsState {
   autoRun: boolean;
   maxSpeakers: number;
   diarizationMode: DiarizationMode;
+  memoryMode: DiarizationMemoryMode;
+  maxSessions: number;
 }
 
 function loadBoolean(key: string, defaultValue: boolean): boolean {
@@ -44,6 +49,12 @@ function loadMode(defaultValue: DiarizationMode): DiarizationMode {
   return raw === "off" || raw === "efficient" || raw === "fast" ? raw : defaultValue;
 }
 
+function loadMemoryMode(defaultValue: DiarizationMemoryMode): DiarizationMemoryMode {
+  if (typeof window === "undefined") return defaultValue;
+  const raw = localStorage.getItem(STORAGE_KEYS.memoryMode);
+  return raw === "auto" || raw === "fast" || raw === "low_memory" ? raw : defaultValue;
+}
+
 function saveSetting(key: string, value: string) {
   if (typeof window === "undefined") return;
   localStorage.setItem(key, value);
@@ -56,6 +67,10 @@ export function DiarizationSettings() {
   const [diarizationMode, setDiarizationMode] = useState<DiarizationMode>(() =>
     loadMode("efficient")
   );
+  const [memoryMode, setMemoryMode] = useState<DiarizationMemoryMode>(() =>
+    loadMemoryMode("auto")
+  );
+  const [maxSessions, setMaxSessions] = useState(() => loadNumber(STORAGE_KEYS.maxSessions, 0));
   const [modelsReady, setModelsReady] = useState<{ segmentation: boolean; embedding: boolean } | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -125,6 +140,15 @@ export function DiarizationSettings() {
       if (unlistenError) unlistenError();
     };
   }, []);
+
+  const persistMemorySettings = async (mode: DiarizationMemoryMode, sessions: number) => {
+    saveDiarizationMemorySettings(mode, sessions);
+    try {
+      await recordingService.setDiarizationSettings(mode, sessions);
+    } catch (error) {
+      console.error("Failed to persist diarization settings to backend:", error);
+    }
+  };
 
   const handleDownload = async () => {
     if (isDownloading) return;
@@ -211,6 +235,53 @@ export function DiarizationSettings() {
           {diarizationMode === "off" &&
             "No diarization during recording. Use “Re-analyze Speakers” after the meeting to run offline speaker analysis."}
         </p>
+      </div>
+
+      {/* Memory mode */}
+      <div>
+        <Label className="text-sm font-medium text-gray-900 mb-1 block">Offline memory mode</Label>
+        <select
+          disabled={!enabled}
+          value={memoryMode}
+          onChange={(e) => {
+            const mode = e.target.value as DiarizationMemoryMode;
+            setMemoryMode(mode);
+            persistMemorySettings(mode, maxSessions);
+          }}
+          className="w-full sm:w-64 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+        >
+          <option value="auto">Auto</option>
+          <option value="fast">Fast</option>
+          <option value="low_memory">Low memory</option>
+        </select>
+        <p className="text-xs text-gray-500 mt-2">
+          {memoryMode === "auto" &&
+            "Balance speed and RAM: moderate ONNX session count and chunking for long recordings."}
+          {memoryMode === "fast" &&
+            "Use the maximum recommended ONNX sessions and disable chunking unless the recording is very long."}
+          {memoryMode === "low_memory" &&
+            "Limit ONNX sessions and always process recordings in chunks to reduce peak memory."}
+        </p>
+      </div>
+
+      {/* Max ONNX sessions */}
+      <div>
+        <Label className="text-sm font-medium text-gray-900 mb-1 block">Max ONNX sessions</Label>
+        <p className="text-xs text-gray-500 mb-2">Set to 0 to let the chosen memory mode decide (1–16).</p>
+        <Input
+          type="number"
+          min={0}
+          max={16}
+          disabled={!enabled}
+          value={maxSessions}
+          onChange={(e) => {
+            const value = parseInt(e.target.value, 10);
+            const normalized = Number.isNaN(value) ? 0 : Math.max(0, Math.min(16, value));
+            setMaxSessions(normalized);
+            persistMemorySettings(memoryMode, normalized);
+          }}
+          className="w-32"
+        />
       </div>
 
       {/* Max speakers */}

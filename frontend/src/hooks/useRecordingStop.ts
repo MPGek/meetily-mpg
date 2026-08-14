@@ -377,7 +377,12 @@ export function useRecordingStop(
                   });
                   return;
                 }
-                await recordingService.startDiarization(meetingId, diarizationSettings.maxSpeakers || undefined);
+                await recordingService.startDiarization(
+                  meetingId,
+                  diarizationSettings.maxSpeakers || undefined,
+                  diarizationSettings.memoryMode,
+                  diarizationSettings.maxSessions || undefined
+                );
               } catch (diarizationError) {
                 console.error('Auto diarization failed:', diarizationError);
                 const message = diarizationError instanceof Error ? diarizationError.message : String(diarizationError);
