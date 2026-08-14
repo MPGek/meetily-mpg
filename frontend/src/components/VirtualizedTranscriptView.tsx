@@ -9,6 +9,7 @@ import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
+import { Pause, Play } from "lucide-react";
 import { TranscriptSegmentData } from "@/types";
 
 export interface VirtualizedTranscriptViewProps {
@@ -38,6 +39,13 @@ export interface VirtualizedTranscriptViewProps {
 
     // Speaker label editing
     onUpdateSpeakerLabel?: (speaker: string, label: string) => Promise<void>;
+
+    // Audio playback from a segment's start time (meeting details page)
+    onPlayFrom?: (startTime: number) => void;
+    /** Whether the meeting audio player is currently playing */
+    isAudioPlaying?: boolean;
+    /** Id of the transcript segment currently being played */
+    activeSegmentId?: string | null;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -177,7 +185,11 @@ const TranscriptSegment = memo(function TranscriptSegment({
     source_device,
     speaker,
     speaker_label,
+    hasAudioTime,
     onUpdateSpeakerLabel,
+    onPlayFrom,
+    isActive,
+    isAudioPlaying,
 }: {
     id: string;
     timestamp: number;
@@ -188,7 +200,11 @@ const TranscriptSegment = memo(function TranscriptSegment({
     source_device?: string;
     speaker?: string;
     speaker_label?: string;
+    hasAudioTime?: boolean;
     onUpdateSpeakerLabel?: (speaker: string, label: string) => Promise<void>;
+    onPlayFrom?: (startTime: number) => void;
+    isActive?: boolean;
+    isAudioPlaying?: boolean;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -197,12 +213,39 @@ const TranscriptSegment = memo(function TranscriptSegment({
     const isLegacy = !isMic && !isSystem;
     const hasSpeaker = !!speaker;
 
+    const showPlayButton = !!onPlayFrom && !!hasAudioTime;
+    const isActivePlaying = !!isActive && !!isAudioPlaying;
+
+    const playButton = showPlayButton ? (
+        <button
+            type="button"
+            onClick={(e) => {
+                e.stopPropagation();
+                onPlayFrom?.(timestamp);
+            }}
+            aria-label={`Play from ${formatRecordingTime(timestamp)}`}
+            title={`Play from ${formatRecordingTime(timestamp)}`}
+            className={`flex-shrink-0 w-5 h-5 flex items-center justify-center rounded-full mt-1 transition-colors ${
+                isActivePlaying
+                    ? 'text-blue-600 bg-blue-100'
+                    : isActive
+                    ? 'text-blue-500 bg-blue-50'
+                    : 'text-gray-400 hover:text-blue-600 hover:bg-blue-50'
+            }`}
+        >
+            {isActivePlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+        </button>
+    ) : null;
+
     const speakerColor = hasSpeaker ? getSpeakerColor(speaker) : undefined;
 
     if (isLegacy) {
         // Legacy neutral style - left-aligned, no bubble
         return (
-            <div id={`segment-${id}`} className="mb-3">
+            <div
+                id={`segment-${id}`}
+                className={isActive ? 'mb-3 bg-blue-50/70 rounded-lg ring-1 ring-blue-300' : 'mb-3'}
+            >
                 <div className="flex items-start gap-2">
                     <Tooltip>
                         <TooltipTrigger>
@@ -216,6 +259,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                             )}
                         </TooltipContent>
                     </Tooltip>
+                    {playButton}
                     <div className="flex-1">
                         {hasSpeaker && (
                             <div className="flex items-center gap-1.5 mb-1 ml-1">
@@ -263,6 +307,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                             )}
                         </TooltipContent>
                     </Tooltip>
+                    {playButton}
                     <div className="flex-1 max-w-[80%]">
                         {hasSpeaker && (
                             <div className="flex items-center gap-1.5 mb-1 ml-1">
@@ -279,7 +324,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                             </div>
                         )}
                         <div
-                            className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2"
+                            className={`bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 ${isActive ? 'ring-2 ring-blue-400' : ''}`}
                             style={hasSpeaker ? { borderLeftColor: speakerColor, borderLeftWidth: 3 } : undefined}
                         >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -311,20 +356,21 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     )}
                     {isStreaming ? (
                         <div
-                            className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2"
+                            className={`bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2 ${isActive ? 'ring-2 ring-emerald-400' : ''}`}
                             style={hasSpeaker ? { borderRightColor: speakerColor, borderRightWidth: 3 } : undefined}
                         >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                         </div>
                     ) : (
                         <div
-                            className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2"
+                            className={`bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2 ${isActive ? 'ring-2 ring-emerald-400' : ''}`}
                             style={hasSpeaker ? { borderRightColor: speakerColor, borderRightWidth: 3 } : undefined}
                         >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                         </div>
                     )}
                 </div>
+                {playButton}
                 <Tooltip>
                     <TooltipTrigger>
                         <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
@@ -357,6 +403,9 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     loadedCount = 0,
     onLoadMore,
     onUpdateSpeakerLabel,
+    onPlayFrom,
+    isAudioPlaying = false,
+    activeSegmentId = null,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -532,7 +581,11 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        hasAudioTime={segment.hasAudioTime ?? false}
                                         onUpdateSpeakerLabel={onUpdateSpeakerLabel}
+                                        onPlayFrom={onPlayFrom}
+                                        isActive={activeSegmentId === segment.id}
+                                        isAudioPlaying={isAudioPlaying}
                                     />
                                 </div>
                             );
@@ -592,7 +645,11 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        hasAudioTime={segment.hasAudioTime ?? false}
                                         onUpdateSpeakerLabel={onUpdateSpeakerLabel}
+                                        onPlayFrom={onPlayFrom}
+                                        isActive={activeSegmentId === segment.id}
+                                        isAudioPlaying={isAudioPlaying}
                                     />
                                 </motion.div>
                             );

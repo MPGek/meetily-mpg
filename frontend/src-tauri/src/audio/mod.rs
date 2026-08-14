@@ -42,6 +42,9 @@ pub mod transcription;
 // Shared utilities for import and retranscription
 pub(crate) mod common;
 
+// Shared audio file discovery and playback preparation
+pub mod audio_file;
+
 // Shared constants
 pub mod constants;
 
@@ -124,6 +127,9 @@ pub use decoder::{decode_audio_file, DecodedAudio};
 
 // Export audio constants
 pub use constants::AUDIO_EXTENSIONS;
+
+// Export shared audio file helpers
+pub use audio_file::{find_audio_file, prepare_audio_for_playback};
 
 // Export diarization
 pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, check_diarization_models, download_diarization_models, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult, DiarizationModelStatus, DiarizationDownloadProgress};

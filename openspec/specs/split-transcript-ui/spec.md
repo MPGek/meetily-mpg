@@ -140,3 +140,41 @@ The transcript view SHALL display a progress indicator when diarization is runni
 #### Scenario: Auto-refresh after completion
 - **WHEN** diarization completes and the meeting detail page is open
 - **THEN** the transcript view SHALL automatically refresh to show speaker labels
+
+### Requirement: Play button on transcript blocks in meeting details view
+Transcript blocks (utterances) in the meeting details view SHALL show a play button that seeks the meeting audio player to the block's recording-relative start time and resumes playback, enabling validation of transcription text and speaker assignment.
+
+#### Scenario: Play button shown for timed utterances
+- **WHEN** a transcript block has an `audio_start_time` and the meeting has a resolvable audio file
+- **THEN** the block SHALL display a play button (in all three visual variants: legacy, microphone, system)
+
+#### Scenario: Play button hidden without audio time
+- **WHEN** a transcript block has no `audio_start_time`
+- **THEN** the block SHALL NOT display a play button
+
+#### Scenario: Play button hidden when meeting has no audio
+- **WHEN** the meeting has no resolvable audio file
+- **THEN** no transcript block SHALL display a play button
+
+#### Scenario: Activating play button seeks and resumes playback
+- **WHEN** the user clicks the play button on a transcript block
+- **THEN** the audio player SHALL seek to the block's `audio_start_time` and resume playback
+
+### Requirement: Active block visual state during playback
+The transcript block currently being played SHALL be visually highlighted with an accent style in all three visual variants (legacy, microphone, system), and its play button SHALL show a pause glyph while playing, revert to a play glyph when paused, and the highlight SHALL clear when playback ends.
+
+#### Scenario: Playing block shows pause glyph and highlight
+- **WHEN** playback is active and the position is inside a transcript block's time range
+- **THEN** that block SHALL be rendered with the active highlight style and its play button SHALL show the pause glyph; all other blocks SHALL show the play glyph without highlight
+
+#### Scenario: Pause reverts glyph, keeps highlight
+- **WHEN** the player is paused
+- **THEN** the highlighted block SHALL keep its highlight but its play button SHALL revert to the play glyph
+
+#### Scenario: Playback end clears highlight
+- **WHEN** playback ends naturally
+- **THEN** no block SHALL show the active highlight or pause glyph
+
+#### Scenario: Highlight applies to mic and system blocks alike
+- **WHEN** the position is inside a block of any visual variant (legacy, microphone, or system)
+- **THEN** that block SHALL receive the active highlight styling

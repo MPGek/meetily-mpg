@@ -1,3 +1,4 @@
+use crate::audio::audio_file::find_audio_file;
 use crate::audio::decoder::decode_audio_file;
 use crate::database::repositories::meeting::MeetingsRepository;
 use crate::state::AppState;
@@ -184,7 +185,7 @@ fn run_diarization_blocking<R: Runtime>(
 ) -> Result<(DiarizationResult, Vec<(String, String)>), String> {
     emit_progress(app, meeting_id, "loading", 10, "Finding audio file...");
 
-    let audio_path = find_audio_file(folder_path)?;
+    let audio_path = find_audio_file(std::path::Path::new(folder_path))?;
 
     emit_progress(app, meeting_id, "decoding", 15, "Decoding audio...");
 
@@ -530,26 +531,6 @@ fn find_best_speaker(segments: &[DiarizationSegment], t_start: f32, t_end: f32) 
         }
     }
     nearest.map(|(_, spk)| spk)
-}
-
-fn find_audio_file(folder_path: &str) -> Result<std::path::PathBuf, String> {
-    use crate::audio::constants::AUDIO_EXTENSIONS;
-    let dir = std::path::Path::new(folder_path);
-    if !dir.exists() {
-        return Err(format!("Folder not found: {}", folder_path));
-    }
-
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("Cannot read dir: {}", e))? {
-        let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
-        let path = entry.path();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if AUDIO_EXTENSIONS.iter().any(|ae| ae.eq_ignore_ascii_case(ext)) {
-                return Ok(path);
-            }
-        }
-    }
-
-    Err(format!("No audio file found in {}", folder_path))
 }
 
 fn emit_progress<R: Runtime>(

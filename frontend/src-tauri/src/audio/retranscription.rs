@@ -1,10 +1,10 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
 use crate::api::TranscriptSegment;
+use crate::audio::audio_file::find_audio_file;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::{get_speech_chunks_with_progress, merge_segments, VadConfig};
 use super::common::{create_transcript_segments, create_transcript_segments_with_source, write_transcripts_json};
-use super::constants::AUDIO_EXTENSIONS;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
@@ -131,38 +131,6 @@ pub async fn start_retranscription<R: Runtime>(
     result
 }
 
-/// Find audio file in meeting folder
-/// Tries common names first, then scans for any file with an audio extension
-fn find_audio_file(folder: &Path) -> Result<PathBuf> {
-    let candidates = [
-        "audio.mp4", "audio.m4a", "audio.wav", "audio.mp3",
-        "audio.flac", "audio.ogg", "recording.mp4",
-        "audio.mkv", "audio.webm", "audio.wma",
-    ];
-
-    for name in candidates {
-        let path = folder.join(name);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    // Fallback: scan folder for any file with an audio extension
-    if let Ok(entries) = std::fs::read_dir(folder) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                let ext = ext.to_string_lossy().to_lowercase();
-                if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    Err(anyhow!("No audio file found in: {}", folder.display()))
-}
-
 /// Internal function to run retranscription
 async fn run_retranscription<R: Runtime>(
     app: AppHandle<R>,
@@ -173,7 +141,7 @@ async fn run_retranscription<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
-    let audio_path = find_audio_file(&folder_path)?;
+    let audio_path = find_audio_file(&folder_path).map_err(|e| anyhow!(e))?;
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -1013,6 +981,7 @@ async fn transcribe_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::constants::AUDIO_EXTENSIONS;
 
     #[test]
     fn test_create_transcript_segments_empty() {

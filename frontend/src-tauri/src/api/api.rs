@@ -1,7 +1,7 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -854,6 +854,66 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
             Err(format!("Failed to retrieve meeting metadata: {}", e))
         }
     }
+}
+
+/// Get the audio file path for a meeting (for playback on the meeting notes page)
+#[tauri::command]
+pub async fn get_meeting_audio_path<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    log_info!("get_meeting_audio_path called for meeting_id: {}", meeting_id);
+
+    let pool = state.db_manager.pool();
+
+    match MeetingsRepository::get_meeting_metadata(pool, &meeting_id).await {
+        Ok(Some(meeting)) => match meeting.folder_path {
+            Some(folder) => {
+                match crate::audio::audio_file::find_audio_file(std::path::Path::new(&folder)) {
+                    Ok(path) => {
+                        // Register in the asset protocol runtime scope so the
+                        // webview can stream it via convertFileSrc (recordings
+                        // live outside the configured $APPDATA/** scope)
+                        if let Err(e) = app.asset_protocol_scope().allow_file(&path) {
+                            log_warn!("Failed to allow audio file in asset scope: {}", e);
+                        }
+                        Ok(Some(path.to_string_lossy().to_string()))
+                    }
+                    Err(e) => {
+                        log_warn!("No audio file for meeting {}: {}", meeting_id, e);
+                        Ok(None)
+                    }
+                }
+            }
+            None => {
+                log_warn!("Meeting {} has no folder path", meeting_id);
+                Ok(None)
+            }
+        },
+        Ok(None) => {
+            log_warn!("Meeting not found: {}", meeting_id);
+            Err(format!("Meeting not found: {}", meeting_id))
+        }
+        Err(e) => {
+            log_error!("Error retrieving meeting metadata {}: {}", meeting_id, e);
+            Err(format!("Failed to retrieve meeting metadata: {}", e))
+        }
+    }
+}
+
+/// Transcode an audio file to WAV for webview playback (cached in temp dir)
+#[tauri::command]
+pub async fn prepare_audio_for_playback(
+    file_path: String,
+) -> Result<String, String> {
+    log_info!("prepare_audio_for_playback called for: {}", file_path);
+
+    tokio::task::spawn_blocking(move || {
+        crate::audio::audio_file::prepare_audio_for_playback(&file_path)
+    })
+    .await
+    .map_err(|e| format!("Transcode task failed: {}", e))?
 }
 
 /// Get paginated transcripts for a meeting
