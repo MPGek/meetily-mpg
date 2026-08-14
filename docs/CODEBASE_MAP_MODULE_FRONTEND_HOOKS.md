@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-08-05T15:00:00Z
+last_mapped: 2026-08-14T12:09:00Z
 module: frontend_hooks
 ---
 
@@ -10,7 +10,7 @@ module: frontend_hooks
 
 ## Overview
 
-**Purpose**: Custom React hooks encapsulating shared logic — recording lifecycle, live transcript buffering, paginated transcript loading, streaming/typewriter effects, auto-scroll, permissions, model selection, and meeting-details orchestration. Recent changes added **`usePaginatedTranscripts`** (offset/limit infinite scroll) and live-mode recording wiring.
+**Purpose**: Custom React hooks encapsulating shared logic — recording lifecycle, live transcript buffering, paginated transcript loading, streaming/typewriter effects, auto-scroll, permissions, model selection, and meeting-details orchestration. Recent changes added **`usePaginatedTranscripts`** (offset/limit infinite scroll), **`useAudioPlayer`** (streaming playback), **`useDiarizationProgress`** (offline diarization tracking), and online-diarization wiring in `useRecordingStart`/`useRecordingStop`.
 
 **Entry point**: `frontend/src/hooks/` — hooks directory.
 **Framework**: React 18 + TypeScript + Tauri IPC (`invoke`/`listen`).
@@ -22,11 +22,12 @@ module: frontend_hooks
 | `usePaginatedTranscripts.ts` | **NEW/CHANGED** — offset/limit pagination for a meeting's persisted transcripts | `usePaginatedTranscripts` | ~1.4k |
 | `useTranscriptStreaming.ts` | Typewriter reveal effect | `useTranscriptStreaming` | — |
 | `useAutoScroll.ts` | Smart auto-scroll to bottom | `useAutoScroll` | — |
-| `useRecordingStart.ts` | Start recording (validates model, picks devices) | `useRecordingStart` | — |
-| `useRecordingStop.ts` | Stop flow: wait transcription → flush → save → navigate | `useRecordingStop` | — |
+| `useRecordingStart.ts` | Start recording (validates model per-provider, picks devices, passes diarization mode) | `useRecordingStart` | ~2.6k |
+| `useRecordingStop.ts` | Stop flow: wait transcription → apply online diarization → flush → save → navigate | `useRecordingStop` | ~4.4k |
 | `useRecordingStateSync.ts` | Poll backend recording state | `useRecordingStateSync` | — |
 | `usePermissionCheck.ts` | Check mic/system permissions | `usePermissionCheck` | — |
-| `useAudioPlayer.ts` | Audio playback | `useAudioPlayer` | — |
+| `useAudioPlayer.ts` | **NEW** low-level audio playback (convertFileSrc + transcode fallback) | `useAudioPlayer` | ~1k |
+| `useDiarizationProgress.ts` | **NEW** offline diarization progress tracking (`diarization-progress`) | `useDiarizationProgress` | <1k |
 | `useImportAudio.ts` | Audio import flow | `useImportAudio` | — |
 | `useModalState.ts` | Modal open/close | `useModalState` | — |
 | `useNavigation.ts` | Navigation helpers | `useNavigation` | — |
@@ -60,6 +61,30 @@ function usePaginatedTranscripts({ meetingId: string | null, initialTimestamp?: 
 - **Guards**: `isLoadingRef` (no concurrent), `lastLoadTimeRef` (100ms debounce), `loadedMeetingIdRef` (no re-load).
 - **`initialTimestamp` is declared but unused** — pagination always starts from offset 0 (deep-linking not yet implemented).
 - Used **only** on the meeting-details page; separate from the live `TranscriptContext` buffer.
+
+### useAudioPlayer
+
+```typescript
+function useAudioPlayer(audioPath: string | null): {
+  isPlaying, currentTime, duration, error, endedCount,
+  load(), play(), pause(), seek(time), audioRef
+}
+```
+- Sets `el.src = convertFileSrc(audioPath)`; attaches duration/time/play/pause/ended/error listeners.
+- On first `error`, retries once via `prepare_audio_for_playback` (FFmpeg WAV); second error = hard error.
+
+### useDiarizationProgress
+
+```typescript
+function useDiarizationProgress({ meetingId, onComplete, onError }): DiarizationProgressState
+// { status, progress, message, isProcessing }
+```
+- Seeds from `get_diarization_status` (resumes `processing` after a reload), subscribes to `diarization-progress` filtered by `meeting_id`; `complete` → `onComplete`, `failed` → `onError`.
+
+### Online diarization wiring (recording start/stop)
+
+- `useRecordingStart`: gates on `check_active_transcription_model_ready` (provider-aware), then `startRecordingWithDevices(mic, sys, title, diarizationMode, maxSpeakers)` — mode `"off"|"efficient"|"fast"` from `lib/diarization.ts`.
+- `useRecordingStop`: on `recording-stopped` reads `{ folder_path, meeting_name, online_diarization_used, speaker_assignments }`; maps `speaker_assignments` by `sequence_id` onto each segment's `speaker` before `saveMeeting`.
 
 ## Internal Architecture
 

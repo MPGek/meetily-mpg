@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-08-05T15:03:00Z
+last_mapped: 2026-08-14T12:09:00Z
 ---
 
 > Part of [Codebase Map](CODEBASE_MAP.md) | [Architecture](CODEBASE_MAP_ARCHITECTURE.md)
@@ -44,18 +44,18 @@ graph LR
 | Module | File | Purpose | Key Classes/Functions | Tokens |
 |--------|------|---------|----------------------|--------|
 | Entry Point | [CODEBASE_MAP_ARCHITECTURE.md](CODEBASE_MAP_ARCHITECTURE.md) | Tauri builder, commands, tray, onboarding | `run()`, `start_recording`, `tray.rs` | ~8k |
-| Audio Engine | [CODEBASE_MAP_MODULE_AUDIO.md](CODEBASE_MAP_MODULE_AUDIO.md) | Capture (mic+sys), per-channel VAD, stereo mixing, recording | `RecordingManager`, `AudioPipelineManager`, `ContinuousVadProcessor`, `RecordingSaver` | ~160k |
+| Audio Engine | [CODEBASE_MAP_MODULE_AUDIO.md](CODEBASE_MAP_MODULE_AUDIO.md) | Capture (mic+sys), per-channel VAD, stereo mixing, recording, **diarization**, audio playback | `RecordingManager`, `AudioPipelineManager`, `ContinuousVadProcessor`, `RecordingSaver`, `start_diarization`, `OnlineDiarizationProcessor` | ~175k |
 | Whisper Engine | [CODEBASE_MAP_MODULE_WHISPER.md](CODEBASE_MAP_MODULE_WHISPER.md) | Whisper.cpp integration and model management | `WhisperEngine`, `ModelInfo`, `ParallelProcessor` (unused) | ~23k |
 | Parakeet Engine | [CODEBASE_MAP_MODULE_PARAKEET.md](CODEBASE_MAP_MODULE_PARAKEET.md) | ONNX streaming transcription | `ParakeetEngine`, `ParakeetModel` (RNN-T/TDT) | ~19k |
 | Summary Service | [CODEBASE_MAP_MODULE_SUMMARY.md](CODEBASE_MAP_MODULE_SUMMARY.md) | AI summarization with multi-provider support | `SummaryService`, `LLMProvider`, `generate_meeting_summary`, `debug_log` | ~48k |
 | AI Providers | [CODEBASE_MAP_MODULE_AI_PROVIDERS.md](CODEBASE_MAP_MODULE_AI_PROVIDERS.md) | Ollama, OpenAI, Anthropic, Groq, OpenRouter adapters | Provider clients, config structs | ~25k |
-| Database | [CODEBASE_MAP_MODULE_DATABASE.md](CODEBASE_MAP_MODULE_DATABASE.md) | SQLite data layer and repositories | `DatabaseManager`, repository implementations | ~12k |
+| Database | [CODEBASE_MAP_MODULE_DATABASE.md](CODEBASE_MAP_MODULE_DATABASE.md) | SQLite data layer and repositories | `DatabaseManager`, repository implementations, diarization mutations | ~13k |
 | API | [CODEBASE_MAP_MODULE_AI_PROVIDERS.md](CODEBASE_MAP_MODULE_AI_PROVIDERS.md) → `api/` | IPC commands + shared DTOs + legacy HTTP client | `api_*` commands, `TranscriptSegment` | ~10k |
 | Notifications | [CODEBASE_MAP_MODULE_NOTIFICATIONS.md](CODEBASE_MAP_MODULE_NOTIFICATIONS.md) | Desktop notification system | `NotificationManager`, DND awareness | ~8k |
 | Analytics | [CODEBASE_MAP_MODULE_ANALYTICS.md](CODEBASE_MAP_MODULE_ANALYTICS.md) | PostHog integration | `Analytics` module, event tracking | ~5k |
 | Frontend App | [CODEBASE_MAP_MODULE_FRONTEND_APP.md](CODEBASE_MAP_MODULE_FRONTEND_APP.md) | Next.js app shell and routing | Provider tree, pages | ~17k |
-| Frontend Components | [CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md](CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md) | UI components + transcript renderer | `VirtualizedTranscriptView`, `Sidebar`, `TranscriptPanel` | ~143k |
-| Frontend Hooks | [CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md](CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md) | React hooks + contexts | `usePaginatedTranscripts`, `TranscriptContext`, `useRecordingStart` | ~32k |
+| Frontend Components | [CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md](CODEBASE_MAP_MODULE_FRONTEND_COMPONENTS.md) | UI components + transcript renderer | `VirtualizedTranscriptView`, `Sidebar`, `TranscriptPanel`, `AudioPlayer`, `DiarizationSettings` | ~143k |
+| Frontend Hooks | [CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md](CODEBASE_MAP_MODULE_FRONTEND_HOOKS.md) | React hooks + contexts | `usePaginatedTranscripts`, `TranscriptContext`, `useRecordingStart`, `useAudioPlayer`, `useDiarizationProgress` | ~33k |
 
 ## Cross-Module Patterns
 
@@ -151,3 +151,11 @@ Mic + System capture → per-channel VAD → Transcription Provider → Summary 
 | `system_detector.rs` | System audio state detection | `SystemAudioDetector`, platform-specific detectors | ~5k |
 | `system_audio_commands.rs` | Tauri commands for system audio | `start_system_audio_capture_command()` | ~3k |
 | `playback_monitor.rs` | Active output device detection | `get_active_audio_output()`, `AudioOutputInfo` | ~2k |
+
+### Speaker Diarization Components (NEW)
+
+| File | Purpose | Key Exports | Tokens |
+|------|---------|-------------|--------|
+| `diarization.rs` | Offline speaker diarization (polyvoice: segmentation + embedding + AHC) | `start_diarization`, `get_diarization_status`, `update_speaker_label_command`, model check/download | ~7.6k |
+| `online_diarization.rs` | Online diarization during recording (Efficient/Fast) | `OnlineDiarizationProcessor`, `DiarizationMode`, `SpeakerAssignment` | ~3.9k |
+| `audio_file.rs` | Audio file discovery + FFmpeg WAV transcode for playback | `find_audio_file`, `prepare_audio_for_playback` | <1k |

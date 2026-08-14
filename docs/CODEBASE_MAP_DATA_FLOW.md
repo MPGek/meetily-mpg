@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-08-05T15:02:00Z
+last_mapped: 2026-08-14T12:09:00Z
 section: data_flow
 ---
 
@@ -151,6 +151,56 @@ sequenceDiagram
     Hook-->>View: append segments (dedup, sort by audio_start_time)
 ```
 
+## Speaker Diarization Flow (offline + online)
+
+```mermaid
+graph TB
+    subgraph Offline["Offline (diarization.rs)"]
+        Trig[invoke start_diarization<br/>meeting_id + max_speakers] --> Dec[find_audio_file + decode_audio_file]
+        Dec --> Split[extract_channels → mic=left / sys=right]
+        Split --> PV[create_polyvoice_diarizer<br/>PowersetSegmenter + ResNet34Adapter + AHC]
+        PV --> Run[per-channel: segment → embed → cluster]
+        Run --> Match[compute_speaker_matches<br/>route by source_device + gap-fill]
+        Match --> Persist[update_transcript_speaker +<br/>update_diarization_status]
+        Persist --> Evt[diarization-progress events]
+    end
+
+    subgraph Online["Online (online_diarization.rs)"]
+        Pipe[audio pipeline flush_pending_segments] --> Emb[embedding_sender channel]
+        Emb --> Proc[OnlineDiarizationProcessor.process_chunk<br/>Efficient: buffer+cluster / Fast: StreamingPipeline]
+        Proc --> Fin[finalize → SpeakerAssignment[]<br/>matched by sequence_id]
+        Fin --> Stop[recording-stopped payload<br/>speaker_assignments]
+        Stop --> FE[frontend applies speaker → saveMeeting]
+    end
+
+    Persist --> DB[(SQLite transcripts.speaker /<br/>meetings.diarization_status)]
+    FE --> DB
+    DB --> Label[update_speaker_label_command<br/>speaker_label + speaker_names JSON]
+```
+
+Label scheme: mic → `MIC_SPEAKER_NN`, system/mono → `SPEAKER_NN`; `speaker_label` is the user-assigned display name.
+
+## Streaming Audio Player Flow
+
+```mermaid
+sequenceDiagram
+    participant Panel as TranscriptPanel
+    participant API as get_meeting_audio_path
+    participant AP as AudioPlayer / useAudioPlayer
+    participant FF as prepare_audio_for_playback
+
+    Panel->>API: invoke get_meeting_audio_path(meetingId)
+    API-->>Panel: file path (registered in asset protocol scope)
+    Panel->>AP: audioPath
+    AP->>AP: el.src = convertFileSrc(path); load()
+    alt native decode fails
+        AP->>FF: invoke prepare_audio_for_playback(filePath)
+        FF-->>AP: transcoded 44.1kHz WAV (temp cache)
+        AP->>AP: reload WAV
+    end
+    AP-->>Panel: currentTime → binary-search activeSegmentId → highlight + auto-scroll
+```
+
 ## Key Data Paths Summary
 
 | Path | Direction | Technology | Purpose |
@@ -161,4 +211,7 @@ sequenceDiagram
 | Summary generation | Frontend → Rust → LLM | `api_process_transcript` + HTTP/sidecar | AI summarization |
 | Re-transcription ("Enhance") | Frontend → Rust | `start_retranscription` | Re-process stored audio with new settings |
 | Audio import | Frontend → Rust | `start_import_audio` | Import external audio as meetings |
+| Speaker diarization (offline) | Frontend → Rust | `start_diarization` + `diarization-progress` events | Label speakers on stored audio |
+| Speaker diarization (online) | Rust → Frontend | `recording-stopped` `speaker_assignments` | Label speakers during recording |
+| Audio playback | Frontend → Rust | `get_meeting_audio_path`, `prepare_audio_for_playback` | Stream meeting recording |
 | Settings/API keys | Frontend → Rust → SQLite | `api_save_model_config`, `api_save_transcript_config` | Persist config |

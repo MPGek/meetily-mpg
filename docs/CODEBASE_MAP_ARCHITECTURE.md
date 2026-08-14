@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-07-13T15:05:00Z
+last_mapped: 2026-08-14T12:09:00Z
 ---
 
 > Part of [Codebase Map](CODEBASE_MAP.md)
@@ -40,6 +40,8 @@ graph TB
                 Mixer[Stereo Mix<br/>left=mic right=system]
                 DeviceMgmt[Device Management<br/>Detection + Reconnection]
                 Record[Recording<br/>Enhance/Re-transcribe/Import]
+                Diar[Speaker Diarization<br/>offline polyvoice + online]
+                Playback[Streaming Audio Player<br/>FFmpeg WAV transcode]
             end
             
             subgraph TranscriptionEngines["Transcription Engines"]
@@ -80,6 +82,9 @@ graph TB
     ProviderAbstraction --> Parakeet
     Capture --> Mixer
     Mixer --> Record
+    Capture --> Diar
+    Diar --> DB
+    Capture --> Playback
     Record --> DB
     Whisper --> SummaryService
     Parakeet --> SummaryService
@@ -124,7 +129,9 @@ The backend has evolved significantly with modular audio processing:
 | **Audio Processing** | `audio/audio_processing.rs`, `audio/post_processor.rs` | Normalization, noise suppression (RNNOISE), spectral subtraction, filters |
 | **Buffer Management** | `audio/buffer_pool.rs`, `audio/batch_processor.rs` | Audio buffer pooling for memory efficiency, batched metrics collection |
 | **Incremental Saving** | `audio/incremental_saver.rs` | Checkpoint-based audio saving for crash recovery |
-| **Transcription Provider** | `audio/transcription/` | Abstract STT provider interface, engine lifecycle management |
+| **Speaker Diarization** | `audio/diarization.rs`, `audio/online_diarization.rs` | Offline + online speaker labeling via polyvoice ONNX (segmentation + ResNet34 embeddings + AHC clustering) |
+| **Audio Playback** | `audio/audio_file.rs` | Meeting recording discovery + FFmpeg WAV transcode for webview streaming |
+| **Transcription Provider** | `audio/transcription/` | Abstract STT provider interface, engine lifecycle management, provider-aware model-readiness gate |
 | **Whisper Engine** | `whisper_engine/`, `whisper_engine/parallel_processor.rs` | Whisper.cpp bindings with GPU acceleration (Metal/CUDA/Vulkan), parallel chunk processing |
 | **Parakeet Engine** | `parakeet_engine/` | ONNX Runtime inference for Parakeet streaming model |
 | **Summary Service** | `summary/service.rs`, `summary/processor.rs`, `summary/language_detection.rs`, `summary/metadata.rs` | Multi-provider AI summarization with chunked processing, language detection, caching |
@@ -172,6 +179,9 @@ meetily/
 │       │   │   ├── incremental_saver.rs # Checkpoint-based saving for crash recovery
 │       │   │   ├── retranscription.rs   # "Enhance" re-transcribe stored audio (stereo split)
 │       │   │   ├── import.rs         # Import external audio files as meetings
+│       │   │   ├── diarization.rs    # Offline speaker diarization (polyvoice)
+│       │   │   ├── online_diarization.rs  # Online (during-recording) diarization
+│       │   │   ├── audio_file.rs     # Audio file discovery + playback transcode
 │       │   │   ├── post_processor.rs # Text cleanup and normalization
 │       │   │   ├── buffer_pool.rs    # Memory-efficient audio buffer pooling
 │       │   │   ├── batch_processor.rs # Batch processing with metrics
@@ -290,7 +300,7 @@ Raw Audio (Mic + System)
 |----------|---------|---------|
 | Desktop Framework | tauri v2.x | Cross-platform desktop app framework |
 | Audio Capture | cpal + cidre (macOS) | Microphone and system audio capture |
-| Transcription | whisper-rs v0.13.x | Whisper.cpp Rust bindings |
+| Transcription | whisper-rs v0.16.x | Whisper.cpp Rust bindings |
 | ONNX Runtime | ort v2.0.x | Parakeet model inference |
 | Database | sqlx v0.8 | Compile-time checked SQLite queries |
 | Async Runtime | tokio v1.32+ | Asynchronous runtime |
@@ -352,19 +362,15 @@ The Rust backend uses **tokio async runtime** extensively:
 - **GDPR-ready**: Data export and deletion support through database layer
 - **Privacy-by-design**: No data leaves the machine unless user explicitly configures cloud AI
 
-## Recent Changes (since 2026-07-13 mapping)
+## Recent Changes (since 2026-08-05 mapping)
 
 Highlights of what changed since the previous map:
 
 | Area | Change |
 |------|--------|
-| **Mic/System channel separation** | Recording now captures mic + system as separate channels, recorded stereo (left=mic, right=system), stored via `source_device` on transcripts, displayed distinctly in the UI, and split again in re-transcription. |
-| **VAD rewritten** | `vad.rs` now uses **Silero VAD v6** (ONNX), a **unified `VadConfig`** (`live()`/`batch()`), and a **rolling buffer** for speech-onset recovery. |
-| **Transcription provider abstraction** | New `audio/transcription/` subpackage (`engine.rs`, `provider.rs`, `worker.rs`, `whisper_provider.rs`, `parakeet_provider.rs`) wraps the engines for live transcription. |
-| **Enhance / Re-transcription** | `audio/retranscription.rs` re-processes stored audio per-channel, cancellable, with atomic DB replacement. |
-| **Audio Import** | `audio/import.rs` imports external audio as meetings (beta-gated). |
-| **LLM debug logging** | New `summary/debug_log.rs` writes a file per LLM call into the meeting folder. |
-| **Frontend** | Paginated transcripts (`usePaginatedTranscripts` + `VirtualizedTranscriptView` infinite scroll); mic/sys visual separation in transcript UI. |
-| **Build/GPU** | New `scripts/env-cuda.*` and `frontend/build-gpu.*`/`dev-gpu.*`; `llama-helper` sidecar built by GPU scripts. |
-| **Python backend removed** | `backend/` deleted; all summarization/transcription is native Rust. |
-| **DB schema** | `transcripts.source_device` column added (2026-07); paginated transcript queries. |
+| **Speaker diarization** | New `audio/diarization.rs` (offline, polyvoice: powerset segmentation + ResNet34 embeddings + AHC clustering, per-channel) and `audio/online_diarization.rs` (during-recording, Efficient buffer+cluster / Fast StreamingPipeline modes). Labels flow to `transcripts.speaker` / `meetings.diarization_status`; user names via `speaker_label`. |
+| **Streaming audio player** | New `audio/audio_file.rs` (`find_audio_file` + `prepare_audio_for_playback` FFmpeg WAV transcode) + frontend `AudioPlayer`/`useAudioPlayer`; `get_meeting_audio_path` + `prepare_audio_for_playback` commands. |
+| **Provider-aware model gate** | Recording start now dispatches model readiness per active transcript provider (`check_active_transcription_model_ready` + `validate_transcription_model_ready`). |
+| **GPU build tooling** | New `scripts/copy-cuda-libs.*`, `frontend/build-exe.bat` (exe-only), VS 2026 detection, incremental-build speed tuning (dev profile + rust-lld), sccache disabled for CUDA/MSVC. |
+| **LLM debug logging** | `summary/debug_log.rs` writes per-call JSON logs into the meeting folder (now committed). |
+| **DB schema** | `transcripts.speaker_label`, `meetings.diarization_status`, `meetings.speaker_names` (2026-08 migrations). |

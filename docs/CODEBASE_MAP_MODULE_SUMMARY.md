@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-08-05T14:58:00Z
+last_mapped: 2026-08-14T12:09:00Z
 module: summary
 ---
 
@@ -149,7 +149,7 @@ Wired into both `llm_client.rs` and `summary_engine/client.rs`. Each LLM call wr
 ## Gotchas and Tech Debt
 
 - **Debug logging writes a plaintext file per LLM call** including full request/response bodies (transcript content, prompts, outputs) into the meeting folder — a **privacy/security consideration**. `DEBUG = true` hardcoded on with no runtime toggle or cleanup/rotation.
-- **`debug_log.rs` is a working-tree (uncommitted) addition** as of this mapping.
+- **Recording-start model gate is provider-aware**: `audio/transcription/commands.rs::check_active_transcription_model_ready` + `engine.rs::validate_transcription_model_ready` now dispatch on the persisted transcript provider (Whisper vs Parakeet) instead of assuming Whisper; the frontend (`useRecordingStart`) and tray gate recording on the result.
 - **Conditional chunking only for Ollama/BuiltInAI**; cloud providers assume huge context windows (approximation).
 - **English base instruction duplicated** into three prompt builders.
 - **Timeout message mismatch** (says 60s, constant is 300s).

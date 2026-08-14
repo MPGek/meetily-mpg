@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-08-05T14:55:00Z
+last_mapped: 2026-08-14T12:09:00Z
 module: audio
 ---
 
@@ -10,7 +10,7 @@ module: audio
 
 ## Overview
 
-**Purpose**: The audio engine captures microphone + system-audio channels, applies per-channel Voice Activity Detection (VAD), mixes them into a stereo recording file, drives live transcription, and saves/imports/re-transcribes meetings. Recent major work introduced **mic/system channel separation** (recorded as stereo, left=mic / right=system), a **unified `VadConfig`** with a **rolling buffer for speech-onset recovery**, the **Silero VAD v6** model, a **transcription provider abstraction** (`transcription/` subpackage), and the **"Enhance" (re-transcription)** mode.
+**Purpose**: The audio engine captures microphone + system-audio channels, applies per-channel Voice Activity Detection (VAD), mixes them into a stereo recording file, drives live transcription, and saves/imports/re-transcribes meetings. Recent major work introduced **mic/system channel separation** (recorded as stereo, left=mic / right=system), a **unified `VadConfig`** with a **rolling buffer for speech-onset recovery**, the **Silero VAD v6** model, a **transcription provider abstraction** (`transcription/` subpackage), the **"Enhance" (re-transcription)** mode, and — most recently — **speaker diarization** (offline `diarization.rs` + online `online_diarization.rs`, both using the **polyvoice** ONNX engine) plus a **streaming meeting audio player** (`audio_file.rs`).
 
 **Entry point**: `audio/mod.rs` — module root declaring all submodules and re-exporting the public API surface.
 
@@ -71,6 +71,10 @@ module: audio
 | `transcription/worker.rs` | Live transcription worker (NUM_WORKERS=1) | `start_transcription_task` | ~5k |
 | `transcription/whisper_provider.rs` | Whisper provider impl | `WhisperProvider` | <1k |
 | `transcription/parakeet_provider.rs` | Parakeet provider impl | `ParakeetProvider` | <1k |
+| `transcription/commands.rs` | **NEW** model-readiness command (provider-aware gate) | `check_active_transcription_model_ready`, `TranscriptionModelStatus` | <1k |
+| `diarization.rs` | **NEW** offline speaker diarization (polyvoice: powerset segmentation + ResNet34 embeddings + AHC clustering, per-channel) | `start_diarization`, `DiarizationResult`, `DiarizationProgress`, model check/download commands | ~7.6k |
+| `online_diarization.rs` | **NEW** online (during-recording) diarization — Efficient (buffer+cluster) / Fast (polyvoice StreamingPipeline) modes | `OnlineDiarizationProcessor`, `DiarizationMode`, `SpeakerAssignment` | ~3.9k |
+| `audio_file.rs` | **NEW** audio file discovery + FFmpeg transcode-to-WAV for webview playback (temp cache) | `find_audio_file`, `prepare_audio_for_playback` | <1k |
 
 ## Public API
 
@@ -91,6 +95,11 @@ module: audio
 | `poll_audio_device_events` | `() -> Result<Option<DeviceEventResponse>, String>` | Frontend polls every 1–2s |
 | `get_reconnection_status` / `attempt_device_reconnect` | `(device_name, device_type) -> Result<bool, String>` | Reconnection |
 | `get_active_audio_output` | `() -> Result<AudioOutputInfo, String>` | Active output device |
+| `start_diarization` | `(app, meeting_id: String, max_speakers: Option<i32>, state) -> Result<DiarizationResult, String>` | **Offline diarization**: decode audio → per-channel polyvoice → match speakers to transcripts → persist |
+| `get_diarization_status` | `(app, meeting_id, state) -> Result<Value, String>` | `{ diarization_status, speaker_names }` for a meeting |
+| `update_speaker_label_command` | `(app, meeting_id, speaker, label, state) -> Result<bool, String>` | Rename a speaker id to a user label |
+| `check_diarization_models` / `download_diarization_models` | `(app) -> Result<DiarizationModelStatus, String>` / `(app) -> Result<(), String>` | Verify / download polyvoice ONNX models (segmentation + embedding) |
+| `check_active_transcription_model_ready` | `(app) -> Result<TranscriptionModelStatus, String>` | **Provider-aware gate**: report `{ ready, provider, downloading }` for the active transcript provider |
 
 ### Key Types
 
@@ -114,6 +123,11 @@ struct VadConfig {                                  // unified VAD config (vad.r
     max_segment_samples: Option<usize>, buffer_capacity: usize,  // rolling buffer
 }
 // presets: VadConfig::live() and VadConfig::batch()
+
+enum DiarizationMode { Off, Efficient, Fast }     // online_diarization.rs; parse(Option<&str>)
+struct SpeakerAssignment { sequence_id: u64, speaker: String }
+struct DiarizationSegment { start: f32, end: f32, speaker: i32 }   // internal, seconds
+// Label scheme (shared offline+online): mic → "MIC_SPEAKER_NN", system/mono → "SPEAKER_NN"
 ```
 
 ## Internal Architecture
@@ -145,7 +159,27 @@ graph LR
 ### Re-transcription ("Enhance") and Import
 
 - `retranscription.rs` re-processes stored audio: decodes → if stereo, `extract_channels()` (left=mic, right=sys) → per-channel VAD (`VadConfig::batch`) → per-channel transcription with Whisper/Parakeet → atomic DB transaction replaces transcripts → rewrites `transcripts.json`/`metadata.json`. Cancellable via `RETRANSCRIPTION_CANCELLED`.
-- `import.rs` imports external audio as a new meeting (validate → copy → decode → VAD → transcribe → DB), 20 GB size guard, beta-gated in the frontend.
+- `import.rs` imports external audio as a new meeting (validate → copy → decode → VAD → transcribe → DB), 20 GB size guard, beta-gated in the frontend. Import is **mono-only** (no `source_device`).
+
+### Speaker Diarization (NEW)
+
+**Offline (`diarization.rs`)** — `start_diarization` runs in `spawn_blocking`:
+1. Load transcripts (`get_transcripts_for_diarization`), locate + decode the meeting audio.
+2. `extract_channels()` splits stereo into mic (left) / system (right); mono is treated as remote-only.
+3. `create_polyvoice_diarizer` loads `PowersetSegmenter` + `ResNet34Adapter` (256-dim, CPU) + `MinClusterSizeClusterer(AhcClusterer, 2)`; geometry overridden from the manifest to fix a polyvoice `window_size`→`window_secs` unit mismatch.
+4. Per-channel: segment → embed → cluster → `DiarizationSegment[]`.
+5. `compute_speaker_matches` routes each transcript by `source_device`, picks the segment with max temporal overlap (with 30s nearest-speaker **gap-fill** fallback), formats `MIC_SPEAKER_NN`/`SPEAKER_NN`.
+6. Persists via `update_transcript_speaker` + `update_diarization_status`; streams `diarization-progress` events.
+
+**Online (`online_diarization.rs`)** — during recording, driven by `recording_commands.rs`:
+- The pipeline fans VAD-merged speech segments to an `embedding_sender` channel; a `spawn_blocking` consumer feeds `OnlineDiarizationProcessor::process_chunk`.
+- **Efficient** mode buffers one ResNet34 embedding per segment per channel, clusters at stop. **Fast** mode runs polyvoice's `StreamingPipeline` (EnergyVAD + ResNet34) per channel, buffering stable turns and re-expanding pipeline time via a `TimelineMapper`.
+- At stop, `finalize` clusters/translates and matches against in-memory `TranscriptSegment`s, returning `SpeakerAssignment[]` attached to the `recording-stopped` payload (`online_diarization_used`, `speaker_assignments`); the frontend applies them before saving.
+- Guarded by `OnlineDiarizationGuard` (one recording at a time); model-init failure degrades to no diarization (`online-diarization-unavailable` event).
+
+### Streaming Meeting Audio Player (`audio_file.rs`)
+
+`find_audio_file` locates a meeting's recording (candidate name list → extension scan); `prepare_audio_for_playback` FFmpeg-transcodes to 44.1 kHz WAV in `%TEMP%/meetily-playback` (cached by `(path, mtime)` hash, atomic `.part`→rename). The webview streams via `convertFileSrc`; on native decode failure `useAudioPlayer` falls back to `prepare_audio_for_playback`.
 
 ### Concurrency Model
 
@@ -162,15 +196,17 @@ graph LR
 | `api::api` | `api_get_transcript_config`, `api_get_model_config`, `TranscriptSegment` | Config + DTOs |
 | `analytics` | `track_meeting_ended` | Recording analytics |
 | `tray` | `update_tray_menu` | Tray icon state |
-| `database` | Repositories (via api layer / retranscription) | Persist transcripts |
+| `database` | Repositories (via api layer / retranscription / diarization) | Persist transcripts, speaker labels, diarization status |
+| `polyvoice` (=0.17.0) | `PowersetSegmenter`, `ResNet34Adapter`, `AhcClusterer`, `streaming::StreamingPipeline` | Speaker diarization (segmentation + embedding + clustering) |
 
 ## Dependents (imported BY)
 
 | Consumer Module | What it uses | Context |
 |----------------|-------------|---------|
-| `lib.rs` | All recording commands + `recording_saver::TranscriptSegment` | Command registration, DB save deferred to frontend |
-| `tray.rs` | stop/pause/resume/is_recording | Tray menu actions |
+| `lib.rs` | All recording commands + diarization commands + `recording_saver::TranscriptSegment` | Command registration, DB save deferred to frontend |
+| `tray.rs` | stop/pause/resume/is_recording + `check_active_transcription_model_ready` | Tray menu actions + model-readiness gating |
 | `summary/` | Transcript data | Summarization consumes recorded transcripts |
+| `api/api.rs` | `find_audio_file`, `prepare_audio_for_playback` | `get_meeting_audio_path` / `prepare_audio_for_playback` commands |
 
 ## Configuration
 
@@ -211,3 +247,10 @@ graph LR
 - **`unsafe` static `SAMPLE_COUNTER`** in `add_samples` for periodic logging (benign data race).
 - **`permissions.rs`**: `check_screen_recording_permission` always returns `true` (misleading); string-matching used to detect denial.
 - VAD requires exactly 16 kHz; non-16k inputs resampled. Timestamps always in 16k sample units.
+- **Diarization is CPU-only** (embedder built with `1` intra-op thread, CPU provider) even though GPU build scripts exist for Whisper.
+- **`DiarizationGuard`/`OnlineDiarizationGuard` are process-global** — one offline + one online diarization run at a time max.
+- **polyvoice geometry unit mismatch** (ONNX `window_size` samples vs `window_secs` seconds) worked around by overriding geometry from the manifest in `create_polyvoice_diarizer`.
+- **Offline `speakers_found` double-counts** a speaker present on both channels (label ids are channel-scoped, not cross-channel).
+- **Online Fast mode labels** come from polyvoice's arrival-order cache, not AHC — may not be globally consistent; channel prefix keeps mic/system separate.
+- **Efficient mode unbounded memory**: a full 256-dim embedding per speech segment is retained for the whole recording.
+- **`audio_file.rs` playback cache is unbounded** (no TTL/size eviction) and keyed by `DefaultHasher` (a Rust toolchain upgrade can invalidate all cached WAVs).

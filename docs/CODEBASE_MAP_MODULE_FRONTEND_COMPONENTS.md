@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-08-05T14:59:00Z
+last_mapped: 2026-08-14T12:09:00Z
 module: frontend_components
 ---
 
@@ -10,7 +10,7 @@ module: frontend_components
 
 ## Overview
 
-**Purpose**: All React UI for the Meetily desktop app — nav (Sidebar), live recording UI (RecordingControls, TranscriptPanel), the virtualized transcript renderer, model managers, settings, and Shadcn/ui primitives. Recent changes added **mic/system visual separation** in the transcript view and **infinite-scroll pagination** for persisted meetings.
+**Purpose**: All React UI for the Meetily desktop app — nav (Sidebar), live recording UI (RecordingControls, TranscriptPanel), the virtualized transcript renderer, model managers, settings, and Shadcn/ui primitives. Recent changes added **mic/system visual separation**, **infinite-scroll pagination**, and — most recently — the **streaming meeting audio player** (`AudioPlayer`) and **speaker diarization UI** (`DiarizationSettings`, speaker labels in `VirtualizedTranscriptView`).
 
 **Entry point**: `frontend/src/components/` (feature components) and `frontend/src/components/ui/` (primitives). Pages in `frontend/src/app/`.
 
@@ -28,9 +28,10 @@ module: frontend_components
 | `ConfidenceIndicator.tsx` | Per-segment confidence display | `ConfidenceIndicator` | — |
 | `PermissionWarning.tsx` | Mic/system permission warnings | `PermissionWarning` | — |
 | `DeviceSelection.tsx` | Audio device picker | `DeviceSelection` | — |
-| `AudioLevelMeter.tsx` / `AudioPlayer.tsx` | Level meter / playback | — | — |
+| `AudioLevelMeter.tsx` / `AudioPlayer.tsx` | Level meter / **streaming playback bar** (`AudioPlayer`) | `AudioPlayer`, `AudioPlayerHandle`, `PlaybackState` | ~1.1k |
+| `DiarizationSettings.tsx` | **NEW** Speaker-diarization settings card (enable/auto-run/mode/max-speakers + model check/download) | `DiarizationSettings`, `DiarizationSettingsState` | ~2.6k |
 | `WhisperModelManager.tsx`, `ParakeetModelManager.tsx`, `BuiltInModelManager.tsx` | Model download/management | — | — |
-| `MeetingDetails/TranscriptPanel.tsx`, `SummaryPanel.tsx` | Persisted meeting view | — | — |
+| `MeetingDetails/TranscriptPanel.tsx`, `SummaryPanel.tsx` | Persisted meeting view (TranscriptPanel now composes AudioPlayer + diarization progress + speaker rename) | — | — |
 | `ImportAudio/`, `DatabaseImport/`, `TranscriptRecovery/` | Import + recovery UI | — | — |
 | `ui/` | Shadcn/ui primitives (button, dialog, tooltip, etc.) | `cn()` helper | — |
 
@@ -59,8 +60,27 @@ interface VirtualizedTranscriptViewProps {
 ```
 
 - **Mic/System separation**: `source_device === 'Microphone'` → left-aligned **blue** bubble; `'System'` → right-aligned **green** bubble; `undefined` (legacy) → neutral no-bubble.
+- **Speaker labels (NEW)**: inline-editable `SpeakerLabel` per segment (blur/Enter commits, Escape reverts) — calls `onUpdateSpeakerLabel` → `update_speaker_label_command`. Speaker color derived from the numeric suffix of `SPEAKER_NN`/`MIC_SPEAKER_NN` (8-color palette).
 - **Virtualization threshold = 10**; below → simple map + Framer Motion entrance; at/above → `useVirtualizer` (`estimateSize: 60`, `overscan: 10`).
 - **Infinite scroll**: `IntersectionObserver` on `loadMoreTriggerRef` (+ rAF scroll fallback within 200px), gated on `onLoadMore && hasMore && !isLoadingMore && !isRecording`.
+
+### AudioPlayer (streaming meeting player)
+
+```tsx
+forwardRef<AudioPlayerHandle, AudioPlayerProps>
+// props: audioPath: string|null, onPlaybackStateChange?, onTimeUpdate?
+// handle: { playFrom(startTime: number): Promise<void> }  // jump-to-segment before metadata loads
+```
+- Wraps `useAudioPlayer`; hidden `<audio>` streams via `convertFileSrc(audioPath)`; on native decode failure falls back to `prepare_audio_for_playback` (FFmpeg WAV).
+- Imperative `playFrom` queues a pending time until `duration > 0`, then seek+play.
+
+### DiarizationSettings (speaker diarization card)
+
+```tsx
+DiarizationSettings(): JSX.Element  // rendered inside PreferenceSettings
+```
+- Persists `enabled`/`autoRun`/`maxSpeakers`/`mode` to localStorage (keys duplicated from `lib/diarization.ts`).
+- `check_diarization_models` → readiness; `download_diarization_models` → download with progress (`diarization-model-download-progress`/`-complete`/`-error` events).
 
 ### Sidebar
 
@@ -126,6 +146,8 @@ TranscriptPanel({ isProcessingStop, isStopping, showModal })
 - **Dead conditional in `TranscriptSegment`**: the `isStreaming` branch returns the same markup as the final state for both mic and system (cosmetic).
 - **Duplicated JSX**: virtualized and non-virtualized branches contain near-identical infinite-scroll and listening-indicator markup.
 - **`playback`/`showPlayback` UI is vestigial** (`setShowPlayback(true)` commented out).
+- **Diarization storage keys duplicated**: `DiarizationSettings.STORAGE_KEYS` vs `lib/diarization.ts` `DIARIZATION_STORAGE_KEYS` — drift risk.
+- **`modelsReady` default-false flicker**: the "Speakers" button briefly shows "Setup Speakers" until `check_diarization_models` resolves.
 - **Version string hardcoded** in the sidebar (drift risk with `tauri.conf.json`).
 - `modelConfig` defaults deliberately **not** applied ("let DB be the source of truth").
 - Clean-stop-word logic strips filler words for display only (not copy).

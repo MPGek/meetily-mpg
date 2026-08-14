@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP_MODULES.md
-last_mapped: 2026-08-05T14:57:00Z
+last_mapped: 2026-08-14T12:09:00Z
 module: database
 ---
 
@@ -10,7 +10,7 @@ module: database
 
 ## Overview
 
-**Purpose**: Complete persistence layer for meetings, transcripts, summary jobs, transcript chunks, and app config, built on **SQLite via sqlx 0.8** (tokio runtime). Owns the DB file lifecycle including legacy `.db` → `.sqlite` migration and WAL-corruption recovery. Recent changes added `source_device` (mic/system channel) storage on transcripts and paginated transcript queries.
+**Purpose**: Complete persistence layer for meetings, transcripts, summary jobs, transcript chunks, and app config, built on **SQLite via sqlx 0.8** (tokio runtime). Owns the DB file lifecycle including legacy `.db` → `.sqlite` migration and WAL-corruption recovery. Recent changes added `source_device` (mic/system channel) storage, paginated transcript queries, and — most recently — **speaker diarization columns** (`transcripts.speaker_label`, `meetings.diarization_status`, `meetings.speaker_names`).
 
 > **Note:** Queries are **runtime strings** (`sqlx::query_as`, `query`), not compile-time `query!` macros — a notable tech-debt point.
 
@@ -27,10 +27,10 @@ module: database
 | `manager.rs` | Connection pool + lifecycle, legacy import, WAL recovery | `DatabaseManager` | ~2k |
 | `setup.rs` | Startup init (first-launch event vs immediate init) | `initialize_database_on_startup` | <1k |
 | `commands.rs` | Tauri IPC for DB import/init/utility | `check_first_launch`, `initialize_fresh_database`, `import_and_initialize_database` | ~2k |
-| `models.rs` | Entity structs (`FromRow`) | `MeetingModel`, `Transcript`, `SummaryProcess`, `TranscriptChunk`, `Setting`, `TranscriptSetting`, `DateTimeUtc` | ~1k |
+| `models.rs` | Entity structs (`FromRow`) | `MeetingModel`, `Transcript`, `SummaryProcess`, `TranscriptChunk`, `Setting`, `TranscriptSetting`, `DateTimeUtc` | ~1.1k |
 | `repositories/mod.rs` | Repository module root | — | <1k |
-| `repositories/meeting.rs` | Meeting + transcript CRUD, pagination | `MeetingsRepository` | ~2k |
-| `repositories/transcript.rs` | Save meeting+segments transactionally, search | `TranscriptsRepository` | ~1k |
+| `repositories/meeting.rs` | Meeting + transcript CRUD, pagination, **diarization mutations** | `MeetingsRepository` | ~2.7k |
+| `repositories/transcript.rs` | Save meeting+segments transactionally, search | `TranscriptsRepository` | ~1.2k |
 | `repositories/transcript_chunk.rs` | Persist full transcript + chunking params | `TranscriptChunksRepository` | <1k |
 | `repositories/summary.rs` | Summary job state machine + result backup/restore | `SummaryProcessesRepository` | ~1.5k |
 | `repositories/setting.rs` | Summary/transcript config + API keys | `SettingsRepository` | ~2.6k |
@@ -64,7 +64,15 @@ struct Transcript {                       // models.rs — includes audio sync +
     id: String, meeting_id: String, transcript: String, timestamp: String,
     summary: Option<String>, action_items: Option<String>, key_points: Option<String>,
     audio_start_time: Option<f64>, audio_end_time: Option<f64>, duration: Option<f64>,
-    source_device: Option<String>,       // 'mic' | 'system'  (mic/system channel)
+    source_device: Option<String>,       // 'Microphone' | 'System'  (mic/system channel)
+    speaker: Option<String>,             // diarization id: 'SPEAKER_NN' | 'MIC_SPEAKER_NN'
+    speaker_label: Option<String>,       // user-assigned display name (e.g. "Alice")
+}
+
+struct MeetingModel {                    // models.rs — diarization tracking
+    id, title, created_at, updated_at, folder_path,
+    diarization_status: Option<String>,  // NULL | "processing" | "complete" | "failed"
+    speaker_names: Option<String>,       // JSON map speaker_id -> label (e.g. {"SPEAKER_00":"Alice"})
 }
 ```
 
@@ -82,6 +90,8 @@ erDiagram
         datetime created_at
         datetime updated_at
         string folder_path
+        string diarization_status   -- added 2026-08 (NULL/processing/complete/failed)
+        string speaker_names        -- added 2026-08 (JSON speaker_id -> label)
     }
     transcripts {
         string id PK
@@ -91,8 +101,9 @@ erDiagram
         real audio_start_time
         real audio_end_time
         real duration
-        string speaker          -- added 2025-11 (values 'mic'/'system')
-        string source_device    -- added 2026-07 (mic/system)
+        string speaker          -- added 2025-11 (now diarization IDs SPEAKER_NN/MIC_SPEAKER_NN)
+        string source_device    -- added 2026-07 (Microphone/System)
+        string speaker_label    -- added 2026-08 (user label)
     }
     settings { string id PK, string provider, string model, ... api keys, customOpenAIConfig }
     transcript_settings { string id PK, string provider, string model, ... api keys }
@@ -106,7 +117,8 @@ erDiagram
 
 - **manager.rs**: single managed `DatabaseManager` in `AppState`; `new_from_app_handle` resolves `app_data_dir()` (`meeting_minutes.sqlite` primary, `meeting_minutes.db` legacy), runs `sqlx::migrate!`, and on "malformed"/"corrupt" error deletes `-wal`/`-shm` and retries once. `cleanup()` runs `PRAGMA wal_checkpoint(TRUNCATE)` then closes pool.
 - **setup.rs**: on first launch spawns a 500ms-delayed `first-launch-detected` event (AppState NOT yet managed); otherwise initializes immediately.
-- **repositories/**: raw-SQL unit structs taking `&SqlitePool`. `MeetingsRepository::get_meeting_transcripts_paginated` orders by `audio_start_time` and returns `(Vec<Transcript>, total)` for infinite scroll. `TranscriptsRepository::save_transcript` inserts meeting + segments atomically (incl. `audio_start_time/end_time/duration/source_device`).
+- **repositories/**: raw-SQL unit structs taking `&SqlitePool`. `MeetingsRepository::get_meeting_transcripts_paginated` orders by `audio_start_time` and returns `(Vec<Transcript>, total)` for infinite scroll. `TranscriptsRepository::save_transcript` inserts meeting + segments atomically (incl. `audio_start_time/end_time/duration/source_device/speaker`); if any segment has a `speaker` it also sets `diarization_status='complete'` (online diarization path).
+- **Diarization methods (NEW)** on `MeetingsRepository`: `update_transcript_speaker(transcript_id, speaker)`, `update_diarization_status(meeting_id, status)`, `update_speaker_label(meeting_id, speaker, label)` (transactional: updates all matching `transcripts.speaker_label` + merges into `meetings.speaker_names` JSON), `update_speaker_names` (raw overwrite — currently uncalled), `get_transcripts_for_diarization(meeting_id)` (ordered by `audio_start_time`).
 - **summary.rs**: `SummaryProcessesRepository` implements a `PENDING → completed/failed/cancelled` state machine with **result backup/restore**: `create_or_reset_process` backs up `result`→`result_backup`; `update_process_failed`/`cancelled` restores `result = COALESCE(result_backup, result)`.
 - **setting.rs**: singleton config rows `id='1'` via UPSERT; per-provider API keys; custom OpenAI as JSON blob.
 
@@ -128,7 +140,7 @@ erDiagram
 | `api/api.rs` | All repositories | Most `api_*` commands are SQLite IPC wrappers |
 | `summary/` (service, commands) | `MeetingsRepository`, `SummaryProcessesRepository`, `TranscriptChunksRepository`, `SettingsRepository` | Summary pipeline + config |
 | `state.rs`, `lib.rs` | `DatabaseManager` | Managed state, exit cleanup |
-| `audio/` | via api/repositories | Transcript persistence |
+| `audio/` | via api/repositories + `MeetingsRepository` diarization methods | Transcript persistence + speaker labeling |
 
 ## Configuration
 
@@ -155,9 +167,10 @@ erDiagram
 
 ## Gotchas and Tech Debt
 
-- **`speaker` vs `source_device` drift**: schema has both columns for mic/system channel; the Rust `Transcript` model only exposes `source_device` (added 2026-07). The `speaker` column is unreachable from Rust — two competing fields.
+- **`speaker` vs `source_device` semantics**: `source_device` ("Microphone"/"System") is the audio channel; `speaker` now holds **diarization IDs** (`SPEAKER_NN`/`MIC_SPEAKER_NN`), and `speaker_label` holds the user-assigned name. The pre-2026-08 `speaker` column stored `'mic'/'system'` — historical drift, now repurposed.
+- **`save_transcript` drops `speaker_label`**: the `INSERT` column list omits `speaker_label` even though `TranscriptSegment` carries it — labels supplied at save time are silently discarded and must be applied later via `update_speaker_label`.
 - **`update_meeting_title` vs `update_meeting_name`** are near-duplicates (one also updates `transcript_chunks.meeting_name`); naming confusing.
-- **Runtime SQL** (no `query!`), and `SELECT *` in `get_meeting` vs explicit columns elsewhere.
+- **Runtime SQL** (no `query!`), and `SELECT *` in `get_meeting` vs explicit columns elsewhere. `#[sqlx(default)]` on `MeetingModel` diarization optionals silently coerces partial `SELECT`s to `None`.
 - **Dynamic column interpolation** is SQL-injection-adjacent (mitigated by fixed match).
 - **Hardcoded defaults** in `save_api_key` (`openai`/`gpt-4o-2024-11-20`/`large-v3`) override whatever provider/model the caller intended — footgun.
 - **No FTS5**: `LOWER(transcript) LIKE '%q%'` → O(N) full scans on large transcripts.

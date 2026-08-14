@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-08-05T15:01:00Z
+last_mapped: 2026-08-14T12:09:00Z
 section: operations
 ---
 
@@ -33,7 +33,11 @@ section: operations
   5. Run `pnpm run tauri:build` / `tauri:dev`.
 - **`build-gpu.sh`/`dev-gpu.sh`** (Unix): export CUDA CMake flags on Linux (`CMAKE_CUDA_ARCHITECTURES=75`, `CMAKE_CUDA_STANDARD=17`, `CMAKE_POSITION_INDEPENDENT_CODE=ON`); `source scripts/env-cuda.sh`; **llama-helper has no `coreml` feature → remap to `metal`** on Apple Silicon; `build-gpu.sh` sets `NO_STRIP=true` for AppImage.
 - **`build-gpu.ps1`/`dev-gpu.ps1`** are **Vulkan-pinned and do NOT** auto-detect GPU or build the llama-helper sidecar — not drop-in equivalents; prefer `.bat`/`.sh`.
+- **`build-exe.bat`** (executable-only build): identical flow but ends with `tauri build --features cuda --no-bundle` → produces only `meetily.exe` (no MSI/NSIS). Hard-codes `--features cuda` regardless of detected GPU.
 - **`scripts/env-cuda.bat` / `.sh`** (idempotent) hard-code **CUDA Toolkit v13.3**: `CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3`, `CUDA_PATH`, `CUDA_PATH_V13_3`, `CUDA_MODULE_LOADING=LAZY`, prepend `<root>\bin`/`<root>\bin\x64` to PATH. Header warns: *"UPDATE THE PATH BELOW IF THE CUDA TOOLKIT VERSION CHANGES."* Does **not** set `CUDNN_LIBRARY` or `BLAS_INCLUDE_DIRS`.
+- **`scripts/copy-cuda-libs.{ps1,bat,sh}`** (NEW): copy `cudart64_13.dll`, `cublas64_13.dll`, `cublasLt64_13.dll` from `$CUDA_PATH\bin\x64` into repo-root `target/release` **before** bundling — `tauri.conf.json` `bundle.resources` references `../../target/release/*_13.dll`, so these must exist or the build fails.
+- **VS 2026 detection** lives in `frontend/scripts/setup-vs-env.bat`: vswhere `-latest`, then probes **VS 2026 paths before VS 2022** (BuildTools/Community/Professional/Enterprise × Program Files + (x86)), then constructs a version-agnostic `LIB`/`INCLUDE`/`PATH` from the newest MSVC toolset + Windows SDK.
+- **sccache deliberately disabled**: sccache 0.17 breaks CUDA 13.3 `fatbinary` PTX and MSVC PDB-locking; `env-cuda.bat` neutralizes it via a pass-through `CMAKE_C/CXX_COMPILER_LAUNCHER`, and `rustc-wrapper` is commented out in root `.cargo/config.toml`.
 
 ### Standard commands (`frontend/package.json`)
 
@@ -55,11 +59,17 @@ Main crate (`frontend/src-tauri/Cargo.toml`):
 - GPU/BLAS features all forward to `whisper-rs`: `metal`, `coreml`, `cuda`, `vulkan`, `hipblas`, `openblas`, `openmp`.
 - Target-specific whisper-rs: macOS → `["raw-api","metal","coreml"]`; Windows/Linux → `["raw-api"]` (CPU; add GPU manually).
 - Tauri features: `macos-private-api`, `protocol-asset`, `tray-icon`.
-- Notable pins: `tauri = "2.6.2"`, `ort = "2.0.0-rc.10"`, `tauri-plugin-single-instance = "=2.3.7"` (exact), `cpal` (git rev), `ffmpeg-sidecar` (git branch `main`), `esaxx-rs` (branch `feat/dynamic-msvc-link`).
+- Notable pins: `tauri = "2.6.2"`, `ort = "=2.0.0-rc.12"` (pre-release exact pin; rc.13+ breaks), `polyvoice = "=0.17.0"` (diarization: `onnx, download, segmentation, embedder, clusterer`), `whisper-rs = "0.16.0"`, `tauri-plugin-single-instance = "=2.3.7"` (exact), `cpal` (git rev), `ffmpeg-sidecar` (git branch `main`), `esaxx-rs` (branch `feat/dynamic-msvc-link`).
 
 `llama-helper/Cargo.toml` (sidecar): features `metal`/`cuda`/`vulkan` forwarded to `llama-cpp-2 = "=0.1.146"` (exact-pinned). **No `coreml`/`hipblas`/`openblas`** — hence the coreml→metal remap. Release profile: `codegen-units=1`, `lto=true`, `opt-level="s"`.
 
 Workspace members: `frontend/src-tauri`, `llama-helper`; **target dir at repo root** (`./target`).
+
+### Incremental build speed (NEW)
+
+- Workspace `[profile.dev]`: `debug = false`, `codegen-units = 256`, `split-debuginfo = "unpacked"`; `[profile.dev.package."*"] opt-level = 0` (fast dep builds).
+- Root `.cargo/config.toml`: `linker = "rust-lld"` on `x86_64-pc-windows-msvc` for faster linking.
+- sccache was the intended caching layer but is disabled (see Gotchas).
 
 ## Tauri Config (`tauri.conf.json`)
 
@@ -67,7 +77,7 @@ Workspace members: `frontend/src-tauri`, `llama-helper`; **target dir at repo ro
 - `frontendDist: "../out"` (static Next.js export), `devUrl: http://localhost:3118`, `beforeDevCommand: "pnpm dev"`, `beforeBuildCommand: "pnpm build"`.
 - Window 1100×700, `macOSPrivateApi: true`. Tight CSP (`default-src 'self'`; `connect-src` allows localhost Ollama `11434`, `5167`, `8178`, `https://api.ollama.ai`).
 - Capabilities (`main`): `fs:default`, `fs:read-all`, `fs:write-all`, `core:*:default`, `store:default`, `notification:default`, `updater:default`, `process:default`.
-- Bundle targets: `deb`, `appimage`, `msi`, `nsis`, `app`, `dmg`. `externalBin`: `binaries/llama-helper`, `binaries/ffmpeg`. Resources: `templates/*.json`. Windows signing via `scripts/sign-windows.ps1`; macOS ad-hoc signing + hardened runtime. Updater endpoint: GitHub `meetily/meeting-minutes` latest.json.
+- Bundle targets: `deb`, `appimage`, `msi`, `nsis`, `app`, `dmg`. `externalBin`: `binaries/llama-helper`, `binaries/ffmpeg`. Resources: `templates/*.json` + CUDA runtime DLLs (`../../target/release/{cudart,cublas,cublasLt}64_13.dll`). Windows signing via `scripts/sign-windows.ps1`; macOS ad-hoc signing + hardened runtime. Updater endpoint: GitHub `meetily/meeting-minutes` latest.json.
 
 ## Gotchas
 

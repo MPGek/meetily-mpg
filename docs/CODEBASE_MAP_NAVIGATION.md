@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-08-05T15:04:00Z
+last_mapped: 2026-08-14T12:09:00Z
 section: navigation
 ---
 
@@ -27,7 +27,10 @@ src-tauri/src/
 │   ├── recording_*.rs         ← State, commands, preferences, saver, manager
 │   ├── retranscription.rs     ← "Enhance" re-transcribe
 │   ├── import.rs              ← Audio import
-│   ├── transcription/         ← STT provider abstraction
+│   ├── diarization.rs         ← Offline speaker diarization (polyvoice)
+│   ├── online_diarization.rs  ← Online diarization (Efficient/Fast)
+│   ├── audio_file.rs          ← Audio file discovery + playback transcode
+│   ├── transcription/         ← STT provider abstraction + provider-aware model gate
 │   └── audio_v2/              ← ORPHANED (dead, not declared)
 ├── whisper_engine/            ← Whisper.cpp wrapper (engine.rs, commands.rs, parallel_processor.rs)
 ├── parakeet_engine/           ← Parakeet ONNX streaming (engine, model.rs)
@@ -71,6 +74,10 @@ src/
 | Toggle LLM debug logging | Summary | `summary/debug_log.rs` | `DEBUG = true` compile-time flag; writes per-call files to meeting folder |
 | Change the DB schema | Database | `database/migrations/*`, `database/models.rs`, `repositories/` | sqlx runtime queries; `source_device`/`speaker` drift is a known gotcha |
 | Add a transcript pagination tweak | Frontend | `hooks/usePaginatedTranscripts.ts`, `components/VirtualizedTranscriptView.tsx`, `api/api.rs` | Page size 100, `api_get_meeting_transcripts` |
+| Add/change speaker diarization | Audio | `audio/diarization.rs`, `audio/online_diarization.rs` | polyvoice engine; label scheme `MIC_SPEAKER_NN`/`SPEAKER_NN` |
+| Add diarization model to catalog | Audio | `audio/diarization.rs` (`check_diarization_models`/`download_diarization_models`) | polyvoice manifest + ONNX paths |
+| Change audio playback behavior | Audio + Frontend | `audio/audio_file.rs`, `hooks/useAudioPlayer.ts`, `components/AudioPlayer.tsx` | `convertFileSrc` + FFmpeg WAV fallback |
+| Change the recording-start model gate | Audio + tray | `audio/transcription/commands.rs`, `engine.rs` | `check_active_transcription_model_ready` (provider-aware) |
 | Change mic/system transcript colors | Frontend | `components/VirtualizedTranscriptView.tsx` | Mic=blue left, System=green right |
 | Add a UI component | Frontend | `components/`, `components/ui/` | Shadcn/ui primitives + `cn()` |
 | Change GPU build features | Ops | `frontend/scripts/tauri-auto.js`, `auto-detect-gpu.js`, `scripts/env-cuda.*` | `TAURI_GPU_FEATURE` override |
@@ -95,6 +102,7 @@ src/
 | VAD or pipeline | `audio/vad.rs`, `pipeline.rs`, `retranscription.rs`, `import.rs` | Shared VAD + segment helpers in `common.rs` |
 | Transcription provider | `audio/transcription/`, `whisper_engine/`, `parakeet_engine/`, `transcript_settings` config | Provider switch affects Rust + frontend + retranscription |
 | Database schema | `database/migrations`, `models.rs`, `repositories/`, `api/api.rs` DTOs | Schema → repo → API → UI chain |
+| Diarization / speaker labels | `audio/diarization.rs`, `online_diarization.rs`, `database/repositories/meeting.rs`, `VirtualizedTranscriptView.tsx` | Labels flow Rust → DB → UI; `speaker_label` is dropped by `save_transcript` |
 | Summary config/LLM | `summary/service.rs`, `llm_client.rs`, AI provider modules | Config → client → API call chain |
 | Recording UI | `contexts/TranscriptContext.tsx`, `RecordingControls`, `hooks/useRecording*` | UI ↔ backend IPC must stay in sync |
 
@@ -108,6 +116,9 @@ src/
 | Stereo recording file | `audio/pipeline.rs` (interleave), `audio/recording_saver.rs` | `audio/incremental_saver.rs` |
 | Re-transcription ("Enhance") | `audio/retranscription.rs` | `audio/common.rs` |
 | Audio import | `audio/import.rs` | frontend `ImportAudio/` (beta) |
+| Speaker diarization (offline) | `audio/diarization.rs` | `audio/online_diarization.rs`, `database/repositories/meeting.rs` |
+| Speaker diarization (online) | `audio/online_diarization.rs` | `audio/recording_commands.rs`, `audio/pipeline.rs` |
+| Meeting audio playback | `audio/audio_file.rs` | `hooks/useAudioPlayer.ts`, `components/AudioPlayer.tsx`, `api/api.rs` |
 | AI summarization | `summary/service.rs`, `processor.rs` | `summary/llm_client.rs`, `summary_engine/` |
 | Transcript pagination | `hooks/usePaginatedTranscripts.ts` | `api/api.rs`, `database/repositories/meeting.rs` |
 | Meeting storage | `database/manager.rs`, `models.rs`, `repositories/` | `api/api.rs` |
