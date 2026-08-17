@@ -41,6 +41,7 @@ The system SHALL trigger speaker clustering on all buffered embeddings when reco
 - **THEN** the system SHALL mark diarization as "no-speech" without error and skip transcript updates
 
 ### Requirement: Fast mode runs full streaming diarization during recording
+
 The system SHALL use the polyvoice `StreamingPipeline` to perform segmentation, embedding extraction, and incremental speaker caching continuously during recording when Fast mode is selected.
 
 #### Scenario: Streaming diarization processes audio chunks
@@ -48,8 +49,12 @@ The system SHALL use the polyvoice `StreamingPipeline` to perform segmentation, 
 - **THEN** the system SHALL feed the VAD-detected 16 kHz speech chunks into the `StreamingPipeline`, which outputs speaker-labeled turns as they become available
 
 #### Scenario: Speaker segments buffered internally
-- **WHEN** the `StreamingPipeline` outputs a speaker turn during recording in Fast mode
-- **THEN** the system SHALL buffer the turn internally (stable turns only) and NOT emit it to the frontend until recording stops
+- **WHEN** the `StreamingPipeline` outputs a stable speaker turn during recording in Fast mode
+- **THEN** the system SHALL buffer the turn internally for the final stop-time assignment pass
+
+#### Scenario: Stable turns emitted live to frontend
+- **WHEN** the `StreamingPipeline` outputs a stable speaker turn during recording in Fast mode
+- **THEN** the system SHALL translate the turn to absolute recording time, emit it to the frontend via the `online-speaker-turn` event, and still buffer the turn for the final stop-time assignment pass
 
 ### Requirement: Speaker labels written at recording stop (both modes)
 The system SHALL assign speaker labels to all transcripts at recording stop, regardless of which online mode was used, using the same `update_transcript_speaker` database path as offline diarization.

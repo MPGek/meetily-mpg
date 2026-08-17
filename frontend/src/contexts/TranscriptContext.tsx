@@ -5,7 +5,7 @@ import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
-import { recordingService } from '@/services/recordingService';
+import { recordingService, type SpeakerTurn } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
 import { loadDiarizationSettings } from '@/lib/diarization';
 
@@ -25,6 +25,34 @@ interface TranscriptContextType {
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
 
+/**
+ * Assign a live transcript segment a speaker by greatest temporal overlap
+ * against emitted speaker turns from the same channel. Mirrors the overlap
+ * pass of the backend `find_best_speaker` (without its stop-time gap-fill).
+ */
+function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): string | undefined {
+  const tStart = segment.audio_start_time ?? 0;
+  const tEnd = segment.audio_end_time ?? tStart;
+
+  let bestSpeaker: string | undefined;
+  let bestOverlap = 0;
+  for (const turn of turns) {
+    if (turn.source_device !== segment.source_device) {
+      continue;
+    }
+    const overlapStart = Math.max(tStart, turn.start_time);
+    const overlapEnd = Math.min(tEnd, turn.end_time);
+    if (overlapStart < overlapEnd) {
+      const overlap = overlapEnd - overlapStart;
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestSpeaker = turn.speaker;
+      }
+    }
+  }
+  return bestSpeaker;
+}
+
 export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
@@ -38,6 +66,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const isUserAtBottomRef = useRef<boolean>(true);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const finalFlushRef = useRef<(() => void) | null>(null);
+  const turnsRef = useRef<SpeakerTurn[]>([]);
 
   // Keep ref updated with current transcripts
   useEffect(() => {
@@ -82,6 +111,42 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, [transcripts]);
 
+  // Listen for live speaker turns (Fast-mode online diarization) and
+  // retroactively assign `speaker` to transcript segments by time overlap.
+  useEffect(() => {
+    let unlistenSpeakerTurn: (() => void) | undefined;
+
+    const setupSpeakerTurnListener = async () => {
+      try {
+        unlistenSpeakerTurn = await recordingService.onSpeakerTurn((turn) => {
+          turnsRef.current = [...turnsRef.current, turn];
+          setTranscripts(prev => {
+            let changed = false;
+            const next = prev.map(t => {
+              const speaker = matchSpeakerToTranscript(t, turnsRef.current);
+              if (speaker !== t.speaker) {
+                changed = true;
+                return { ...t, speaker };
+              }
+              return t;
+            });
+            return changed ? next : prev;
+          });
+        });
+      } catch (error) {
+        console.error('Failed to setup speaker turn listener:', error);
+      }
+    };
+
+    setupSpeakerTurnListener();
+
+    return () => {
+      if (unlistenSpeakerTurn) {
+        unlistenSpeakerTurn();
+      }
+    };
+  }, []);
+
   // Initialize IndexedDB and listen for recording-started/stopped events
   useEffect(() => {
     let unlistenRecordingStarted: (() => void) | undefined;
@@ -95,6 +160,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         // Listen for recording-started event
         unlistenRecordingStarted = await recordingService.onRecordingStarted(async () => {
           try {
+            // Reset live speaker turns for the new recording session
+            turnsRef.current = [];
+
             // Generate unique meeting ID
             const meetingId = `meeting-${Date.now()}`;
             setCurrentMeetingId(meetingId);
@@ -516,6 +584,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // Clear transcripts (used when starting new recording)
   const clearTranscripts = useCallback(() => {
     setTranscripts([]);
+    turnsRef.current = [];
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 

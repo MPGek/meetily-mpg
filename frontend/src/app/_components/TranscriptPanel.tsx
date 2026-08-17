@@ -46,6 +46,7 @@ export function TranscriptPanel({
       text: t.text,
       confidence: t.confidence,
       source_device: t.source_device,
+      speaker: t.speaker,
     })),
     [transcripts]
   );

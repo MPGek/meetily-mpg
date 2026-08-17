@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{info, warn};
 use serde::Serialize;
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::recording_saver::TranscriptSegment;
 use super::recording_state::{AudioChunk, DeviceType};
@@ -80,6 +81,15 @@ impl DiarizationMode {
 pub struct SpeakerAssignment {
     pub sequence_id: u64,
     pub speaker: String,
+}
+
+/// A live speaker turn emitted to the frontend during Fast-mode recording.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeakerTurn {
+    pub start_time: f64,
+    pub end_time: f64,
+    pub speaker: String,
+    pub source_device: String,
 }
 
 /// polyvoice `Embedder` backed by the polyvoice ONNX ResNet34 INT8 model
@@ -233,6 +243,7 @@ pub struct OnlineDiarizationProcessor {
     max_speakers: usize,
     saw_system_audio: bool,
     engine: Option<Engine>,
+    turn_sender: Option<UnboundedSender<SpeakerTurn>>,
     _guard: OnlineDiarizationGuard,
 }
 
@@ -245,6 +256,7 @@ impl OnlineDiarizationProcessor {
         mode: DiarizationMode,
         max_speakers: usize,
         models_dir: &Path,
+        turn_sender: Option<UnboundedSender<SpeakerTurn>>,
     ) -> Result<Self, String> {
         if !mode.is_online() {
             return Err("Online diarization disabled".to_string());
@@ -280,6 +292,7 @@ impl OnlineDiarizationProcessor {
             max_speakers,
             saw_system_audio: false,
             engine: Some(engine),
+            turn_sender,
             _guard: guard,
         })
     }
@@ -318,6 +331,11 @@ impl OnlineDiarizationProcessor {
             self.saw_system_audio = true;
         }
 
+        // Capture live-emission state before borrowing the engine, so the
+        // Fast-mode loop can send turns without conflicting borrows.
+        let turn_sender = self.turn_sender.clone();
+        let saw_system_audio = self.saw_system_audio;
+
         match engine {
             Engine::Efficient { extractor, mic, sys } => {
                 let embedding = match extractor.embed(&samples) {
@@ -336,9 +354,13 @@ impl OnlineDiarizationProcessor {
                 }
             }
             Engine::Fast { mic, sys } => {
-                let channel = match chunk.device_type {
-                    DeviceType::Microphone => mic,
-                    DeviceType::System => sys,
+                let (channel, source_device, prefix) = match chunk.device_type {
+                    DeviceType::Microphone => (
+                        mic,
+                        "Microphone",
+                        if saw_system_audio { "MIC_SPEAKER" } else { "SPEAKER" },
+                    ),
+                    DeviceType::System => (sys, "System", "SPEAKER"),
                 };
                 channel
                     .mapper
@@ -347,11 +369,25 @@ impl OnlineDiarizationProcessor {
                     Ok(turns) => {
                         for turn in turns {
                             if turn.stable {
+                                let speaker_index = turn.speaker.0 as usize;
+                                let start = turn.time.start as f32;
+                                let end = turn.time.end as f32;
                                 channel.turns.push(SpeakerSegment {
-                                    start: turn.time.start as f32,
-                                    end: turn.time.end as f32,
-                                    speaker: turn.speaker.0 as usize,
+                                    start,
+                                    end,
+                                    speaker: speaker_index,
                                 });
+                                if let Some(sender) = &turn_sender {
+                                    let turn_event = SpeakerTurn {
+                                        start_time: channel.mapper.to_abs(start as f64),
+                                        end_time: channel.mapper.to_abs(end as f64),
+                                        speaker: format!("{}_{:02}", prefix, speaker_index),
+                                        source_device: source_device.to_string(),
+                                    };
+                                    if let Err(e) = sender.send(turn_event) {
+                                        warn!("Failed to send online speaker turn: {}", e);
+                                    }
+                                }
                             }
                         }
                     }

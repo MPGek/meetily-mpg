@@ -22,7 +22,7 @@ use super::{
     DeviceMonitorType
 };
 
-use super::online_diarization::{DiarizationMode, OnlineDiarizationProcessor, SpeakerAssignment};
+use super::online_diarization::{DiarizationMode, OnlineDiarizationProcessor, SpeakerAssignment, SpeakerTurn};
 
 // Import transcription modules
 use super::transcription::{
@@ -400,6 +400,19 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             tokio::sync::mpsc::unbounded_channel::<super::recording_state::AudioChunk>();
         manager.set_embedding_sender(Some(embedding_sender));
 
+        // Channel carrying live speaker turns (Fast mode) from the blocking
+        // processor back to the async side for emission to the frontend.
+        let (turn_sender, mut turn_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<SpeakerTurn>();
+        let app_for_turns = app.clone();
+        let _turn_forwarder = tokio::spawn(async move {
+            while let Some(turn) = turn_receiver.recv().await {
+                if let Err(e) = app_for_turns.emit("online-speaker-turn", turn) {
+                    warn!("Failed to emit online speaker turn: {}", e);
+                }
+            }
+        });
+
         let models_dir = app
             .path()
             .app_data_dir()
@@ -409,7 +422,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         let task = tokio::task::spawn_blocking(
             move || -> Result<Option<OnlineDiarizationProcessor>, String> {
                 let max_speakers_usize = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
-                let mut processor = match OnlineDiarizationProcessor::new(online_mode, max_speakers_usize, &models_dir)
+                let mut processor = match OnlineDiarizationProcessor::new(
+                    online_mode,
+                    max_speakers_usize,
+                    &models_dir,
+                    Some(turn_sender),
+                )
                 {
                     Ok(processor) => processor,
                     Err(e) => {

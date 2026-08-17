@@ -262,16 +262,16 @@ export function useRecordingStop(
         const freshTranscripts = [...transcriptsRef.current];
 
         // Apply online diarization speaker labels (computed at stop in Rust)
-        // before the DB save, keyed by sequence_id
+        // before the DB save, keyed by sequence_id. Stop-time assignments are
+        // authoritative: overwrite any transient live label and clear it where
+        // the stop-time pass produced no assignment, so live labels never leak
+        // into the database.
         if (speakerAssignmentsRef.current.length > 0) {
           const assignmentBySequence = new Map(
             speakerAssignmentsRef.current.map(a => [a.sequence_id, a.speaker])
           );
           for (const transcript of freshTranscripts) {
-            const speaker = assignmentBySequence.get(transcript.sequence_id ?? -1);
-            if (speaker) {
-              transcript.speaker = speaker;
-            }
+            transcript.speaker = assignmentBySequence.get(transcript.sequence_id ?? -1);
           }
           console.log('Applied online diarization labels to', freshTranscripts.length, 'transcripts');
         }

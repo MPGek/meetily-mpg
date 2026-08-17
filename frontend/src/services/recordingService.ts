@@ -21,6 +21,13 @@ export interface SpeakerAssignment {
   speaker: string;
 }
 
+export interface SpeakerTurn {
+  start_time: number;
+  end_time: number;
+  speaker: string;
+  source_device: string;
+}
+
 export interface RecordingStoppedPayload {
   message: string;
   folder_path?: string;
@@ -250,6 +257,17 @@ export class RecordingService {
     callback: (payload: DiarizationProgressPayload) => void
   ): Promise<UnlistenFn> {
     return listen<DiarizationProgressPayload>('diarization-progress', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for live online-speaker-turn events (Fast-mode diarization)
+   * @param callback - Function to call when a stable speaker turn is emitted during recording
+   * @returns Unlisten function
+   */
+  async onSpeakerTurn(callback: (turn: SpeakerTurn) => void): Promise<UnlistenFn> {
+    return listen<SpeakerTurn>('online-speaker-turn', (event) => {
       callback(event.payload);
     });
   }
