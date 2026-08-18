@@ -60,6 +60,9 @@ pub mod diarization;
 // Online diarization module (speaker identification during recording via polyvoice)
 pub mod online_diarization;
 
+// Speaker recognition core (cosine matching against enrolled voiceprints)
+pub mod speaker_recognition;
+
 pub use devices::{
     default_input_device, default_output_device, get_device_and_config, list_audio_devices,
     parse_audio_device, trigger_audio_permission,
@@ -132,7 +135,7 @@ pub use constants::AUDIO_EXTENSIONS;
 pub use audio_file::{find_audio_file, prepare_audio_for_playback};
 
 // Export diarization
-pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, check_diarization_models, download_diarization_models, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult, DiarizationModelStatus, DiarizationDownloadProgress};
+pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, rematch_meeting_speakers, check_diarization_models, download_diarization_models, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult, DiarizationModelStatus, DiarizationDownloadProgress};
 
 // Export online diarization
 pub use online_diarization::{OnlineDiarizationProcessor, DiarizationMode, SpeakerAssignment, is_online_diarization_active};

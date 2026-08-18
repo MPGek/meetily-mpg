@@ -301,6 +301,20 @@ export function useRecordingStop(
             throw new Error('No meeting ID received from save operation');
           }
 
+          // Finalize the online diarization session now that the meeting row
+          // exists: persists cluster centroids + exemplar caches, runs
+          // auto-recognition, enrolls user-assigned clusters, and persists the
+          // expected-speaker allowlist. Stop-time assignments were already
+          // applied above; this adds the speaker-registry side.
+          if (onlineDiarizationUsedRef.current) {
+            try {
+              const finalized = await recordingService.finalizeOnlineSession(meetingId);
+              console.log('Finalized online diarization session:', finalized);
+            } catch (finalizeError) {
+              console.error('Failed to finalize online diarization session:', finalizeError);
+            }
+          }
+
           let shouldDetectSummaryLanguage = false;
           try {
             shouldDetectSummaryLanguage = !(await applyPinnedSummaryLanguageToMeeting(meetingId));

@@ -21,6 +21,7 @@ interface TranscriptContextType {
   clearTranscripts: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
+  applyLiveSpeakerLabel: (clusterLabel: string, name: string, transcriptId?: string) => void;
 }
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
@@ -29,12 +30,15 @@ const TranscriptContext = createContext<TranscriptContextType | undefined>(undef
  * Assign a live transcript segment a speaker by greatest temporal overlap
  * against emitted speaker turns from the same channel. Mirrors the overlap
  * pass of the backend `find_best_speaker` (without its stop-time gap-fill).
+ * Returns the matching cluster label plus the recognized registry display
+ * name (if the backend matched the turn above threshold).
  */
-function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): string | undefined {
+function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): { speaker: string; displayName?: string } | undefined {
   const tStart = segment.audio_start_time ?? 0;
   const tEnd = segment.audio_end_time ?? tStart;
 
   let bestSpeaker: string | undefined;
+  let bestDisplayName: string | undefined;
   let bestOverlap = 0;
   for (const turn of turns) {
     if (turn.source_device !== segment.source_device) {
@@ -47,10 +51,11 @@ function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): st
       if (overlap > bestOverlap) {
         bestOverlap = overlap;
         bestSpeaker = turn.speaker;
+        bestDisplayName = turn.display_name;
       }
     }
   }
-  return bestSpeaker;
+  return bestSpeaker ? { speaker: bestSpeaker, displayName: bestDisplayName } : undefined;
 }
 
 export function TranscriptProvider({ children }: { children: ReactNode }) {
@@ -123,10 +128,12 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           setTranscripts(prev => {
             let changed = false;
             const next = prev.map(t => {
-              const speaker = matchSpeakerToTranscript(t, turnsRef.current);
-              if (speaker !== t.speaker) {
+              const matched = matchSpeakerToTranscript(t, turnsRef.current);
+              if (!matched) return t;
+              const displayName = matched.displayName || (matched.speaker === t.speaker ? t.speaker_label : undefined);
+              if (matched.speaker !== t.speaker || (displayName && displayName !== t.speaker_label)) {
                 changed = true;
-                return { ...t, speaker };
+                return { ...t, speaker: matched.speaker, speaker_label: displayName ?? t.speaker_label };
               }
               return t;
             });
@@ -611,6 +618,24 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, [currentMeetingId]);
 
+  // Apply a live Fast-mode rename locally. Default (no transcriptId): every
+  // block of the cluster shows the chosen name immediately (cluster-wide
+  // bind/prototype update already done by the backend). When a transcriptId
+  // is given (single-block scope), only that segment is relabeled via its
+  // per-turn override; the backend already recorded it in session state.
+  const applyLiveSpeakerLabel = useCallback((clusterLabel: string, name: string, transcriptId?: string) => {
+    setTranscripts(prev =>
+      prev.map(t => {
+        if (transcriptId !== undefined) {
+          if (t.id !== transcriptId || t.speaker_label === name) return t;
+          return { ...t, speaker_label: name };
+        }
+        if (t.speaker !== clusterLabel || t.speaker_label === name) return t;
+        return { ...t, speaker_label: name };
+      })
+    );
+  }, []);
+
   const value: TranscriptContextType = {
     transcripts,
     transcriptsRef,
@@ -623,6 +648,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,
+    applyLiveSpeakerLabel,
   };
 
   return (

@@ -135,3 +135,73 @@ pub struct TranscriptSetting {
     #[serde(rename = "openaiApiKey")]
     pub openai_api_key: Option<String>,
 }
+
+// ===== Speaker identity registry (change: speaker-identity-registry) =====
+
+/// Global speaker registry row. Identity is cross-meeting; names are unique
+/// case-insensitively (enforced by idx_speakers_name_nocase).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct Speaker {
+    pub id: String,
+    pub name: String,
+    /// Stored as INTEGER 0/1 in SQLite.
+    pub is_me: bool,
+    pub created_at: DateTimeUtc,
+    pub updated_at: DateTimeUtc,
+}
+
+/// Voiceprint row. One table, two owners: an enrolled prototype
+/// (`speaker_id` set) or an unassigned per-meeting cluster cache
+/// (`meeting_id` + `cluster_label` set). The CHECK constraint in the
+/// migration guarantees exactly one owner kind.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SpeakerEmbedding {
+    pub id: String,
+    pub embedding: Vec<u8>,
+    pub model: String,
+    pub channel: String,
+    pub duration_secs: f64,
+    pub speaker_id: Option<String>,
+    pub meeting_id: Option<String>,
+    pub cluster_label: Option<String>,
+    pub created_at: DateTimeUtc,
+}
+
+/// Per-meeting cluster -> person mapping. `centroid` is the recognition
+/// target (mean of the cluster's exemplar embeddings). `matched_by` is
+/// 'auto' (recognized above threshold), 'user' (manual edit), or NULL.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingSpeaker {
+    pub meeting_id: String,
+    pub cluster_label: String,
+    pub speaker_id: Option<String>,
+    pub centroid: Option<Vec<u8>>,
+    pub channel: Option<String>,
+    pub matched_by: Option<String>,
+    pub match_score: Option<f64>,
+}
+
+/// Expected-speaker allowlist row. An empty set for a meeting means
+/// recognition matches against ALL registry speakers.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingExpectedSpeaker {
+    pub meeting_id: String,
+    pub speaker_id: String,
+}
+
+/// Serialize a 256-d f32 embedding into a little-endian byte blob for storage.
+pub fn embedding_to_bytes(emb: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(emb.len() * 4);
+    for v in emb {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Deserialize a little-endian byte blob back into f32 embedding components.
+pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}

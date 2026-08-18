@@ -26,6 +26,7 @@ export interface SpeakerTurn {
   end_time: number;
   speaker: string;
   source_device: string;
+  display_name?: string;
 }
 
 export interface RecordingStoppedPayload {
@@ -92,6 +93,8 @@ export class RecordingService {
    * @param systemDeviceName - System audio device name (null for none)
    * @param meetingName - Meeting name/title
    * @param diarizationMode - Online diarization mode: "off" | "efficient" | "fast"
+   * @param maxSpeakers - Maximum number of speakers (null for auto-detect)
+   * @param expectedSpeakerIds - Registry speaker IDs expected at this meeting (null/empty = match all)
    * @returns Promise<void>
    */
   async startRecordingWithDevices(
@@ -99,7 +102,8 @@ export class RecordingService {
     systemDeviceName: string | null,
     meetingName: string,
     diarizationMode: string = "off",
-    maxSpeakers: number | null = null
+    maxSpeakers: number | null = null,
+    expectedSpeakerIds: string[] | null = null
   ): Promise<void> {
     return invoke('start_recording_with_devices_and_meeting', {
       micDeviceName: micDeviceName,
@@ -107,6 +111,7 @@ export class RecordingService {
       meetingName: meetingName,
       diarizationMode: diarizationMode,
       maxSpeakers: maxSpeakers,
+      expectedSpeakerIds: expectedSpeakerIds,
     });
   }
 
@@ -312,6 +317,159 @@ export class RecordingService {
   ): Promise<UnlistenFn> {
     return listen<{ error: string }>('diarization-model-download-error', (event) => {
       callback(event.payload.error);
+    });
+  }
+
+  // ===== Speaker Identity Registry =====
+
+  /**
+   * List all registry speakers (for editor dropdowns).
+   */
+  async listSpeakers(): Promise<Array<{ id: string; name: string; is_me: boolean }>> {
+    return invoke('list_speakers');
+  }
+
+  /**
+   * Link a meeting cluster to a registry speaker with matched_by='user'
+   * and enroll the cluster's cached embeddings as that speaker's prototypes.
+   */
+  async assignSpeaker(
+    meetingId: string,
+    clusterLabel: string,
+    speakerId?: string,
+    newName?: string
+  ): Promise<{ meeting_id: string; cluster_label: string; speaker_id: string; name: string }> {
+    return invoke('assign_speaker', {
+      meetingId,
+      clusterLabel,
+      speakerId: speakerId ?? null,
+      newName: newName ?? null,
+    });
+  }
+
+  /**
+   * Globally rename a registry speaker. Applies to every meeting via the
+   * read-time join.
+   */
+  async renameSpeaker(speakerId: string, newName: string): Promise<boolean> {
+    return invoke('rename_speaker', { speakerId, newName });
+  }
+
+  /**
+   * Replace the expected-speaker allowlist for a meeting.
+   * Empty list = recognition matches all registry speakers.
+   */
+  async setExpectedSpeakers(meetingId: string, speakerIds: string[]): Promise<void> {
+    return invoke('set_expected_speakers', {
+      request: { meeting_id: meetingId, speaker_ids: speakerIds },
+    });
+  }
+
+  /**
+   * Read the expected-speaker ids for a meeting.
+   */
+  async getExpectedSpeakers(meetingId: string): Promise<string[]> {
+    return invoke('get_expected_speakers', { meetingId });
+  }
+
+  /**
+   * Re-run speaker recognition from cached centroids (no audio re-processing).
+   * User bindings are preserved.
+   */
+  async rematchMeetingSpeakers(meetingId: string): Promise<{ meeting_id: string; matched: number }> {
+    return invoke('rematch_meeting_speakers', { meetingId });
+  }
+
+  /**
+   * Finalize an online diarization session after the meeting row exists.
+   * Persists cluster caches, enrolls embeddings, persists expected speakers.
+   */
+  async finalizeOnlineSession(meetingId: string): Promise<{ meeting_id: string; live_bindings: number; enrolled: number }> {
+    return invoke('finalize_online_session', { meetingId });
+  }
+
+  /**
+   * Voiceprint storage statistics (registry speakers, prototypes, caches, bytes).
+   */
+  async speakerStorageStats(): Promise<{
+    registry_count: number;
+    prototype_count: number;
+    cache_count: number;
+    total_bytes: number;
+  }> {
+    return invoke('speaker_storage_stats');
+  }
+
+  /**
+   * Relabel a single transcript block via a per-transcript speaker override.
+   * Does NOT touch the cluster mapping or enroll embeddings.
+   */
+  async assignBlockSpeaker(
+    transcriptId: string,
+    speakerId?: string,
+    newName?: string
+  ): Promise<{ transcript_id: string; speaker_id: string; name: string }> {
+    return invoke('assign_block_speaker', {
+      transcriptId,
+      speakerId: speakerId ?? null,
+      newName: newName ?? null,
+    });
+  }
+
+  /**
+   * Apply a speaker to all blocks of a transcript's cluster (the "apply to
+   * all blocks of this speaker" editor option). Cluster-wide link + enrollment.
+   */
+  async applyBlockSpeakerToCluster(
+    transcriptId: string,
+    speakerId?: string,
+    newName?: string
+  ): Promise<{ meeting_id: string; cluster_label: string; speaker_id: string; name: string }> {
+    return invoke('apply_block_speaker_to_cluster', {
+      transcriptId,
+      speakerId: speakerId ?? null,
+      newName: newName ?? null,
+    });
+  }
+
+  /**
+   * Assign a live speaker during Fast-mode recording. Updates the in-memory
+   * prototype store so subsequent chunks match immediately.
+   */
+  async assignLiveSpeaker(
+    clusterLabel: string,
+    speakerId?: string,
+    newName?: string
+  ): Promise<{ cluster_label: string; speaker_id: string; name: string }> {
+    return invoke('assign_live_speaker', {
+      clusterLabel,
+      speakerId: speakerId ?? null,
+      newName: newName ?? null,
+      scope: null,
+      startTime: null,
+      endTime: null,
+    });
+  }
+
+  /**
+   * Relabel a single live turn (Fast mode) via a per-turn override scoped to
+   * the turn's time range. Takes effect immediately and persists to the
+   * matched transcript at stop. `startTime`/`endTime` are audio seconds.
+   */
+  async assignLiveSpeakerBlock(
+    clusterLabel: string,
+    startTime: number,
+    speakerId?: string,
+    newName?: string,
+    endTime?: number
+  ): Promise<{ cluster_label: string; speaker_id: string; name: string }> {
+    return invoke('assign_live_speaker', {
+      clusterLabel,
+      speakerId: speakerId ?? null,
+      newName: newName ?? null,
+      scope: 'block',
+      startTime,
+      endTime: endTime ?? null,
     });
   }
 }

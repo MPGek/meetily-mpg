@@ -25,6 +25,7 @@ export default function PageContent({
   onAutoGenerateComplete,
   onMeetingUpdated,
   onRefetchTranscripts,
+  onUpdateSpeakerLabelLocal,
   // Pagination props for efficient transcript loading
   segments,
   hasMore,
@@ -40,6 +41,7 @@ export default function PageContent({
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
   onRefetchTranscripts?: () => Promise<void>;
+  onUpdateSpeakerLabelLocal?: (speaker: string, label: string, transcriptId?: string) => void;
   // Pagination props
   segments?: any[];
   hasMore?: boolean;
@@ -198,6 +200,7 @@ export default function PageContent({
           meetingId={meeting.id}
           meetingFolderPath={meeting.folder_path}
           onRefetchTranscripts={onRefetchTranscripts}
+          onUpdateSpeakerLabelLocal={onUpdateSpeakerLabelLocal}
           diarizationProgress={diarizationProgress}
         />
         <SummaryPanel

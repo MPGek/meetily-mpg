@@ -6,7 +6,6 @@ import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { AudioPlayer, AudioPlayerHandle, PlaybackState } from '@/components/AudioPlayer';
 import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { recordingService } from '@/services/recordingService';
 import { toast } from 'sonner';
 
 interface TranscriptPanelProps {
@@ -31,6 +30,9 @@ interface TranscriptPanelProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+  /** In-place speaker relabel (design D11): updates only the affected
+   *  segment(s) in local paginated state — no refetch, no scroll reset. */
+  onUpdateSpeakerLabelLocal?: (speaker: string, label: string, transcriptId?: string) => void;
 
   // Diarization progress
   diarizationProgress?: {
@@ -59,21 +61,30 @@ export function TranscriptPanel({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  onUpdateSpeakerLabelLocal,
   diarizationProgress,
 }: TranscriptPanelProps) {
-  const handleUpdateSpeakerLabel = useCallback(async (speaker: string, label: string) => {
-    if (!meetingId) return;
+  const handleUpdateSpeakerLabel = useCallback(async (speaker: string, label: string, transcriptId?: string) => {
+    // The registry binding/override is handled by the combobox depending on
+    // its scope: single-block -> `assign_block_speaker` (per-transcript
+    // override), apply-to-all -> `assign_speaker` (cluster link + enroll).
+    // Here we only propagate the new name into local state, in place: no
+    // refetch, so scroll position and the rest of the list are untouched
+    // (design D11). The backend write already succeeded before this runs.
+    if (onUpdateSpeakerLabelLocal) {
+      onUpdateSpeakerLabelLocal(speaker, label, transcriptId);
+      return;
+    }
+    // Fallback (no local updater): refresh resolved display names from DB.
     try {
-      await recordingService.updateSpeakerLabel(meetingId, speaker, label);
-      toast.success('Speaker renamed', { duration: 2000 });
       if (onRefetchTranscripts) {
         await onRefetchTranscripts();
       }
     } catch (error) {
-      console.error('Failed to rename speaker:', error);
-      toast.error('Failed to rename speaker');
+      console.error('Failed to refresh speaker labels:', error);
+      toast.error('Failed to refresh speaker labels');
     }
-  }, [meetingId, onRefetchTranscripts]);
+  }, [onUpdateSpeakerLabelLocal, onRefetchTranscripts]);
 
   // Resolve the meeting's audio file path for playback
   const [audioPath, setAudioPath] = useState<string | null>(null);
@@ -227,6 +238,7 @@ export function TranscriptPanel({
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
           onUpdateSpeakerLabel={handleUpdateSpeakerLabel}
+          meetingId={meetingId}
           onPlayFrom={audioPath ? handlePlayFrom : undefined}
           isAudioPlaying={isAudioPlaying}
           activeSegmentId={activeSegmentId}

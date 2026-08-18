@@ -4,6 +4,14 @@ use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqliteConnection, SqlitePool};
 use tracing::{error, info};
 
+/// Transcript display columns with the speaker display name resolved at read
+/// time: `speaker` keeps the raw cluster label; `speaker_label` becomes
+/// `COALESCE(so.name, s.name, t.speaker_label)` via LEFT JOINs onto the
+/// per-transcript override (design D10), then `meeting_speakers` -> `speakers`
+/// (design D3). Legacy `speaker_label` is the fallback when neither a
+/// per-block override nor a cluster registry binding exists.
+const TRANSCRIPT_DISPLAY_SELECT: &str = "SELECT t.id, t.meeting_id, t.transcript, t.timestamp, t.summary, t.action_items, t.key_points, t.audio_start_time, t.audio_end_time, t.duration, t.source_device, t.speaker, COALESCE(so.name, s.name, t.speaker_label) AS speaker_label FROM transcripts t LEFT JOIN speakers so ON so.id = t.speaker_override_id LEFT JOIN meeting_speakers ms ON ms.meeting_id = t.meeting_id AND ms.cluster_label = t.speaker LEFT JOIN speakers s ON s.id = ms.speaker_id";
+
 pub struct MeetingsRepository;
 
 impl MeetingsRepository {
@@ -73,9 +81,10 @@ impl MeetingsRepository {
         }
 
         if let Some(meeting) = meeting {
-            // Get all transcripts for this meeting
+            // Get all transcripts for this meeting with display names resolved
+            // via meeting_speakers -> speakers (legacy speaker_label fallback).
             let transcripts =
-                sqlx::query_as::<_, Transcript>("SELECT * FROM transcripts WHERE meeting_id = ?")
+                sqlx::query_as::<_, Transcript>(&format!("{} WHERE t.meeting_id = ?", TRANSCRIPT_DISPLAY_SELECT))
                     .bind(meeting_id)
                     .fetch_all(&mut *transaction)
                     .await?;
@@ -154,12 +163,10 @@ impl MeetingsRepository {
         .fetch_one(pool)
         .await?;
 
-        // Get paginated transcripts ordered by audio_start_time
+        // Get paginated transcripts ordered by audio_start_time, with display
+        // names resolved via meeting_speakers -> speakers (legacy fallback).
         let transcripts = sqlx::query_as::<_, Transcript>(
-            "SELECT * FROM transcripts
-             WHERE meeting_id = ?
-             ORDER BY audio_start_time ASC
-             LIMIT ? OFFSET ?"
+            &format!("{} WHERE t.meeting_id = ? ORDER BY t.audio_start_time ASC LIMIT ? OFFSET ?", TRANSCRIPT_DISPLAY_SELECT),
         )
         .bind(meeting_id)
         .bind(limit)
@@ -360,13 +367,30 @@ async fn delete_meeting_with_transaction(
         .execute(&mut *transaction)
         .await?;
 
-    // 3. Delete from transcripts
+    // 3. Delete speaker-registry rows owned by this meeting. Cache rows in
+    //    speaker_embeddings (meeting_id set) and the mapping/allowlist tables
+    //    are meeting-scoped; enrolled prototypes (speaker_id set) are global
+    //    and kept. FK enforcement is off, so these are manual cascades.
+    sqlx::query("DELETE FROM speaker_embeddings WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM meeting_speakers WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM meeting_expected_speakers WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *transaction)
+        .await?;
+
+    // 4. Delete from transcripts
     sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
         .bind(meeting_id)
         .execute(&mut *transaction)
         .await?;
 
-    // 4. Finally, delete the meeting
+    // 5. Finally, delete the meeting
     let result = sqlx::query("DELETE FROM meetings WHERE id = ?")
         .bind(meeting_id)
         .execute(&mut *transaction)

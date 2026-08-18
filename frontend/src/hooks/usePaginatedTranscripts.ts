@@ -25,6 +25,13 @@ interface UsePaginatedTranscriptsReturn {
     loadMore: () => Promise<void>;
     reset: () => void;
     refetch: () => Promise<void>;
+    /**
+     * Apply a speaker relabel to local state only (design D11): with a
+     * transcriptId only that block updates; without one, every block of the
+     * cluster updates. No refetch — the scroll container stays mounted and
+     * the list does not re-render or blank.
+     */
+    updateSpeakerLabel: (speaker: string, label: string, transcriptId?: string) => void;
 }
 
 /**
@@ -170,6 +177,22 @@ export function usePaginatedTranscripts({
         }
     }, [meetingId, reset, loadMetadata, loadTranscriptsAtOffset]);
 
+    // In-place speaker relabel (design D11): mutate only the affected
+    // transcript(s) in local state. With a transcriptId, only that block;
+    // otherwise every block sharing the cluster label (apply-to-all).
+    const updateSpeakerLabel = useCallback((speaker: string, label: string, transcriptId?: string) => {
+        setTranscripts(prev =>
+            prev.map(t => {
+                if (transcriptId !== undefined) {
+                    if (t.id !== transcriptId || t.speaker_label === label) return t;
+                    return { ...t, speaker_label: label };
+                }
+                if (t.speaker !== speaker || t.speaker_label === label) return t;
+                return { ...t, speaker_label: label };
+            })
+        );
+    }, []);
+
     // Initial load
     useEffect(() => {
         if (!meetingId) {
@@ -215,5 +238,6 @@ export function usePaginatedTranscripts({
         loadMore,
         reset,
         refetch,
+        updateSpeakerLabel,
     };
 }

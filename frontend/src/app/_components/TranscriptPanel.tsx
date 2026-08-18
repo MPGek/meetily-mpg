@@ -31,7 +31,7 @@ export function TranscriptPanel({
   showModal
 }: TranscriptPanelProps) {
   // Contexts
-  const { transcripts, transcriptContainerRef, copyTranscript } = useTranscripts();
+  const { transcripts, transcriptContainerRef, copyTranscript, applyLiveSpeakerLabel } = useTranscripts();
   const { transcriptModelConfig } = useConfig();
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
@@ -47,6 +47,7 @@ export function TranscriptPanel({
       confidence: t.confidence,
       source_device: t.source_device,
       speaker: t.speaker,
+      speaker_label: t.speaker_label,
     })),
     [transcripts]
   );
@@ -115,6 +116,13 @@ export function TranscriptPanel({
               isStopping={isStopping}
               enableStreaming={isRecording}
               showConfidence={true}
+              onUpdateSpeakerLabel={async (speaker, label, transcriptId) => {
+                if (transcriptId) {
+                  applyLiveSpeakerLabel(speaker, label, transcriptId);
+                } else {
+                  applyLiveSpeakerLabel(speaker, label);
+                }
+              }}
             />
           </div>
         </div>

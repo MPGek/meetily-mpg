@@ -107,6 +107,7 @@ async fn start_recording<R: Runtime>(
         meeting_name.clone(),
         None,
         None,
+        None,
     )
     .await
     {
@@ -302,7 +303,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None, None).await
 }
 
 #[tauri::command]
@@ -313,9 +314,10 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     meeting_name: Option<String>,
     diarization_mode: Option<String>,
     max_speakers: Option<i32>,
+    expected_speaker_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
-    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}, DiarizationMode: {:?}, MaxSpeakers: {:?}",
-             mic_device_name, system_device_name, meeting_name, diarization_mode, max_speakers);
+    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}, DiarizationMode: {:?}, MaxSpeakers: {:?}, ExpectedSpeakers: {:?}",
+             mic_device_name, system_device_name, meeting_name, diarization_mode, max_speakers, expected_speaker_ids);
 
     // Clone meeting_name for notification use later
     let meeting_name_for_notification = meeting_name.clone();
@@ -344,6 +346,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 meeting_name,
                 diarization_mode,
                 max_speakers,
+                expected_speaker_ids,
             )
             .await
         }
@@ -761,8 +764,21 @@ pub fn run() {
             audio::diarization::start_diarization,
             audio::diarization::get_diarization_status,
             audio::diarization::update_speaker_label_command,
+            audio::diarization::rematch_meeting_speakers,
             audio::diarization::check_diarization_models,
             audio::diarization::download_diarization_models,
+            // Speaker identity registry commands
+            database::speaker_commands::list_speakers,
+            database::speaker_commands::assign_speaker,
+            database::speaker_commands::assign_block_speaker,
+            database::speaker_commands::apply_block_speaker_to_cluster,
+            database::speaker_commands::rename_speaker,
+            database::speaker_commands::set_expected_speakers,
+            database::speaker_commands::get_expected_speakers,
+            database::speaker_commands::speaker_storage_stats,
+            // Online session finalization and live speaker assignment
+            audio::recording_commands::finalize_online_session,
+            audio::recording_commands::assign_live_speaker,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

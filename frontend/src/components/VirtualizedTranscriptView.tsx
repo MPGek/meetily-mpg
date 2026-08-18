@@ -1,13 +1,16 @@
 'use client';
 
-import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
+import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Input } from "./ui/input";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
 import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import { recordingService } from "@/services/recordingService";
+import { toast } from "sonner";
+import { Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Pause, Play } from "lucide-react";
 import { TranscriptSegmentData } from "@/types";
@@ -37,8 +40,12 @@ export interface VirtualizedTranscriptViewProps {
     loadedCount?: number;
     onLoadMore?: () => void;
 
-    // Speaker label editing
-    onUpdateSpeakerLabel?: (speaker: string, label: string) => Promise<void>;
+    // Speaker label editing. Third arg is the transcript id for single-block
+    // updates (used by the live view to relabel just that segment).
+    onUpdateSpeakerLabel?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
+
+    // Meeting ID for speaker registry operations
+    meetingId?: string;
 
     // Audio playback from a segment's start time (meeting details page)
     onPlayFrom?: (startTime: number) => void;
@@ -93,71 +100,237 @@ function formatSpeakerId(speaker: string): string {
     return isNaN(idx) ? speaker : `Speaker ${idx + 1}`;
 }
 
-// Inline editable speaker label
+// Inline editable speaker label — combobox with registry dropdown + free text.
+// Default scope is "this block" (per-transcript override); an explicit
+// "apply to all blocks of this speaker" option links the whole cluster.
 function SpeakerLabel({
     speaker,
     label,
     color,
     onUpdate,
+    meetingId,
+    transcriptId,
+    startTime,
+    endTime,
 }: {
     speaker: string;
     label?: string;
     color: string;
-    onUpdate?: (speaker: string, label: string) => Promise<void>;
+    onUpdate?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
+    meetingId?: string;
+    transcriptId?: string;
+    startTime?: number;
+    endTime?: number;
 }) {
-    const [isEditing, setIsEditing] = useState(false);
-    const [editValue, setEditValue] = useState(label || formatSpeakerId(speaker));
+    const [open, setOpen] = useState(false);
+    const [query, setQuery] = useState("");
+    const [registrySpeakers, setRegistrySpeakers] = useState<Array<{ id: string; name: string }>>([]);
+    const [loading, setLoading] = useState(false);
+    const [scopeAll, setScopeAll] = useState(false);
 
     const displayName = label || formatSpeakerId(speaker);
 
-    const commit = async () => {
-        const trimmed = editValue.trim();
-        const newLabel = trimmed || formatSpeakerId(speaker);
-        setEditValue(newLabel);
-        setIsEditing(false);
-        if (onUpdate && trimmed && trimmed !== label) {
-            try {
-                await onUpdate(speaker, trimmed);
-            } catch (error) {
-                console.error('Failed to update speaker label:', error);
+    // Load registry speakers when popover opens
+    useEffect(() => {
+        if (!open) return;
+        let cancelled = false;
+        setLoading(true);
+        recordingService.listSpeakers().then((speakers) => {
+            if (!cancelled) {
+                setRegistrySpeakers(speakers);
+                setLoading(false);
             }
+        }).catch(() => {
+            if (!cancelled) setLoading(false);
+        });
+        return () => { cancelled = true; };
+    }, [open]);
+
+    const filtered = useMemo(() => {
+        if (!query.trim()) return registrySpeakers;
+        const q = query.toLowerCase();
+        return registrySpeakers.filter((s) => s.name.toLowerCase().includes(q));
+    }, [registrySpeakers, query]);
+
+    const handleAssign = async (sp: { id: string; name: string }) => {
+        setOpen(false);
+        setQuery("");
+        setScopeAll(false);
+        if (!onUpdate) return;
+        try {
+            if (meetingId) {
+                if (scopeAll) {
+                    // Link the whole cluster (matched_by='user' + enrollment).
+                    await recordingService.assignSpeaker(meetingId, speaker, sp.id);
+                } else if (transcriptId) {
+                    // Default: relabel only this block via a per-transcript override.
+                    await recordingService.assignBlockSpeaker(transcriptId, sp.id);
+                } else {
+                    await recordingService.assignSpeaker(meetingId, speaker, sp.id);
+                }
+            } else {
+                // Live recording view: cluster-wide via the prototype store,
+                // or a per-turn override on this block when scoped.
+                if (scopeAll || !transcriptId) {
+                    await recordingService.assignLiveSpeaker(speaker, sp.id);
+                } else {
+                    await recordingService.assignLiveSpeakerBlock(
+                        speaker,
+                        startTime ?? 0,
+                        sp.id,
+                        undefined,
+                        endTime
+                    );
+                }
+            }
+            // Scope-aware local propagation: apply-to-all passes no
+            // transcriptId so the updater relabels every block of the
+            // cluster; single-block passes the id (design D11).
+            await onUpdate(speaker, sp.name, scopeAll ? undefined : transcriptId);
+        } catch (error) {
+            console.error("Failed to assign speaker:", error);
+            // Backend write runs before onUpdate, so the local label was never
+            // applied — the list is undisturbed. Surface the failure (9.3).
+            toast.error("Failed to assign speaker");
         }
     };
 
-    if (isEditing) {
+    const handleCreateNew = async (name: string) => {
+        const trimmed = name.trim();
+        if (!trimmed) return;
+        setOpen(false);
+        setQuery("");
+        setScopeAll(false);
+        if (!onUpdate) return;
+        try {
+            if (meetingId) {
+                if (scopeAll) {
+                    await recordingService.assignSpeaker(meetingId, speaker, undefined, trimmed);
+                } else if (transcriptId) {
+                    await recordingService.assignBlockSpeaker(transcriptId, undefined, trimmed);
+                } else {
+                    await recordingService.assignSpeaker(meetingId, speaker, undefined, trimmed);
+                }
+            } else {
+                if (scopeAll || !transcriptId) {
+                    await recordingService.assignLiveSpeaker(speaker, undefined, trimmed);
+                } else {
+                    await recordingService.assignLiveSpeakerBlock(
+                        speaker,
+                        startTime ?? 0,
+                        undefined,
+                        trimmed,
+                        endTime
+                    );
+                }
+            }
+            await onUpdate(speaker, trimmed, scopeAll ? undefined : transcriptId);
+        } catch (error) {
+            console.error("Failed to create speaker:", error);
+            toast.error("Failed to assign speaker");
+        }
+    };
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            const val = query.trim();
+            if (val) {
+                // Check if exact match exists
+                const exact = registrySpeakers.find(
+                    (s) => s.name.toLowerCase() === val.toLowerCase()
+                );
+                if (exact) {
+                    handleAssign(exact);
+                } else {
+                    handleCreateNew(val);
+                }
+            }
+        } else if (e.key === "Escape") {
+            setOpen(false);
+            setQuery("");
+        }
+    };
+
+    if (!onUpdate) {
         return (
-            <Input
-                autoFocus
-                value={editValue}
-                onChange={(e) => setEditValue(e.target.value)}
-                onBlur={commit}
-                onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                        commit();
-                    } else if (e.key === 'Escape') {
-                        setEditValue(displayName);
-                        setIsEditing(false);
-                    }
-                }}
-                className="h-5 min-w-[80px] max-w-[200px] text-xs py-0 px-1.5"
-            />
+            <span
+                className="text-xs font-medium text-gray-600"
+                style={{ color }}
+            >
+                {displayName}
+            </span>
         );
     }
 
     return (
-        <span
-            className={`text-xs font-medium text-gray-600 ${onUpdate ? 'cursor-pointer hover:underline' : ''}`}
-            style={{ color }}
-            onClick={() => {
-                if (onUpdate) {
-                    setEditValue(displayName);
-                    setIsEditing(true);
-                }
-            }}
-            title={onUpdate ? 'Click to rename speaker' : undefined}
-        >
-            {displayName}
-        </span>
+        <Popover open={open} onOpenChange={setOpen}>
+            <PopoverTrigger asChild>
+                <span
+                    className="text-xs font-medium text-gray-600 cursor-pointer hover:underline"
+                    style={{ color }}
+                    title="Click to rename speaker"
+                >
+                    {displayName}
+                </span>
+            </PopoverTrigger>
+            <PopoverContent className="w-64 p-0" align="start">
+                <div className="border-b px-3 py-2">
+                    <input
+                        autoFocus
+                        placeholder="Search or type name..."
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={handleKeyDown}
+                        className="w-full text-xs bg-transparent outline-none placeholder:text-gray-400"
+                    />
+                </div>
+                <div className="max-h-48 overflow-y-auto">
+                    {loading ? (
+                        <div className="px-3 py-2 text-xs text-gray-400">Loading...</div>
+                    ) : filtered.length > 0 ? (
+                        filtered.map((sp) => (
+                            <button
+                                key={sp.id}
+                                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-100 text-left"
+                                onClick={() => handleAssign(sp)}
+                            >
+                                <Check className="h-3 w-3 shrink-0 opacity-0" />
+                                <span className="truncate">{sp.name}</span>
+                            </button>
+                        ))
+                    ) : (
+                        <div className="px-3 py-2 text-xs text-gray-400">
+                            {query.trim()
+                                ? `Press Enter to create "${query.trim()}"`
+                                : "No speakers yet"}
+                        </div>
+                    )}
+                </div>
+                {query.trim() && !registrySpeakers.some(
+                    (s) => s.name.toLowerCase() === query.trim().toLowerCase()
+                ) && (
+                    <div className="border-t px-3 py-2">
+                        <button
+                            className="w-full text-xs text-left text-blue-600 hover:underline"
+                            onClick={() => handleCreateNew(query)}
+                        >
+                            Create "{query.trim()}"
+                        </button>
+                    </div>
+                )}
+                <div className="border-t px-3 py-2 flex items-center gap-2">
+                    <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={scopeAll}
+                            onChange={(e) => setScopeAll(e.target.checked)}
+                        />
+                        Apply to all blocks of this speaker
+                    </label>
+                </div>
+            </PopoverContent>
+        </Popover>
     );
 }
 
@@ -178,6 +351,7 @@ function cleanStopWords(text: string): string {
 const TranscriptSegment = memo(function TranscriptSegment({
     id,
     timestamp,
+    endTime,
     text,
     confidence,
     isStreaming,
@@ -187,12 +361,14 @@ const TranscriptSegment = memo(function TranscriptSegment({
     speaker_label,
     hasAudioTime,
     onUpdateSpeakerLabel,
+    meetingId,
     onPlayFrom,
     isActive,
     isAudioPlaying,
 }: {
     id: string;
     timestamp: number;
+    endTime?: number;
     text: string;
     confidence?: number;
     isStreaming: boolean;
@@ -201,7 +377,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     speaker?: string;
     speaker_label?: string;
     hasAudioTime?: boolean;
-    onUpdateSpeakerLabel?: (speaker: string, label: string) => Promise<void>;
+    onUpdateSpeakerLabel?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
+    meetingId?: string;
     onPlayFrom?: (startTime: number) => void;
     isActive?: boolean;
     isAudioPlaying?: boolean;
@@ -272,6 +449,10 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     label={speaker_label}
                                     color={speakerColor!}
                                     onUpdate={onUpdateSpeakerLabel}
+                                    meetingId={meetingId}
+                                    transcriptId={id}
+                                    startTime={timestamp}
+                                    endTime={endTime}
                                 />
                             </div>
                         )}
@@ -320,6 +501,10 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     label={speaker_label}
                                     color={speakerColor!}
                                     onUpdate={onUpdateSpeakerLabel}
+                                    meetingId={meetingId}
+                                    transcriptId={id}
+                                    startTime={timestamp}
+                                    endTime={endTime}
                                 />
                             </div>
                         )}
@@ -342,12 +527,16 @@ const TranscriptSegment = memo(function TranscriptSegment({
                 <div className="flex-1 max-w-[80%]">
                     {hasSpeaker && (
                         <div className="flex items-center gap-1.5 mb-1 mr-1 justify-end">
-                            <SpeakerLabel
-                                speaker={speaker}
-                                label={speaker_label}
-                                color={speakerColor!}
-                                onUpdate={onUpdateSpeakerLabel}
-                            />
+                                <SpeakerLabel
+                                    speaker={speaker}
+                                    label={speaker_label}
+                                    color={speakerColor!}
+                                    onUpdate={onUpdateSpeakerLabel}
+                                    meetingId={meetingId}
+                                    transcriptId={id}
+                                    startTime={timestamp}
+                                    endTime={endTime}
+                                />
                             <span
                                 className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
                                 style={{ backgroundColor: speakerColor }}
@@ -403,6 +592,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     loadedCount = 0,
     onLoadMore,
     onUpdateSpeakerLabel,
+    meetingId,
     onPlayFrom,
     isAudioPlaying = false,
     activeSegmentId = null,
@@ -574,6 +764,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                     <TranscriptSegment
                                         id={segment.id}
                                         timestamp={segment.timestamp}
+                                        endTime={segment.endTime}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
@@ -583,6 +774,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speaker_label={segment.speaker_label}
                                         hasAudioTime={segment.hasAudioTime ?? false}
                                         onUpdateSpeakerLabel={onUpdateSpeakerLabel}
+                                        meetingId={meetingId}
                                         onPlayFrom={onPlayFrom}
                                         isActive={activeSegmentId === segment.id}
                                         isAudioPlaying={isAudioPlaying}
@@ -638,6 +830,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                     <TranscriptSegment
                                         id={segment.id}
                                         timestamp={segment.timestamp}
+                                        endTime={segment.endTime}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
@@ -647,6 +840,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speaker_label={segment.speaker_label}
                                         hasAudioTime={segment.hasAudioTime ?? false}
                                         onUpdateSpeakerLabel={onUpdateSpeakerLabel}
+                                        meetingId={meetingId}
                                         onPlayFrom={onPlayFrom}
                                         isActive={activeSegmentId === segment.id}
                                         isAudioPlaying={isAudioPlaying}

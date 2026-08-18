@@ -3,10 +3,16 @@ use crate::audio::decoder::{
     convert_to_wav_with_ffmpeg, decode_audio_file, needs_ffmpeg_conversion, probe_audio_metadata,
 };
 use crate::audio::ffmpeg::find_ffmpeg_path;
+use crate::audio::speaker_recognition::{best_match, l2_normalize_in_place, Prototype};
 use crate::database::repositories::meeting::MeetingsRepository;
+use crate::database::repositories::speaker::{
+    Exemplar, SpeakerRepository, SPEAKER_EMBEDDING_MODEL,
+};
 use crate::state::AppState;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -15,6 +21,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+/// Maximum exemplar cache rows persisted per cluster (top by duration).
+/// Enrollment later reparents the best-K=8 of these; the cache is bounded so
+/// storage grows with the number of clusters, not segments.
+const MAX_CLUSTER_CACHE_EXEMPLARS: usize = 32;
 
 static DIARIZATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DIARIZATION_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -96,6 +107,90 @@ pub async fn update_speaker_label_command<R: Runtime>(
         .map_err(|e| format!("Failed to update speaker label: {}", e))
 }
 
+/// Re-run speaker recognition for a meeting from the cached cluster centroids
+/// only — no audio re-processing. User bindings (`matched_by='user'`) are
+/// preserved; only unbound or auto-bound clusters are updated. The
+/// expected-speaker allowlist (or all speakers when empty) constrains
+/// candidates. Used after editing the expected-speaker list.
+#[tauri::command]
+pub async fn rematch_meeting_speakers<R: Runtime>(
+    _app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let pool = state.db_manager.pool();
+
+    let centroids = SpeakerRepository::get_cluster_centroids(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load cached centroids: {}", e))?;
+    if centroids.is_empty() {
+        return Ok(serde_json::json!({ "meeting_id": meeting_id, "matched": 0 }));
+    }
+
+    let expected = SpeakerRepository::get_expected_speakers(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load expected speakers: {}", e))?;
+    let candidates: Option<&[String]> = if expected.is_empty() {
+        None
+    } else {
+        Some(&expected)
+    };
+    let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
+        pool,
+        candidates,
+        SPEAKER_EMBEDDING_MODEL,
+    )
+    .await
+    .map_err(|e| format!("Failed to load prototypes: {}", e))?
+    .into_iter()
+    .map(Prototype::from)
+    .collect();
+
+    let mut matched = 0usize;
+    // Current bindings so re-match only counts actual new assignments and
+    // skips user-bound clusters (which are always preserved).
+    let existing_rows = SpeakerRepository::get_meeting_speakers(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load meeting speakers: {}", e))?;
+    let existing: HashMap<&str, (Option<&str>, Option<&str>)> = existing_rows
+        .iter()
+        .map(|r| {
+            (
+                r.cluster_label.as_str(),
+                (r.speaker_id.as_deref(), r.matched_by.as_deref()),
+            )
+        })
+        .collect();
+    for c in &centroids {
+        if let Some(m) = best_match(&c.centroid, c.channel.as_deref(), &prototypes) {
+            // Skip user-bound clusters: their binding always wins.
+            if let Some((_, by)) = existing.get(c.cluster_label.as_str()) {
+                if *by == Some("user") {
+                    continue;
+                }
+            }
+            // Skip clusters already bound to the same candidate.
+            if let Some((sid, _)) = existing.get(c.cluster_label.as_str()) {
+                if *sid == Some(m.speaker_id.as_str()) {
+                    continue;
+                }
+            }
+            SpeakerRepository::set_auto_binding_if_unbound(
+                pool,
+                &meeting_id,
+                &c.cluster_label,
+                &m.speaker_id,
+                m.score as f64,
+            )
+            .await
+            .map_err(|e| format!("Failed to auto-assign speaker: {}", e))?;
+            matched += 1;
+        }
+    }
+
+    Ok(serde_json::json!({ "meeting_id": meeting_id, "matched": matched }))
+}
+
 #[tauri::command]
 pub async fn start_diarization<R: Runtime>(
     app: AppHandle<R>,
@@ -158,12 +253,24 @@ pub async fn start_diarization<R: Runtime>(
     .map_err(|e| format!("Diarization task panicked: {}", e))?;
 
     match result {
-        Ok((diar_result, speaker_updates)) => {
+        Ok((diar_result, speaker_updates, mic_clusters, sys_clusters, is_stereo)) => {
             for (transcript_id, speaker_id) in &speaker_updates {
                 MeetingsRepository::update_transcript_speaker(pool, transcript_id, speaker_id)
                     .await
                     .map_err(|e| format!("Failed to update speaker: {}", e))?;
             }
+
+            // Persist per-cluster centroid + exemplar caches, then auto-assign
+            // recognized speakers (change: speaker-identity-registry). Clusters
+            // without candidates / below threshold stay anonymous.
+            persist_and_recognize_session(
+                pool,
+                &meeting_id,
+                &mic_clusters.embeddings,
+                &sys_clusters.embeddings,
+                is_stereo,
+            )
+            .await?;
 
             MeetingsRepository::update_diarization_status(pool, &meeting_id, "complete")
                 .await
@@ -260,7 +367,7 @@ fn run_diarization_blocking<R: Runtime>(
     max_speakers: Option<i32>,
     config: &DiarizationConfig,
     transcripts: &[crate::database::models::Transcript],
-) -> Result<(DiarizationResult, Vec<(String, String)>), String> {
+) -> Result<(DiarizationResult, Vec<(String, String)>, ChannelClusters, ChannelClusters, bool), String> {
     let overall_start = Instant::now();
     let mut timings = StageTimings::default();
     let memory_sampler = MemorySampler::start();
@@ -301,8 +408,8 @@ fn run_diarization_blocking<R: Runtime>(
 
     let channel_start = Instant::now();
     let (mic_result, sys_result): (
-        Result<(Vec<DiarizationSegment>, StageTimings), String>,
-        Result<(Vec<DiarizationSegment>, StageTimings), String>,
+        Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String>,
+        Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String>,
     ) = match find_ffmpeg_path() {
         Some(ffmpeg) => {
             if is_stereo {
@@ -315,7 +422,7 @@ fn run_diarization_blocking<R: Runtime>(
             } else {
                 let mono = spawn_ffmpeg_pcm(&ffmpeg, &source_path, None)?;
                 let mic = run_channel_diarization_stream(&diarizer, mono, config);
-                (mic, Ok((Vec::new(), StageTimings::default())))
+                (mic, Ok((Vec::new(), Vec::new(), StageTimings::default())))
             }
         }
         None => {
@@ -332,7 +439,7 @@ fn run_diarization_blocking<R: Runtime>(
                 )
             } else {
                 let mic = run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic");
-                (mic, Ok((Vec::new(), StageTimings::default())))
+                (mic, Ok((Vec::new(), Vec::new(), StageTimings::default())))
             }
         }
     };
@@ -341,8 +448,10 @@ fn run_diarization_blocking<R: Runtime>(
         return Err("Diarization cancelled".to_string());
     }
 
-    let (mic_segments, mic_timings) = mic_result.map_err(|e| format!("Microphone channel failed: {}", e))?;
-    let (sys_segments, sys_timings) = sys_result.map_err(|e| format!("System channel failed: {}", e))?;
+    let (mic_segments, mic_embeddings, mic_timings) =
+        mic_result.map_err(|e| format!("Microphone channel failed: {}", e))?;
+    let (sys_segments, sys_embeddings, sys_timings) =
+        sys_result.map_err(|e| format!("System channel failed: {}", e))?;
 
     timings.segmentation_secs = mic_timings.segmentation_secs + sys_timings.segmentation_secs;
     timings.embedding_secs = mic_timings.embedding_secs + sys_timings.embedding_secs;
@@ -390,6 +499,15 @@ fn run_diarization_blocking<R: Runtime>(
             speakers_found,
         },
         speaker_updates,
+        ChannelClusters {
+            segments: mic_segments,
+            embeddings: mic_embeddings,
+        },
+        ChannelClusters {
+            segments: sys_segments,
+            embeddings: sys_embeddings,
+        },
+        is_stereo,
     ))
 }
 
@@ -399,7 +517,7 @@ fn run_channel_diarization(
     sample_rate: u32,
     config: &DiarizationConfig,
     channel_name: &str,
-) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
+) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
     info!(
         "Running diarization on {} channel ({} samples, {}Hz)",
         channel_name,
@@ -415,6 +533,25 @@ struct DiarizationSegment {
     start: f32,
     end: f32,
     speaker: i32,
+}
+
+/// An embedding tagged with its cluster id and source-segment duration,
+/// produced after clustering. Used to compute per-cluster centroids and
+/// exemplar caches for the speaker identity registry. Public so the online
+/// diarization path can build the same shape at recording stop.
+#[derive(Debug, Clone)]
+pub struct ClusteredEmbedding {
+    pub speaker: i32,
+    pub embedding: Vec<f32>,
+    pub duration_secs: f32,
+}
+
+/// Per-channel diarization output: labeled segments plus the clustered
+/// embeddings aligned to them (captured before the start-time sort).
+#[derive(Debug, Clone, Default)]
+struct ChannelClusters {
+    segments: Vec<DiarizationSegment>,
+    embeddings: Vec<ClusteredEmbedding>,
 }
 
 /// Polyvoice diarization engine: powerset segmentation + ResNet34 embedding +
@@ -569,7 +706,7 @@ fn run_chunked_polyvoice_diarization(
     samples: &[f32],
     sample_rate: u32,
     config: &DiarizationConfig,
-) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
+) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
     use polyvoice::segmentation::Segmenter as _;
 
     let mut timings = StageTimings::default();
@@ -633,7 +770,7 @@ fn run_chunked_polyvoice_diarization(
     }
 
     if all_segments.is_empty() {
-        return Ok((Vec::new(), timings));
+        return Ok((Vec::new(), Vec::new(), timings));
     }
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
@@ -651,6 +788,18 @@ fn run_chunked_polyvoice_diarization(
         segment.speaker = label as i32;
     }
 
+    // Capture clustered embeddings while segments and embeddings are still
+    // aligned (the sort below reshuffles segments only).
+    let clustered: Vec<ClusteredEmbedding> = all_segments
+        .iter()
+        .zip(all_embeddings.iter())
+        .map(|(s, e)| ClusteredEmbedding {
+            speaker: s.speaker,
+            embedding: e.clone(),
+            duration_secs: (s.end - s.start).max(0.0),
+        })
+        .collect();
+
     all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
 
     info!(
@@ -659,7 +808,7 @@ fn run_chunked_polyvoice_diarization(
         count_unique_speakers(&all_segments)
     );
 
-    Ok((all_segments, timings))
+    Ok((all_segments, clustered, timings))
 }
 
 fn channel_chunks(
@@ -907,7 +1056,7 @@ fn run_channel_diarization_stream(
     diarizer: &PolyvoiceDiarizer,
     mut pcm: PcmStream,
     config: &DiarizationConfig,
-) -> Result<(Vec<DiarizationSegment>, StageTimings), String> {
+) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
     use polyvoice::segmentation::Segmenter as _;
 
     let mut timings = StageTimings::default();
@@ -972,7 +1121,7 @@ fn run_channel_diarization_stream(
     pcm.finish()?;
 
     if all_segments.is_empty() {
-        return Ok((Vec::new(), timings));
+        return Ok((Vec::new(), Vec::new(), timings));
     }
 
     let cluster_start = Instant::now();
@@ -986,6 +1135,18 @@ fn run_channel_diarization_stream(
         segment.speaker = label as i32;
     }
 
+    // Capture clustered embeddings while segments and embeddings are still
+    // aligned (the sort below reshuffles segments only).
+    let clustered: Vec<ClusteredEmbedding> = all_segments
+        .iter()
+        .zip(all_embeddings.iter())
+        .map(|(s, e)| ClusteredEmbedding {
+            speaker: s.speaker,
+            embedding: e.clone(),
+            duration_secs: (s.end - s.start).max(0.0),
+        })
+        .collect();
+
     all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
 
     info!(
@@ -994,7 +1155,7 @@ fn run_channel_diarization_stream(
         count_unique_speakers(&all_segments)
     );
 
-    Ok((all_segments, timings))
+    Ok((all_segments, clustered, timings))
 }
 
 fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
@@ -1002,6 +1163,136 @@ fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
     speakers.sort();
     speakers.dedup();
     speakers.len()
+}
+
+/// Group a channel's clustered embeddings by cluster id, computing the
+/// L2-normalized centroid (mean of member embeddings) and a bounded set of
+/// exemplar embeddings (top by duration) for each cluster.
+fn group_cluster_embeddings(
+    embeddings: &[ClusteredEmbedding],
+) -> Vec<(i32, Vec<f32>, Vec<Exemplar>)> {
+    let mut by_cluster: HashMap<i32, Vec<&ClusteredEmbedding>> = HashMap::new();
+    for e in embeddings {
+        by_cluster.entry(e.speaker).or_default().push(e);
+    }
+
+    let mut out = Vec::new();
+    for (spk, items) in by_cluster {
+        let dim = items.first().map(|e| e.embedding.len()).unwrap_or(0);
+        let mut centroid = vec![0.0f32; dim];
+        for it in &items {
+            for (i, x) in it.embedding.iter().enumerate() {
+                centroid[i] += x;
+            }
+        }
+        let n = items.len().max(1) as f32;
+        for c in centroid.iter_mut() {
+            *c /= n;
+        }
+        l2_normalize_in_place(&mut centroid);
+
+        let mut sorted: Vec<&ClusteredEmbedding> = items.clone();
+        sorted.sort_by(|a, b| {
+            b.duration_secs
+                .partial_cmp(&a.duration_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let exemplars: Vec<Exemplar> = sorted
+            .iter()
+            .take(MAX_CLUSTER_CACHE_EXEMPLARS)
+            .map(|e| Exemplar {
+                embedding: e.embedding.clone(),
+                duration_secs: e.duration_secs as f64,
+            })
+            .collect();
+
+        out.push((spk, centroid, exemplars));
+    }
+    out
+}
+
+/// Persist each cluster's centroid + exemplar cache for one channel, then
+/// auto-assign recognized speakers from the provided prototypes. User
+/// bindings are preserved. `prototypes` is pre-loaded by the caller.
+async fn persist_channel_clusters(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    embeddings: &[ClusteredEmbedding],
+    prefix: &str,
+    channel: &str,
+    prototypes: &[Prototype],
+) -> Result<(), String> {
+    let clusters = group_cluster_embeddings(embeddings);
+    for (spk, centroid, exemplars) in clusters {
+        let label = format!("{}_{:02}", prefix, spk);
+        SpeakerRepository::write_cluster_cache(
+            pool,
+            meeting_id,
+            &label,
+            channel,
+            &centroid,
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .map_err(|e| format!("Failed to persist cluster cache: {}", e))?;
+
+        if let Some(m) = best_match(&centroid, Some(channel), prototypes) {
+            SpeakerRepository::set_auto_binding_if_unbound(
+                pool,
+                meeting_id,
+                &label,
+                &m.speaker_id,
+                m.score as f64,
+            )
+            .await
+            .map_err(|e| format!("Failed to auto-assign speaker: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Persist per-cluster centroids + exemplar caches for both channels and
+/// auto-assign recognized speakers. The expected-speaker allowlist (or all
+/// speakers when empty) constrains candidates; prototypes are loaded once.
+/// Used by both the offline diarization path and the online recording
+/// stop-time finalize.
+pub async fn persist_and_recognize_session(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    mic: &[ClusteredEmbedding],
+    sys: &[ClusteredEmbedding],
+    is_stereo: bool,
+) -> Result<(), String> {
+    if mic.is_empty() && sys.is_empty() {
+        return Ok(());
+    }
+
+    let expected = SpeakerRepository::get_expected_speakers(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load expected speakers: {}", e))?;
+    let candidates: Option<&[String]> = if expected.is_empty() {
+        None
+    } else {
+        Some(&expected)
+    };
+    let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
+        pool,
+        candidates,
+        SPEAKER_EMBEDDING_MODEL,
+    )
+    .await
+    .map_err(|e| format!("Failed to load prototypes: {}", e))?
+    .into_iter()
+    .map(Prototype::from)
+    .collect();
+
+    let mic_prefix = if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
+    persist_channel_clusters(pool, meeting_id, mic, mic_prefix, "mic", &prototypes).await?;
+    if is_stereo {
+        persist_channel_clusters(pool, meeting_id, sys, "SPEAKER", "system", &prototypes).await?;
+    }
+    Ok(())
 }
 
 fn compute_speaker_matches<R: Runtime>(
@@ -1405,7 +1696,7 @@ mod spike_tests {
         let diarizer = create_polyvoice_diarizer(&models_dir, None, &default_config())
             .expect("polyvoice diarizer should initialize with the INT8 models");
         let samples = synthetic_speech_16k();
-        let (segments, _) =
+        let (segments, _, _) =
             run_chunked_polyvoice_diarization(&diarizer, &samples, 16000, &default_config())
                 .expect("offline diarization should return a result");
         info!(

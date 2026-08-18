@@ -44,6 +44,22 @@ function loadMode(defaultValue: DiarizationMode): DiarizationMode {
   return raw === "off" || raw === "efficient" || raw === "fast" ? raw : defaultValue;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(1)} GB`;
+}
+
+interface SpeakerStorageStats {
+  registry_count: number;
+  prototype_count: number;
+  cache_count: number;
+  total_bytes: number;
+}
+
 function saveSetting(key: string, value: string) {
   if (typeof window === "undefined") return;
   localStorage.setItem(key, value);
@@ -60,8 +76,18 @@ export function DiarizationSettings() {
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadMessage, setDownloadMessage] = useState("");
+  const [speakerStats, setSpeakerStats] = useState<SpeakerStorageStats | null>(null);
 
   const mountedRef = useRef(false);
+
+  const loadSpeakerStats = async () => {
+    try {
+      const stats = await recordingService.speakerStorageStats();
+      if (mountedRef.current) setSpeakerStats(stats);
+    } catch (error) {
+      console.error("Failed to load speaker storage stats:", error);
+    }
+  };
 
   const checkModels = async () => {
     try {
@@ -78,6 +104,7 @@ export function DiarizationSettings() {
   useEffect(() => {
     mountedRef.current = true;
     checkModels();
+    loadSpeakerStats();
 
     let unlistenProgress: (() => void) | undefined;
     let unlistenComplete: (() => void) | undefined;
@@ -304,6 +331,37 @@ export function DiarizationSettings() {
         <p className="text-xs text-gray-500 mt-3">
           Models are downloaded to your application data directory and run entirely on-device.
         </p>
+      </div>
+
+      {/* Voiceprint storage stats */}
+      <div className="p-4 border rounded-lg bg-gray-50">
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-medium">Voiceprint Storage</div>
+          {speakerStats && (
+            <span className="text-xs text-gray-500">{formatBytes(speakerStats.total_bytes)}</span>
+          )}
+        </div>
+        <p className="text-xs text-gray-500 mb-3">
+          Known voices and per-meeting voiceprint caches are retained indefinitely.
+        </p>
+        {speakerStats ? (
+          <div className="grid grid-cols-3 gap-3 text-center">
+            <div>
+              <div className="text-lg font-semibold text-gray-900">{speakerStats.registry_count}</div>
+              <div className="text-xs text-gray-500">Known speakers</div>
+            </div>
+            <div>
+              <div className="text-lg font-semibold text-gray-900">{speakerStats.prototype_count}</div>
+              <div className="text-xs text-gray-500">Voiceprints</div>
+            </div>
+            <div>
+              <div className="text-lg font-semibold text-gray-900">{speakerStats.cache_count}</div>
+              <div className="text-xs text-gray-500">Meeting caches</div>
+            </div>
+          </div>
+        ) : (
+          <p className="text-xs text-gray-400">Loading voiceprint stats...</p>
+        )}
       </div>
     </div>
   );

@@ -177,6 +177,15 @@ graph LR
 - At stop, `finalize` clusters/translates and matches against in-memory `TranscriptSegment`s, returning `SpeakerAssignment[]` attached to the `recording-stopped` payload (`online_diarization_used`, `speaker_assignments`); the frontend applies them before saving.
 - Guarded by `OnlineDiarizationGuard` (one recording at a time); model-init failure degrades to no diarization (`online-diarization-unavailable` event).
 
+**Speaker identity registry (`speaker-identity-registry` change)** — the embeddings both paths compute are now persisted instead of discarded:
+
+- New tables (migration `20260817000000_add_speaker_identity_registry.sql`): `speakers` (global person registry, case-insensitive unique names), `speaker_embeddings` (one table, two owners — enrolled prototype `speaker_id` or per-meeting cluster cache `meeting_id`+`cluster_label`, enforced by a CHECK), `meeting_speakers` (per-meeting cluster→person mapping + centroid + `matched_by`/'auto'/'user'), `meeting_expected_speakers` (recognition allowlist; empty = match all).
+- `audio/speaker_recognition.rs`: brute-force cosine matching (`best_match`, τ=0.7, same-channel preference, `model` tag filter `resnet34-int8`).
+- `database/repositories/speaker.rs`: find-or-create/rename speakers, `write_cluster_cache` (centroid + exemplar cache), enrollment by reparenting best-K=8 cache rows (per-person cap 64), prototype loading, expected-speaker set/get, storage stats.
+- After clustering/stop, `persist_and_recognize_session` (offline `diarization.rs`) or `finalize_online_session` (online, called by the frontend after the meeting save) persists caches, auto-recognizes against expected/all prototypes, enrolls user-assigned clusters, and persists expected speakers. `rematch_meeting_speakers` re-runs recognition from cached centroids only (no audio), preserving `matched_by='user'`.
+- New Tauri commands: `list_speakers`, `assign_speaker`, `rename_speaker`, `set_expected_speakers`, `get_expected_speakers`, `assign_live_speaker`, `rematch_meeting_speakers`, `finalize_online_session`, `speaker_storage_stats`.
+- Live Fast mode: `PrototypeStore` (shared `Arc<RwLock>` beside `ONLINE_DIARIZATION_TASK`) matches each chunk embedding and relabels turns via `SpeakerTurn.display_name`; `assign_live_speaker` binds mid-recording renames that take effect immediately.
+
 ### Streaming Meeting Audio Player (`audio_file.rs`)
 
 `find_audio_file` locates a meeting's recording (candidate name list → extension scan); `prepare_audio_for_playback` FFmpeg-transcodes to 44.1 kHz WAV in `%TEMP%/meetily-playback` (cached by `(path, mtime)` hash, atomic `.part`→rename). The webview streams via `convertFileSrc`; on native decode failure `useAudioPlayer` falls back to `prepare_audio_for_playback`.
