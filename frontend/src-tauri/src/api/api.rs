@@ -147,6 +147,10 @@ pub struct MeetingTranscript {
     pub speaker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_matched_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_match_score: Option<f64>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -956,6 +960,8 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     source_device: t.source_device,
                     speaker: t.speaker,
                     speaker_label: t.speaker_label,
+                    speaker_matched_by: t.speaker_matched_by,
+                    speaker_match_score: t.speaker_match_score,
                 })
                 .collect::<Vec<_>>();
 

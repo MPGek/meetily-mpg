@@ -27,6 +27,8 @@ export interface SpeakerTurn {
   speaker: string;
   source_device: string;
   display_name?: string;
+  matched_by?: string; // 'user' | 'auto'
+  match_score?: number; // cosine similarity 0..1 for auto matches
 }
 
 export interface RecordingStoppedPayload {

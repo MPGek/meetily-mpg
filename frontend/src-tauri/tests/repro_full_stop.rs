@@ -74,13 +74,14 @@ async fn full_stop_flow_fast_1322() {
         .collect();
 
     // Load prototype store like the real app (empty registry is fine).
-    let store = Arc::new(RwLock::new(PrototypeStore::load(&pool, None).await.expect("store")));
+    let store = Arc::new(RwLock::new(PrototypeStore::load(&pool, None, true).await.expect("store")));
 
     let (turn_sender, _turn_rx) = mpsc::unbounded_channel();
     let models_dir = "C:/Users/vasiliy.kotov/AppData/Roaming/com.meetily.ai/models";
     let mut processor = OnlineDiarizationProcessor::new(
         DiarizationMode::Fast,
         8,
+        true,
         Path::new(models_dir),
         Some(turn_sender),
         Some(store),

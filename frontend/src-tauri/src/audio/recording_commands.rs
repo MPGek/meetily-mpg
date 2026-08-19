@@ -58,12 +58,18 @@ pub(crate) static ONLINE_DIARIZATION_STORE: Mutex<Option<Arc<RwLock<PrototypeSto
 
 // Session data retained between recording stop and the frontend-initiated
 // finalize_online_session call (which needs the meeting_id created by the
-// frontend save). Holds cluster embeddings for persistence + enrollment
-// and the expected-speaker list for the meeting row.
+// frontend save). Holds cluster embeddings for persistence + enrollment,
+// the raw per-channel chunk buffers for ground-truth block enrollment, and
+// the expected-speaker list for the meeting row.
 pub(crate) struct OnlineSessionData {
     pub cluster_embeddings: OnlineClusterEmbeddings,
     pub live_bindings: std::collections::HashMap<String, String>,
     pub expected_speaker_ids: Vec<String>,
+    /// Raw timestamped mic-channel chunk embeddings (`(start, end, embedding)`),
+    /// for enrolling user-assigned blocks as ground truth.
+    pub mic_embeddings: Vec<(f32, f32, Vec<f32>)>,
+    /// Raw timestamped system-channel chunk embeddings.
+    pub sys_embeddings: Vec<(f32, f32, Vec<f32>)>,
 }
 
 pub(crate) static ONLINE_SESSION_DATA: Mutex<Option<OnlineSessionData>> = Mutex::new(None);
@@ -448,6 +454,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             tokio::sync::mpsc::unbounded_channel::<super::recording_state::AudioChunk>();
         manager.set_embedding_sender(Some(embedding_sender));
 
+        // Fix the microphone label prefix for the whole session: when a
+        // system device was selected the session is stereo, so mic clusters
+        // are namespaced MIC_SPEAKER_NN; otherwise mono, so SPEAKER_NN.
+        let has_system_device = system_device.is_some();
+
         // Channel carrying live speaker turns (Fast mode) from the blocking
         // processor back to the async side for emission to the frontend.
         let (turn_sender, mut turn_receiver) =
@@ -474,7 +485,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             let state = app.state::<crate::state::AppState>();
             state.db_manager.pool().clone()
         };
-        let prototype_store = match PrototypeStore::load(&pool, candidate_ids).await {
+        let prototype_store = match PrototypeStore::load(&pool, candidate_ids, has_system_device)
+            .await
+        {
             Ok(store) => {
                 let arc = Arc::new(RwLock::new(store));
                 {
@@ -501,6 +514,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 let mut processor = match OnlineDiarizationProcessor::new(
                     online_mode,
                     max_speakers_usize,
+                    has_system_device,
                     &models_dir,
                     Some(turn_sender),
                     prototype_store,
@@ -857,8 +871,26 @@ pub async fn stop_recording<R: Runtime>(
                         .clone();
                     {
                         let mut session_data = ONLINE_SESSION_DATA.lock().unwrap();
+                        // Move the raw buffers out of the cluster embeddings so
+                        // the full chunk set is held exactly once between stop
+                        // and finalize_online_session (no double-buffer clone).
+                        let OnlineClusterEmbeddings {
+                            mic,
+                            sys,
+                            saw_system_audio,
+                            mic_raw,
+                            sys_raw,
+                        } = cluster_embeddings;
                         *session_data = Some(OnlineSessionData {
-                            cluster_embeddings,
+                            mic_embeddings: mic_raw,
+                            sys_embeddings: sys_raw,
+                            cluster_embeddings: OnlineClusterEmbeddings {
+                                mic,
+                                sys,
+                                saw_system_audio,
+                                mic_raw: Vec::new(),
+                                sys_raw: Vec::new(),
+                            },
                             live_bindings,
                             expected_speaker_ids: stored_expected,
                         });
@@ -1586,6 +1618,54 @@ pub async fn finalize_online_session(
         .drain(..)
         .map(|o| (o.cluster_label, o.start_secs, o.end_secs, o.speaker_id))
         .collect();
+
+    // Ground-truth enrollment for each single-block override: the chunk
+    // embeddings overlapping the relabeled block's time window become
+    // prototypes of the chosen speaker, improving the global registry. A user
+    // pick is ground truth — it should strengthen the person's identity.
+    for (cluster_label, start, end, speaker_id) in &turn_overrides {
+        let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
+            Some("mic")
+        } else if cluster_label.starts_with("SPEAKER_") {
+            if session_data.cluster_embeddings.saw_system_audio {
+                Some("system")
+            } else {
+                Some("mic")
+            }
+        } else {
+            None
+        };
+        let Some(channel) = channel else { continue };
+        let buffer = if channel == "mic" {
+            &session_data.mic_embeddings
+        } else {
+            &session_data.sys_embeddings
+        };
+        match SpeakerRepository::enroll_embeddings_from_buffer(
+            pool,
+            speaker_id,
+            channel,
+            buffer,
+            (*start as f32, *end as f32),
+        )
+        .await
+        {
+            Ok(n) => {
+                if n > 0 {
+                    enrolled += n;
+                    info!(
+                        "Ground-truth enrollment: {} embeddings for {} from override {} [{:.1}s-{:.1}s]",
+                        n, speaker_id, cluster_label, start, end
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Failed to enroll ground-truth embeddings for {} from {}: {}",
+                speaker_id, cluster_label, e
+            ),
+        }
+    }
+
     if !turn_overrides.is_empty() {
         SpeakerRepository::apply_turn_overrides(pool, &meeting_id, &turn_overrides)
             .await

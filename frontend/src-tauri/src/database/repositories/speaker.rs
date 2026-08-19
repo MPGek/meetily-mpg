@@ -3,7 +3,7 @@ use crate::database::models::{
     SpeakerEmbedding,
 };
 use chrono::Utc;
-use sqlx::{Error as SqlxError, SqlitePool};
+use sqlx::{Error as SqlxError, SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 /// Model tag identifying the extractor that produced stored embeddings.
@@ -57,6 +57,36 @@ pub struct Exemplar {
 pub struct SpeakerRepository;
 
 impl SpeakerRepository {
+    /// Enforce the per-person prototype cap by pruning the lowest-duration
+    /// rows above the cap. Returns the speaker's prototype count after
+    /// pruning (capped). Shared by cluster-cache enrollment and
+    /// ground-truth buffer enrollment.
+    async fn enforce_prototype_cap(
+        conn: &mut SqliteConnection,
+        speaker_id: &str,
+    ) -> Result<usize, SqlxError> {
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(speaker_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        let excess = count.0 - PER_PERSON_PROTOTYPE_CAP as i64;
+        if excess > 0 {
+            sqlx::query(
+                "DELETE FROM speaker_embeddings WHERE id IN (
+                     SELECT id FROM speaker_embeddings
+                     WHERE speaker_id = ?
+                     ORDER BY duration_secs ASC LIMIT ?
+                 )",
+            )
+            .bind(speaker_id)
+            .bind(excess)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(count.0.min(PER_PERSON_PROTOTYPE_CAP as i64) as usize)
+    }
+
     // ===== Speakers CRUD =====
 
     /// List all registry speakers ordered by name (for the editor dropdown).
@@ -352,30 +382,64 @@ impl SpeakerRepository {
         .execute(&mut *tx)
         .await?;
 
-        // Enforce the per-person prototype cap: if the speaker now has more
-        // than the cap, delete the lowest-duration rows above the cap.
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
-                .bind(speaker_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let excess = count.0 - PER_PERSON_PROTOTYPE_CAP as i64;
-        if excess > 0 {
-            sqlx::query(
-                "DELETE FROM speaker_embeddings WHERE id IN (
-                     SELECT id FROM speaker_embeddings
-                     WHERE speaker_id = ?
-                     ORDER BY duration_secs ASC LIMIT ?
-                 )",
-            )
-            .bind(speaker_id)
-            .bind(excess)
-            .execute(&mut *tx)
-            .await?;
-        }
+        let enrolled = Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
 
         tx.commit().await?;
-        Ok(count.0.min(PER_PERSON_PROTOTYPE_CAP as i64) as usize)
+        Ok(enrolled)
+    }
+
+    /// Enroll chunk embeddings as ground truth for a speaker: picks the
+    /// best-N (longest duration first, capped at K=8) chunk embeddings whose
+    /// time window overlaps `[window.0, window.1]` and inserts them as direct
+    /// prototypes of the speaker (no cluster ownership), enforcing the
+    /// per-person cap. Used to make user-chosen block assignments improve
+    /// the speaker's global voiceprint set.
+    pub async fn enroll_embeddings_from_buffer(
+        pool: &SqlitePool,
+        speaker_id: &str,
+        channel: &str,
+        embeddings: &[(f32, f32, Vec<f32>)],
+        window: (f32, f32),
+    ) -> Result<usize, SqlxError> {
+        let (win_start, win_end) = window;
+        if win_end <= win_start {
+            return Ok(0);
+        }
+        let mut candidates: Vec<(f64, Vec<f32>)> = embeddings
+            .iter()
+            .filter(|(e_start, e_end, _)| e_start < &win_end && e_end > &win_start)
+            .map(|(s, e, emb)| ((e - s) as f64, emb.clone()))
+            .collect();
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+        candidates.truncate(ENROLLMENT_BEST_K as usize);
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = pool.begin().await?;
+        let now = Utc::now();
+        let mut inserted = 0usize;
+        for (dur, emb) in candidates {
+            let id = format!("emb-{}", Uuid::new_v4());
+            let emb_bytes = embedding_to_bytes(&emb);
+            sqlx::query(
+                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&emb_bytes)
+            .bind(SPEAKER_EMBEDDING_MODEL)
+            .bind(channel)
+            .bind(dur)
+            .bind(speaker_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            inserted += 1;
+        }
+        Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
+        tx.commit().await?;
+        Ok(inserted)
     }
 
     // ===== Prototype queries (recognition) =====
@@ -755,6 +819,60 @@ mod tests {
             protos.len(),
             PER_PERSON_PROTOTYPE_CAP
         );
+    }
+
+    #[tokio::test]
+    async fn enroll_embeddings_from_buffer_takes_overlapping_best_n() {
+        let pool = setup_pool().await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+
+        // Buffer: two chunks overlapping [1.0, 5.0], one far outside.
+        let buffer = vec![
+            (0.5f32, 4.0f32, emb(&[1.0, 0.0, 0.0, 0.0])), // overlaps
+            (2.0f32, 3.0f32, emb(&[2.0, 0.0, 0.0, 0.0])), // overlaps (shortest dur)
+            (9.0f32, 12.0f32, emb(&[3.0, 0.0, 0.0, 0.0])), // outside
+            (0.0f32, 6.0f32, emb(&[4.0, 0.0, 0.0, 0.0])), // overlaps (longest dur)
+        ];
+
+        let n = SpeakerRepository::enroll_embeddings_from_buffer(
+            &pool, &alice.id, "mic", &buffer, (1.0, 5.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 3, "only window-overlapping chunks enroll");
+        assert_eq!(buffer.len() as usize - 1, n);
+
+        let protos =
+            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
+                .await
+                .unwrap();
+        assert_eq!(protos.len(), 3);
+        assert!(protos.iter().all(|p| p.channel == "mic"));
+        // The longest-overlapping chunk (duration 6, x=4.0) must be included.
+        assert!(protos.iter().any(|p| p.embedding[0] == 4.0));
+        assert!(
+            protos.iter().all(|p| p.embedding[0] != 3.0),
+            "non-overlapping chunk must not enroll"
+        );
+    }
+
+    #[tokio::test]
+    async fn enroll_embeddings_from_buffer_keeps_channels_clean() {
+        let pool = setup_pool().await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+
+        let _ = SpeakerRepository::enroll_embeddings_from_buffer(
+            &pool, &alice.id, "mic", &[(0.0, 4.0, emb(&[1.0, 0.0, 0.0, 0.0]))], (0.0, 4.0),
+        )
+        .await
+        .unwrap();
+
+        let protos =
+            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
+                .await
+                .unwrap();
+        assert_eq!(protos.len(), 1);
+        assert_eq!(protos[0].channel, "mic");
     }
 
     #[tokio::test]

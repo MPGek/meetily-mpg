@@ -19,6 +19,8 @@ export interface Transcript {
   source_device?: string;    // "Microphone" or "System"
   speaker?: string;          // Speaker ID from diarization
   speaker_label?: string;    // User-assigned speaker name
+  speaker_matched_by?: string; // 'user' | 'auto' | 'fallback'
+  speaker_match_score?: number; // cosine similarity 0..1 for auto-matched
 }
 
 export interface TranscriptUpdate {
@@ -116,6 +118,8 @@ export interface TranscriptSegmentData {
   source_device?: string; // "Microphone" or "System"
   speaker?: string;       // Speaker ID from diarization
   speaker_label?: string; // User-assigned speaker name
+  speaker_matched_by?: string; // 'user' | 'auto' | 'fallback'
+  speaker_match_score?: number; // cosine similarity 0..1
 }
 
 // Speaker diarization types

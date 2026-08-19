@@ -10,7 +10,7 @@ use tracing::{error, info};
 /// per-transcript override (design D10), then `meeting_speakers` -> `speakers`
 /// (design D3). Legacy `speaker_label` is the fallback when neither a
 /// per-block override nor a cluster registry binding exists.
-const TRANSCRIPT_DISPLAY_SELECT: &str = "SELECT t.id, t.meeting_id, t.transcript, t.timestamp, t.summary, t.action_items, t.key_points, t.audio_start_time, t.audio_end_time, t.duration, t.source_device, t.speaker, COALESCE(so.name, s.name, t.speaker_label) AS speaker_label FROM transcripts t LEFT JOIN speakers so ON so.id = t.speaker_override_id LEFT JOIN meeting_speakers ms ON ms.meeting_id = t.meeting_id AND ms.cluster_label = t.speaker LEFT JOIN speakers s ON s.id = ms.speaker_id";
+const TRANSCRIPT_DISPLAY_SELECT: &str = "SELECT t.id, t.meeting_id, t.transcript, t.timestamp, t.summary, t.action_items, t.key_points, t.audio_start_time, t.audio_end_time, t.duration, t.source_device, t.speaker, COALESCE(so.name, s.name, t.speaker_label) AS speaker_label, CASE WHEN t.speaker_override_id IS NOT NULL THEN 'user' WHEN ms.speaker_id IS NOT NULL THEN COALESCE(ms.matched_by, 'auto') ELSE 'fallback' END AS speaker_matched_by, ms.match_score AS speaker_match_score FROM transcripts t LEFT JOIN speakers so ON so.id = t.speaker_override_id LEFT JOIN meeting_speakers ms ON ms.meeting_id = t.meeting_id AND ms.cluster_label = t.speaker LEFT JOIN speakers s ON s.id = ms.speaker_id";
 
 pub struct MeetingsRepository;
 
@@ -104,6 +104,8 @@ impl MeetingsRepository {
                     source_device: t.source_device,
                     speaker: t.speaker,
                     speaker_label: t.speaker_label,
+                    speaker_matched_by: t.speaker_matched_by,
+                    speaker_match_score: t.speaker_match_score,
                 })
                 .collect::<Vec<_>>();
 

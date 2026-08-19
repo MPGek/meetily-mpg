@@ -33,7 +33,7 @@ The system SHALL record the link between a meeting's speaker cluster label and a
 - **THEN** the system SHALL NOT overwrite the user's binding
 
 ### Requirement: Speaker enrollment on assignment
-When a user links a meeting cluster to a registry speaker (existing or newly created), the system SHALL enroll that cluster's cached exemplar embeddings as prototypes of the speaker by reparenting the best rows (longest duration first, capped at K=8 per enrollment). Per-person prototype count SHALL be capped (64), pruning lowest-quality rows.
+When a user links a meeting cluster to a registry speaker (existing or newly created), the system SHALL enroll that cluster's cached exemplar embeddings as prototypes of the speaker by reparenting the best rows (longest duration first, capped at K=8 per enrollment). When a user assigns a speaker to a transcript block (live or offline, single-block or cluster-wide), the embeddings whose time windows cover that block SHALL additionally be enrolled into that speaker's global prototype set as ground truth, so the person is recognized across future meetings. Enrollment seeding SHALL be keyed by the underlying pipeline speaker identity and capture channel — embeddings from microphone and system channels SHALL never be mixed into the same seed set. Per-person prototype count SHALL be capped (64), pruning lowest-quality rows.
 
 #### Scenario: Naming enrolls voiceprint
 - **WHEN** user assigns the name "Alice" to cluster `SPEAKER_00` of a diarized meeting
@@ -42,6 +42,14 @@ When a user links a meeting cluster to a registry speaker (existing or newly cre
 #### Scenario: Linking existing person enrolls too
 - **WHEN** user links cluster `SPEAKER_01` to existing registry speaker "Bob"
 - **THEN** the cluster's cached embeddings SHALL be added to Bob's prototypes, subject to the per-person cap
+
+#### Scenario: Ground-truth block assignment enrolls its covering embeddings
+- **WHEN** a user assigns "Alice" to a single transcript block whose time window is covered by session embeddings
+- **THEN** the embeddings overlapping that block's time window SHALL be enrolled as prototypes of Alice at the same time as the block's identity is saved
+
+#### Scenario: Enrollment seeding keeps channels separate
+- **WHEN** a user assigns a microphone-channel block to "Alice" and a system-channel block to "Bob" in the same session
+- **THEN** Alice's enrollment SHALL contain only microphone-channel embeddings and Bob's only system-channel embeddings, even when both channels share the same numeric pipeline speaker index
 
 ### Requirement: Expected-speaker allowlist per meeting
 The system SHALL allow users to select, per meeting, a set of expected speakers from the registry (`meeting_expected_speakers` table). Automatic recognition for that meeting SHALL match only against prototypes of expected speakers. If no expected speakers are selected, recognition SHALL match against ALL registry speakers. The allowlist SHALL NOT restrict manual speaker assignment.
@@ -77,7 +85,7 @@ Because cluster centroids are cached in `meeting_speakers`, the system SHALL pro
 - **THEN** previously unidentified clusters SHALL be matched against Dave's prototypes and auto-assigned where confident, with no diarization re-run
 
 ### Requirement: Speaker display name resolution
-Transcript queries SHALL resolve each transcript's display name by first checking the transcript's per-block speaker override (if any), then joining its meeting's `meeting_speakers` mapping to `speakers`, and finally falling back to legacy `transcripts.speaker_label` and then to the formatted cluster label. The cluster label SHALL remain stored on the transcript row unchanged.
+Transcript queries SHALL resolve each transcript's display name by first checking the transcript's per-block speaker override (if any), then joining its meeting's `meeting_speakers` mapping to `speakers`, and finally falling back to legacy `transcripts.speaker_label` and then to the formatted cluster label. The cluster label SHALL remain stored on the transcript row unchanged. Transcript queries SHALL also return the provenance of the resolved name (user-assigned, auto-matched, or fallback) and, for auto-matched names, the match score.
 
 #### Scenario: Joined name displayed
 - **WHEN** a transcript's cluster is linked to registry speaker Alice via `meeting_speakers`
@@ -90,6 +98,14 @@ Transcript queries SHALL resolve each transcript's display name by first checkin
 #### Scenario: Legacy fallback
 - **WHEN** a transcript has a legacy `speaker_label` but no `meeting_speakers` mapping and no per-block override
 - **THEN** transcript queries SHALL return the legacy label
+
+#### Scenario: Auto-matched name carries score
+- **WHEN** a transcript's display name resolves through a `meeting_speakers` row with `matched_by='auto'` and `match_score=0.78`
+- **THEN** transcript queries SHALL return the name together with 'auto' provenance and a 0.78 score
+
+#### Scenario: User-assigned name carries user provenance
+- **WHEN** a transcript's display name resolves through a `meeting_speakers` row with `matched_by='user'`
+- **THEN** transcript queries SHALL return the name together with 'user' provenance and no score
 
 ### Requirement: Per-block speaker override
 The system SHALL allow relabeling a single transcript block to a registry speaker (existing or newly created) without affecting the rest of its cluster. Block-level assignment SHALL store a per-transcript override that takes precedence over the cluster mapping at display time, SHALL NOT modify `meeting_speakers`, and SHALL NOT enroll any embeddings (a single block owns no cached embeddings). Auto-recognition and re-match SHALL NOT overwrite block overrides.

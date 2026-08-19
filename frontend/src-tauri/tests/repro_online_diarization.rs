@@ -63,6 +63,7 @@ async fn run_mode(
     let mut processor = match OnlineDiarizationProcessor::new(
         mode,
         8,
+        true,
         Path::new(&models_dir),
         Some(turn_sender),
         None,
@@ -212,6 +213,7 @@ async fn run_mode_short(
     let mut processor = match OnlineDiarizationProcessor::new(
         mode,
         8,
+        true,
         Path::new(&models_dir),
         Some(turn_sender),
         None,
@@ -272,6 +274,7 @@ async fn run_mode_16k(
     let mut processor = match OnlineDiarizationProcessor::new(
         mode,
         8,
+        true,
         Path::new(&models_dir),
         Some(turn_sender),
         None,
@@ -345,6 +348,7 @@ async fn run_mode_long(
     let mut processor = match OnlineDiarizationProcessor::new(
         mode,
         8,
+        true,
         Path::new(&models_dir),
         Some(turn_sender),
         None,
@@ -414,6 +418,7 @@ async fn run_mode_ms(
     let mut processor = match OnlineDiarizationProcessor::new(
         mode,
         max_speakers,
+        true,
         Path::new(&models_dir),
         Some(turn_sender),
         None,

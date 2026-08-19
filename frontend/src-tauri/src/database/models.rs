@@ -42,6 +42,13 @@ pub struct Transcript {
     pub source_device: Option<String>,
     pub speaker: Option<String>,
     pub speaker_label: Option<String>,
+    /// Provenance of the resolved display name: "user" (per-block override or
+    /// user binding), "auto" (automatic recognition), or "fallback".
+    #[sqlx(default)]
+    pub speaker_matched_by: Option<String>,
+    /// Recognition match score for auto-matched names (0..1).
+    #[sqlx(default)]
+    pub speaker_match_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

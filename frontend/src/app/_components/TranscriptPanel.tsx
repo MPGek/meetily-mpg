@@ -48,6 +48,8 @@ export function TranscriptPanel({
       source_device: t.source_device,
       speaker: t.speaker,
       speaker_label: t.speaker_label,
+      speaker_matched_by: t.speaker_matched_by,
+      speaker_match_score: t.speaker_match_score,
     })),
     [transcripts]
   );

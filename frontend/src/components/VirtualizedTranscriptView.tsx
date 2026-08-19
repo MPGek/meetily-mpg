@@ -100,6 +100,24 @@ function formatSpeakerId(speaker: string): string {
     return isNaN(idx) ? speaker : `Speaker ${idx + 1}`;
 }
 
+/**
+ * Resolve the display text for a speaker identity. Auto-matched names render
+ * with an `(auto)` suffix and the similarity as a percentage (trustworthy at a
+ * glance); user-assigned names render plain; fallback (unlinked cluster) uses
+ * the formatted cluster label with no decoration.
+ */
+function formatSpeakerDisplay(
+    baseName: string,
+    matchedBy?: string,
+    matchScore?: number
+): string {
+    if (matchedBy === 'auto') {
+        const pct = matchScore !== undefined ? `${Math.round(matchScore * 100)}%` : '';
+        return `${baseName} (auto)${pct ? ` ${pct}` : ''}`;
+    }
+    return baseName;
+}
+
 // Inline editable speaker label — combobox with registry dropdown + free text.
 // Default scope is "this block" (per-transcript override); an explicit
 // "apply to all blocks of this speaker" option links the whole cluster.
@@ -112,6 +130,8 @@ function SpeakerLabel({
     transcriptId,
     startTime,
     endTime,
+    matchedBy,
+    matchScore,
 }: {
     speaker: string;
     label?: string;
@@ -121,6 +141,8 @@ function SpeakerLabel({
     transcriptId?: string;
     startTime?: number;
     endTime?: number;
+    matchedBy?: string;
+    matchScore?: number;
 }) {
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
@@ -128,7 +150,7 @@ function SpeakerLabel({
     const [loading, setLoading] = useState(false);
     const [scopeAll, setScopeAll] = useState(false);
 
-    const displayName = label || formatSpeakerId(speaker);
+    const displayName = formatSpeakerDisplay(label || formatSpeakerId(speaker), matchedBy, matchScore);
 
     // Load registry speakers when popover opens
     useEffect(() => {
@@ -359,6 +381,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     source_device,
     speaker,
     speaker_label,
+    speaker_matched_by,
+    speaker_match_score,
     hasAudioTime,
     onUpdateSpeakerLabel,
     meetingId,
@@ -376,6 +400,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     source_device?: string;
     speaker?: string;
     speaker_label?: string;
+    speaker_matched_by?: string;
+    speaker_match_score?: number;
     hasAudioTime?: boolean;
     onUpdateSpeakerLabel?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
     meetingId?: string;
@@ -453,6 +479,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     transcriptId={id}
                                     startTime={timestamp}
                                     endTime={endTime}
+                                    matchedBy={speaker_matched_by}
+                                    matchScore={speaker_match_score}
                                 />
                             </div>
                         )}
@@ -505,6 +533,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     transcriptId={id}
                                     startTime={timestamp}
                                     endTime={endTime}
+                                    matchedBy={speaker_matched_by}
+                                    matchScore={speaker_match_score}
                                 />
                             </div>
                         )}
@@ -536,6 +566,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     transcriptId={id}
                                     startTime={timestamp}
                                     endTime={endTime}
+                                    matchedBy={speaker_matched_by}
+                                    matchScore={speaker_match_score}
                                 />
                             <span
                                 className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
@@ -772,6 +804,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        speaker_matched_by={segment.speaker_matched_by}
+                                        speaker_match_score={segment.speaker_match_score}
                                         hasAudioTime={segment.hasAudioTime ?? false}
                                         onUpdateSpeakerLabel={onUpdateSpeakerLabel}
                                         meetingId={meetingId}
@@ -838,6 +872,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        speaker_matched_by={segment.speaker_matched_by}
+                                        speaker_match_score={segment.speaker_match_score}
                                         hasAudioTime={segment.hasAudioTime ?? false}
                                         onUpdateSpeakerLabel={onUpdateSpeakerLabel}
                                         meetingId={meetingId}

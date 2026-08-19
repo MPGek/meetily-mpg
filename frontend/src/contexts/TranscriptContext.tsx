@@ -33,12 +33,14 @@ const TranscriptContext = createContext<TranscriptContextType | undefined>(undef
  * Returns the matching cluster label plus the recognized registry display
  * name (if the backend matched the turn above threshold).
  */
-function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): { speaker: string; displayName?: string } | undefined {
+function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): { speaker: string; displayName?: string; matchedBy?: string; matchScore?: number } | undefined {
   const tStart = segment.audio_start_time ?? 0;
   const tEnd = segment.audio_end_time ?? tStart;
 
   let bestSpeaker: string | undefined;
   let bestDisplayName: string | undefined;
+  let bestMatchedBy: string | undefined;
+  let bestMatchScore: number | undefined;
   let bestOverlap = 0;
   for (const turn of turns) {
     if (turn.source_device !== segment.source_device) {
@@ -52,10 +54,12 @@ function matchSpeakerToTranscript(segment: Transcript, turns: SpeakerTurn[]): { 
         bestOverlap = overlap;
         bestSpeaker = turn.speaker;
         bestDisplayName = turn.display_name;
+        bestMatchedBy = turn.matched_by;
+        bestMatchScore = turn.match_score;
       }
     }
   }
-  return bestSpeaker ? { speaker: bestSpeaker, displayName: bestDisplayName } : undefined;
+  return bestSpeaker ? { speaker: bestSpeaker, displayName: bestDisplayName, matchedBy: bestMatchedBy, matchScore: bestMatchScore } : undefined;
 }
 
 export function TranscriptProvider({ children }: { children: ReactNode }) {
@@ -72,6 +76,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const finalFlushRef = useRef<(() => void) | null>(null);
   const turnsRef = useRef<SpeakerTurn[]>([]);
+  // User-pinned live labels: transcriptId -> { cluster, name }. A pinned block
+  // keeps its user-chosen name and cluster for the rest of the session and is
+  // never reverted by a later speaker-turn event carrying a stale display_name.
+  const pinnedLabelsRef = useRef<Map<string, { cluster: string; name: string }>>(new Map());
 
   // Keep ref updated with current transcripts
   useEffect(() => {
@@ -128,12 +136,25 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           setTranscripts(prev => {
             let changed = false;
             const next = prev.map(t => {
+              // Pinned blocks (user-assigned) keep their cluster+name and are
+              // never re-matched against the turn stream, so a stale later
+              // turn cannot revert the user's explicit choice.
+              const pin = pinnedLabelsRef.current.get(t.id);
+              if (pin && pin.cluster === turn.speaker) {
+                return t;
+              }
               const matched = matchSpeakerToTranscript(t, turnsRef.current);
               if (!matched) return t;
               const displayName = matched.displayName || (matched.speaker === t.speaker ? t.speaker_label : undefined);
               if (matched.speaker !== t.speaker || (displayName && displayName !== t.speaker_label)) {
                 changed = true;
-                return { ...t, speaker: matched.speaker, speaker_label: displayName ?? t.speaker_label };
+                return {
+                  ...t,
+                  speaker: matched.speaker,
+                  speaker_label: displayName ?? t.speaker_label,
+                  speaker_matched_by: matched.matchedBy,
+                  speaker_match_score: matched.matchScore,
+                };
               }
               return t;
             });
@@ -169,6 +190,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           try {
             // Reset live speaker turns for the new recording session
             turnsRef.current = [];
+            pinnedLabelsRef.current = new Map();
 
             // Generate unique meeting ID
             const meetingId = `meeting-${Date.now()}`;
@@ -592,6 +614,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const clearTranscripts = useCallback(() => {
     setTranscripts([]);
     turnsRef.current = [];
+    pinnedLabelsRef.current = new Map();
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -624,14 +647,22 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // is given (single-block scope), only that segment is relabeled via its
   // per-turn override; the backend already recorded it in session state.
   const applyLiveSpeakerLabel = useCallback((clusterLabel: string, name: string, transcriptId?: string) => {
+    // Record pins so later speaker-turn events can't revert the user's choice.
+    pinnedLabelsRef.current = new Map(pinnedLabelsRef.current);
     setTranscripts(prev =>
       prev.map(t => {
         if (transcriptId !== undefined) {
+          if (t.id === transcriptId) {
+            pinnedLabelsRef.current.set(t.id, { cluster: t.speaker ?? clusterLabel, name });
+          }
           if (t.id !== transcriptId || t.speaker_label === name) return t;
-          return { ...t, speaker_label: name };
+          return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
+        }
+        if (t.speaker === clusterLabel) {
+          pinnedLabelsRef.current.set(t.id, { cluster: clusterLabel, name });
         }
         if (t.speaker !== clusterLabel || t.speaker_label === name) return t;
-        return { ...t, speaker_label: name };
+        return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
       })
     );
   }, []);

@@ -26,7 +26,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::diarization::ClusteredEmbedding;
 use super::recording_saver::TranscriptSegment;
 use super::recording_state::{AudioChunk, DeviceType};
-use super::speaker_recognition::{best_match, Prototype};
+use super::speaker_recognition::{best_match, MatchResult, Prototype};
 use crate::database::repositories::speaker::{SpeakerRepository, SPEAKER_EMBEDDING_MODEL};
 use polyvoice::clusterer::Clusterer as _;
 use polyvoice::embedder::Embedder as _;
@@ -100,47 +100,68 @@ pub struct SpeakerTurn {
     pub source_device: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Whether this turn's identity came from a user binding (`user`), an
+    /// automatic registry match (`auto`), or neither (None).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_by: Option<String>,
+    /// Cosine similarity of the automatic recognition (0..1), when recognized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_score: Option<f32>,
 }
 
 /// Per-channel clustered embeddings produced at recording stop, shaped for the
 /// shared `persist_and_recognize_session` (centroid + exemplar persistence +
 /// auto-recognition). `saw_system_audio` is the online equivalent of the
-/// offline `is_stereo` flag.
+/// offline `is_stereo` flag. Raw per-chunk buffers are carried so
+/// ground-truth enrollment of user-assigned blocks can reuse session audio.
 #[derive(Debug, Clone, Default)]
 pub struct OnlineClusterEmbeddings {
     pub mic: Vec<ClusteredEmbedding>,
     pub sys: Vec<ClusteredEmbedding>,
     pub saw_system_audio: bool,
+    /// Raw timestamped mic-channel chunk embeddings (`(start, end, embedding)`).
+    pub mic_raw: Vec<(f32, f32, Vec<f32>)>,
+    /// Raw timestamped system-channel chunk embeddings (`(start, end, embedding)`).
+    pub sys_raw: Vec<(f32, f32, Vec<f32>)>,
 }
 
 /// In-memory prototype store shared between the online diarization processor
 /// (Fast mode) and the `assign_live_speaker` command, so mid-recording renames
 /// take effect immediately for the remainder of the session (design D6).
 /// Holds the candidate prototypes for live matching, speaker id -> name, the
-/// session's cluster -> person bindings, and per-pipeline-speaker buffered
-/// embeddings used to seed a newly created person's prototypes.
+/// session's cluster -> person bindings, and per-(channel, pipeline-speaker)
+/// buffered embeddings used to seed a newly created person's prototypes. Keys
+/// are channel-qualified so mic and system voices never mix (design: keep
+/// enrollment seeding channel-clean).
 pub struct PrototypeStore {
     pub prototypes: Vec<Prototype>,
     pub names: HashMap<String, String>,
     pub bindings: HashMap<String, String>,
-    pub session_embeddings: HashMap<usize, Vec<(Vec<f32>, f32, String)>>,
+    /// Session chunk embeddings keyed by `(channel, pipeline_speaker_id)`.
+    pub session_embeddings: HashMap<(String, usize), Vec<(Vec<f32>, f32)>>,
+    /// Session mic label prefix ("MIC_SPEAKER" for stereo, "SPEAKER" for mono).
+    /// Used to resolve a label's channel when seeding prototypes on bind.
+    pub mic_prefix: String,
 }
 
 impl PrototypeStore {
-    pub fn new() -> Self {
+    pub fn new(mic_prefix: String) -> Self {
         Self {
             prototypes: Vec::new(),
             names: HashMap::new(),
             bindings: HashMap::new(),
             session_embeddings: HashMap::new(),
+            mic_prefix,
         }
     }
 
     /// Load candidate prototypes + speaker names. When `candidate_ids` is
     /// None (empty allowlist), loads prototypes for ALL speakers.
+    /// `has_system_device` fixes the session's channel scheme.
     pub async fn load(
         pool: &SqlitePool,
         candidate_ids: Option<Vec<String>>,
+        has_system_device: bool,
     ) -> Result<Self, String> {
         let candidates_ref = candidate_ids.as_deref();
         let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
@@ -160,23 +181,49 @@ impl PrototypeStore {
         let names: HashMap<String, String> =
             speakers.into_iter().map(|s| (s.id, s.name)).collect();
 
+        let mic_prefix = if has_system_device {
+            "MIC_SPEAKER".to_string()
+        } else {
+            "SPEAKER".to_string()
+        };
+
         Ok(Self {
             prototypes,
             names,
             bindings: HashMap::new(),
             session_embeddings: HashMap::new(),
+            mic_prefix,
         })
     }
 
-    /// Match an embedding against the store; returns the recognized speaker's
-    /// display name when above threshold, else None.
-    pub fn recognize(&self, embedding: &[f32], channel: &str) -> Option<String> {
-        best_match(embedding, Some(channel), &self.prototypes)
-            .and_then(|m| self.names.get(&m.speaker_id).cloned())
+    /// The channel and pipeline speaker id encoded in a cluster label. For a
+    /// `MIC_SPEAKER_` prefix the channel is always mic. A bare `SPEAKER_`
+    /// prefix is the system channel in a stereo session and the mic channel in
+    /// a mono session (the session's `mic_prefix` disambiguates).
+    pub fn channel_and_id(&self, cluster_label: &str) -> Option<(String, usize)> {
+        let id = parse_pipeline_id(cluster_label)?;
+        let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
+            "mic".to_string()
+        } else if cluster_label.starts_with("SPEAKER_") {
+            if self.mic_prefix == "MIC_SPEAKER" {
+                "system".to_string()
+            } else {
+                "mic".to_string()
+            }
+        } else {
+            return None;
+        };
+        Some((channel, id))
     }
 
-    /// Record a chunk embedding tagged with its pipeline speaker id, for
-    /// seeding a newly created person's prototypes on live rename.
+    /// Match an embedding against the store; returns the recognized match
+    /// (speaker id + score) when above threshold, else None.
+    pub fn recognize(&self, embedding: &[f32], channel: &str) -> Option<MatchResult> {
+        best_match(embedding, Some(channel), &self.prototypes)
+    }
+
+    /// Record a chunk embedding tagged with its channel + pipeline speaker id,
+    /// for seeding a newly created person's prototypes on live rename.
     pub fn push_session(
         &mut self,
         pipeline_id: usize,
@@ -185,24 +232,25 @@ impl PrototypeStore {
         channel: String,
     ) {
         self.session_embeddings
-            .entry(pipeline_id)
+            .entry((channel, pipeline_id))
             .or_default()
-            .push((embedding, duration, channel));
+            .push((embedding, duration));
     }
 
     /// Bind a cluster to a person and merge that cluster's session-derived
-    /// embeddings as the person's prototypes, so subsequent chunks match.
+    /// embeddings as the person's prototypes, so subsequent chunks match. Only
+    /// embeddings from the cluster's own channel are seeded (never both).
     pub fn bind(&mut self, cluster_label: &str, speaker_id: &str, name: &str) {
         self.bindings
             .insert(cluster_label.to_string(), speaker_id.to_string());
         self.names
             .insert(speaker_id.to_string(), name.to_string());
-        if let Some(pid) = parse_pipeline_id(cluster_label) {
-            if let Some(embs) = self.session_embeddings.get(&pid) {
-                for (emb, _dur, ch) in embs {
+        if let Some((channel, pid)) = self.channel_and_id(cluster_label) {
+            if let Some(embs) = self.session_embeddings.get(&(channel.clone(), pid)) {
+                for (emb, _dur) in embs.iter() {
                     self.prototypes.push(Prototype {
                         speaker_id: speaker_id.to_string(),
-                        channel: ch.clone(),
+                        channel: channel.clone(),
                         embedding: emb.clone(),
                     });
                 }
@@ -386,6 +434,11 @@ pub struct OnlineDiarizationProcessor {
     mode: DiarizationMode,
     max_speakers: usize,
     saw_system_audio: bool,
+    /// Channel-scoped label prefix for the microphone channel, fixed for the
+    /// whole session. `MIC_SPEAKER` when a system device was captured (stereo),
+    /// else `SPEAKER` (mono). Chosen at construction so live labels and
+    /// stop-time assignments always agree.
+    mic_prefix: String,
     engine: Option<Engine>,
     turn_sender: Option<UnboundedSender<SpeakerTurn>>,
     /// Shared live-recognition store (Fast mode). None in Efficient mode or
@@ -398,10 +451,12 @@ const MIN_SEGMENT_SAMPLES: usize = 3200; // 200 ms at 16 kHz (spec minimum)
 
 impl OnlineDiarizationProcessor {
     /// Initializes polyvoice components based on mode. Model initialization is
-    /// blocking — call from a blocking task.
+    /// blocking — call from a blocking task. `has_system_device` fixes the
+    /// microphone label prefix for the whole session (stereo vs mono).
     pub fn new(
         mode: DiarizationMode,
         max_speakers: usize,
+        has_system_device: bool,
         models_dir: &Path,
         turn_sender: Option<UnboundedSender<SpeakerTurn>>,
         prototype_store: Option<Arc<RwLock<PrototypeStore>>>,
@@ -412,6 +467,11 @@ impl OnlineDiarizationProcessor {
         let guard = OnlineDiarizationGuard::acquire()?;
 
         let embedding_model = super::diarization::diarization_model_paths(models_dir).1;
+        let mic_prefix = if has_system_device {
+            "MIC_SPEAKER".to_string()
+        } else {
+            "SPEAKER".to_string()
+        };
 
         let engine = match mode {
             DiarizationMode::Efficient => {
@@ -440,16 +500,18 @@ impl OnlineDiarizationProcessor {
         };
 
         info!(
-            "Online diarization processor initialized (mode: {:?}, max_speakers: {}, prototype_store: {})",
+            "Online diarization processor initialized (mode: {:?}, max_speakers: {}, prototype_store: {}, mic_prefix: {})",
             mode,
             max_speakers,
-            prototype_store.is_some()
+            prototype_store.is_some(),
+            mic_prefix
         );
 
         Ok(Self {
             mode,
             max_speakers,
             saw_system_audio: false,
+            mic_prefix,
             engine: Some(engine),
             turn_sender,
             prototype_store,
@@ -497,8 +559,8 @@ impl OnlineDiarizationProcessor {
         // Capture live-emission state before borrowing the engine, so the
         // Fast-mode loop can send turns without conflicting borrows.
         let turn_sender = self.turn_sender.clone();
-        let saw_system_audio = self.saw_system_audio;
         let prototype_store = self.prototype_store.clone();
+        let mic_prefix = self.mic_prefix.as_str();
 
         match engine {
             Engine::Efficient { extractor, mic, sys } => {
@@ -522,7 +584,7 @@ impl OnlineDiarizationProcessor {
                     DeviceType::Microphone => (
                         mic,
                         "Microphone",
-                        if saw_system_audio { "MIC_SPEAKER" } else { "SPEAKER" },
+                        mic_prefix,
                         mic_emb,
                         "mic",
                     ),
@@ -543,9 +605,14 @@ impl OnlineDiarizationProcessor {
                 let end = start + samples.len() as f32 / 16000.0;
                 let duration = (end - start).max(0.0);
 
-                // Live recognition against the prototype store (relabel turns).
-                let recognized_name = prototype_store.as_ref().and_then(|store| {
-                    store.read().ok().and_then(|s| s.recognize(&chunk_embedding, channel_str))
+                // Live recognition against the prototype store (relabel turns). Keep
+                // the match result (id, name, score) so the emitted turn can
+                // carry provenance + confidence.
+                let recognition = prototype_store.as_ref().and_then(|store| {
+                    let read = store.read().ok()?;
+                    let m = read.recognize(&chunk_embedding, channel_str)?;
+                    let name = read.names.get(&m.speaker_id).cloned();
+                    Some((m.speaker_id, name, m.score))
                 });
 
                 // Buffer the chunk embedding for stop-time centroids/enrollment
@@ -582,12 +649,44 @@ impl OnlineDiarizationProcessor {
                                     }
                                 }
                                 if let Some(sender) = &turn_sender {
+                                    let turn_label = format!("{}_{:02}", prefix, speaker_index);
+                                    // A user-bound cluster labels its turns with
+                                    // the user's chosen name; otherwise the
+                                    // automatic recognition name (if any) is shown.
+                                    let bound_speaker =
+                                        prototype_store.as_ref().and_then(|store| {
+                                            store
+                                                .read()
+                                                .ok()
+                                                .and_then(|s| s.bindings().get(&turn_label).cloned())
+                                        });
+                                    let display_name = match &bound_speaker {
+                                        Some(spk_id) => prototype_store
+                                            .as_ref()
+                                            .and_then(|store| {
+                                                store
+                                                    .read()
+                                                    .ok()
+                                                    .and_then(|s| s.names.get(spk_id).cloned())
+                                            })
+                                            .or_else(|| recognition.as_ref().and_then(|r| r.1.clone())),
+                                        None => recognition.as_ref().and_then(|r| r.1.clone()),
+                                    };
+                                    let matched_by = if bound_speaker.is_some() {
+                                        Some("user".to_string())
+                                    } else if recognition.is_some() {
+                                        Some("auto".to_string())
+                                    } else {
+                                        None
+                                    };
                                     let turn_event = SpeakerTurn {
                                         start_time: channel.mapper.to_abs(turn_start as f64),
                                         end_time: channel.mapper.to_abs(turn_end as f64),
-                                        speaker: format!("{}_{:02}", prefix, speaker_index),
+                                        speaker: turn_label,
                                         source_device: source_device.to_string(),
-                                        display_name: recognized_name.clone(),
+                                        display_name,
+                                        matched_by,
+                                        match_score: recognition.as_ref().map(|r| r.2),
                                     };
                                     if let Err(e) = sender.send(turn_event) {
                                         warn!("Failed to send online speaker turn: {}", e);
@@ -618,53 +717,77 @@ impl OnlineDiarizationProcessor {
             return Err("Online diarization unavailable (error state)".to_string());
         };
 
-        let (mic_segments, sys_segments, mic_clustered, sys_clustered) = match engine {
-            Engine::Efficient { extractor: _, mic, sys } => {
-                let mic_segments = mic.cluster(self.max_speakers);
-                let sys_segments = sys.cluster(self.max_speakers);
-                // Efficient mode: embeddings are buffered per segment; cluster()
-                // returns labels aligned with the buffer entries, so group by
-                // those labels directly.
-                let mic_clustered = cluster_embeddings_by_labels(&mic.entries, &mic_segments);
-                let sys_clustered = cluster_embeddings_by_labels(&sys.entries, &sys_segments);
-                (mic_segments, sys_segments, mic_clustered, sys_clustered)
-            }
-            Engine::Fast { mut mic, mut sys, extractor: _, mic_emb, sys_emb } => {
-                let mut mic_segments: Vec<SpeakerSegment> = mic
-                    .turns
-                    .iter()
-                    .map(|t| SpeakerSegment {
-                        start: mic.mapper.to_abs(t.start as f64) as f32,
-                        end: mic.mapper.to_abs(t.end as f64) as f32,
-                        speaker: t.speaker,
-                    })
-                    .collect();
-                let mut sys_segments: Vec<SpeakerSegment> = sys
-                    .turns
-                    .iter()
-                    .map(|t| SpeakerSegment {
-                        start: sys.mapper.to_abs(t.start as f64) as f32,
-                        end: sys.mapper.to_abs(t.end as f64) as f32,
-                        speaker: t.speaker,
-                    })
-                    .collect();
-                mic_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-                sys_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-                // Fast mode: buffer entries have no cluster id; group them by
-                // time-overlap with the stable turns (which carry pipeline
-                // speaker ids), using the same find_best_speaker logic.
-                let mic_clustered =
-                    cluster_embeddings_by_overlap(&mic_emb.entries, &mic_segments);
-                let sys_clustered =
-                    cluster_embeddings_by_overlap(&sys_emb.entries, &sys_segments);
-                (mic_segments, sys_segments, mic_clustered, sys_clustered)
-            }
-        };
+        let mic_prefix = self.mic_prefix.clone();
+        let (mic_segments, sys_segments, mic_clustered, sys_clustered, mic_raw, sys_raw) =
+            match engine {
+                Engine::Efficient { extractor: _, mic, sys } => {
+                    let mic_segments = mic.cluster(self.max_speakers);
+                    let sys_segments = sys.cluster(self.max_speakers);
+                    // Efficient mode: embeddings are buffered per segment; cluster()
+                    // returns labels aligned with the buffer entries, so group by
+                    // those labels directly.
+                    let mic_clustered = cluster_embeddings_by_labels(&mic.entries, &mic_segments);
+                    let sys_clustered = cluster_embeddings_by_labels(&sys.entries, &sys_segments);
+                    (
+                        mic_segments,
+                        sys_segments,
+                        mic_clustered,
+                        sys_clustered,
+                        mic.entries,
+                        sys.entries,
+                    )
+                }
+                Engine::Fast {
+                    mut mic,
+                    mut sys,
+                    extractor: _,
+                    mic_emb,
+                    sys_emb,
+                } => {
+                    let mut mic_segments: Vec<SpeakerSegment> = mic
+                        .turns
+                        .iter()
+                        .map(|t| SpeakerSegment {
+                            start: mic.mapper.to_abs(t.start as f64) as f32,
+                            end: mic.mapper.to_abs(t.end as f64) as f32,
+                            speaker: t.speaker,
+                        })
+                        .collect();
+                    let mut sys_segments: Vec<SpeakerSegment> = sys
+                        .turns
+                        .iter()
+                        .map(|t| SpeakerSegment {
+                            start: sys.mapper.to_abs(t.start as f64) as f32,
+                            end: sys.mapper.to_abs(t.end as f64) as f32,
+                            speaker: t.speaker,
+                        })
+                        .collect();
+                    mic_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+                    sys_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+                    // Fast mode: buffer entries have no cluster id; group them by
+                    // time-overlap with the stable turns (which carry pipeline
+                    // speaker ids), using the same find_best_speaker logic.
+                    let mic_clustered =
+                        cluster_embeddings_by_overlap(&mic_emb.entries, &mic_segments);
+                    let sys_clustered =
+                        cluster_embeddings_by_overlap(&sys_emb.entries, &sys_segments);
+                    (
+                        mic_segments,
+                        sys_segments,
+                        mic_clustered,
+                        sys_clustered,
+                        mic_emb.entries,
+                        sys_emb.entries,
+                    )
+                }
+            };
 
         let clusters = OnlineClusterEmbeddings {
             mic: mic_clustered,
             sys: sys_clustered,
             saw_system_audio: self.saw_system_audio,
+            mic_raw,
+            sys_raw,
         };
 
         // Extract live user bindings (Fast-mode renames) to apply at the
@@ -689,16 +812,15 @@ impl OnlineDiarizationProcessor {
 
             // Same channel scheme as offline diarization: system-source
             // transcripts match system-channel segments (SPEAKER_NN); all
-            // others match mic-channel segments (MIC_SPEAKER_NN). When no
-            // system audio was captured, everything matches the single run.
-            let (segments, prefix) = if self.saw_system_audio {
-                if transcript.source_device.as_str() == "System" {
-                    (&sys_segments, "SPEAKER")
-                } else {
-                    (&mic_segments, "MIC_SPEAKER")
-                }
+            // others match mic-channel segments. When no system audio was
+            // captured, everything matches the single run. The mic prefix
+            // always comes from the session-stable `mic_prefix`.
+            let (segments, prefix) = if self.saw_system_audio
+                && transcript.source_device.as_str() == "System"
+            {
+                (&sys_segments, "SPEAKER")
             } else {
-                (&mic_segments, "SPEAKER")
+                (&mic_segments, mic_prefix.as_str())
             };
 
             match find_best_speaker(segments, t_start, t_end) {
@@ -820,4 +942,85 @@ fn find_best_speaker(segments: &[SpeakerSegment], t_start: f32, t_end: f32) -> O
         }
     }
     nearest.map(|(_, spk)| spk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with(mic_prefix: &str) -> PrototypeStore {
+        PrototypeStore::new(mic_prefix.to_string())
+    }
+
+    #[test]
+    fn parse_pipeline_id_parses_trailing_index() {
+        assert_eq!(parse_pipeline_id("MIC_SPEAKER_03"), Some(3));
+        assert_eq!(parse_pipeline_id("SPEAKER_02"), Some(2));
+        assert_eq!(parse_pipeline_id("SPEAKER_00"), Some(0));
+        assert_eq!(parse_pipeline_id("SPEAKER"), None);
+        assert_eq!(parse_pipeline_id("SystemAudio"), None);
+    }
+
+    #[test]
+    fn channel_and_id_stereo_resolves_mic_and_system() {
+        let store = store_with("MIC_SPEAKER");
+        assert_eq!(store.channel_and_id("MIC_SPEAKER_03"), Some(("mic".to_string(), 3)));
+        assert_eq!(store.channel_and_id("SPEAKER_02"), Some(("system".to_string(), 2)));
+        assert_eq!(store.channel_and_id("SPEAKER_00"), Some(("system".to_string(), 0)));
+    }
+
+    #[test]
+    fn channel_and_id_mono_resolves_bare_prefix_as_mic() {
+        let store = store_with("SPEAKER");
+        assert_eq!(store.channel_and_id("SPEAKER_01"), Some(("mic".to_string(), 1)));
+        assert_eq!(store.channel_and_id("SPEAKER_00"), Some(("mic".to_string(), 0)));
+    }
+
+    #[test]
+    fn channel_and_id_rejects_unknown_prefixes() {
+        let store = store_with("MIC_SPEAKER");
+        assert_eq!(store.channel_and_id("SystemAudio"), None);
+        assert_eq!(store.channel_and_id("AVATAR_3"), None);
+    }
+
+    #[test]
+    fn bind_seeds_only_the_bound_channels_embeddings() {
+        // Stereo session: mic speaker 0 and system speaker 0 share the same
+        // numeric id; binding the mic cluster must NOT pull in system embeds.
+        let mut store = store_with("MIC_SPEAKER");
+        store.push_session(0, vec![1.0, 0.0, 0.0, 0.0], 2.0, "mic".to_string());
+        store.push_session(0, vec![0.0, 1.0, 0.0, 0.0], 2.0, "system".to_string());
+        store.push_session(1, vec![0.0, 0.0, 1.0, 0.0], 1.0, "mic".to_string());
+
+        store.bind("MIC_SPEAKER_00", "speaker-alice", "Alice");
+
+        // The single mic-0 embedding seeds as Alice's prototype; the system-0
+        // embedding must NOT be among them.
+        let alice_protos: Vec<&Prototype> = store
+            .prototypes
+            .iter()
+            .filter(|p| p.speaker_id == "speaker-alice")
+            .collect();
+        assert_eq!(alice_protos.len(), 1, "system embedding leaked into mic binding");
+        assert!(alice_protos.iter().all(|p| p.channel == "mic"));
+        assert!(alice_protos.iter().all(|p| (p.embedding[0] - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn bind_system_cluster_seeds_only_system_embeddings() {
+        let mut store = store_with("MIC_SPEAKER");
+        store.push_session(0, vec![1.0, 0.0, 0.0, 0.0], 2.0, "mic".to_string());
+        store.push_session(0, vec![0.0, 1.0, 0.0, 0.0], 2.0, "system".to_string());
+
+        store.bind("SPEAKER_00", "speaker-bob", "Bob");
+
+        let bob_protos: Vec<&Prototype> = store
+            .prototypes
+            .iter()
+            .filter(|p| p.speaker_id == "speaker-bob")
+            .collect();
+        assert_eq!(bob_protos.len(), 1, "mic embedding leaked into system binding");
+        assert_eq!(bob_protos[0].channel, "system");
+        assert!((bob_protos[0].embedding[1] - 1.0).abs() < 1e-9);
+    }
 }
