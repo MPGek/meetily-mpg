@@ -15,6 +15,13 @@ pub struct AudioInput {
     pub device: Arc<AudioDevice>,
 }
 
+/// AAC codec profile used for all saved recordings (native ffmpeg AAC is LC-only)
+const AAC_PROFILE: &str = "aac_low";
+/// VBR quality for the native AAC encoder (0.1-1.0 scale, 1.0 = highest).
+/// 0.7 targets ~96 kbps for stereo voice - transparent for speech and roughly
+/// half the former fixed 192 kbps CBR, with VBR saving further on silence.
+const AAC_VBR_QUALITY: &str = "0.7";
+
 pub fn encode_single_audio(
     data: &[u8],
     sample_rate: u32,
@@ -46,10 +53,10 @@ pub fn encode_single_audio(
             "pipe:0",
             "-c:a",
             "aac",
-            "-b:a",
-            "192k", // Increased from 64k for better audio quality (especially for speech)
+            "-q:a",
+            AAC_VBR_QUALITY,
             "-profile:a",
-            "aac_low", // Use AAC-LC profile for better compatibility
+            AAC_PROFILE, // Use AAC-LC profile for better compatibility
             "-movflags",
             "+faststart", // Optimize for web streaming
             "-f",

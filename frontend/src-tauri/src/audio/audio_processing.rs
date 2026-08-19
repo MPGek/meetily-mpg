@@ -690,7 +690,7 @@ pub fn write_audio_to_file_with_meeting_name(
         encode_single_audio(
             bytemuck::cast_slice(audio),
             sample_rate,
-            1,
+            2, // Stereo (left = microphone, right = system audio), matching the incremental saver
             &file_path.into(),
         )?;
     }
