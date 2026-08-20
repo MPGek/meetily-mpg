@@ -474,6 +474,12 @@ impl RecordingSaver {
         }
     }
 
+    /// Get a clone of the shared transcript segments Arc.
+    /// Used by the event listener to write segments without accessing RecordingManager.
+    pub fn shared_segments(&self) -> Arc<Mutex<Vec<TranscriptSegment>>> {
+        self.transcript_segments.clone()
+    }
+
     /// Get meeting name (for reload sync)
     pub fn get_meeting_name(&self) -> Option<String> {
         self.meeting_name.clone()
@@ -484,4 +490,56 @@ impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Standalone function to write transcript segments to disk.
+/// Used by the event listener to persist transcripts without accessing RecordingManager.
+pub fn write_transcripts_to_disk(
+    folder: &std::path::Path,
+    segments: &Arc<Mutex<Vec<TranscriptSegment>>>,
+) -> Result<()> {
+    let segments_clone = if let Ok(segs) = segments.lock() {
+        segs.clone()
+    } else {
+        return Err(anyhow::anyhow!("Failed to lock transcript segments"));
+    };
+
+    info!("Writing {} transcript segments to JSON", segments_clone.len());
+
+    let transcript_path = folder.join("transcripts.json");
+    let temp_path = folder.join(".transcripts.json.tmp");
+
+    let json = serde_json::json!({
+        "version": "1.0",
+        "segments": segments_clone,
+        "last_updated": chrono::Utc::now().to_rfc3339(),
+        "total_segments": segments_clone.len()
+    });
+
+    let json_string = serde_json::to_string_pretty(&json)
+        .map_err(|e| {
+            error!("Failed to serialize transcripts to JSON: {}", e);
+            anyhow::anyhow!("JSON serialization failed: {}", e)
+        })?;
+
+    std::fs::write(&temp_path, &json_string)
+        .map_err(|e| {
+            error!("Failed to write transcript temp file to {}: {}", temp_path.display(), e);
+            anyhow::anyhow!("Failed to write temp file: {}", e)
+        })?;
+
+    if !temp_path.exists() {
+        error!("Temp transcript file does not exist after write: {}", temp_path.display());
+        return Err(anyhow::anyhow!("Temp file verification failed"));
+    }
+
+    std::fs::rename(&temp_path, &transcript_path)
+        .map_err(|e| {
+            error!("Failed to rename transcript file from {} to {}: {}",
+                   temp_path.display(), transcript_path.display(), e);
+            anyhow::anyhow!("Failed to rename transcript file: {}", e)
+        })?;
+
+    info!("✅ Successfully wrote transcripts.json with {} segments", segments_clone.len());
+    Ok(())
 }

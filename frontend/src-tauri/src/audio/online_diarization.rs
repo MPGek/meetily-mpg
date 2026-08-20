@@ -855,6 +855,8 @@ fn cluster_embeddings_by_labels(
             speaker: seg.speaker as i32,
             embedding: emb.clone(),
             duration_secs: (end - start).max(0.0),
+            start_secs: Some(*start),
+            end_secs: Some(*end),
         })
         .collect()
 }
@@ -873,6 +875,8 @@ fn cluster_embeddings_by_overlap(
                 speaker: spk as i32,
                 embedding: emb.clone(),
                 duration_secs: (end - start).max(0.0),
+                start_secs: Some(*start),
+                end_secs: Some(*end),
             })
         })
         .collect()

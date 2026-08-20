@@ -10,6 +10,7 @@ export const useAudioPlayer = (audioPath: string | null) => {
   const [endedCount, setEndedCount] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const retriedRef = useRef(false);
+  const rangeEndRef = useRef<number | null>(null);
 
   // Attach element listeners and (re)load whenever the path changes
   useEffect(() => {
@@ -32,7 +33,13 @@ export const useAudioPlayer = (audioPath: string | null) => {
       setDuration(el.duration || 0);
       setError(null);
     };
-    const onTimeUpdate = () => setCurrentTime(el.currentTime);
+    const onTimeUpdate = () => {
+      setCurrentTime(el.currentTime);
+      if (rangeEndRef.current !== null && el.currentTime >= rangeEndRef.current) {
+        el.pause();
+        rangeEndRef.current = null;
+      }
+    };
     const onPlay = () => {
       setIsPlaying(true);
       setError(null);
@@ -130,6 +137,22 @@ export const useAudioPlayer = (audioPath: string | null) => {
     // Native behavior: a playing element keeps playing after a seek
   }, []);
 
+  const playRange = useCallback(async (start: number, end: number) => {
+    const el = audioRef.current;
+    if (!el) return;
+    rangeEndRef.current = end;
+    const clampedStart = Math.max(0, Math.min(start, el.duration || 0));
+    el.currentTime = clampedStart;
+    setCurrentTime(clampedStart);
+    try {
+      await el.play();
+    } catch (e) {
+      console.error('Error during playRange:', e);
+      setError('Failed to play audio');
+      rangeEndRef.current = null;
+    }
+  }, []);
+
   return {
     isPlaying,
     currentTime,
@@ -140,6 +163,7 @@ export const useAudioPlayer = (audioPath: string | null) => {
     play,
     pause,
     seek,
+    playRange,
     audioRef,
   };
 };

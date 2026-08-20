@@ -171,6 +171,10 @@ pub struct SpeakerEmbedding {
     pub speaker_id: Option<String>,
     pub meeting_id: Option<String>,
     pub cluster_label: Option<String>,
+    #[sqlx(default)]
+    pub audio_start_time: Option<f64>,
+    #[sqlx(default)]
+    pub audio_end_time: Option<f64>,
     pub created_at: DateTimeUtc,
 }
 

@@ -98,6 +98,11 @@ pub(crate) static ONLINE_TURN_OVERRIDES: Mutex<Vec<TurnOverride>> = Mutex::new(V
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
+// Shared transcript segments and meeting folder for event listener access.
+// These bypass RecordingManager to avoid cross-thread access to !Send types (cpal::Stream).
+static SHARED_SEGMENTS: Mutex<Option<Arc<Mutex<Vec<super::recording_saver::TranscriptSegment>>>>> = Mutex::new(None);
+static SHARED_FOLDER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
 // ============================================================================
 // PUBLIC TYPES
 // ============================================================================
@@ -297,6 +302,16 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         *global_manager = Some(manager);
     }
 
+    // Extract shared transcript state for the event listener.
+    // This avoids cross-thread access to RecordingManager (which contains !Send cpal::Stream).
+    {
+        let manager_guard = RECORDING_MANAGER.lock().unwrap();
+        if let Some(ref mgr) = *manager_guard {
+            *SHARED_SEGMENTS.lock().unwrap() = Some(mgr.shared_segments());
+            *SHARED_FOLDER.lock().unwrap() = mgr.get_meeting_folder();
+        }
+    }
+
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     IS_RECORDING.store(true, Ordering::SeqCst);
@@ -310,31 +325,48 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         *global_task = Some(task_handle);
     }
 
-    // CRITICAL: Listen for transcript-update events and save to recording manager
-    // This enables transcript history persistence for page reload sync
-    // Store listener ID for cleanup during stop_recording to ensure microphone is released
+    // CRITICAL: Listen for transcript-update events and save to shared transcript state.
+    // Uses SHARED_SEGMENTS / SHARED_FOLDER to avoid accessing RecordingManager
+    // (which contains !Send cpal::Stream types) from the event dispatch thread.
     {
         use tauri::Listener;
         let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-            // Parse the transcript update from the event payload
             if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                // Create structured transcript segment
                 let segment = crate::audio::recording_saver::TranscriptSegment {
                     id: format!("seg_{}", update.sequence_id),
                     text: update.text.clone(),
                     audio_start_time: update.audio_start_time,
                     audio_end_time: update.audio_end_time,
                     duration: update.duration,
-                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
+                    display_time: update.timestamp.clone(),
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
                     source_device: update.source_device.clone(),
                 };
 
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
+                // Write to shared transcript segments (no RecordingManager access)
+                if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
+                    if let Some(ref shared) = *segments_guard {
+                        if let Ok(mut segs) = shared.lock() {
+                            if let Some(existing) = segs.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+                                *existing = segment.clone();
+                            } else {
+                                segs.push(segment.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Persist to disk
+                if let Ok(folder_guard) = SHARED_FOLDER.lock() {
+                    if let Some(ref folder) = *folder_guard {
+                        if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
+                            if let Some(ref shared) = *segments_guard {
+                                if let Err(e) = crate::audio::recording_saver::write_transcripts_to_disk(folder, shared) {
+                                    warn!("Failed to write incremental transcript update: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -574,6 +606,16 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         *global_manager = Some(manager);
     }
 
+    // Extract shared transcript state for the event listener.
+    // This avoids cross-thread access to RecordingManager (which contains !Send cpal::Stream).
+    {
+        let manager_guard = RECORDING_MANAGER.lock().unwrap();
+        if let Some(ref mgr) = *manager_guard {
+            *SHARED_SEGMENTS.lock().unwrap() = Some(mgr.shared_segments());
+            *SHARED_FOLDER.lock().unwrap() = mgr.get_meeting_folder();
+        }
+    }
+
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     IS_RECORDING.store(true, Ordering::SeqCst);
@@ -587,31 +629,48 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         *global_task = Some(task_handle);
     }
 
-    // CRITICAL: Listen for transcript-update events and save to recording manager
-    // This enables transcript history persistence for page reload sync
-    // Store listener ID for cleanup during stop_recording to ensure microphone is released
+    // CRITICAL: Listen for transcript-update events and save to shared transcript state.
+    // Uses SHARED_SEGMENTS / SHARED_FOLDER to avoid accessing RecordingManager
+    // (which contains !Send cpal::Stream types) from the event dispatch thread.
     {
         use tauri::Listener;
         let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-            // Parse the transcript update from the event payload
             if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                // Create structured transcript segment
                 let segment = crate::audio::recording_saver::TranscriptSegment {
                     id: format!("seg_{}", update.sequence_id),
                     text: update.text.clone(),
                     audio_start_time: update.audio_start_time,
                     audio_end_time: update.audio_end_time,
                     duration: update.duration,
-                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
+                    display_time: update.timestamp.clone(),
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
                     source_device: update.source_device.clone(),
                 };
 
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
+                // Write to shared transcript segments (no RecordingManager access)
+                if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
+                    if let Some(ref shared) = *segments_guard {
+                        if let Ok(mut segs) = shared.lock() {
+                            if let Some(existing) = segs.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+                                *existing = segment.clone();
+                            } else {
+                                segs.push(segment.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Persist to disk
+                if let Ok(folder_guard) = SHARED_FOLDER.lock() {
+                    if let Some(ref folder) = *folder_guard {
+                        if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
+                            if let Some(ref shared) = *segments_guard {
+                                if let Err(e) = crate::audio::recording_saver::write_transcripts_to_disk(folder, shared) {
+                                    warn!("Failed to write incremental transcript update: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -748,7 +807,7 @@ pub async fn stop_recording<R: Runtime>(
         }
     }
 
-    // Step 1.5: Clean up transcript listener to release microphone
+    // Step 1.5: Clean up transcript listener and shared state
     // Unlisten transcript-update event to prevent lingering references
     {
         use tauri::Listener;
@@ -756,6 +815,9 @@ pub async fn stop_recording<R: Runtime>(
             app.unlisten(listener_id);
             info!("✅ Transcript-update listener removed");
         }
+        // Clear shared transcript state
+        *SHARED_SEGMENTS.lock().unwrap() = None;
+        *SHARED_FOLDER.lock().unwrap() = None;
     }
 
     // Step 2: Signal transcription workers to finish processing ALL queued chunks

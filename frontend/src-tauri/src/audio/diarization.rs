@@ -544,6 +544,8 @@ pub struct ClusteredEmbedding {
     pub speaker: i32,
     pub embedding: Vec<f32>,
     pub duration_secs: f32,
+    pub start_secs: Option<f32>,
+    pub end_secs: Option<f32>,
 }
 
 /// Per-channel diarization output: labeled segments plus the clustered
@@ -797,6 +799,8 @@ fn run_chunked_polyvoice_diarization(
             speaker: s.speaker,
             embedding: e.clone(),
             duration_secs: (s.end - s.start).max(0.0),
+            start_secs: Some(s.start),
+            end_secs: Some(s.end),
         })
         .collect();
 
@@ -1144,6 +1148,8 @@ fn run_channel_diarization_stream(
             speaker: s.speaker,
             embedding: e.clone(),
             duration_secs: (s.end - s.start).max(0.0),
+            start_secs: Some(s.start),
+            end_secs: Some(s.end),
         })
         .collect();
 
@@ -1203,6 +1209,8 @@ fn group_cluster_embeddings(
             .map(|e| Exemplar {
                 embedding: e.embedding.clone(),
                 duration_secs: e.duration_secs as f64,
+                start_secs: e.start_secs,
+                end_secs: e.end_secs,
             })
             .collect();
 

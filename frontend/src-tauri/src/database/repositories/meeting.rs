@@ -373,7 +373,7 @@ async fn delete_meeting_with_transaction(
     //    speaker_embeddings (meeting_id set) and the mapping/allowlist tables
     //    are meeting-scoped; enrolled prototypes (speaker_id set) are global
     //    and kept. FK enforcement is off, so these are manual cascades.
-    sqlx::query("DELETE FROM speaker_embeddings WHERE meeting_id = ?")
+    sqlx::query("DELETE FROM speaker_embeddings WHERE meeting_id = ? AND speaker_id IS NULL")
         .bind(meeting_id)
         .execute(&mut *transaction)
         .await?;

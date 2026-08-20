@@ -1,5 +1,7 @@
 use crate::database::models::Speaker;
-use crate::database::repositories::speaker::{SpeakerRepository, SpeakerStorageStats};
+use crate::database::repositories::speaker::{
+    SpeakerRepository, SpeakerStorageStats, VoiceprintBrowser,
+};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 
@@ -234,4 +236,110 @@ pub async fn speaker_storage_stats(
     SpeakerRepository::storage_stats(pool)
         .await
         .map_err(|e| format!("Failed to load speaker storage stats: {}", e))
+}
+
+/// Voiceprint browser: grouped speakers + unconfirmed caches with provenance.
+#[tauri::command]
+pub async fn list_voiceprints(
+    speaker_id: Option<String>,
+    unconfirmed_only: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<VoiceprintBrowser, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::list_voiceprints(
+        pool,
+        speaker_id.as_deref(),
+        unconfirmed_only.unwrap_or(false),
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|e| format!("Failed to list voiceprints: {}", e))
+}
+
+#[tauri::command]
+pub async fn reject_voiceprint(
+    id: String,
+    permanent: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SpeakerRepositoryReexportRejectResult, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::reject_voiceprint(pool, &id, permanent.unwrap_or(false))
+        .await
+        .map_err(|e| format!("Failed to reject voiceprint: {}", e))
+        .map(|r| SpeakerRepositoryReexportRejectResult {
+            speaker_id: r.speaker_id,
+            remaining_prototypes: r.remaining_prototypes,
+        })
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpeakerRepositoryReexportRejectResult {
+    pub speaker_id: Option<String>,
+    pub remaining_prototypes: i64,
+}
+
+#[tauri::command]
+pub async fn reconfirm_voiceprint(
+    id: String,
+    speaker_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::reconfirm_voiceprint(pool, &id, &speaker_id)
+        .await
+        .map_err(|e| format!("Failed to reconfirm voiceprint: {}", e))
+}
+
+#[tauri::command]
+pub async fn replace_speaker(
+    source: String,
+    target: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SpeakerRepositoryReplaceResult, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::replace_speaker(pool, &source, target.as_deref())
+        .await
+        .map_err(|e| format!("Failed to replace speaker: {}", e))
+        .map(|r| SpeakerRepositoryReplaceResult {
+            affected_meetings: r.affected_meetings,
+            affected_clusters: r.affected_clusters,
+            affected_transcripts: r.affected_transcripts,
+        })
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpeakerRepositoryReplaceResult {
+    pub affected_meetings: i64,
+    pub affected_clusters: i64,
+    pub affected_transcripts: i64,
+}
+
+#[tauri::command]
+pub async fn find_or_create_speaker(
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Speaker, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::find_or_create_by_name(pool, &name)
+        .await
+        .map_err(|e| format!("Failed to find-or-create speaker: {}", e))
+}
+
+#[tauri::command]
+pub async fn preview_replace_speaker(
+    source: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<SpeakerRepositoryReplaceResult, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::preview_replace_speaker(pool, &source)
+        .await
+        .map_err(|e| format!("Failed to preview replace: {}", e))
+        .map(|r| SpeakerRepositoryReplaceResult {
+            affected_meetings: r.affected_meetings,
+            affected_clusters: r.affected_clusters,
+            affected_transcripts: r.affected_transcripts,
+        })
 }

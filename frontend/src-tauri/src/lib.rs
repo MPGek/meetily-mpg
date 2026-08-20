@@ -776,6 +776,12 @@ pub fn run() {
             database::speaker_commands::set_expected_speakers,
             database::speaker_commands::get_expected_speakers,
             database::speaker_commands::speaker_storage_stats,
+            database::speaker_commands::list_voiceprints,
+            database::speaker_commands::reject_voiceprint,
+            database::speaker_commands::reconfirm_voiceprint,
+            database::speaker_commands::replace_speaker,
+            database::speaker_commands::find_or_create_speaker,
+            database::speaker_commands::preview_replace_speaker,
             // Online session finalization and live speaker assignment
             audio::recording_commands::finalize_online_session,
             audio::recording_commands::assign_live_speaker,

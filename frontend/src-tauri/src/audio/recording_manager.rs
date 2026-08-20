@@ -456,6 +456,12 @@ impl RecordingManager {
         self.recording_saver.add_transcript_segment(segment);
     }
 
+    /// Get a clone of the shared transcript segments Arc.
+    /// Used by the event listener to write segments without accessing RecordingManager.
+    pub fn shared_segments(&self) -> std::sync::Arc<std::sync::Mutex<Vec<super::recording_saver::TranscriptSegment>>> {
+        self.recording_saver.shared_segments()
+    }
+
     /// Add a transcript chunk to be saved later (legacy method)
     pub fn add_transcript_chunk(&self, text: String) {
         self.recording_saver.add_transcript_chunk(text);
