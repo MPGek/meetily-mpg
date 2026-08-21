@@ -474,6 +474,23 @@ export class RecordingService {
       endTime: endTime ?? null,
     });
   }
+
+  /**
+   * Confirm that an automatically recognized speaker is correct without
+   * changing the name: marks the cluster/block as user-owned and clears the
+   * auto confidence so the `(auto) xx%` suffix drops. Does NOT re-enroll
+   * voiceprints. `scopeAll` confirms the whole cluster; otherwise only this
+   * single block.
+   */
+  async confirmBlockSpeaker(
+    transcriptId: string,
+    scopeAll?: boolean
+  ): Promise<number> {
+    return invoke('confirm_block_speaker', {
+      transcriptId,
+      scopeAll: scopeAll ?? false,
+    });
+  }
 }
 
 // Export singleton instance

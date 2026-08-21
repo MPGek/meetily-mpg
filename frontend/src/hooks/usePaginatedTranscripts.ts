@@ -181,16 +181,20 @@ export function usePaginatedTranscripts({
 
     // In-place speaker relabel (design D11): mutate only the affected
     // transcript(s) in local state. With a transcriptId, only that block;
-    // otherwise every block sharing the cluster label (apply-to-all).
+    // otherwise every block sharing the cluster label (apply-to-all). Mirrors
+    // the live updater by setting user provenance + clearing the match score so
+    // the `(auto) xx%` suffix drops immediately without a refetch. Re-selecting
+    // the already-displayed name is still applied (user confirmation), never a
+    // silent no-op.
     const updateSpeakerLabel = useCallback((speaker: string, label: string, transcriptId?: string) => {
         setTranscripts(prev =>
             prev.map(t => {
                 if (transcriptId !== undefined) {
-                    if (t.id !== transcriptId || t.speaker_label === label) return t;
-                    return { ...t, speaker_label: label };
+                    if (t.id !== transcriptId) return t;
+                    return { ...t, speaker_label: label, speaker_matched_by: 'user', speaker_match_score: undefined };
                 }
-                if (t.speaker !== speaker || t.speaker_label === label) return t;
-                return { ...t, speaker_label: label };
+                if (t.speaker !== speaker) return t;
+                return { ...t, speaker_label: label, speaker_matched_by: 'user', speaker_match_score: undefined };
             })
         );
     }, []);

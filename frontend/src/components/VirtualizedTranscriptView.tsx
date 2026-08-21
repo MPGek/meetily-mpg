@@ -180,8 +180,15 @@ function SpeakerLabel({
         setScopeAll(false);
         if (!onUpdate) return;
         try {
+            // Re-selecting the already-displayed name on an auto-matched label is
+            // a confirmation, not a silent no-op: mark it user-owned and clear
+            // the `(auto)` suffix. Offline persists via the confirm command;
+            // live records the binding so it persists as a user binding at stop.
+            const isConfirm = matchedBy === 'auto' && label !== undefined && sp.name === label;
             if (meetingId) {
-                if (scopeAll) {
+                if (isConfirm) {
+                    await recordingService.confirmBlockSpeaker(transcriptId ?? '', scopeAll);
+                } else if (scopeAll) {
                     // Link the whole cluster (matched_by='user' + enrollment).
                     await recordingService.assignSpeaker(meetingId, speaker, sp.id);
                 } else if (transcriptId) {
@@ -214,6 +221,38 @@ function SpeakerLabel({
             // Backend write runs before onUpdate, so the local label was never
             // applied — the list is undisturbed. Surface the failure (9.3).
             toast.error("Failed to assign speaker");
+        }
+    };
+
+    // Explicit "confirm this prediction is correct" affordance shown on
+    // auto-matched labels. Marks the block/cluster user-owned without
+    // re-enrolling and clears the `(auto)` suffix, with visible feedback.
+    const handleConfirm = async () => {
+        setOpen(false);
+        if (!onUpdate || label === undefined) return;
+        try {
+            if (meetingId) {
+                await recordingService.confirmBlockSpeaker(transcriptId ?? '', scopeAll);
+            } else {
+                // Live: record a binding with the displayed (auto) name so it
+                // persists as a user binding at stop.
+                if (scopeAll || !transcriptId) {
+                    await recordingService.assignLiveSpeaker(speaker, undefined, label);
+                } else {
+                    await recordingService.assignLiveSpeakerBlock(
+                        speaker,
+                        startTime ?? 0,
+                        undefined,
+                        label,
+                        endTime
+                    );
+                }
+            }
+            await onUpdate(speaker, label, scopeAll ? undefined : transcriptId);
+            toast.success("Speaker confirmed");
+        } catch (error) {
+            console.error("Failed to confirm speaker:", error);
+            toast.error("Failed to confirm speaker");
         }
     };
 
@@ -288,12 +327,24 @@ function SpeakerLabel({
     return (
         <Popover open={open} onOpenChange={setOpen}>
             <PopoverTrigger asChild>
-                <span
-                    className="text-xs font-medium text-gray-600 cursor-pointer hover:underline"
-                    style={{ color }}
-                    title="Click to rename speaker"
-                >
-                    {displayName}
+                <span className="inline-flex items-center gap-1">
+                    <span
+                        className="text-xs font-medium text-gray-600 cursor-pointer hover:underline"
+                        style={{ color }}
+                        title="Click to rename speaker"
+                    >
+                        {displayName}
+                    </span>
+                    {matchedBy === 'auto' && (
+                        <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); handleConfirm(); }}
+                            title="Confirm this speaker is correct"
+                            className="text-xs text-green-600 hover:text-green-700 shrink-0"
+                        >
+                            <Check className="h-3 w-3" />
+                        </button>
+                    )}
                 </span>
             </PopoverTrigger>
             <PopoverContent className="w-64 p-0" align="start">

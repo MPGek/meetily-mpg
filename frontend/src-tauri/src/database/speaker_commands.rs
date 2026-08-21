@@ -90,9 +90,10 @@ pub struct AssignedBlockSpeaker {
 
 /// Link a single transcript block to a registry speaker via a per-transcript
 /// override (design D10). The editor defaults to this scope: only the edited
-/// block is relabeled, the cluster mapping and enrolled prototypes are
-/// untouched. Pass `speaker_id` for an existing person or `new_name` to
-/// create one.
+/// block is relabeled. In addition to the override, the block's cluster cached
+/// exemplars are enrolled as the speaker's prototypes so a single-block
+/// correction doubles as a teaching signal (no-op on clusters with no cache).
+/// Pass `speaker_id` for an existing person or `new_name` to create one.
 #[tauri::command]
 pub async fn assign_block_speaker(
     transcript_id: String,
@@ -124,6 +125,19 @@ pub async fn assign_block_speaker(
         .map_err(|e| format!("Failed to set block override: {}", e))?;
     if !written {
         return Err(format!("Transcript {} not found", transcript_id));
+    }
+
+    // Enroll the block's cluster cached exemplars as the speaker's prototypes.
+    // Resolve the transcript's (meeting_id, cluster_label) and reparent the
+    // best-K cache rows. No-op when the cluster has no cache (legacy meeting).
+    if let Some((meeting_id, Some(cluster_label))) =
+        SpeakerRepository::get_transcript_cluster(pool, &transcript_id)
+            .await
+            .map_err(|e| format!("Failed to load transcript cluster: {}", e))?
+    {
+        let _ = SpeakerRepository::enroll_cluster(pool, &meeting_id, &cluster_label, &speaker.id)
+            .await
+            .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
     }
 
     Ok(AssignedBlockSpeaker {
@@ -200,6 +214,23 @@ pub async fn rename_speaker(
     SpeakerRepository::rename_speaker(pool, &speaker_id, &new_name)
         .await
         .map_err(|e| format!("Failed to rename speaker: {}", e))
+}
+
+/// Confirm an automatically recognized speaker binding as correct WITHOUT
+/// changing the name and WITHOUT re-enrolling voiceprints. When `scope_all` is
+/// true, flips the whole cluster to user provenance; otherwise also marks the
+/// single transcript block as user-owned. Clears the auto confidence so the
+/// `(auto) xx%` suffix drops.
+#[tauri::command]
+pub async fn confirm_block_speaker(
+    transcript_id: String,
+    scope_all: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::confirm_speaker_binding(pool, &transcript_id, scope_all.unwrap_or(false))
+        .await
+        .map_err(|e| format!("Failed to confirm speaker: {}", e))
 }
 
 /// Replace the expected-speaker allowlist for a meeting. An empty list means

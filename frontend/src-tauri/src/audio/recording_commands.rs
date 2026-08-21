@@ -1607,11 +1607,16 @@ pub async fn finalize_online_session(
 ) -> Result<serde_json::Value, String> {
     let pool = state.db_manager.pool();
 
-    let session_data = ONLINE_SESSION_DATA
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or_else(|| "No online session data to finalize".to_string())?;
+    // Take the pending session data. When none is present (e.g. a non-online
+    // recording that still navigates through finalize), no-op gracefully so the
+    // frontend may finalize unconditionally and never drop live bindings.
+    let Some(session_data) = ONLINE_SESSION_DATA.lock().unwrap().take() else {
+        return Ok(serde_json::json!({
+            "meeting_id": meeting_id,
+            "live_bindings": 0,
+            "enrolled": 0,
+        }));
+    };
 
     // Persist the expected-speaker allowlist FIRST (empty list = match all),
     // so the stop-time auto-recognition below is restricted to the session's
@@ -1668,6 +1673,19 @@ pub async fn finalize_online_session(
         .await
         {
             warn!("Failed to persist live user binding {label} → {speaker_id}: {e}", label = cluster_label);
+        }
+        // Also write the user's identity onto the stored transcript rows of the
+        // cluster, so each row resolves to the user via the override join even
+        // if the meeting_speakers render-time join is unavailable.
+        if let Err(e) = SpeakerRepository::apply_cluster_binding_overrides(
+            pool,
+            &meeting_id,
+            cluster_label,
+            speaker_id,
+        )
+        .await
+        {
+            warn!("Failed to persist cluster binding overrides for {cluster_label}: {e}");
         }
     }
 
@@ -1814,17 +1832,17 @@ pub async fn assign_live_speaker(
         );
     } else {
         // Cluster-wide binding: update the in-memory prototype store so
-        // subsequent chunks of this cluster match.
-        {
-            let store_guard = ONLINE_DIARIZATION_STORE.lock().unwrap();
-            if let Some(store_arc) = store_guard.as_ref() {
-                if let Ok(mut store) = store_arc.write() {
-                    store.bind(&cluster_label, &speaker.id, &speaker.name);
-                }
-            } else {
-                warn!("assign_live_speaker: no prototype store active");
-            }
-        }
+        // subsequent chunks of this cluster match. Fail loudly when no live
+        // prototype store is active so a correction cannot silently disappear
+        // and later revert to a predicted label at stop.
+        let store_guard = ONLINE_DIARIZATION_STORE.lock().unwrap();
+        let store_arc = store_guard.as_ref().ok_or_else(|| {
+            "No live diarization session active; cannot assign a live speaker".to_string()
+        })?;
+        store_arc
+            .write()
+            .map_err(|_| "Live prototype store is locked".to_string())?
+            .bind(&cluster_label, &speaker.id, &speaker.name);
     }
 
     // The actual DB persistence (meeting_speakers + enrollment / transcript

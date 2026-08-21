@@ -640,10 +640,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     setTranscripts(prev =>
       prev.map(t => {
         if (transcriptId !== undefined) {
-          if (t.id !== transcriptId || t.speaker_label === name) return t;
+          if (t.id !== transcriptId) return t;
           return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
         }
-        if (t.speaker !== clusterLabel || t.speaker_label === name) return t;
+        if (t.speaker !== clusterLabel) return t;
         return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
       })
     );

@@ -47,6 +47,19 @@ type StorageStats = {
 
 type SpeakerLite = { id: string; name: string; is_me?: boolean };
 
+// Human-readable size formatter, kept identical to the one used by the
+// Settings general-tab storage section (DiarizationSettings.tsx) so the two
+// surfaces agree on how embedding size is displayed.
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(1)} GB`;
+}
+
+
 // ——— Shared person picker (same as speaker name change / assignment) ———
 function PersonPickerDialog({
   open,
@@ -249,11 +262,9 @@ export default function VoiceprintBrowser() {
       setStats(s);
       const list = await invoke<SpeakerLite[]>('list_speakers');
       setSpeakersList(list.map((x) => ({ id: x.id, name: x.name })));
-      // Default expanded: all groups visible so existing content remains immediately visible; no reload on toggle
-      const allIds = new Set<string>();
-      browser.speakers.forEach((sp) => allIds.add(`speaker:${sp.speaker_id}`));
-      browser.unconfirmed.forEach((mg) => allIds.add(`meeting:${mg.meeting_id}`));
-      setExpanded(allIds);
+      // Default state is collapsed: leave `expanded` as the empty set so all
+      // speaker/meeting groups start collapsed. Expand-all / collapse-all and
+      // per-group toggles remain available in the header.
     } catch (e) {
       setError(String(e));
     }
@@ -428,7 +439,7 @@ export default function VoiceprintBrowser() {
             <span>Speakers: {stats.registry_count}</span>
             <span>Prototypes: {stats.prototype_count}</span>
             <span>Unconfirmed caches: {stats.cache_count}</span>
-            <span>Bytes: {stats.total_bytes}</span>
+            <span>Storage size: {formatBytes(stats.total_bytes)}</span>
           </div>
         </div>
       )}

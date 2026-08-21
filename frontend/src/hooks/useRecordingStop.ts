@@ -305,14 +305,15 @@ export function useRecordingStop(
           // exists: persists cluster centroids + exemplar caches, runs
           // auto-recognition, enrolls user-assigned clusters, and persists the
           // expected-speaker allowlist. Stop-time assignments were already
-          // applied above; this adds the speaker-registry side.
-          if (onlineDiarizationUsedRef.current) {
-            try {
-              const finalized = await recordingService.finalizeOnlineSession(meetingId);
-              console.log('Finalized online diarization session:', finalized);
-            } catch (finalizeError) {
-              console.error('Failed to finalize online diarization session:', finalizeError);
-            }
+          // applied above; this adds the speaker-registry side. Always
+          // attempted on every saved meeting so live speaker bindings are
+          // never dropped when the online_diarization_used flag is false —
+          // the backend no-ops when no session data is pending.
+          try {
+            const finalized = await recordingService.finalizeOnlineSession(meetingId);
+            console.log('Finalized online diarization session:', finalized);
+          } catch (finalizeError) {
+            console.error('Failed to finalize online diarization session:', finalizeError);
           }
 
           let shouldDetectSummaryLanguage = false;

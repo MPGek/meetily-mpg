@@ -773,6 +773,7 @@ pub fn run() {
             database::speaker_commands::assign_block_speaker,
             database::speaker_commands::apply_block_speaker_to_cluster,
             database::speaker_commands::rename_speaker,
+            database::speaker_commands::confirm_block_speaker,
             database::speaker_commands::set_expected_speakers,
             database::speaker_commands::get_expected_speakers,
             database::speaker_commands::speaker_storage_stats,

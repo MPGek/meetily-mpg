@@ -387,6 +387,59 @@ impl SpeakerRepository {
         Ok(rows.rows_affected() > 0)
     }
 
+    /// Mark an automatically recognized binding as user-confirmed without
+    /// changing the name and without enrolling new voiceprints. When
+    /// `scope_all` is false (single block) the transcript's override is set to
+    /// the cluster's bound speaker; in every case the cluster's `matched_by`
+    /// flips to 'user' and its `match_score` is cleared, so the `(auto)`
+    /// decoration no longer renders. Returns the number of bindings confirmed
+    /// (0 when the block's cluster has no bound speaker to confirm).
+    pub async fn confirm_speaker_binding(
+        pool: &SqlitePool,
+        transcript_id: &str,
+        scope_all: bool,
+    ) -> Result<usize, SqlxError> {
+        // Resolve the transcript's cluster and its currently bound speaker.
+        let cluster = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT t.meeting_id, t.speaker, ms.speaker_id
+             FROM transcripts t
+             LEFT JOIN meeting_speakers ms
+               ON ms.meeting_id = t.meeting_id AND ms.cluster_label = t.speaker
+             WHERE t.id = ?",
+        )
+        .bind(transcript_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((meeting_id, Some(cluster_label), Some(bound_speaker_id))) = cluster else {
+            return Ok(0);
+        };
+
+        // Flip the cluster binding to user provenance and clear its score.
+        let rows = sqlx::query(
+            "UPDATE meeting_speakers SET matched_by = 'user', match_score = NULL
+             WHERE meeting_id = ? AND cluster_label = ? AND speaker_id = ?",
+        )
+        .bind(&meeting_id)
+        .bind(&cluster_label)
+        .bind(&bound_speaker_id)
+        .execute(pool)
+        .await?;
+
+        let mut tx = pool.begin().await?;
+        if !scope_all {
+            // Single-block confirm: mark THIS transcript as user-owned so it
+            // reads as user provenance via the override join.
+            sqlx::query("UPDATE transcripts SET speaker_override_id = ? WHERE id = ?")
+                .bind(&bound_speaker_id)
+                .bind(transcript_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        Ok(rows.rows_affected() as usize)
+    }
+
     /// Read cached cluster centroids for a meeting (used by re-match, which
     /// runs recognition from centroids only — no audio re-processing).
     pub async fn get_cluster_centroids(
@@ -1096,6 +1149,31 @@ impl SpeakerRepository {
         Ok(updated)
     }
 
+    /// Persist a user's identity onto the stored rows of a user-bound cluster.
+    /// Sets `speaker_override_id` on every transcript of the cluster so each
+    /// stored row itself resolves to the user's name and user provenance via
+    /// the override join, independent of the `meeting_speakers` render-time
+    /// join alone. `transcripts.speaker` (the cluster label) is left intact so
+    /// it still joins to `meeting_speakers`. This does NOT touch the cluster
+    /// binding and does NOT enroll embeddings.
+    pub async fn apply_cluster_binding_overrides(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+        speaker_id: &str,
+    ) -> Result<usize, SqlxError> {
+        let rows = sqlx::query(
+            "UPDATE transcripts SET speaker_override_id = ?
+             WHERE meeting_id = ? AND speaker = ?",
+        )
+        .bind(speaker_id)
+        .bind(meeting_id)
+        .bind(cluster_label)
+        .execute(pool)
+        .await?;
+        Ok(rows.rows_affected() as usize)
+    }
+
     // ===== Display-name resolution (used by transcript/meeting queries) =====
 
     /// Resolve a meeting's cluster_label -> display name map by joining
@@ -1245,6 +1323,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_correction_enrolls_cluster_cache() {
+        // Simulates assign_block_speaker: set the per-block override, then
+        // enroll the block's cluster cached exemplars (reparent).
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        let exemplars: Vec<Exemplar> = (0..5)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: (i + 1) as f64,
+                start_secs: Some(i as f32 * 10.0),
+                end_secs: Some(i as f32 * 10.0 + (i + 1) as f32),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool, "m1", "SPEAKER_00", "mic", &emb(&[99.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // The single-block correction path: set override + enroll cluster.
+        assert!(SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id).await.unwrap());
+        let (meeting_id, cluster_label) =
+            SpeakerRepository::get_transcript_cluster(&pool, "t1").await.unwrap().unwrap();
+        let cluster_label = cluster_label.unwrap();
+        let n = SpeakerRepository::enroll_cluster(&pool, &meeting_id, &cluster_label, &bob.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 5, "all cached exemplars of the block's cluster are enrolled");
+
+        let protos = SpeakerRepository::load_prototypes(&pool, Some(&[bob.id.clone()]), SPEAKER_EMBEDDING_MODEL)
+            .await
+            .unwrap();
+        assert_eq!(protos.len(), 5);
+
+        // Enrolled prototypes retain provenance (meeting_id, cluster_label).
+        let rows: Vec<SpeakerEmbedding> = sqlx::query_as::<_, SpeakerEmbedding>(
+            "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at FROM speaker_embeddings WHERE speaker_id = ?",
+        )
+        .bind(&bob.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 5);
+        for r in &rows {
+            assert_eq!(r.meeting_id.as_deref(), Some("m1"));
+            assert_eq!(r.cluster_label.as_deref(), Some("SPEAKER_00"));
+        }
+
+        // The block override must still resolve to Bob.
+        assert_eq!(
+            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            Some("Bob")
+        );
+    }
+
+    #[tokio::test]
+    async fn block_correction_without_cache_is_noop() {
+        // Legacy/no-cache meeting: enroll_cluster for a cluster with no cache
+        // rows returns 0 without error, so the label still applies.
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        let (meeting_id, cluster_label) =
+            SpeakerRepository::get_transcript_cluster(&pool, "t1").await.unwrap().unwrap();
+        let cluster_label = cluster_label.unwrap();
+
+        let n = SpeakerRepository::enroll_cluster(&pool, &meeting_id, &cluster_label, &bob.id).await.unwrap();
+        assert_eq!(n, 0, "no cache rows -> zero prototypes enrolled, no error");
+
+        let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(stats.prototype_count, 0);
+    }
+
+    #[tokio::test]
     async fn enrollment_enforces_per_person_cap() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
@@ -1373,6 +1530,135 @@ mod tests {
         let row = rows.iter().find(|r| r.cluster_label == "SPEAKER_00").unwrap();
         assert_eq!(row.speaker_id.as_deref(), Some(alice.id.as_str()));
         assert_eq!(row.matched_by.as_deref(), Some("user"));
+    }
+
+    #[tokio::test]
+    async fn confirm_cluster_binding_clears_score_and_sets_user() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        // Auto-recognized cluster with a score.
+        SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.78)
+            .await
+            .unwrap();
+
+        // scope_all=true confirms the whole cluster.
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", true).await.unwrap();
+        assert_eq!(n, 1);
+
+        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1").await.unwrap();
+        let row = rows.iter().find(|r| r.cluster_label == "SPEAKER_00").unwrap();
+        assert_eq!(row.matched_by.as_deref(), Some("user"), "cluster flips to user");
+        assert_eq!(row.match_score, None, "match score is cleared so (auto) drops");
+        assert_eq!(row.speaker_id.as_deref(), Some(alice.id.as_str()), "speaker name unchanged");
+    }
+
+    #[tokio::test]
+    async fn confirm_single_block_sets_override() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.65)
+            .await
+            .unwrap();
+
+        // scope_all=false confirms only this block.
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", false).await.unwrap();
+        assert_eq!(n, 1);
+
+        // Block resolves as user provenance via the override, still to Alice.
+        assert_eq!(
+            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            Some("Alice")
+        );
+        let override_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT speaker_override_id FROM transcripts WHERE id = ?",
+        )
+        .bind("t1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(override_id.as_deref(), Some(alice.id.as_str()), "single block marked user-owned");
+    }
+
+    #[tokio::test]
+    async fn confirm_does_not_duplicate_prototypes() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        // Seed the cluster cache + enroll so Alice has prototypes.
+        let exemplars = vec![Exemplar { embedding: emb(&[1.0, 2.0, 3.0, 4.0]), duration_secs: 1.0, start_secs: Some(10.0), end_secs: Some(11.0) }];
+        SpeakerRepository::write_cluster_cache(
+            &pool, "m1", "SPEAKER_00", "mic", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+
+        // Auto-recognition also binds the cluster (score recorded on unused cache? no - binding).
+        SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.9)
+            .await
+            .unwrap();
+        let before = SpeakerRepository::storage_stats(&pool).await.unwrap().prototype_count;
+
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", true).await.unwrap();
+        assert_eq!(n, 1);
+
+        let after = SpeakerRepository::storage_stats(&pool).await.unwrap().prototype_count;
+        assert_eq!(after, before, "confirming must not create new speaker_embeddings");
+    }
+
+    #[tokio::test]
+    async fn confirm_with_no_bound_speaker_returns_zero() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", false).await.unwrap();
+        assert_eq!(n, 0, "no cluster binding -> nothing confirmed, no error");
+    }
+
+    #[tokio::test]
+    async fn cluster_binding_overrides_persist_user_identity_on_rows() {
+        // Simulates finalize persisting a live cluster binding: set_user_binding
+        // (meeting_speakers) + apply_cluster_binding_overrides (transcript rows).
+        // Reopening the meeting must show the user's name with user provenance.
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+        insert_transcript(&pool, "t2", "m1", "SPEAKER_00").await;
+
+        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        let n = SpeakerRepository::apply_cluster_binding_overrides(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "both transcripts of the cluster carry the user's identity");
+
+        for tid in ["t1", "t2"] {
+            assert_eq!(
+                SpeakerRepository::get_transcript_display_name(&pool, tid)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("Alice"),
+                "stored row resolves to the user's name after reopen"
+            );
+            let override_id: Option<String> = sqlx::query_scalar(
+                "SELECT speaker_override_id FROM transcripts WHERE id = ?",
+            )
+            .bind(tid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(override_id.as_deref(), Some(alice.id.as_str()), "row is user-confirmed");
+        }
     }
 
     #[tokio::test]
