@@ -680,6 +680,13 @@ impl ContinuousVadProcessor {
         self.processed_samples += chunk.len();
         Ok(())
     }
+
+    /// Current processed sample position in milliseconds (16 kHz domain).
+    /// Used by the pipeline to anchor VAD-relative segment timestamps to real
+    /// recording time via per-dispatch capture-time anchors.
+    pub fn processed_ms(&self) -> f64 {
+        self.processed_samples as f64 / 16.0
+    }
 }
 
 /// Legacy function for backward compatibility - now uses the optimized approach

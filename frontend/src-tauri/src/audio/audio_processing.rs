@@ -521,7 +521,7 @@ pub fn write_audio_to_file_with_meeting_name(
     // Run FFmpeg in a separate task
     if !skip_encoding {
         encode_single_audio(
-            bytemuck::cast_slice(audio),
+            audio,
             sample_rate,
             2, // Stereo (left = microphone, right = system audio), matching the incremental saver
             &file_path.into(),

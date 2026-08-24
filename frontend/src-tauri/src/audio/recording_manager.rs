@@ -357,7 +357,7 @@ impl RecordingManager {
     }
 
     /// Get recording stats from the saver
-    pub fn get_recording_stats(&self) -> (usize, u32) {
+    pub fn get_recording_stats(&self) -> (usize, u32, usize) {
         self.recording_saver.get_stats()
     }
 

@@ -125,6 +125,52 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
     };
   }, [showModal]);
 
+  // Set up recording-audio-warning listener: surfaces a partial-audio save
+  // (failed checkpoints or a duration mismatch) after recording stops.
+  // The warning is additive and display-only; the transcript/meeting save flow
+  // is untouched. Payload: { saved_duration_seconds, expected_duration_seconds,
+  // failed_checkpoints }.
+  useEffect(() => {
+    let unlistenFn: (() => void) | undefined;
+
+    const setupRecordingAudioWarningListener = async () => {
+      try {
+        console.log('Setting up recording-audio-warning listener...');
+        unlistenFn = await listen<{
+          saved_duration_seconds: number;
+          expected_duration_seconds: number;
+          failed_checkpoints: number;
+        }>('recording-audio-warning', (event) => {
+          console.log('Recording audio warning received:', event.payload);
+          const { saved_duration_seconds, expected_duration_seconds, failed_checkpoints } = event.payload;
+
+          const saved = Math.round(saved_duration_seconds);
+          const expected = Math.round(expected_duration_seconds);
+          const details = failed_checkpoints > 0
+            ? `Some audio checkpoints failed to save (${failed_checkpoints}).`
+            : `Saved ${saved}s of ${expected}s.`;
+
+          toast.warning('Audio recording is incomplete', {
+            description: `${details} Part of the meeting audio may be missing.`,
+            duration: 8000,
+          });
+        });
+        console.log('Recording audio warning listener setup complete');
+      } catch (error) {
+        console.error('Failed to setup recording audio warning listener:', error);
+      }
+    };
+
+    setupRecordingAudioWarningListener();
+
+    return () => {
+      console.log('Cleaning up recording audio warning listener...');
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, []);
+
   // Set up transcription error listener for model loading failures
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use log::{info, warn, error};
-use super::encode::encode_single_audio;
+use super::encode::{encode_single_audio, run_ffmpeg_with_timeout, MERGE_TIMEOUT};
 use super::recording_state::AudioChunk;
 use serde::{Serialize, Deserialize};
 
@@ -18,8 +18,12 @@ struct AudioData {
 /// to minimize memory usage and enable crash recovery
 pub struct IncrementalAudioSaver {
     checkpoint_buffer: Vec<AudioData>,
-    checkpoint_interval_samples: usize,  // 30s at 48kHz = 1,440,000 samples
+    checkpoint_interval_samples: usize,  // 30s at 48kHz stereo = 2,880,000 interleaved samples
     checkpoint_count: u32,
+    /// Number of checkpoints whose encode failed and whose buffer segment was
+    /// discarded (drop-and-continue). Exposed so the stop flow can surface a
+    /// partial-audio warning instead of reporting a silent full-success save.
+    failed_checkpoints: u32,
     checkpoints_dir: PathBuf,
     meeting_folder: PathBuf,
     sample_rate: u32,
@@ -41,8 +45,12 @@ impl IncrementalAudioSaver {
 
         Ok(Self {
             checkpoint_buffer: Vec::new(),
-            checkpoint_interval_samples: sample_rate as usize * 30, // 30 seconds
+            // The buffer holds stereo-interleaved samples, so the sample
+            // threshold is sample_rate * 30s * 2 channels. Counting interleaved
+            // samples as mono frames previously halved real checkpoints to ~15s.
+            checkpoint_interval_samples: sample_rate as usize * 30 * 2, // 30 seconds (stereo)
             checkpoint_count: 0,
+            failed_checkpoints: 0,
             checkpoints_dir,
             meeting_folder,
             sample_rate,
@@ -65,16 +73,21 @@ impl IncrementalAudioSaver {
             .map(|c| c.data.len())
             .sum();
 
-        // Save checkpoint when buffer reaches threshold (30 seconds)
+        // Save checkpoint when buffer reaches threshold (30 seconds);
+        // save_checkpoint clears the buffer on both success and failure.
         if total_samples >= self.checkpoint_interval_samples {
             self.save_checkpoint()?;
-            self.checkpoint_buffer.clear();
         }
 
         Ok(())
     }
 
     /// Save current buffer as a checkpoint file
+    ///
+    /// On encode failure the affected buffered segment is discarded and
+    /// checkpointing continues at the next boundary (drop-and-continue), so a
+    /// single bad checkpoint can never wedge the accumulation task and silently
+    /// lose the rest of the recording.
     fn save_checkpoint(&mut self) -> Result<()> {
         // Concatenate all chunks in buffer
         let audio_data: Vec<f32> = self.checkpoint_buffer
@@ -93,15 +106,22 @@ impl IncrementalAudioSaver {
             .join(format!("audio_chunk_{:03}.mp4", self.checkpoint_count));
 
         // Encode and save checkpoint
-        encode_single_audio(
-            bytemuck::cast_slice(&audio_data),
+        if let Err(e) = encode_single_audio(
+            &audio_data,
             self.sample_rate,
             2,  // stereo
             &checkpoint_path
-        )?;
+        ) {
+            error!("Checkpoint encode failed ({}): {}", checkpoint_path.display(), e);
+            self.failed_checkpoints += 1;
+            self.checkpoint_buffer.clear();
+            return Ok(());
+        }
 
-        let duration_seconds = audio_data.len() as f32 / self.sample_rate as f32;
+        let frames = audio_data.len() / 2; // interleaved stereo -> frames per channel
+        let duration_seconds = frames as f32 / self.sample_rate as f32;
         self.checkpoint_count += 1;
+        self.checkpoint_buffer.clear();
 
         info!("Saved checkpoint {}: {:.2}s of audio ({} samples)",
               self.checkpoint_count,
@@ -121,7 +141,6 @@ impl IncrementalAudioSaver {
         if !self.checkpoint_buffer.is_empty() {
             info!("Saving final checkpoint with remaining {} chunks", self.checkpoint_buffer.len());
             self.save_checkpoint()?;
-            self.checkpoint_buffer.clear();
         }
 
         if self.checkpoint_count == 0 {
@@ -185,7 +204,9 @@ impl IncrementalAudioSaver {
             "-c", "copy",            // Copy codec - no re-encoding!
             "-y",                    // Overwrite output file
             output.to_str().unwrap()
-        ]);
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
         // Hide console window on Windows to prevent CMD popup during finalization
         #[cfg(target_os = "windows")]
@@ -195,7 +216,20 @@ impl IncrementalAudioSaver {
             command.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let ffmpeg_output = command.output()?;
+        // Bound the merge (~2 min) so a hung FFmpeg cannot hang finalize forever
+        let ffmpeg_output = tokio::task::spawn_blocking(move || {
+            run_ffmpeg_with_timeout(command, None, MERGE_TIMEOUT)
+        })
+        .await
+        .map_err(|e| anyhow!("FFmpeg merge task panicked: {:?}", e))?;
+
+        let ffmpeg_output = match ffmpeg_output {
+            Ok(output) => output,
+            Err(e) => {
+                error!("FFmpeg merge failed: {}", e);
+                return Err(anyhow!("FFmpeg concat failed: {}", e));
+            }
+        };
 
         if !ffmpeg_output.status.success() {
             let stderr = String::from_utf8_lossy(&ffmpeg_output.stderr);
@@ -222,6 +256,17 @@ impl IncrementalAudioSaver {
     /// Get current checkpoint count
     pub fn get_checkpoint_count(&self) -> u32 {
         self.checkpoint_count
+    }
+
+    /// Get the number of checkpoint encodes that failed and were discarded
+    pub fn get_failed_checkpoints(&self) -> u32 {
+        self.failed_checkpoints
+    }
+
+    /// Get checkpoint statistics for the consuming (stop) flow.
+    /// Returns (checkpoint_count, sample_rate, failed_checkpoints).
+    pub fn get_stats(&self) -> (u32, u32, u32) {
+        (self.checkpoint_count, self.sample_rate, self.failed_checkpoints)
     }
 }
 
@@ -319,7 +364,9 @@ pub async fn recover_audio_from_checkpoints(
         "-c", "copy",
         "-y", // Overwrite if exists
         &output_path_str
-    ]);
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
 
     // Hide console window on Windows
     #[cfg(target_os = "windows")]
@@ -329,10 +376,15 @@ pub async fn recover_audio_from_checkpoints(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let ffmpeg_result = command.output();
+    // Bound the recovery merge (~2 min) so a hung FFmpeg cannot hang recovery
+    let ffmpeg_result = tokio::task::spawn_blocking(move || {
+        run_ffmpeg_with_timeout(command, None, MERGE_TIMEOUT)
+    })
+    .await
+    .map_err(|e| format!("FFmpeg recovery task panicked: {:?}", e));
 
     match ffmpeg_result {
-        Ok(output) if output.status.success() => {
+        Ok(Ok(output)) if output.status.success() => {
             // Clean up concat file
             let _ = std::fs::remove_file(concat_file_path);
 
@@ -346,7 +398,7 @@ pub async fn recover_audio_from_checkpoints(
                 message: format!("Successfully recovered {} audio chunks", chunk_count),
             })
         }
-        Ok(output) => {
+        Ok(Ok(output)) => {
             let error = String::from_utf8_lossy(&output.stderr);
             error!("FFmpeg recovery failed: {}", error);
             Ok(AudioRecoveryStatus {
@@ -357,7 +409,7 @@ pub async fn recover_audio_from_checkpoints(
                 message: format!("FFmpeg failed: {}", error),
             })
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Failed to run FFmpeg: {}", e);
             Ok(AudioRecoveryStatus {
                 status: "failed".to_string(),
@@ -365,6 +417,16 @@ pub async fn recover_audio_from_checkpoints(
                 estimated_duration_seconds: estimated_duration,
                 audio_file_path: None,
                 message: format!("Failed to run FFmpeg: {}", e),
+            })
+        }
+        Err(e) => {
+            error!("FFmpeg recovery task failed: {}", e);
+            Ok(AudioRecoveryStatus {
+                status: "failed".to_string(),
+                chunk_count,
+                estimated_duration_seconds: estimated_duration,
+                audio_file_path: None,
+                message: format!("FFmpeg recovery failed: {}", e),
             })
         }
     }
@@ -432,20 +494,22 @@ mod tests {
             48000
         ).unwrap();
 
-        // Add 60 seconds worth of audio (should create 2 checkpoints)
-        for i in 0..120 {  // 120 chunks of 0.5s each
+        // 60 seconds of stereo-interleaved audio (each 24000-sample chunk is
+        // 0.25s of stereo audio) at a 30s checkpoint cadence produces exactly 2
+        // checkpoints - not 4 as when interleaved samples were counted as mono.
+        for i in 0..240 {  // 240 chunks of 0.25s stereo each = 60s
             let chunk = AudioChunk {
-                data: vec![0.5f32; 24000],  // 0.5s at 48kHz
+                data: vec![0.5f32; 24000],  // 0.25s stereo at 48kHz
                 sample_rate: 48000,
-                timestamp: i as f64 * 0.5,  // timestamp in seconds
+                timestamp: i as f64 * 0.25,  // timestamp in seconds
                 chunk_id: i as u64,
                 device_type: DeviceType::Microphone,
-                channels: 1,
+                channels: 2,
             };
             saver.add_chunk(chunk).unwrap();
         }
 
-        // Verify 2 checkpoints created
+        // Verify 2 checkpoints created (30s each)
         assert_eq!(saver.checkpoint_count, 2);
 
         // Finalize and verify merge
@@ -454,6 +518,63 @@ mod tests {
 
         // Verify checkpoints directory deleted
         assert!(!meeting_folder.join(".checkpoints").exists());
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_failure_drop_and_continue() {
+        // Create temp meeting folder
+        let temp_dir = tempdir().unwrap();
+        let meeting_folder = temp_dir.path().join("Failure_Test");
+        std::fs::create_dir_all(&meeting_folder).unwrap();
+        let checkpoints_dir = meeting_folder.join(".checkpoints");
+        std::fs::create_dir_all(&checkpoints_dir).unwrap();
+
+        let mut saver = IncrementalAudioSaver::new(
+            meeting_folder.clone(),
+            48000
+        ).unwrap();
+
+        // Remove the checkpoints directory so every checkpoint encode fails
+        // (its output path's parent no longer exists).
+        std::fs::remove_dir_all(&checkpoints_dir).unwrap();
+
+        // Feed more than one checkpoint window worth of audio (~75s stereo).
+        for i in 0..300 {
+            let chunk = AudioChunk {
+                data: vec![0.5f32; 24000],  // 0.25s stereo at 48kHz
+                sample_rate: 48000,
+                timestamp: i as f64 * 0.25,
+                chunk_id: i as u64,
+                device_type: DeviceType::Microphone,
+                channels: 2,
+            };
+            // Accumulation must keep accepting audio even while encodes fail.
+            saver.add_chunk(chunk).unwrap();
+        }
+
+        // The failure was counted but did not wedge or stop accumulation.
+        assert!(saver.failed_checkpoints >= 1, "expected at least one failed checkpoint");
+        assert_eq!(saver.checkpoint_count, 0, "no checkpoint should have succeeded while the dir is gone");
+
+        // Restore the checkpoints directory: subsequent audio must still
+        // produce checkpoints (checkpointing continues after a failure).
+        std::fs::create_dir_all(&checkpoints_dir).unwrap();
+
+        for i in 300..430 {  // another ~32.5s of stereo audio
+            let chunk = AudioChunk {
+                data: vec![0.5f32; 24000],
+                sample_rate: 48000,
+                timestamp: i as f64 * 0.25,
+                chunk_id: i as u64,
+                device_type: DeviceType::Microphone,
+                channels: 2,
+            };
+            saver.add_chunk(chunk).unwrap();
+        }
+
+        // Later audio still produced checkpoints and the failure count is reported.
+        assert!(saver.checkpoint_count >= 1, "checkpointing should continue after a failure");
+        assert!(saver.get_failed_checkpoints() >= 1);
     }
 
     #[tokio::test]

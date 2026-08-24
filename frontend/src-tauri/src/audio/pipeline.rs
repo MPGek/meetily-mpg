@@ -634,6 +634,9 @@ pub struct AudioPipeline {
     ring_buffer: AudioMixerRingBuffer,
     // Recording sender for stereo interleaved audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Throttle: only surface the first saver-delivery failure per run so a dead
+    // channel is reported without spamming the recording error surface.
+    recording_save_failure_reported: bool,
     // Per-source mono accumulation buffers for window-batched VAD dispatch
     vad_buffer_mic: Vec<f32>,
     vad_buffer_sys: Vec<f32>,
@@ -642,6 +645,33 @@ pub struct AudioPipeline {
     vad_pending_mic: Vec<SpeechSegment>,
     vad_pending_sys: Vec<SpeechSegment>,
     live_vad_config: VadConfig,
+    // Real-time anchoring for live transcription timestamps. VAD segments are
+    // timestamped in the per-source sample domain; a stream that starts late or
+    // delivers nothing during silent periods (e.g. WASAPI loopback) shifts every
+    // later segment into the past. These anchors map the VAD counter domain (ms)
+    // to recording-relative seconds using the chunk capture timestamps, so
+    // transcription timestamps stay aligned with the audio file.
+    vad_mic_buffer_real_base: Option<f64>,
+    vad_sys_buffer_real_base: Option<f64>,
+    vad_mic_anchors: Vec<(f64, f64)>,
+    vad_sys_anchors: Vec<(f64, f64)>,
+}
+
+/// Remap VAD sample-domain segment timestamps (per-source counter ms) to
+/// recording-relative seconds using per-dispatch real-time anchors.
+/// `anchors` maps VAD counter ms -> real recording seconds at the start of each
+/// dispatched buffer; empty anchors leave the segment unchanged.
+fn remap_segment_times_to_real(anchors: &[(f64, f64)], segments: &mut [SpeechSegment]) {
+    for seg in segments.iter_mut() {
+        // Find the latest anchor whose counter is at or before the segment start.
+        let idx = anchors.partition_point(|(counter_ms, _)| *counter_ms <= seg.start_timestamp_ms);
+        if idx > 0 {
+            let (counter_ms, real_sec) = anchors[idx - 1];
+            let shift_ms = (real_sec - counter_ms / 1000.0) * 1000.0;
+            seg.start_timestamp_ms = (seg.start_timestamp_ms + shift_ms).max(0.0);
+            seg.end_timestamp_ms = (seg.end_timestamp_ms + shift_ms).max(0.0);
+        }
+    }
 }
 
 impl AudioPipeline {
@@ -723,6 +753,7 @@ impl AudioPipeline {
             // Initialize ring buffer
             ring_buffer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            recording_save_failure_reported: false,
             // Initialize VAD accumulation buffers
             vad_buffer_mic: Vec::with_capacity(vad_dispatch_threshold_samples * 2),
             vad_buffer_sys: Vec::with_capacity(vad_dispatch_threshold_samples * 2),
@@ -730,6 +761,10 @@ impl AudioPipeline {
             vad_pending_mic: Vec::new(),
             vad_pending_sys: Vec::new(),
             live_vad_config: vad_config_clone,
+            vad_mic_buffer_real_base: None,
+            vad_sys_buffer_real_base: None,
+            vad_mic_anchors: Vec::new(),
+            vad_sys_anchors: Vec::new(),
         }
     }
 
@@ -829,10 +864,15 @@ impl AudioPipeline {
                     }
 
                     // STEP 1: Accumulate mono audio into per-source VAD buffer
-                    let vad_buffer = match chunk.device_type {
-                        DeviceType::Microphone => &mut self.vad_buffer_mic,
-                        DeviceType::System => &mut self.vad_buffer_sys,
+                    let (vad_buffer, real_base) = match chunk.device_type {
+                        DeviceType::Microphone => (&mut self.vad_buffer_mic, &mut self.vad_mic_buffer_real_base),
+                        DeviceType::System => (&mut self.vad_buffer_sys, &mut self.vad_sys_buffer_real_base),
                     };
+                    if vad_buffer.is_empty() {
+                        // The oldest sample of a fresh buffer anchors the source's
+                        // VAD counter timeline to real recording time.
+                        *real_base = Some(chunk.timestamp);
+                    }
                     vad_buffer.extend_from_slice(&chunk.data);
 
                     // STEP 2: Dispatch to VAD only when buffer reaches threshold (window-batched)
@@ -849,10 +889,30 @@ impl AudioPipeline {
                         };
 
                         // Take accumulated samples and clear buffer
+                        let counter_base_ms = vad.processed_ms();
                         let accumulated: Vec<f32> = std::mem::take(buffer);
 
+                        // Record the real-time anchor for this dispatch batch
+                        {
+                            let (base_ref, anchors) = match chunk.device_type {
+                                DeviceType::Microphone => (&mut self.vad_mic_buffer_real_base, &mut self.vad_mic_anchors),
+                                DeviceType::System => (&mut self.vad_sys_buffer_real_base, &mut self.vad_sys_anchors),
+                            };
+                            if let Some(real_base) = base_ref.take() {
+                                anchors.push((counter_base_ms, real_base));
+                            }
+                        }
+
                         match vad.process_audio(&accumulated) {
-                            Ok(speech_segments) => {
+                            Ok(mut speech_segments) => {
+                                // Convert sample-domain times to recording-relative
+                                // seconds so transcription stays aligned to the audio.
+                                let anchors = match chunk.device_type {
+                                    DeviceType::Microphone => &self.vad_mic_anchors,
+                                    DeviceType::System => &self.vad_sys_anchors,
+                                };
+                                remap_segment_times_to_real(anchors, &mut speech_segments);
+
                                 let pending_ref = match chunk.device_type {
                                     DeviceType::Microphone => &mut self.vad_pending_mic,
                                     DeviceType::System => &mut self.vad_pending_sys,
@@ -908,7 +968,16 @@ impl AudioPipeline {
                                     device_type: DeviceType::Microphone,
                                     channels: 2,
                                 };
-                                let _ = sender.send(recording_chunk);
+                                if sender.send(recording_chunk).is_err() {
+                                    // The saver channel is closed/unavailable.
+                                    // Log and surface (throttled) instead of
+                                    // silently discarding the recording chunk.
+                                    warn!("Failed to deliver recording chunk to saver (channel closed/unavailable) - audio may be lost");
+                                    if !self.recording_save_failure_reported {
+                                        self.recording_save_failure_reported = true;
+                                        self.state.report_error(AudioError::SaveUnavailable);
+                                    }
+                                }
                             }
                         }
                     }
@@ -940,11 +1009,28 @@ impl AudioPipeline {
             (&mut self.vad_processor_sys, &mut self.vad_buffer_sys, DeviceType::System),
         ] {
             if !buffer.is_empty() {
+                let counter_base_ms = vad.processed_ms();
                 let accumulated: Vec<f32> = std::mem::take(buffer);
                 info!("Flushing VAD buffer [{:?}]: {} samples", device_type, accumulated.len());
 
-                if let Ok(speech_segments) = vad.process_audio(&accumulated) {
+                // Record the real-time anchor for this final dispatch batch
+                {
+                    let (base_ref, anchors) = match device_type {
+                        DeviceType::Microphone => (&mut self.vad_mic_buffer_real_base, &mut self.vad_mic_anchors),
+                        DeviceType::System => (&mut self.vad_sys_buffer_real_base, &mut self.vad_sys_anchors),
+                    };
+                    if let Some(real_base) = base_ref.take() {
+                        anchors.push((counter_base_ms, real_base));
+                    }
+                }
+
+                if let Ok(mut speech_segments) = vad.process_audio(&accumulated) {
                     if !speech_segments.is_empty() {
+                        let anchors = match device_type {
+                            DeviceType::Microphone => &self.vad_mic_anchors,
+                            DeviceType::System => &self.vad_sys_anchors,
+                        };
+                        remap_segment_times_to_real(anchors, &mut speech_segments);
                         let pending = match device_type {
                             DeviceType::Microphone => &mut self.vad_pending_mic,
                             DeviceType::System => &mut self.vad_pending_sys,
@@ -961,8 +1047,13 @@ impl AudioPipeline {
             (&mut self.vad_processor_sys, DeviceType::System),
         ] {
             match vad.flush() {
-                Ok(final_segments) => {
+                Ok(mut final_segments) => {
                     if !final_segments.is_empty() {
+                        let anchors = match device_type {
+                            DeviceType::Microphone => &self.vad_mic_anchors,
+                            DeviceType::System => &self.vad_sys_anchors,
+                        };
+                        remap_segment_times_to_real(anchors, &mut final_segments);
                         let pending = match device_type {
                             DeviceType::Microphone => &mut self.vad_pending_mic,
                             DeviceType::System => &mut self.vad_pending_sys,
@@ -1132,5 +1223,69 @@ impl AudioPipelineManager {
 impl Default for AudioPipelineManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remap_segment_times_to_real_constant_late_start() {
+        // A stream that began delivering 730s after the recording started:
+        // VAD counter 0 <-> real 730s, counter 200ms <-> real 750s (a gap).
+        let anchors = vec![(0.0, 730.0), (200.0, 750.0)];
+        let mut segments = vec![
+            SpeechSegment {
+                samples: vec![0.0; 1600],
+                start_timestamp_ms: 300.0,
+                end_timestamp_ms: 1400.0,
+                confidence: 0.9,
+            },
+            // A segment that started in the previous anchor span.
+            SpeechSegment {
+                samples: vec![0.0; 800],
+                start_timestamp_ms: 50.0,
+                end_timestamp_ms: 900.0,
+                confidence: 0.9,
+            },
+        ];
+        remap_segment_times_to_real(&anchors, &mut segments);
+
+// 300ms of the second anchor batch: real = 750 + 0.1 = 750.1s
+        assert!((segments[0].start_timestamp_ms - 750_100.0).abs() < 0.001);
+        assert!((segments[0].end_timestamp_ms - 751_200.0).abs() < 0.001);
+        // 50ms falls in the first anchor: real = 730 + 0.05 = 730.05s
+        assert!((segments[1].start_timestamp_ms - 730_050.0).abs() < 0.001);
+        assert!((segments[1].end_timestamp_ms - 730_900.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_remap_segment_times_to_real_no_anchors_is_noop() {
+        let anchors: Vec<(f64, f64)> = Vec::new();
+        let mut segments = vec![SpeechSegment {
+            samples: vec![0.0; 1600],
+            start_timestamp_ms: 1000.0,
+            end_timestamp_ms: 2000.0,
+            confidence: 0.9,
+        }];
+        remap_segment_times_to_real(&anchors, &mut segments);
+        assert_eq!(segments[0].start_timestamp_ms, 1000.0);
+        assert_eq!(segments[0].end_timestamp_ms, 2000.0);
+    }
+
+    #[test]
+    fn test_remap_segment_times_to_real_clamps_negative() {
+        // A pathological backward shift (anchor below the stream timeline) must
+        // be clamped at 0, never negative.
+        let anchors = vec![(0.0, -1000.0)];
+        let mut segments = vec![SpeechSegment {
+            samples: vec![0.0; 1600],
+            start_timestamp_ms: 100.0,
+            end_timestamp_ms: 500.0,
+            confidence: 0.9,
+        }];
+        remap_segment_times_to_real(&anchors, &mut segments);
+        assert_eq!(segments[0].start_timestamp_ms, 0.0);
+        assert_eq!(segments[0].end_timestamp_ms, 0.0);
     }
 }

@@ -5,11 +5,13 @@ use log::{info, warn, error};
 use tauri::{AppHandle, Runtime, Emitter};
 use tokio::sync::mpsc;
 use serde::{Serialize, Deserialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
 use super::incremental_saver::IncrementalAudioSaver;
+use super::encode::run_ffmpeg_with_timeout;
+use super::ffmpeg::find_ffmpeg_path;
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +25,16 @@ pub struct TranscriptSegment {
     pub confidence: f32,
     pub sequence_id: u64,
     pub source_device: String,  // "Microphone" or "System"
+}
+
+/// Structured partial-audio warning recorded in metadata.json and surfaced to
+/// the user via the `recording-audio-warning` event when the saved audio is
+/// known to be incomplete (failed checkpoints or a significant duration gap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWarning {
+    pub saved_duration_seconds: f64,
+    pub expected_duration_seconds: f64,
+    pub failed_checkpoints: u32,
 }
 
 /// Meeting metadata structure
@@ -39,6 +51,7 @@ pub struct MeetingMetadata {
     pub transcript_file: String,
     pub sample_rate: u32,
     pub status: String,  // "recording", "completed", "error"
+    pub audio_warning: Option<AudioWarning>,  // additive partial-audio flag (absent on clean saves)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +274,7 @@ impl RecordingSaver {
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
+            audio_warning: None,
         };
 
         // Write initial metadata.json
@@ -340,15 +354,16 @@ impl RecordingSaver {
     }
 
     // in frontend/src-tauri/src/audio/recording_saver.rs
-    pub fn get_stats(&self) -> (usize, u32) {
+    pub fn get_stats(&self) -> (usize, u32, usize) {
         if let Some(ref saver) = self.incremental_saver {
             if let Ok(guard) = saver.try_lock() {
-                (guard.get_checkpoint_count() as usize, 48000)
+                let (checkpoints, sample_rate, failed) = guard.get_stats();
+                (checkpoints as usize, sample_rate, failed as usize)
             } else {
-                (0, 48000)
+                (0, 48000, 0)
             }
         } else {
-            (0, 48000)
+            (0, 48000, 0)
         }
     }
 
@@ -399,6 +414,43 @@ impl RecordingSaver {
             return Err("No incremental saver initialized".to_string());
         };
 
+        // Collect partial-audio signals for the duration validation below.
+        let failed_checkpoints = if let Some(saver_arc) = &self.incremental_saver {
+            let saver = saver_arc.lock().await;
+            saver.get_failed_checkpoints()
+        } else {
+            0
+        };
+
+        // Probe the merged audio duration and compare with the session duration.
+        // A probe failure never fails the save (logged and ignored).
+        let saved_duration = probe_audio_duration(&final_audio_path);
+
+        let audio_warning = build_audio_warning(
+            saved_duration,
+            recording_duration,
+            failed_checkpoints,
+        );
+
+        if let Some(ref warning) = audio_warning {
+            warn!(
+                "⚠️ Partial audio save: {:.1}s saved vs {:.1}s expected, {} failed checkpoint(s)",
+                warning.saved_duration_seconds,
+                warning.expected_duration_seconds,
+                warning.failed_checkpoints
+            );
+            if let Err(e) = app.emit(
+                "recording-audio-warning",
+                serde_json::json!({
+                    "saved_duration_seconds": warning.saved_duration_seconds,
+                    "expected_duration_seconds": warning.expected_duration_seconds,
+                    "failed_checkpoints": warning.failed_checkpoints,
+                }),
+            ) {
+                warn!("Failed to emit recording-audio-warning event: {}", e);
+            }
+        }
+
         // Save final transcripts.json with validation
         if let Some(folder) = &self.meeting_folder {
             if let Err(e) = self.write_transcripts_json(folder) {
@@ -429,6 +481,9 @@ impl RecordingSaver {
                     None
                 }
             });
+
+            // Annotate a partial save instead of an unqualified "completed".
+            metadata.audio_warning = audio_warning.clone();
 
             if let Err(e) = self.write_metadata(folder, &metadata) {
                 error!("❌ Failed to update metadata to completed: {}", e);
@@ -492,6 +547,133 @@ impl Default for RecordingSaver {
     }
 }
 
+/// Compute the partial-audio warning for a completed save.
+///
+/// A warning is emitted when at least one checkpoint failed (audio data was
+/// dropped) or when the merged file's duration differs from the session by
+/// more than 5% and more than 30 s.
+fn build_audio_warning(
+    saved_duration: Option<f64>,
+    expected_duration: Option<f64>,
+    failed_checkpoints: u32,
+) -> Option<AudioWarning> {
+    let saved = saved_duration.unwrap_or(0.0);
+    let expected = expected_duration.unwrap_or(0.0);
+
+    if let Some(expected) = expected_duration {
+        if let Some(saved) = saved_duration {
+            let gap = (expected - saved).abs();
+            if expected > 0.0 && gap > 30.0 && gap / expected > 0.05 {
+                return Some(AudioWarning {
+                    saved_duration_seconds: saved,
+                    expected_duration_seconds: expected,
+                    failed_checkpoints,
+                });
+            }
+        }
+    }
+
+    if failed_checkpoints > 0 {
+        return Some(AudioWarning {
+            saved_duration_seconds: saved,
+            expected_duration_seconds: expected,
+            failed_checkpoints,
+        });
+    }
+
+    None
+}
+
+/// Probe the duration (seconds) of a media file using the bundled ffprobe
+/// (with an ffmpeg `-i` Duration parse as fallback). Never fail the caller:
+/// logs and returns None on any error, timeout, or unparseable output.
+fn probe_audio_duration(file: &Path) -> Option<f64> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let ffmpeg_path = find_ffmpeg_path()?;
+    let ffprobe_path = {
+        let name = if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        ffmpeg_path.with_file_name(name)
+    };
+
+    if ffprobe_path.exists() {
+        let mut command = std::process::Command::new(&ffprobe_path);
+        command
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                file.to_str().unwrap_or(""),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(output) = run_ffmpeg_with_timeout(command, None, PROBE_TIMEOUT) {
+            if output.status.success() {
+                if let Ok(s) = String::from_utf8(output.stdout) {
+                    if let Ok(parsed) = s.trim().parse::<f64>() {
+                        if parsed.is_finite() && parsed > 0.0 {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: parse "Duration: HH:MM:SS.xx" from `ffmpeg -i <file>` stderr.
+    let mut command = std::process::Command::new(&ffmpeg_path);
+    command
+        .args(["-i", file.to_str().unwrap_or("")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = run_ffmpeg_with_timeout(command, None, PROBE_TIMEOUT) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            if let Some(idx) = line.find("Duration: ") {
+                let rest = &line[idx + "Duration: ".len()..];
+                let duration_str = rest.split(',').next().unwrap_or("").trim();
+                let parts: Vec<&str> = duration_str.split(':').collect();
+                if parts.len() == 3 {
+                    if let (Ok(h), Ok(m), Ok(s)) = (
+                        parts[0].parse::<f64>(),
+                        parts[1].parse::<f64>(),
+                        parts[2].parse::<f64>(),
+                    ) {
+                        let total = h * 3600.0 + m * 60.0 + s;
+                        if total.is_finite() && total > 0.0 {
+                            return Some(total);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    warn!(
+        "Failed to probe audio duration for {} (probe failures never fail the save)",
+        file.display()
+    );
+    None
+}
+
 /// Standalone function to write transcript segments to disk.
 /// Used by the event listener to persist transcripts without accessing RecordingManager.
 pub fn write_transcripts_to_disk(
@@ -542,4 +724,38 @@ pub fn write_transcripts_to_disk(
 
     info!("✅ Successfully wrote transcripts.json with {} segments", segments_clone.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_audio_warning_none_on_clean_save() {
+        let warning = build_audio_warning(Some(1891.9), Some(1891.9), 0);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_build_audio_warning_on_duration_mismatch() {
+        // ~50% of the session saved: gap > 5% and > 30s -> warning.
+        let warning = build_audio_warning(Some(990.0), Some(1891.9), 0).unwrap();
+        assert_eq!(warning.saved_duration_seconds, 990.0);
+        assert_eq!(warning.expected_duration_seconds, 1891.9);
+        assert_eq!(warning.failed_checkpoints, 0);
+    }
+
+    #[test]
+    fn test_build_audio_warning_ignores_small_gap() {
+        // Sub-5% gap (and under 30s) must not warn.
+        let warning = build_audio_warning(Some(188.0), Some(190.0), 0);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_build_audio_warning_on_failed_checkpoints() {
+        // Failed checkpoints warn even when the duration looks fine.
+        let warning = build_audio_warning(Some(120.0), Some(120.0), 2).unwrap();
+        assert_eq!(warning.failed_checkpoints, 2);
+    }
 }

@@ -48,6 +48,10 @@ pub enum AudioError {
     PermissionDenied,
     BufferOverflow,
     SampleRateUnsupported,
+    /// Recording audio could not be delivered to the saver (channel closed or
+    /// unavailable). Recoverable and never trips the automatic stop threshold:
+    /// the loss is surfaced as a warning instead of killing the recording.
+    SaveUnavailable,
 }
 
 impl AudioError {
@@ -65,6 +69,7 @@ impl AudioError {
             AudioError::PermissionDenied => false,
             AudioError::BufferOverflow => true,
             AudioError::SampleRateUnsupported => false,
+            AudioError::SaveUnavailable => true,
         }
     }
 
@@ -81,6 +86,7 @@ impl AudioError {
             AudioError::PermissionDenied => "Microphone permission denied",
             AudioError::BufferOverflow => "Audio buffer overflow",
             AudioError::SampleRateUnsupported => "Audio sample rate not supported",
+            AudioError::SaveUnavailable => "Recording audio could not be saved",
         }
     }
 }
@@ -295,13 +301,17 @@ impl RecordingState {
     pub fn report_error(&self, error: AudioError) {
         let count = self.error_count.fetch_add(1, Ordering::SeqCst) + 1;
 
+        // A stalled saver channel is surfaced but must never trip the automatic
+        // stop-recording thresholds (recoverable_count / total count).
+        let is_save_unavailable = matches!(error, AudioError::SaveUnavailable);
+
         // Track recoverable vs non-recoverable errors separately
         if error.is_recoverable() {
             let recoverable_count = self.recoverable_error_count.fetch_add(1, Ordering::SeqCst) + 1;
             log::warn!("Recoverable audio error ({}): {:?}", recoverable_count, error);
 
             // Allow more recoverable errors before stopping
-            if recoverable_count >= 10 {
+            if recoverable_count >= 10 && !is_save_unavailable {
                 log::error!("Too many recoverable errors ({}), stopping recording", recoverable_count);
                 self.stop_recording();
             }
@@ -319,7 +329,7 @@ impl RecordingState {
         }
 
         // Fallback: stop recording after too many total errors
-        if count >= 15 {
+        if count >= 15 && !is_save_unavailable {
             log::error!("Too many total audio errors ({}), stopping recording", count);
             self.stop_recording();
         }
