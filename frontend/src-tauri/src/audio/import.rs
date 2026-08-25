@@ -1162,6 +1162,7 @@ mod tests {
                 source_device: None,
                 speaker: None,
                 speaker_label: None,
+                tokens: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1173,6 +1174,7 @@ mod tests {
                 source_device: None,
                 speaker: None,
                 speaker_label: None,
+                tokens: None,
             },
         ];
 

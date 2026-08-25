@@ -70,6 +70,7 @@ async fn full_stop_flow_fast_1322() {
             confidence: 1.0,
             sequence_id: i as u64,
             source_device: dev.clone(),
+            tokens: None,
         })
         .collect();
 

@@ -1,6 +1,6 @@
 use crate::database::models::Speaker;
 use crate::database::repositories::speaker::{
-    SpeakerRepository, SpeakerStorageStats, VoiceprintBrowser,
+    ClearAllResult, SpeakerRepository, SpeakerStorageStats, VoiceprintBrowser,
 };
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
@@ -373,4 +373,30 @@ pub async fn preview_replace_speaker(
             affected_clusters: r.affected_clusters,
             affected_transcripts: r.affected_transcripts,
         })
+}
+
+#[tauri::command]
+pub async fn clear_all_voiceprints(
+    state: tauri::State<'_, AppState>,
+) -> Result<ClearAllResult, String> {
+    let pool = state.db_manager.pool();
+    let result = SpeakerRepository::clear_all_voiceprints(pool)
+        .await
+        .map_err(|e| format!("Failed to clear voiceprints: {}", e))?;
+    // Best-effort clear of in-memory PrototypeStore for live Fast-mode
+    // sessions so subsequent recognition does not use deleted prototypes.
+    // The global store lives in audio::recording_commands::ONLINE_DIARIZATION_STORE.
+    {
+        use crate::audio::recording_commands::ONLINE_DIARIZATION_STORE;
+        if let Ok(guard) = ONLINE_DIARIZATION_STORE.try_lock() {
+            if let Some(store_arc) = guard.as_ref() {
+                if let Ok(mut store) = store_arc.try_write() {
+                    store.prototypes.clear();
+                    store.bindings.clear();
+                    store.session_embeddings.clear();
+                }
+            }
+        }
+    }
+    Ok(result)
 }

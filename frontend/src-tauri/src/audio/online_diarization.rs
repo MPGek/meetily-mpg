@@ -26,8 +26,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::diarization::ClusteredEmbedding;
 use super::recording_saver::TranscriptSegment;
 use super::recording_state::{AudioChunk, DeviceType};
-use super::speaker_recognition::{best_match, MatchResult, Prototype};
-use crate::database::repositories::speaker::{SpeakerRepository, SPEAKER_EMBEDDING_MODEL};
+use super::speaker_recognition::{MatchResult, Prototype};
+use super::token_assignment::{assign_tokens_to_speakers, SpeakerTurn as TokenTurn};
+use crate::database::repositories::speaker::SpeakerRepository;
 use polyvoice::clusterer::Clusterer as _;
 use polyvoice::embedder::Embedder as _;
 
@@ -119,6 +120,8 @@ pub struct OnlineClusterEmbeddings {
     pub mic: Vec<ClusteredEmbedding>,
     pub sys: Vec<ClusteredEmbedding>,
     pub saw_system_audio: bool,
+    /// Model family tag that produced the centroids (for family-aware persistence).
+    pub model_tag: Option<String>,
     /// Raw timestamped mic-channel chunk embeddings (`(start, end, embedding)`).
     pub mic_raw: Vec<(f32, f32, Vec<f32>)>,
     /// Raw timestamped system-channel chunk embeddings (`(start, end, embedding)`).
@@ -142,6 +145,8 @@ pub struct PrototypeStore {
     /// Session mic label prefix ("MIC_SPEAKER" for stereo, "SPEAKER" for mono).
     /// Used to resolve a label's channel when seeding prototypes on bind.
     pub mic_prefix: String,
+    /// Model family tag that produced the prototypes (for threshold selection).
+    pub model_tag: String,
 }
 
 impl PrototypeStore {
@@ -152,6 +157,7 @@ impl PrototypeStore {
             bindings: HashMap::new(),
             session_embeddings: HashMap::new(),
             mic_prefix,
+            model_tag: crate::audio::embedder::ENHANCED_MODEL_TAG.to_string(),
         }
     }
 
@@ -163,11 +169,22 @@ impl PrototypeStore {
         candidate_ids: Option<Vec<String>>,
         has_system_device: bool,
     ) -> Result<Self, String> {
+        Self::load_with_model(pool, candidate_ids, has_system_device, crate::audio::embedder::ENHANCED_MODEL_TAG).await
+    }
+
+    /// Model-aware load: filters prototypes by the active embedder family so
+    /// cross-family comparisons never occur (design D6, spec 6.1).
+    pub async fn load_with_model(
+        pool: &SqlitePool,
+        candidate_ids: Option<Vec<String>>,
+        has_system_device: bool,
+        model_tag: &str,
+    ) -> Result<Self, String> {
         let candidates_ref = candidate_ids.as_deref();
         let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
             pool,
             candidates_ref,
-            SPEAKER_EMBEDDING_MODEL,
+            model_tag,
         )
         .await
         .map_err(|e| format!("Failed to load prototypes: {}", e))?
@@ -193,6 +210,7 @@ impl PrototypeStore {
             bindings: HashMap::new(),
             session_embeddings: HashMap::new(),
             mic_prefix,
+            model_tag: model_tag.to_string(),
         })
     }
 
@@ -217,9 +235,11 @@ impl PrototypeStore {
     }
 
     /// Match an embedding against the store; returns the recognized match
-    /// (speaker id + score) when above threshold, else None.
+    /// (speaker id + score) when above threshold, else None. Threshold is the
+    /// enhanced TitaNet recognition τ.
     pub fn recognize(&self, embedding: &[f32], channel: &str) -> Option<MatchResult> {
-        best_match(embedding, Some(channel), &self.prototypes)
+        let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
+        crate::audio::speaker_recognition::best_match_with_threshold(embedding, Some(channel), &self.prototypes, threshold)
     }
 
     /// Record a chunk embedding tagged with its channel + pipeline speaker id,
@@ -277,19 +297,19 @@ fn parse_pipeline_id(cluster_label: &str) -> Option<usize> {
     last.parse::<usize>().ok()
 }
 
-/// polyvoice `Embedder` backed by the polyvoice ONNX ResNet34 INT8 model
-/// (16 kHz, 256 dims). Same embedder family as the offline path.
-type DiarizationEmbedder = polyvoice::embedder::ResNet34Adapter;
+/// polyvoice `Embedder` backed by the enhanced TitaNet-Large ONNX model
+/// (16 kHz, 192 dims). Same embedder family as the offline path.
+type DiarizationEmbedder = polyvoice::fbank_onnx::FbankOnnxExtractor;
 
-fn create_resnet34_embedder(embedding_model: &Path) -> Result<DiarizationEmbedder, String> {
+fn create_enhanced_embedder(embedding_model: &Path) -> Result<DiarizationEmbedder, String> {
     if !embedding_model.exists() {
         return Err(format!(
-            "Embedding model not found at {}. Download models in Settings.",
+            "Enhanced embedding model not found at {}. The enhanced diarization models (segmentation-3.0 + TitaNet-Large) are bundled at build time; rebuild with network or install a build that includes them.",
             embedding_model.display()
         ));
     }
-    DiarizationEmbedder::new(embedding_model, 1, polyvoice::onnx::ExecutionProvider::Cpu)
-        .map_err(|e| format!("Failed to create speaker embedding extractor: {}", e))
+    DiarizationEmbedder::new(embedding_model, 192, 1, polyvoice::onnx::ExecutionProvider::Cpu)
+        .map_err(|e| format!("Failed to create enhanced speaker embedding extractor: {}", e))
 }
 
 #[derive(Debug, Clone)]
@@ -314,7 +334,7 @@ impl EmbeddingBuffer {
         self.entries.push((start, end, embedding));
     }
 
-    fn cluster(&self, max_speakers: usize) -> Vec<SpeakerSegment> {
+    fn cluster(&self, max_speakers: usize, threshold: f32) -> Vec<SpeakerSegment> {
         if self.entries.is_empty() {
             return Vec::new();
         }
@@ -330,7 +350,7 @@ impl EmbeddingBuffer {
         let clusterer = polyvoice::clusterer::MinClusterSizeClusterer::new(
             Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
                 max_speakers,
-                polyvoice::DEFAULT_AHC_THRESHOLD,
+                threshold,
             )),
             2,
         );
@@ -439,6 +459,10 @@ pub struct OnlineDiarizationProcessor {
     /// else `SPEAKER` (mono). Chosen at construction so live labels and
     /// stop-time assignments always agree.
     mic_prefix: String,
+    /// Model family tag active for this session (192 vs 256). Set at construction
+    /// from the installed model set so clustering and persistence use the
+    /// family threshold.
+    model_tag: &'static str,
     engine: Option<Engine>,
     turn_sender: Option<UnboundedSender<SpeakerTurn>>,
     /// Shared live-recognition store (Fast mode). None in Efficient mode or
@@ -466,16 +490,23 @@ impl OnlineDiarizationProcessor {
         }
         let guard = OnlineDiarizationGuard::acquire()?;
 
-        let embedding_model = super::diarization::diarization_model_paths(models_dir).1;
+        let (_, embedding_model) = crate::audio::embedder::enhanced_model_paths(models_dir);
+        if !crate::audio::embedder::is_enhanced_installed(models_dir) {
+            return Err(format!(
+                "Enhanced diarization models not found at {}. The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time; rebuild with network or install a build that includes them.",
+                embedding_model.display()
+            ));
+        }
         let mic_prefix = if has_system_device {
             "MIC_SPEAKER".to_string()
         } else {
             "SPEAKER".to_string()
         };
+        let model_tag = crate::audio::embedder::ENHANCED_MODEL_TAG;
 
         let engine = match mode {
             DiarizationMode::Efficient => {
-                let extractor = create_resnet34_embedder(&embedding_model)?;
+                let extractor = create_enhanced_embedder(&embedding_model)?;
                 Engine::Efficient {
                     extractor,
                     mic: EmbeddingBuffer::default(),
@@ -487,7 +518,7 @@ impl OnlineDiarizationProcessor {
                 let sys = create_fast_channel(&embedding_model)?;
                 // Fast mode embeds chunks itself (the pipeline turns carry no
                 // embedding). Reuse one extractor for both channels' buffers.
-                let extractor = create_resnet34_embedder(&embedding_model)?;
+                let extractor = create_enhanced_embedder(&embedding_model)?;
                 Engine::Fast {
                     mic,
                     sys,
@@ -512,6 +543,7 @@ impl OnlineDiarizationProcessor {
             max_speakers,
             saw_system_audio: false,
             mic_prefix,
+            model_tag,
             engine: Some(engine),
             turn_sender,
             prototype_store,
@@ -718,11 +750,12 @@ impl OnlineDiarizationProcessor {
         };
 
         let mic_prefix = self.mic_prefix.clone();
+        let family_threshold = crate::audio::embedder::TITANET_CLUSTER_THRESHOLD;
         let (mic_segments, sys_segments, mic_clustered, sys_clustered, mic_raw, sys_raw) =
             match engine {
                 Engine::Efficient { extractor: _, mic, sys } => {
-                    let mic_segments = mic.cluster(self.max_speakers);
-                    let sys_segments = sys.cluster(self.max_speakers);
+                    let mic_segments = mic.cluster(self.max_speakers, family_threshold);
+                    let sys_segments = sys.cluster(self.max_speakers, family_threshold);
                     // Efficient mode: embeddings are buffered per segment; cluster()
                     // returns labels aligned with the buffer entries, so group by
                     // those labels directly.
@@ -786,6 +819,7 @@ impl OnlineDiarizationProcessor {
             mic: mic_clustered,
             sys: sys_clustered,
             saw_system_audio: self.saw_system_audio,
+            model_tag: Some(self.model_tag.to_string()),
             mic_raw,
             sys_raw,
         };
@@ -804,17 +838,45 @@ impl OnlineDiarizationProcessor {
             return Ok((Vec::new(), clusters, live_bindings));
         }
 
+        // N-way token expansion: if a transcript carries token timestamps spanning
+        // multiple speakers, expand it into N gap-free transcript rows before
+        // assignment, per design D3 (≥2 contiguous tokens per boundary).
+        let mut expanded: Vec<TranscriptSegment> = Vec::new();
+        for t in transcripts {
+            if let Some(tokens) = &t.tokens {
+                if !tokens.is_empty() {
+                    let segs_ref = if self.saw_system_audio && t.source_device.as_str() == "System" { &sys_segments } else { &mic_segments };
+                    let turns: Vec<TokenTurn> = segs_ref.iter().map(|s| TokenTurn { start: s.start, end: s.end, speaker: s.speaker as i32 }).collect();
+                    let assign = assign_tokens_to_speakers(tokens, &turns);
+                    if assign.blocks.len() > 1 {
+                        for (idx, block) in assign.blocks.iter().enumerate() {
+                            let mut clone = t.clone();
+                            clone.audio_start_time = block.start as f64;
+                            clone.audio_end_time = block.end as f64;
+                            clone.duration = (block.end - block.start) as f64;
+                            let txt = tokens[block.start_idx..=block.end_idx].iter().map(|tok| tok.text.clone()).collect::<Vec<_>>().join("");
+                            let txt = txt.trim();
+                            if !txt.is_empty() { clone.text = txt.to_string(); }
+                            if idx != 0 {
+                                clone.id = format!("{}_split{}", t.id, idx);
+                                clone.sequence_id = t.sequence_id + idx as u64 * 10000 + 1000;
+                            }
+                            // Ensure display_time updated? Keep original but duration covers it
+                            expanded.push(clone);
+                        }
+                        continue;
+                    }
+                }
+            }
+            expanded.push(t.clone());
+        }
+
         let mut assignments = Vec::new();
         let mut skipped_no_match = 0usize;
-        for transcript in transcripts {
+        for transcript in &expanded {
             let t_start = transcript.audio_start_time as f32;
             let t_end = transcript.audio_end_time as f32;
 
-            // Same channel scheme as offline diarization: system-source
-            // transcripts match system-channel segments (SPEAKER_NN); all
-            // others match mic-channel segments. When no system audio was
-            // captured, everything matches the single run. The mic prefix
-            // always comes from the session-stable `mic_prefix`.
             let (segments, prefix) = if self.saw_system_audio
                 && transcript.source_device.as_str() == "System"
             {
@@ -886,7 +948,7 @@ fn create_fast_channel(embedding_model: &Path) -> Result<FastChannel, String> {
     use polyvoice::streaming::{LatencyPreset, StreamingPipeline};
     use polyvoice::vad::{EnergyVad, VadConfig};
 
-    let extractor = create_resnet34_embedder(embedding_model)?;
+    let extractor = create_enhanced_embedder(embedding_model)?;
     let vad = EnergyVad::new(-100.0, 16000, 512);
     let pipeline = StreamingPipeline::with_latency_preset(
         vad,

@@ -766,7 +766,7 @@ pub fn run() {
             audio::diarization::update_speaker_label_command,
             audio::diarization::rematch_meeting_speakers,
             audio::diarization::check_diarization_models,
-            audio::diarization::download_diarization_models,
+            // Enhanced models are bundled at build time (no runtime download/remove)
             // Speaker identity registry commands
             database::speaker_commands::list_speakers,
             database::speaker_commands::assign_speaker,
@@ -783,6 +783,7 @@ pub fn run() {
             database::speaker_commands::replace_speaker,
             database::speaker_commands::find_or_create_speaker,
             database::speaker_commands::preview_replace_speaker,
+            database::speaker_commands::clear_all_voiceprints,
             // Online session finalization and live speaker assignment
             audio::recording_commands::finalize_online_session,
             audio::recording_commands::assign_live_speaker,

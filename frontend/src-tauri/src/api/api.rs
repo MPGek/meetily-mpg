@@ -207,6 +207,8 @@ pub struct TranscriptSegment {
     pub speaker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

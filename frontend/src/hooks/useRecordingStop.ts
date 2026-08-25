@@ -381,9 +381,9 @@ export function useRecordingStop(
             (async () => {
               try {
                 const modelStatus = await recordingService.checkDiarizationModels();
-                if (!modelStatus.segmentation_ready || !modelStatus.embedding_ready) {
-                  toast.error('Speaker diarization models not downloaded', {
-                    description: 'Download the models in Settings to enable auto-analysis.',
+                if (!modelStatus.ready) {
+                  toast.error('Enhanced diarization models not bundled', {
+                    description: 'The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time; rebuild with network or install a build that includes them.',
                     action: {
                       label: 'Open Settings',
                       onClick: () => router.push('/settings?tab=general'),

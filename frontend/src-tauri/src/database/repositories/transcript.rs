@@ -43,25 +43,79 @@ impl TranscriptsRepository {
 
         info!("Successfully created meeting with id: {}", meeting_id);
 
-        // 2. Save each transcript segment with audio timing fields
+        // 2. Save each transcript segment with audio timing fields and token timestamps (for diarization refinement)
         let mut has_speakers = false;
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
-            let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(&transcript_id)
-            .bind(&meeting_id)
-            .bind(&segment.text)
-            .bind(&segment.timestamp)
-            .bind(segment.audio_start_time)
-            .bind(segment.audio_end_time)
-            .bind(segment.duration)
-            .bind(&segment.source_device)
-            .bind(&segment.speaker)
-            .execute(&mut *transaction)
-            .await;
+            // Serialize tokens if present (Word-level timestamps for diarization split)
+            let tokens_json = segment
+                .tokens
+                .as_ref()
+                .map(|v| {
+                    // Value may already be array; ensure JSON string
+                    if v.is_string() {
+                        v.as_str().unwrap_or("").to_string()
+                    } else {
+                        serde_json::to_string(v).unwrap_or_default()
+                    }
+                })
+                .filter(|s| !s.is_empty() && s != "null");
+            let result = if tokens_json.is_some() {
+                let res = sqlx::query(
+                    "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker, tokens)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&transcript_id)
+                .bind(&meeting_id)
+                .bind(&segment.text)
+                .bind(&segment.timestamp)
+                .bind(segment.audio_start_time)
+                .bind(segment.audio_end_time)
+                .bind(segment.duration)
+                .bind(&segment.source_device)
+                .bind(&segment.speaker)
+                .bind(tokens_json.clone())
+                .execute(&mut *transaction)
+                .await;
+                match res {
+                    Ok(r) => Ok(r),
+                    Err(e) if e.to_string().contains("no such column") || e.to_string().contains("has no column named") => {
+                        // Pre-migration DB without tokens column: fallback without tokens
+                        sqlx::query(
+                            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                        )
+                        .bind(&transcript_id)
+                        .bind(&meeting_id)
+                        .bind(&segment.text)
+                        .bind(&segment.timestamp)
+                        .bind(segment.audio_start_time)
+                        .bind(segment.audio_end_time)
+                        .bind(segment.duration)
+                        .bind(&segment.source_device)
+                        .bind(&segment.speaker)
+                        .execute(&mut *transaction)
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                sqlx::query(
+                    "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&transcript_id)
+                .bind(&meeting_id)
+                .bind(&segment.text)
+                .bind(&segment.timestamp)
+                .bind(segment.audio_start_time)
+                .bind(segment.audio_end_time)
+                .bind(segment.duration)
+                .bind(&segment.source_device)
+                .bind(&segment.speaker)
+                .execute(&mut *transaction)
+                .await
+            };
 
             if let Err(e) = result {
                 error!(

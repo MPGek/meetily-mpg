@@ -3,7 +3,7 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAudioPlayer } from '@/hooks/useAudioPlayer';
-import { ChevronDown, ChevronRight, ChevronsDown, ChevronsUp } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronsDown, ChevronsUp, Play, Pause, AlertCircle, Trash2 } from 'lucide-react';
 
 type VoiceprintRow = {
   id: string;
@@ -242,13 +242,54 @@ function ConfirmReplaceDialog({
   );
 }
 
+function ConfirmClearAllDialog({
+  open,
+  onClose,
+  onConfirm,
+  stats,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  stats: StorageStats | null;
+}) {
+  if (!open) return null;
+  const proto = stats?.prototype_count ?? 0;
+  const caches = stats?.cache_count ?? 0;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden />
+      <div role="dialog" aria-modal="true" aria-label="Confirm bulk delete" className="relative bg-white rounded-lg shadow-xl w-[420px] border p-4">
+        <h4 className="font-semibold text-sm mb-2">Remove all voiceprints & caches?</h4>
+        <p className="text-sm text-gray-600 mb-3">
+          This will permanently delete <span className="font-medium">{proto}</span> prototypes and <span className="font-medium">{caches}</span> cached embeddings for all speakers/meetings and cannot be undone.
+        </p>
+        <div className="bg-red-50 border border-red-200 rounded p-3 text-xs mb-3 text-red-800">
+          All enrolled voiceprints and unassigned caches will be removed. The speaker names themselves will be kept, but they will have no voiceprints until re-enrolled.
+        </div>
+        <div className="flex justify-end gap-2">
+          <button className="text-xs px-3 py-1.5 bg-gray-100 rounded" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="text-xs px-3 py-1.5 bg-red-600 text-white rounded" onClick={onConfirm} aria-label="Confirm delete all">
+            Confirm delete all
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function VoiceprintBrowser() {
   const [data, setData] = useState<VoiceprintBrowserData | null>(null);
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [pendingRange, setPendingRange] = useState<{ start: number; end: number } | null>(null);
+  const [playingRowId, setPlayingRowId] = useState<string | null>(null);
+  const [failedRowId, setFailedRowId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [speakersList, setSpeakersList] = useState<SpeakerLite[]>([]);
+  const [clearAllOpen, setClearAllOpen] = useState(false);
   const player = useAudioPlayer(audioPath);
 
   // Collapse/expand state — set of expanded group ids: `speaker:${id}` / `meeting:${id}`
@@ -281,6 +322,19 @@ export default function VoiceprintBrowser() {
     }
   }, [audioPath, pendingRange, player]);
 
+  useEffect(() => {
+    if (player.endedCount > 0) {
+      setPlayingRowId(null);
+    }
+  }, [player.endedCount]);
+
+  useEffect(() => {
+    if (player.error && playingRowId) {
+      setFailedRowId(playingRowId);
+      setPlayingRowId(null);
+    }
+  }, [player.error, playingRowId]);
+
   const toggleGroup = useCallback((key: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -304,16 +358,26 @@ export default function VoiceprintBrowser() {
 
   const handlePlay = async (row: VoiceprintRow) => {
     if (row.audio_start_time == null || row.audio_end_time == null || !row.meeting_id) return;
+    if (playingRowId === row.id && player.isPlaying) {
+      player.pause();
+      setPlayingRowId(null);
+      if (failedRowId === row.id) setFailedRowId(null);
+      return;
+    }
+    if (failedRowId) setFailedRowId(null);
     try {
       const path = await invoke<string>('get_meeting_audio_path', { meetingId: row.meeting_id });
       if (!path) {
         setError('No audio file for meeting');
+        setFailedRowId(row.id);
         return;
       }
+      setPlayingRowId(row.id);
       setPendingRange({ start: row.audio_start_time, end: row.audio_end_time });
       setAudioPath(path);
     } catch (e) {
       setError(String(e));
+      setFailedRowId(row.id);
     }
   };
 
@@ -420,6 +484,21 @@ export default function VoiceprintBrowser() {
     }
   };
 
+  const handleClearAllConfirm = async () => {
+    try {
+      const res = await invoke<{ deleted_prototypes: number; deleted_caches: number; total_deleted: number }>('clear_all_voiceprints');
+      setClearAllOpen(false);
+      player.pause();
+      setPlayingRowId(null);
+      setFailedRowId(null);
+      setPendingRange(null);
+      await load();
+      window.alert(`Cleared. Deleted prototypes: ${res.deleted_prototypes}, caches: ${res.deleted_caches}`);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   if (error) return <div className="p-4 text-red-600">{error}</div>;
   if (!data) return <div className="p-4">Loading voiceprints…</div>;
 
@@ -434,7 +513,18 @@ export default function VoiceprintBrowser() {
       <audio ref={player.audioRef} style={{ display: 'none' }} />
       {stats && (
         <div className="bg-white p-4 rounded border">
-          <h3 className="font-semibold mb-2">Storage</h3>
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="font-semibold">Storage</h3>
+            <button
+              onClick={() => setClearAllOpen(true)}
+              disabled={stats.prototype_count + stats.cache_count === 0}
+              className="text-xs px-2 py-1 bg-red-100 text-red-700 rounded disabled:opacity-40 flex items-center gap-1 hover:bg-red-200"
+              title="Remove all voiceprints and cached embeddings"
+              aria-label="Remove all voiceprints and cached embeddings"
+            >
+              <Trash2 className="h-3 w-3" /> Remove all
+            </button>
+          </div>
           <div className="text-sm text-gray-600 flex gap-4 flex-wrap">
             <span>Speakers: {stats.registry_count}</span>
             <span>Prototypes: {stats.prototype_count}</span>
@@ -514,6 +604,8 @@ export default function VoiceprintBrowser() {
                       {sp.prototypes.map((row) => {
                         const hasProvenance = row.meeting_id != null && row.audio_start_time != null;
                         const disabledPlay = row.audio_start_time == null || row.audio_end_time == null;
+                        const isPlayingRow = playingRowId === row.id && player.isPlaying;
+                        const isFailedRow = failedRowId === row.id;
                         return (
                           <tr key={row.id} className="border-t">
                             <td>{row.channel}</td>
@@ -523,7 +615,8 @@ export default function VoiceprintBrowser() {
                             </td>
                             <td>{row.audio_start_time != null && row.audio_end_time != null ? `${row.audio_start_time.toFixed(1)}–${row.audio_end_time.toFixed(1)}s` : '—'}</td>
                             <td className="flex gap-1 py-1">
-                              <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs ${disabledPlay ? 'bg-gray-100 text-gray-400' : 'bg-blue-500 text-white'}`}>
+                              <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs flex items-center gap-1 ${disabledPlay ? 'bg-gray-100 text-gray-400' : isFailedRow ? 'bg-red-600 text-white' : isPlayingRow ? 'bg-blue-700 text-white' : 'bg-blue-500 text-white'}`}>
+                                {isFailedRow ? <AlertCircle className="h-3 w-3" /> : isPlayingRow ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                                 Play clip
                               </button>
                               <button onClick={() => handleReject(row, false)} className="px-2 py-0.5 bg-gray-200 rounded text-xs">
@@ -614,6 +707,8 @@ export default function VoiceprintBrowser() {
                     <tbody>
                       {mg.caches.map((row) => {
                         const disabledPlay = row.audio_start_time == null || row.audio_end_time == null;
+                        const isPlayingRow = playingRowId === row.id && player.isPlaying;
+                        const isFailedRow = failedRowId === row.id;
                         return (
                           <tr key={row.id} className="border-t">
                             <td>{row.channel}</td>
@@ -621,7 +716,8 @@ export default function VoiceprintBrowser() {
                             <td>{row.cluster_label}</td>
                             <td>{row.audio_start_time != null && row.audio_end_time != null ? `${row.audio_start_time.toFixed(1)}–${row.audio_end_time.toFixed(1)}s` : '—'}</td>
                             <td className="flex gap-1 py-1">
-                              <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs ${disabledPlay ? 'bg-gray-100 text-gray-400' : 'bg-blue-500 text-white'}`}>
+                              <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs flex items-center gap-1 ${disabledPlay ? 'bg-gray-100 text-gray-400' : isFailedRow ? 'bg-red-600 text-white' : isPlayingRow ? 'bg-blue-700 text-white' : 'bg-blue-500 text-white'}`}>
+                                {isFailedRow ? <AlertCircle className="h-3 w-3" /> : isPlayingRow ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                                 Play clip
                               </button>
                               <button onClick={() => setPicker({ mode: 'reconfirm', rowId: row.id })} className="px-2 py-0.5 bg-green-100 rounded text-xs">
@@ -670,6 +766,12 @@ export default function VoiceprintBrowser() {
         sourceName={confirm?.sourceName ?? ''}
         targetName={confirm?.targetName ?? null}
         preview={confirm?.preview ?? null}
+      />
+      <ConfirmClearAllDialog
+        open={clearAllOpen}
+        onClose={() => setClearAllOpen(false)}
+        onConfirm={handleClearAllConfirm}
+        stats={stats}
       />
     </div>
   );

@@ -465,5 +465,6 @@ fn tseg(seq: u64, start: f64, end: f64) -> TranscriptSegment {
         confidence: 1.0,
         sequence_id: seq,
         source_device: "System".to_string(),
+        tokens: None,
     }
 }

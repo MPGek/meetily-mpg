@@ -342,6 +342,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
                     source_device: update.source_device.clone(),
+                    tokens: update.tokens.clone(),
                 };
 
                 // Write to shared transcript segments (no RecordingManager access)
@@ -517,8 +518,13 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             let state = app.state::<crate::state::AppState>();
             state.db_manager.pool().clone()
         };
-        let prototype_store = match PrototypeStore::load(&pool, candidate_ids, has_system_device)
-            .await
+        let models_dir_for_store = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to get app data dir: {}", e))?
+            .join("models");
+        let store_model_tag = crate::audio::embedder::ENHANCED_MODEL_TAG;
+        let prototype_store = match PrototypeStore::load_with_model(&pool, candidate_ids, has_system_device, store_model_tag).await
         {
             Ok(store) => {
                 let arc = Arc::new(RwLock::new(store));
@@ -534,11 +540,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             }
         };
 
-        let models_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("Failed to get app data dir: {}", e))?
-            .join("models");
+        let models_dir = models_dir_for_store;
         let app_for_event = app.clone();
         let task = tokio::task::spawn_blocking(
             move || -> Result<Option<OnlineDiarizationProcessor>, String> {
@@ -646,6 +648,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
                     source_device: update.source_device.clone(),
+                    tokens: None,
                 };
 
                 // Write to shared transcript segments (no RecordingManager access)
@@ -940,6 +943,7 @@ pub async fn stop_recording<R: Runtime>(
                             mic,
                             sys,
                             saw_system_audio,
+                            model_tag,
                             mic_raw,
                             sys_raw,
                         } = cluster_embeddings;
@@ -950,6 +954,7 @@ pub async fn stop_recording<R: Runtime>(
                                 mic,
                                 sys,
                                 saw_system_audio,
+                                model_tag,
                                 mic_raw: Vec::new(),
                                 sys_raw: Vec::new(),
                             },
@@ -1632,6 +1637,7 @@ pub async fn finalize_online_session(
     }
 
     // Persist cluster centroids + exemplar caches and auto-assign recognized speakers.
+    // Matching is enhanced-only; the session tag is informational.
     if !session_data.cluster_embeddings.mic.is_empty()
         || !session_data.cluster_embeddings.sys.is_empty()
     {

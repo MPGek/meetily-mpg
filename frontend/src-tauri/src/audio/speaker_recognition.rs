@@ -2,19 +2,22 @@
 //! (a cluster centroid or a live chunk embedding) against enrolled prototype
 //! embeddings grouped by speaker.
 //!
-//! Design D4: prototypes are L2-normalized 256-d f32; matching is max cosine
-//! over a candidate's prototypes, best candidate wins, assigned if score > τ.
-//! When a candidate has prototypes captured on the same channel as the query,
-//! only those are considered (same-channel preference); otherwise all of the
-//! candidate's prototypes are used (cross-channel fallback). The `model` tag
-//! filter is applied upstream by `SpeakerRepository::load_prototypes`, so the
-//! prototypes passed here are already constrained to the current extractor.
+//! Design D4: prototypes are L2-normalized 192-d f32; matching is max cosine
+//! over a candidate's prototypes, best candidate wins, assigned if score > τ
+//! (the enhanced TitaNet recognition threshold). When a candidate has
+//! prototypes captured on the same channel as the query, only those are
+//! considered (same-channel preference); otherwise all of the candidate's
+//! prototypes are used (cross-channel fallback). The `model` tag filter is
+//! applied upstream by `SpeakerRepository::load_prototypes`, which loads only
+//! `titanet_large` rows — legacy `resnet34_int8` rows are never candidates.
 
 use std::collections::HashMap;
 
-/// Recognition threshold τ (design: start at 0.7, tune after field data).
-/// A match is assigned only when the best cosine score is strictly above τ.
-pub const RECOGNITION_THRESHOLD: f32 = 0.7;
+/// The enhanced TitaNet recognition threshold τ (design: start at 0.7, tune
+/// after field data). A match is assigned only when the best cosine score is
+/// strictly above τ. Single source of truth is
+/// `audio::embedder::TITANET_RECOGNITION_THRESHOLD`.
+pub const RECOGNITION_THRESHOLD: f32 = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
 
 /// A prototype used by the matcher. Owned so the matcher is pure and testable
 /// without a database. Convert from `PrototypeRow` (see the `From` impl below).
@@ -87,18 +90,12 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Find the best-matching speaker for `query` among `prototypes`.
-///
-/// `query_channel` is the channel the query embedding was captured on
-/// ('mic'/'system'), used for the same-channel preference. When `None`, all
-/// of each candidate's prototypes are considered (no preference).
-///
-/// Returns `Some(MatchResult)` only when the best score is strictly above
-/// `RECOGNITION_THRESHOLD`; otherwise `None` (the cluster stays anonymous).
-pub fn best_match(
+/// Threshold-parameterized matching core.
+pub fn best_match_with_threshold(
     query: &[f32],
     query_channel: Option<&str>,
     prototypes: &[Prototype],
+    threshold: f32,
 ) -> Option<MatchResult> {
     if prototypes.is_empty() {
         return None;
@@ -142,12 +139,21 @@ pub fn best_match(
     }
 
     best.and_then(|m| {
-        if m.score > RECOGNITION_THRESHOLD {
+        if m.score > threshold {
             Some(m)
         } else {
             None
         }
     })
+}
+
+/// Convenience wrapper using the enhanced TitaNet recognition threshold.
+pub fn best_match(
+    query: &[f32],
+    query_channel: Option<&str>,
+    prototypes: &[Prototype],
+) -> Option<MatchResult> {
+    best_match_with_threshold(query, query_channel, prototypes, RECOGNITION_THRESHOLD)
 }
 
 #[cfg(test)]

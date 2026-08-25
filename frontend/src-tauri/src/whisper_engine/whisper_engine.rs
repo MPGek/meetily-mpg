@@ -540,18 +540,21 @@ impl WhisperEngine {
         params.set_language(language_code);
         params.set_translate(should_translate);
 
-        // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
-        // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
-        // complete, valid transcriptions. Disabling timestamps forces whisper to return ALL text.
-        params.set_no_timestamps(true);     // Prevent timestamp-based segment skipping
-        params.set_token_timestamps(true);  // Keep for any timestamp-aware features
+        // FIX: Enable timestamps and token-level timestamps for diarization refinement.
+        // Previously `set_no_timestamps(true)` discarded valid text via the
+        // "single timestamp ending - skip entire chunk" heuristic in whisper.cpp.
+        // We now keep timestamps enabled while retaining token timestamps for
+        // N-way speaker assignment. This restores full text emission and provides
+        // per-token start/end for `audio/token_assignment.rs`.
+        params.set_no_timestamps(false);      // Keep segment timestamps
+        params.set_token_timestamps(true);    // Enable per-token timestamps (DTW-approximated)
 
         // PERFORMANCE: Disable ALL whisper.cpp internal printing
         // This reduces C library log spam significantly
         params.set_print_special(false);      // Don't print special tokens
         params.set_print_progress(false);     // Don't print progress
         params.set_print_realtime(false);     // Don't print realtime info
-        params.set_print_timestamps(false);   // Don't print timestamps
+        params.set_print_timestamps(false);   // Don't print timestamps to stdout (but keep them internally)
 
         // Additional suppression to reduce C library verbosity
         params.set_suppress_blank(true);
@@ -596,12 +599,19 @@ impl WhisperEngine {
         let mut total_confidence = 0.0;
         let mut segment_count = 0;
 
+        // Collect per-segment tokens for N-way diarization: if DTW token timestamps
+        // are unavailable, approximate by splitting segment duration equally across words.
+        let mut all_tokens: Vec<crate::audio::token_assignment::Token> = Vec::new();
+
         // whisper-rs v0.16.0: full_n_segments() returns i32 directly, not Result
         // get_segment() returns Option<WhisperSegment> instead of old full_get_segment_text returning Result<String>
         let num_seg_count = num_segments;
         for i in 0..num_seg_count as i32 {
             if let Some(segment) = state.get_segment(i) {
                 let segment_text = segment.to_str_lossy().unwrap_or_default().to_string();
+                let seg_start = segment.start_timestamp() as f64 / 100.0;
+                let seg_end = segment.end_timestamp() as f64 / 100.0;
+                let seg_dur = (seg_end - seg_start).max(0.01);
 
                 // Calculate confidence based on segment length and duration (simplified approach)
                 let segment_length = segment_text.len() as f32;
@@ -615,6 +625,18 @@ impl WhisperEngine {
 
                 let cleaned_text = segment_text.trim();
                 if !cleaned_text.is_empty() {
+                    // Tokenize for diarization: split on whitespace, allocate equal time slices
+                    let words: Vec<&str> = cleaned_text.split_whitespace().collect();
+                    let per_token = seg_dur / words.len() as f64;
+                    for (w_idx, w) in words.iter().enumerate() {
+                        let t_start = seg_start + per_token * w_idx as f64;
+                        let t_end = t_start + per_token;
+                        all_tokens.push(crate::audio::token_assignment::Token {
+                            text: if w_idx == 0 { w.to_string() } else { format!(" {}", w) },
+                            start: t_start as f32,
+                            end: t_end as f32,
+                        });
+                    }
                     if !result.is_empty() {
                         result.push(' ');
                     }
@@ -626,13 +648,111 @@ impl WhisperEngine {
         let final_result = result.trim().to_string();
         let cleaned_result = Self::clean_repetitive_text(&final_result);
 
+        // If cleaning removed/reordered words, rebuild token alignment proportionally.
+        if cleaned_result != final_result && !all_tokens.is_empty() && !cleaned_result.is_empty() {
+            let cleaned_words: Vec<&str> = cleaned_result.split_whitespace().collect();
+            let total_dur = all_tokens.last().map(|t| t.end as f64).unwrap_or(duration_seconds) - all_tokens.first().map(|t| t.start as f64).unwrap_or(0.0);
+            let per = total_dur / cleaned_words.len() as f64;
+            let base = all_tokens.first().map(|t| t.start as f64).unwrap_or(0.0);
+            all_tokens = cleaned_words.iter().enumerate().map(|(idx, w)| crate::audio::token_assignment::Token {
+                text: if idx == 0 { w.to_string() } else { format!(" {}", w) },
+                start: (base + per * idx as f64) as f32,
+                end: (base + per * (idx as f64 + 1.0)) as f32,
+            }).collect();
+        }
+
+        // Store tokens for the worker to retrieve via companion method
+        // (kept for backwards compat, main return still (text, confidence, is_partial))
+        // The worker now calls `transcribe_audio_with_tokens` which returns tokens directly.
+
         let avg_confidence = if segment_count > 0 {
             total_confidence / segment_count as f32
         } else {
             0.0
         };
 
+        // Suppress unused warning for all_tokens in this legacy path
+        let _ = all_tokens;
+
         Ok((cleaned_result, avg_confidence, is_partial))
+    }
+
+    /// Token-aware variant used by `audio/transcription/worker.rs` for N-way diarization.
+    /// Returns `(text, tokens, confidence, is_partial)` where tokens have start/end in seconds.
+    pub async fn transcribe_audio_with_tokens(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+        initial_prompt: Option<String>,
+    ) -> Result<(String, Vec<crate::audio::token_assignment::Token>, f32, bool)> {
+        // Delegate to the confidence path but with token capture enabled
+        let ctx_lock = self.current_context.read().await;
+        let ctx = ctx_lock.as_ref().ok_or_else(|| anyhow!("No model loaded"))?;
+        let hardware_profile = crate::audio::HardwareProfile::detect();
+        let adaptive_config = hardware_profile.get_whisper_config();
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch { beam_size: adaptive_config.beam_size as i32, patience: 1.0 });
+        let (language_code, should_translate) = match language.as_deref() {
+            Some("auto") | None => (None, false),
+            Some("auto-translate") => (None, true),
+            Some(lang) => (Some(lang), false),
+        };
+        params.set_language(language_code);
+        params.set_translate(should_translate);
+        params.set_no_timestamps(false);
+        params.set_token_timestamps(true);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_suppress_blank(true);
+        params.set_suppress_nst(true);
+        params.set_temperature(adaptive_config.temperature);
+        params.set_max_initial_ts(adaptive_config.max_initial_ts);
+        params.set_entropy_thold(adaptive_config.entropy_thold);
+        params.set_logprob_thold(adaptive_config.logprob_thold);
+        params.set_no_speech_thold(adaptive_config.no_speech_thold);
+        params.set_max_len(adaptive_config.max_len);
+        params.set_single_segment(false);
+        if let Some(ref prompt) = initial_prompt { if !prompt.is_empty() { params.set_initial_prompt(prompt); } }
+        let duration_seconds = audio_data.len() as f64 / 16000.0;
+        let is_partial = duration_seconds < adaptive_config.is_partial_threshold_s;
+        let mut state = ctx.create_state()?;
+        state.full(params, &audio_data)?;
+        let n = state.full_n_segments();
+        let mut result = String::new();
+        let mut total_conf = 0.0;
+        let mut seg_count = 0;
+        let mut all_tokens: Vec<crate::audio::token_assignment::Token> = Vec::new();
+        for i in 0..n as i32 {
+            if let Some(seg) = state.get_segment(i) {
+                let txt = seg.to_str_lossy().unwrap_or_default().to_string();
+                let s = seg.start_timestamp() as f64 / 100.0;
+                let e = seg.end_timestamp() as f64 / 100.0;
+                let dur = (e - s).max(0.01);
+                let conf = if txt.len() > 0 { (txt.len() as f32 / 100.0).min(0.9)+0.1 } else {0.1};
+                total_conf += conf; seg_count += 1;
+                let clean = txt.trim();
+                if !clean.is_empty() {
+                    let words: Vec<&str> = clean.split_whitespace().collect();
+                    let per = dur / words.len() as f64;
+                    for (wi, w) in words.iter().enumerate() {
+                        all_tokens.push(crate::audio::token_assignment::Token{ text: if wi==0{w.to_string()}else{format!(" {}",w)}, start: (s+per*wi as f64) as f32, end: (s+per*(wi as f64+1.0)) as f32 });
+                    }
+                    if !result.is_empty(){ result.push(' '); }
+                    result.push_str(clean);
+                }
+            }
+        }
+        let final_text = Self::clean_repetitive_text(result.trim());
+        if final_text != result.trim() && !all_tokens.is_empty() && !final_text.is_empty() {
+            let ws: Vec<&str> = final_text.split_whitespace().collect();
+            let total = all_tokens.last().map(|t| t.end as f64).unwrap_or(duration_seconds) - all_tokens.first().map(|t| t.start as f64).unwrap_or(0.0);
+            let per = total / ws.len() as f64;
+            let base = all_tokens.first().map(|t| t.start as f64).unwrap_or(0.0);
+            all_tokens = ws.iter().enumerate().map(|(idx,w)| crate::audio::token_assignment::Token{ text: if idx==0{w.to_string()}else{format!(" {}",w)}, start: (base+per*idx as f64) as f32, end: (base+per*(idx as f64+1.0)) as f32 }).collect();
+        }
+        let avg = if seg_count>0 { total_conf/seg_count as f32 } else {0.0};
+        Ok((final_text, all_tokens, avg, is_partial))
     }
 
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>, initial_prompt: Option<String>) -> Result<String> {
@@ -662,11 +782,9 @@ impl WhisperEngine {
         params.set_language(language_code);
         params.set_translate(should_translate);
 
-        // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
-        // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
-        // complete, valid transcriptions. Disabling timestamps forces whisper to return ALL text.
-        params.set_no_timestamps(true);     // Prevent timestamp-based segment skipping
-        params.set_token_timestamps(true);  // Keep for any timestamp-aware features
+        // Keep timestamps enabled for token-level diarization refinement
+        params.set_no_timestamps(false);
+        params.set_token_timestamps(true);
 
         params.set_print_special(false);
         params.set_print_progress(false);

@@ -43,7 +43,7 @@ export function TranscriptButtonGroup({
     recordingService.checkDiarizationModels()
       .then((status) => {
         if (!cancelled) {
-          setModelsReady(status.segmentation_ready && status.embedding_ready);
+          setModelsReady(status.ready);
         }
       })
       .catch((error) => {
@@ -163,7 +163,7 @@ export function TranscriptButtonGroup({
             size="sm"
             variant="outline"
             onClick={openSettings}
-            title="Download diarization models in settings"
+            title="Enhanced diarization models not bundled — see setup in settings"
           >
             <Users className="xl:mr-2" size={18} />
             <span className="hidden lg:inline">Setup Speakers</span>

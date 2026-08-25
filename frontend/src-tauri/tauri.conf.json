@@ -97,6 +97,7 @@
         ],
         "resources": [
             "templates/*.json",
+            "models/*.onnx",
             "../../target/release/cudart64_13.dll",
             "../../target/release/cublas64_13.dll",
             "../../target/release/cublasLt64_13.dll"

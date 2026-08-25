@@ -54,6 +54,15 @@ pub mod retranscription;
 // Import module (import external audio files as new meetings)
 pub mod import;
 
+// Model-aware embedder abstraction (diarization-accuracy-upgrade)
+pub mod embedder;
+
+// Token-level speaker assignment helpers
+pub mod token_assignment;
+
+// Segmentation-3.0 offline loader (enhanced set)
+pub mod segmentation;
+
 // Diarization module (speaker identification on recorded meetings)
 pub mod diarization;
 
@@ -135,7 +144,7 @@ pub use constants::AUDIO_EXTENSIONS;
 pub use audio_file::{find_audio_file, prepare_audio_for_playback};
 
 // Export diarization
-pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, rematch_meeting_speakers, check_diarization_models, download_diarization_models, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult, DiarizationModelStatus, DiarizationDownloadProgress};
+pub use diarization::{start_diarization, get_diarization_status, update_speaker_label_command, rematch_meeting_speakers, check_diarization_models, cancel_diarization, is_diarization_in_progress, DiarizationProgress, DiarizationResult, DiarizationModelStatus};
 
 // Export online diarization
 pub use online_diarization::{OnlineDiarizationProcessor, DiarizationMode, SpeakerAssignment, is_online_diarization_active};

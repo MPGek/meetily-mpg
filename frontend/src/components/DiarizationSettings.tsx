@@ -2,12 +2,10 @@
 
 import { useEffect, useState, useRef } from "react";
 import { Switch } from "./ui/switch";
-import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { recordingService } from "@/services/recordingService";
-import { toast } from "sonner";
-import { Download, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
+import { CheckCircle, AlertCircle } from "lucide-react";
 import type { DiarizationMode } from "@/lib/diarization";
 
 const STORAGE_KEYS = {
@@ -60,6 +58,12 @@ interface SpeakerStorageStats {
   total_bytes: number;
 }
 
+interface DiarizationModelStatus {
+  segmentation_ready: boolean;
+  embedding_ready: boolean;
+  ready: boolean;
+}
+
 function saveSetting(key: string, value: string) {
   if (typeof window === "undefined") return;
   localStorage.setItem(key, value);
@@ -72,10 +76,7 @@ export function DiarizationSettings() {
   const [diarizationMode, setDiarizationMode] = useState<DiarizationMode>(() =>
     loadMode("efficient")
   );
-  const [modelsReady, setModelsReady] = useState<{ segmentation: boolean; embedding: boolean } | null>(null);
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [downloadMessage, setDownloadMessage] = useState("");
+  const [modelsReady, setModelsReady] = useState<DiarizationModelStatus | null>(null);
   const [speakerStats, setSpeakerStats] = useState<SpeakerStorageStats | null>(null);
 
   const mountedRef = useRef(false);
@@ -92,10 +93,13 @@ export function DiarizationSettings() {
   const checkModels = async () => {
     try {
       const status = await recordingService.checkDiarizationModels();
-      setModelsReady({
-        segmentation: status.segmentation_ready,
-        embedding: status.embedding_ready,
-      });
+      if (mountedRef.current) {
+        setModelsReady({
+          segmentation_ready: status.segmentation_ready,
+          embedding_ready: status.embedding_ready,
+          ready: status.ready,
+        });
+      }
     } catch (error) {
       console.error("Failed to check diarization models:", error);
     }
@@ -106,72 +110,10 @@ export function DiarizationSettings() {
     checkModels();
     loadSpeakerStats();
 
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenComplete: (() => void) | undefined;
-    let unlistenError: (() => void) | undefined;
-
-    const setupListeners = async () => {
-      unlistenProgress = await recordingService.onDiarizationModelDownloadProgress((progress, message) => {
-        if (!mountedRef.current) return;
-        setDownloadProgress(progress);
-        setDownloadMessage(message);
-      });
-
-      unlistenComplete = await recordingService.onDiarizationModelDownloadComplete(() => {
-        if (!mountedRef.current) return;
-        setIsDownloading(false);
-        setDownloadProgress(100);
-        setDownloadMessage("Models ready");
-        toast.success("Diarization models downloaded", {
-          description: "Speaker analysis is now available.",
-        });
-        checkModels();
-      });
-
-      unlistenError = await recordingService.onDiarizationModelDownloadError((error) => {
-        if (!mountedRef.current) return;
-        setIsDownloading(false);
-        setDownloadProgress(0);
-        setDownloadMessage("");
-        toast.error("Failed to download diarization models", {
-          description: error,
-          action: {
-            label: "Retry",
-            onClick: handleDownload,
-          },
-        });
-      });
-    };
-
-    setupListeners();
-
     return () => {
       mountedRef.current = false;
-      if (unlistenProgress) unlistenProgress();
-      if (unlistenComplete) unlistenComplete();
-      if (unlistenError) unlistenError();
     };
   }, []);
-
-  const handleDownload = async () => {
-    if (isDownloading) return;
-    setIsDownloading(true);
-    setDownloadProgress(0);
-    setDownloadMessage("Starting download...");
-    try {
-      await recordingService.downloadDiarizationModels();
-    } catch (error) {
-      setIsDownloading(false);
-      setDownloadProgress(0);
-      setDownloadMessage("");
-      toast.error("Failed to start model download", {
-        description: error instanceof Error ? error.message : "Unknown error",
-      });
-    }
-  };
-
-  const allModelsReady = modelsReady?.segmentation && modelsReady?.embedding;
-  const anyModelMissing = modelsReady && !allModelsReady;
 
   return (
     <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm space-y-6">
@@ -260,76 +202,42 @@ export function DiarizationSettings() {
         />
       </div>
 
-      {/* Model status and download */}
+      {/* Enhanced model set - read-only, bundled at build time */}
       <div className="p-4 border rounded-lg bg-gray-50">
         <div className="flex items-center justify-between mb-3">
-          <div className="font-medium">Diarization Models</div>
-          {allModelsReady ? (
+          <div className="font-medium">Enhanced Models (segmentation-3.0 + TitaNet-Large)</div>
+          {modelsReady?.ready ? (
             <span className="flex items-center gap-1 text-xs font-medium text-green-600">
               <CheckCircle className="w-3.5 h-3.5" />
-              Ready
+              Ready (bundled)
             </span>
           ) : (
             <span className="flex items-center gap-1 text-xs font-medium text-amber-600">
               <AlertCircle className="w-3.5 h-3.5" />
-              Not downloaded
+              {modelsReady ? "Not bundled" : "Checking…"}
             </span>
           )}
         </div>
-
         {modelsReady && (
           <div className="space-y-1 text-xs text-gray-600 mb-3">
             <div className="flex items-center gap-2">
-              <span className={modelsReady.segmentation ? "text-green-600" : "text-amber-600"}>
-                {modelsReady.segmentation ? "✓" : "○"}
+              <span className={modelsReady.segmentation_ready ? "text-green-600" : "text-amber-600"}>
+                {modelsReady.segmentation_ready ? "✓" : "○"}
               </span>
-              <span>Segmentation model</span>
+              <span>Enhanced segmentation-3.0 (onnx-community)</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className={modelsReady.embedding ? "text-green-600" : "text-amber-600"}>
-                {modelsReady.embedding ? "✓" : "○"}
+              <span className={modelsReady.embedding_ready ? "text-green-600" : "text-amber-600"}>
+                {modelsReady.embedding_ready ? "✓" : "○"}
               </span>
-              <span>Speaker embedding model</span>
+              <span>Enhanced TitaNet-Large (192-d, Recogment)</span>
             </div>
           </div>
         )}
-
-        {isDownloading ? (
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-blue-700 font-medium">{downloadMessage}</span>
-              <span className="text-blue-700 font-semibold">{Math.round(downloadProgress)}%</span>
-            </div>
-            <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-blue-600 rounded-full transition-all duration-300"
-                style={{ width: `${downloadProgress}%` }}
-              />
-            </div>
-          </div>
-        ) : (
-          <Button
-            onClick={handleDownload}
-            disabled={isDownloading}
-            variant={allModelsReady ? "outline" : "default"}
-            className="w-full sm:w-auto"
-          >
-            {allModelsReady ? (
-              <>
-                <Download className="w-4 h-4 mr-2" />
-                Re-download Models
-              </>
-            ) : (
-              <>
-                {anyModelMissing ? <AlertCircle className="w-4 h-4 mr-2" /> : <Download className="w-4 h-4 mr-2" />}
-                Download Models
-              </>
-            )}
-          </Button>
-        )}
-
-        <p className="text-xs text-gray-500 mt-3">
-          Models are downloaded to your application data directory and run entirely on-device.
+        <p className="text-xs text-gray-500 mt-2">
+          Bundled at build time from public Hugging Face (onnx-community + Recogment), both files required. No runtime
+          download and no remove control — diarization uses these models exclusively. Rebuild with network to update the
+          bundle.
         </p>
       </div>
 

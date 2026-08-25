@@ -75,6 +75,7 @@ pub(crate) fn create_transcript_segments_with_source(
                 source_device: source_device.clone(),
                 speaker: None,
                 speaker_label: None,
+                tokens: None,
             }
         })
         .collect()

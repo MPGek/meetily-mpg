@@ -39,6 +39,9 @@ pub struct TranscriptUpdate {
     pub source_device: String, // "Microphone" or "System"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>, // Speaker ID from diarization (e.g., "SPEAKER_00")
+    /// Token-level timestamps for diarization refinement (4.1). None when provider does not supply tokens or for legacy chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<crate::audio::token_assignment::Token>>,
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -170,7 +173,7 @@ pub fn start_transcription_task<R: Runtime>(
                             )
                             .await
                             {
-                                Ok((transcript, confidence_opt, is_partial)) => {
+                                Ok((transcript, tokens_opt, confidence_opt, is_partial)) => {
                                     // Provider-aware confidence threshold
                                     let confidence_threshold = match &engine_clone {
                                         TranscriptionEngine::Whisper(_) | TranscriptionEngine::Provider(_) => 0.3,
@@ -234,6 +237,18 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         // Emit transcript update with NEW recording-relative timestamps
 
+                                        // Offset chunk-relative token timestamps to recording-relative
+                                        let tokens_recording = tokens_opt.map(|toks| {
+                                            toks.into_iter().map(|mut t| {
+                                                t.start += audio_start_time as f32;
+                                                t.end += audio_start_time as f32;
+                                                // Clamp to segment bounds
+                                                if t.end > audio_end_time as f32 { t.end = audio_end_time as f32; }
+                                                if t.start < audio_start_time as f32 { t.start = audio_start_time as f32; }
+                                                t
+                                            }).collect::<Vec<_>>()
+                                        });
+
                                         let update = TranscriptUpdate {
                                             text: transcript,
                                             timestamp: format_current_timestamp(),
@@ -250,6 +265,7 @@ pub fn start_transcription_task<R: Runtime>(
                                                 crate::audio::RecordingDeviceType::System => "System".to_string(),
                                             },
                                             speaker: None,
+                                            tokens: tokens_recording,
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
@@ -437,13 +453,13 @@ pub fn start_transcription_task<R: Runtime>(
 }
 
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
-/// Returns: (text, confidence Option, is_partial)
+/// Returns: (text, tokens, confidence Option, is_partial)
 async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
     initial_prompt: Option<String>,
-) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
+) -> std::result::Result<(String, Option<Vec<crate::audio::token_assignment::Token>>, Option<f32>, bool), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
         crate::audio::audio_processing::resample_audio(&chunk.data, chunk.sample_rate, 16000)
@@ -483,21 +499,22 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             let language = crate::get_language_preference_internal();
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language, initial_prompt.clone())
+                .transcribe_audio_with_tokens(speech_samples, language, initial_prompt.clone())
                 .await
             {
-                Ok((text, confidence, is_partial)) => {
+                Ok((text, tokens, confidence, is_partial)) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), Some(confidence), is_partial));
+                        return Ok((String::new(), None, Some(confidence), is_partial));
                     }
 
                     info!(
-                        "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
-                        chunk.chunk_id, cleaned_text, confidence, is_partial
+                        "Whisper transcription complete for chunk {}: '{}' ({} tokens, confidence: {:.2}, partial: {})",
+                        chunk.chunk_id, cleaned_text, tokens.len(), confidence, is_partial
                     );
 
-                    Ok((cleaned_text, Some(confidence), is_partial))
+                    let tokens_opt = if tokens.is_empty() { None } else { Some(tokens) };
+                    Ok((cleaned_text, tokens_opt, Some(confidence), is_partial))
                 }
                 Err(e) => {
                     error!(
@@ -524,7 +541,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                 Ok(text) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), None, false));
+                        return Ok((String::new(), None, None, false));
                     }
 
                     info!(
@@ -532,8 +549,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         chunk.chunk_id, cleaned_text
                     );
 
-                    // Parakeet doesn't provide confidence or partial results
-                    Ok((cleaned_text, None, false))
+                    // Parakeet doesn't provide confidence, partial, or token timestamps
+                    Ok((cleaned_text, None, None, false))
                 }
                 Err(e) => {
                     error!(
@@ -563,7 +580,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                 Ok(result) => {
                     let cleaned_text = result.text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), result.confidence, result.is_partial));
+                        return Ok((String::new(), None, result.confidence, result.is_partial));
                     }
 
                     let confidence_str = match result.confidence {
@@ -580,7 +597,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         result.is_partial
                     );
 
-                    Ok((cleaned_text, result.confidence, result.is_partial))
+                    // Provider trait does not yet expose token timestamps – no split
+                    Ok((cleaned_text, None, result.confidence, result.is_partial))
                 }
                 Err(e) => {
                     error!(

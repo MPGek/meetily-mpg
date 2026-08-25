@@ -280,46 +280,12 @@ export class RecordingService {
   }
 
   /**
-   * Check whether the diarization ONNX models are present on disk
+   * Check whether the bundled enhanced diarization models (segmentation-3.0 +
+   * TitaNet-Large) are available. The models are bundled at build time; there
+   * is no runtime download.
    */
-  async checkDiarizationModels(): Promise<{ segmentation_ready: boolean; embedding_ready: boolean }> {
+  async checkDiarizationModels(): Promise<{ segmentation_ready: boolean; embedding_ready: boolean; ready: boolean }> {
     return invoke('check_diarization_models');
-  }
-
-  /**
-   * Download the diarization ONNX models to the app data directory
-   */
-  async downloadDiarizationModels(): Promise<void> {
-    return invoke('download_diarization_models');
-  }
-
-  /**
-   * Listen for diarization model download progress events
-   */
-  async onDiarizationModelDownloadProgress(
-    callback: (progress: number, message: string) => void
-  ): Promise<UnlistenFn> {
-    return listen<{ progress: number; message: string }>('diarization-model-download-progress', (event) => {
-      callback(event.payload.progress, event.payload.message);
-    });
-  }
-
-  /**
-   * Listen for diarization model download completion
-   */
-  async onDiarizationModelDownloadComplete(callback: () => void): Promise<UnlistenFn> {
-    return listen('diarization-model-download-complete', callback);
-  }
-
-  /**
-   * Listen for diarization model download errors
-   */
-  async onDiarizationModelDownloadError(
-    callback: (error: string) => void
-  ): Promise<UnlistenFn> {
-    return listen<{ error: string }>('diarization-model-download-error', (event) => {
-      callback(event.payload.error);
-    });
   }
 
   // ===== Speaker Identity Registry =====
@@ -400,6 +366,19 @@ export class RecordingService {
     total_bytes: number;
   }> {
     return invoke('speaker_storage_stats');
+  }
+
+  /**
+   * Bulk removal of all voiceprints and cached embeddings.
+   * Deletes every row from `speaker_embeddings` and clears in-memory
+   * PrototypeStore. Returns counts of deleted prototypes/caches.
+   */
+  async clearAllVoiceprints(): Promise<{
+    deleted_prototypes: number;
+    deleted_caches: number;
+    total_deleted: number;
+  }> {
+    return invoke('clear_all_voiceprints');
   }
 
   /**

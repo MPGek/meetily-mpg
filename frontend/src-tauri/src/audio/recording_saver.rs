@@ -25,6 +25,8 @@ pub struct TranscriptSegment {
     pub confidence: f32,
     pub sequence_id: u64,
     pub source_device: String,  // "Microphone" or "System"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<crate::audio::token_assignment::Token>>,
 }
 
 /// Structured partial-audio warning recorded in metadata.json and surfaced to
@@ -144,6 +146,7 @@ impl RecordingSaver {
             confidence: 1.0,
             sequence_id: 0,
             source_device: "Microphone".to_string(),
+                    tokens: None,
         };
         self.add_transcript_segment(segment);
     }

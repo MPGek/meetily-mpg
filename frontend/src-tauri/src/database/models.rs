@@ -49,6 +49,11 @@ pub struct Transcript {
     /// Recognition match score for auto-matched names (0..1).
     #[sqlx(default)]
     pub speaker_match_score: Option<f64>,
+    /// JSON-encoded token array with per-token timestamps (Whisper word-level).
+    /// When present, diarization refines assignment to token granularity and
+    /// splits cross-speaker segments into N rows.
+    #[sqlx(default)]
+    pub tokens: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

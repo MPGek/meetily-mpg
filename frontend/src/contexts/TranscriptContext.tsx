@@ -225,14 +225,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
               if (diarSettings.enabled && diarSettings.autoRun && !onlineDiarizationUsed) {
                 try {
                   const modelStatus = await recordingService.checkDiarizationModels();
-                  if (modelStatus.segmentation_ready && modelStatus.embedding_ready) {
+                  if (modelStatus.ready) {
                     console.log('[Diarization] Auto-triggering speaker analysis for meeting:', currentMeetingId);
                     await recordingService.startDiarization(
                       currentMeetingId,
                       diarSettings.maxSpeakers || undefined
                     );
                   } else {
-                    console.log('[Diarization] Models not ready, skipping auto-trigger');
+                    console.log('[Diarization] Enhanced models not ready, skipping auto-trigger');
                   }
                 } catch (diarError) {
                   console.error('[Diarization] Auto-trigger failed:', diarError);

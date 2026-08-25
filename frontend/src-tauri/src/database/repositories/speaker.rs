@@ -7,10 +7,14 @@ use sqlx::{Error as SqlxError, SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 /// Model tag identifying the extractor that produced stored embeddings.
-/// Both the offline and online diarization paths use the polyvoice WeSpeaker
-/// ResNet34 INT8 model, so all embeddings share this tag. Recognition filters
-/// to the current model so prints are never compared across extractors.
-pub const SPEAKER_EMBEDDING_MODEL: &str = "resnet34-int8";
+///
+/// Legacy ResNet34 INT8 tag is `resnet34_int8` (underscore). The DB historically
+/// stored `resnet34-int8` (dash); queries accept both so no migration is needed.
+/// New writes always use the underscore form. When enhanced models are active
+/// the producing tag is `titanet_large` (192-d); recognition filters by tag.
+pub const SPEAKER_EMBEDDING_MODEL: &str = "resnet34_int8";
+/// Legacy alias retained for backward-compatible queries (pre-upgrade rows).
+pub const SPEAKER_EMBEDDING_MODEL_LEGACY_DASH: &str = "resnet34-int8";
 
 /// Best-K exemplars reparented into a speaker per enrollment (design open
 /// question: start at 8). Tunable as field data accumulates.
@@ -105,6 +109,13 @@ pub struct ReplaceResult {
     pub affected_meetings: i64,
     pub affected_clusters: i64,
     pub affected_transcripts: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClearAllResult {
+    pub deleted_prototypes: i64,
+    pub deleted_caches: i64,
+    pub total_deleted: i64,
 }
 
 pub struct SpeakerRepository;
@@ -541,13 +552,15 @@ impl SpeakerRepository {
         for (dur, emb, start, end) in candidates {
             let id = format!("emb-{}", Uuid::new_v4());
             let emb_bytes = embedding_to_bytes(&emb);
+            // Model-aware: infer family from embedding dimension (192 = TitaNet, 256 = legacy).
+            let model_tag = if emb.len() == 192 { "titanet_large" } else { SPEAKER_EMBEDDING_MODEL };
             sqlx::query(
                 "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, audio_start_time, audio_end_time, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(&emb_bytes)
-            .bind(SPEAKER_EMBEDDING_MODEL)
+            .bind(model_tag)
             .bind(channel)
             .bind(dur)
             .bind(speaker_id)
@@ -574,6 +587,8 @@ impl SpeakerRepository {
         candidate_speaker_ids: Option<&[String]>,
         model: &str,
     ) -> Result<Vec<PrototypeRow>, SqlxError> {
+        // Backward compat: legacy stored `resnet34-int8` (dash) but canonical is `resnet34_int8` (underscore).
+        let is_legacy = model == SPEAKER_EMBEDDING_MODEL;
         let rows: Vec<SpeakerEmbedding> = match candidate_speaker_ids {
             Some(ids) if !ids.is_empty() => {
                 // Build an IN (?, ?, ...) clause for the candidate set.
@@ -581,27 +596,55 @@ impl SpeakerRepository {
                     .take(ids.len())
                     .collect::<Vec<_>>()
                     .join(",");
-                let sql = format!(
-                    "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at
-                     FROM speaker_embeddings
-                     WHERE speaker_id IS NOT NULL AND model = ? AND speaker_id IN ({})",
-                    placeholders
-                );
-                let mut q = sqlx::query_as::<_, SpeakerEmbedding>(&sql).bind(model);
+                let sql = if is_legacy {
+                    format!(
+                        "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at
+                         FROM speaker_embeddings
+                         WHERE speaker_id IS NOT NULL AND model IN (?, ?) AND speaker_id IN ({})",
+                        placeholders
+                    )
+                } else {
+                    format!(
+                        "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at
+                         FROM speaker_embeddings
+                         WHERE speaker_id IS NOT NULL AND model = ? AND speaker_id IN ({})",
+                        placeholders
+                    )
+                };
+                let mut q = sqlx::query_as::<_, SpeakerEmbedding>(&sql);
+                if is_legacy {
+                    q = q.bind(SPEAKER_EMBEDDING_MODEL).bind(SPEAKER_EMBEDDING_MODEL_LEGACY_DASH);
+                } else {
+                    q = q.bind(model);
+                }
                 for id in ids {
                     q = q.bind(id);
                 }
                 q.fetch_all(pool).await?
             }
             _ => {
-                sqlx::query_as::<_, SpeakerEmbedding>(
-                    "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at
-                     FROM speaker_embeddings
-                     WHERE speaker_id IS NOT NULL AND model = ?",
-                )
-                .bind(model)
-                .fetch_all(pool)
-                .await?
+                let (sql, is_legacy_all) = if is_legacy {
+                    (
+                        "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at
+                         FROM speaker_embeddings
+                         WHERE speaker_id IS NOT NULL AND model IN (?, ?)",
+                        true,
+                    )
+                } else {
+                    (
+                        "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at
+                         FROM speaker_embeddings
+                         WHERE speaker_id IS NOT NULL AND model = ?",
+                        false,
+                    )
+                };
+                let mut q = sqlx::query_as::<_, SpeakerEmbedding>(sql);
+                if is_legacy_all {
+                    q = q.bind(SPEAKER_EMBEDDING_MODEL).bind(SPEAKER_EMBEDDING_MODEL_LEGACY_DASH);
+                } else {
+                    q = q.bind(model);
+                }
+                q.fetch_all(pool).await?
             }
         };
 
@@ -1194,6 +1237,33 @@ impl SpeakerRepository {
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Bulk removal of all voiceprints and cached embeddings.
+    /// Deletes every row from `speaker_embeddings` (both prototypes with
+    /// `speaker_id` set and unassigned caches with `meeting_id`/`cluster_label`),
+    /// returning counts of what was removed. The `speakers` registry itself is
+    /// NOT deleted. Callers should also clear any in-memory `PrototypeStore`
+    /// after this completes.
+    pub async fn clear_all_voiceprints(pool: &SqlitePool) -> Result<ClearAllResult, SqlxError> {
+        let proto: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await?;
+        let caches: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL AND meeting_id IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await?;
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings").fetch_one(pool).await?;
+        sqlx::query("DELETE FROM speaker_embeddings").execute(pool).await?;
+        Ok(ClearAllResult {
+            deleted_prototypes: proto.0,
+            deleted_caches: caches.0,
+            total_deleted: total.0,
+        })
     }
 }
 

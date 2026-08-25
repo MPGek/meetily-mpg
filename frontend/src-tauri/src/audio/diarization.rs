@@ -3,11 +3,10 @@ use crate::audio::decoder::{
     convert_to_wav_with_ffmpeg, decode_audio_file, needs_ffmpeg_conversion, probe_audio_metadata,
 };
 use crate::audio::ffmpeg::find_ffmpeg_path;
-use crate::audio::speaker_recognition::{best_match, l2_normalize_in_place, Prototype};
+use crate::audio::speaker_recognition::{l2_normalize_in_place, Prototype};
+use crate::audio::token_assignment::{assign_tokens_to_speakers, SpeakerTurn as TokenTurn};
 use crate::database::repositories::meeting::MeetingsRepository;
-use crate::database::repositories::speaker::{
-    Exemplar, SpeakerRepository, SPEAKER_EMBEDDING_MODEL,
-};
+use crate::database::repositories::speaker::{Exemplar, SpeakerRepository};
 use crate::state::AppState;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -135,10 +134,13 @@ pub async fn rematch_meeting_speakers<R: Runtime>(
     } else {
         Some(&expected)
     };
+    // Enhanced-only matching: centroids are loaded unconditionally and matched
+    // against prototypes of the enhanced `titanet_large` family; legacy
+    // `resnet34_int8` (256-d) rows are never candidates.
     let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
         pool,
         candidates,
-        SPEAKER_EMBEDDING_MODEL,
+        crate::audio::embedder::ENHANCED_MODEL_TAG,
     )
     .await
     .map_err(|e| format!("Failed to load prototypes: {}", e))?
@@ -162,7 +164,8 @@ pub async fn rematch_meeting_speakers<R: Runtime>(
         })
         .collect();
     for c in &centroids {
-        if let Some(m) = best_match(&c.centroid, c.channel.as_deref(), &prototypes) {
+        let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
+        if let Some(m) = crate::audio::speaker_recognition::best_match_with_threshold(&c.centroid, c.channel.as_deref(), &prototypes, threshold) {
             // Skip user-bound clusters: their binding always wins.
             if let Some((_, by)) = existing.get(c.cluster_label.as_str()) {
                 if *by == Some("user") {
@@ -237,6 +240,7 @@ pub async fn start_diarization<R: Runtime>(
 
     let app_clone = app.clone();
     let meeting_id_clone = meeting_id.clone();
+    let transcripts_for_block = transcripts.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         run_diarization_blocking(
@@ -246,14 +250,89 @@ pub async fn start_diarization<R: Runtime>(
             &models_dir,
             max_speakers,
             &config,
-            &transcripts,
+            &transcripts_for_block,
         )
     })
     .await
     .map_err(|e| format!("Diarization task panicked: {}", e))?;
 
     match result {
-        Ok((diar_result, speaker_updates, mic_clusters, sys_clusters, is_stereo)) => {
+        Ok((diar_result, mut speaker_updates, mic_clusters, sys_clusters, is_stereo)) => {
+            // Token-level refinement for offline path (task 4.3/4.4): if a transcript
+            // carries token JSON and its tokens span ≥2 speakers, split the row
+            // into N contiguous, gap-free blocks before persisting speakers.
+            // This mirrors online_diarization.rs finalize logic but runs on the
+            // post-clustering segments for offline re-analysis.
+            let mut expanded_inserts: Vec<(String, String, String, Option<String>, f64, f64, f64, String, String)> = Vec::new(); // (id, meeting_id, timestamp, source_device, start, end, duration, text, tokens_json)
+            let mut original_row_updates: Vec<(String, f64, f64, f64, String, String)> = Vec::new(); // (id, start, end, duration, text, tokens_json) for first block
+            let mut token_based_updates: Vec<(String, String)> = Vec::new();
+            let mut saw_token_split = false;
+            for t in &transcripts {
+                if let Some(tokens_json) = &t.tokens {
+                    if let Ok(tokens) = serde_json::from_str::<Vec<crate::audio::token_assignment::Token>>(tokens_json) {
+                        if tokens.len() >= 2 {
+                            let segs_ref = if is_stereo && t.source_device.as_deref() == Some("System") {
+                                &sys_clusters.segments
+                            } else {
+                                &mic_clusters.segments
+                            };
+                            if !segs_ref.is_empty() {
+                                let turns: Vec<TokenTurn> = segs_ref.iter().map(|s| TokenTurn { start: s.start, end: s.end, speaker: s.speaker }).collect();
+                                let assign = assign_tokens_to_speakers(&tokens, &turns);
+                                if assign.blocks.len() > 1 {
+                                    saw_token_split = true;
+                                    for (idx, block) in assign.blocks.iter().enumerate() {
+                                        let slice = &tokens[block.start_idx..=block.end_idx];
+                                        let text_parts: Vec<String> = slice.iter().map(|tk| tk.text.clone()).collect();
+                                        let joined = text_parts.join("");
+                                        let text = if joined.trim().is_empty() { text_parts.join(" ") } else { joined };
+                                        let text = text.trim().to_string();
+                                        let block_tokens_json = serde_json::to_string(slice).unwrap_or_else(|_| "[]".to_string());
+                                        let start = block.start as f64;
+                                        let end = block.end as f64;
+                                        let dur = (end - start).max(0.0);
+                                        if idx == 0 {
+                                            original_row_updates.push((t.id.clone(), start, end, dur, text.clone(), block_tokens_json.clone()));
+                                            let prefix = if is_stereo && t.source_device.as_deref() == Some("System") { "SPEAKER" } else if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
+                                            token_based_updates.push((t.id.clone(), format!("{}_{:02}", prefix, block.speaker)));
+                                        } else {
+                                            let new_id = format!("{}_split{}", t.id, idx);
+                                            expanded_inserts.push((new_id.clone(), t.meeting_id.clone(), t.timestamp.clone(), t.source_device.clone(), start, end, dur, text.clone(), block_tokens_json.clone()));
+                                            let prefix = if is_stereo && t.source_device.as_deref() == Some("System") { "SPEAKER" } else if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
+                                            token_based_updates.push((new_id, format!("{}_{:02}", prefix, block.speaker)));
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if saw_token_split {
+                // Apply timing/text updates to original rows that split
+                for (id, start, end, dur, text, tokens_json) in &original_row_updates {
+                    let _ = sqlx::query("UPDATE transcripts SET audio_start_time = ?, audio_end_time = ?, duration = ?, transcript = ?, tokens = ? WHERE id = ?")
+                        .bind(*start).bind(*end).bind(*dur).bind(text).bind(tokens_json).bind(id)
+                        .execute(pool).await;
+                }
+                // Insert remaining blocks as new rows
+                for (new_id, meeting_id_ins, ts, src, start, end, dur, text, tokens_json) in &expanded_inserts {
+                    let _ = sqlx::query("INSERT OR IGNORE INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                        .bind(new_id).bind(meeting_id_ins).bind(text).bind(ts).bind(*start).bind(*end).bind(*dur).bind(src).bind(tokens_json)
+                        .execute(pool).await;
+                }
+                // Replace speaker_updates with token-derived ones plus non-split fallback entries
+                let split_ids: Vec<String> = original_row_updates.iter().map(|(oid,_,_,_,_,_)| oid.clone()).collect();
+                let mut non_split_updates = Vec::new();
+                for (tid, spk) in &speaker_updates {
+                    if !split_ids.contains(tid) {
+                        non_split_updates.push((tid.clone(), spk.clone()));
+                    }
+                }
+                speaker_updates = [token_based_updates, non_split_updates].concat();
+            }
+
             for (transcript_id, speaker_id) in &speaker_updates {
                 MeetingsRepository::update_transcript_speaker(pool, transcript_id, speaker_id)
                     .await
@@ -556,11 +635,11 @@ struct ChannelClusters {
     embeddings: Vec<ClusteredEmbedding>,
 }
 
-/// Polyvoice diarization engine: powerset segmentation + ResNet34 embedding +
-/// AHC clustering, loaded once per run and reused for both channel streams.
+/// Polyvoice diarization engine: enhanced segmentation-3.0 + TitaNet-Large
+/// embedding + AHC clustering, loaded once per run.
 struct PolyvoiceDiarizer {
-    segmenter: polyvoice::PowersetSegmenter,
-    embedder: polyvoice::embedder::ResNet34Adapter,
+    segmenter: Box<dyn crate::audio::segmentation::Segmenter>,
+    embedder: Box<dyn crate::audio::embedder::SpeakerEmbedder>,
     clusterer: Box<dyn polyvoice::clusterer::Clusterer>,
 }
 
@@ -569,99 +648,45 @@ fn create_polyvoice_diarizer(
     max_speakers: Option<i32>,
     config: &DiarizationConfig,
 ) -> Result<PolyvoiceDiarizer, String> {
-    use polyvoice::models::default_manifest;
-    use polyvoice::models::metadata::{load_model_config, ModelConfigMeta};
-    use polyvoice::onnx::ExecutionProvider;
-
-    let (seg_model, emb_model) = diarization_model_paths(models_dir);
-
-    if !seg_model.exists() {
-        return Err(format!(
-            "Segmentation model not found at {}. Download models in Settings.",
-            seg_model.display()
-        ));
-    }
-    if !emb_model.exists() {
-        return Err(format!(
-            "Embedding model not found at {}. Download models in Settings.",
-            emb_model.display()
-        ));
-    }
-
-    // Resolve the balanced profile's model ids from the embedded manifest so
-    // the geometry overlay stays in sync with the shipped model files.
-    let manifest = default_manifest();
-    let profile = manifest
-        .profile(polyvoice::Profile::Balanced.manifest_id())
-        .ok_or_else(|| "polyvoice manifest is missing the balanced profile".to_string())?;
-    let seg_entry = manifest
-        .model(&profile.segmenter)
-        .ok_or_else(|| "polyvoice manifest is missing the segmenter model".to_string())?;
-
-    let meta = load_model_config(Some(&seg_model), Some(seg_entry), &ModelConfigMeta::default());
-    let mut seg_config = polyvoice::PowersetConfig::default().with_model_meta(&meta);
-
-    // Override geometry from the manifest entry: polyvoice maps the ONNX
-    // "window_size" key (samples, e.g. 160000) to "window_secs" (seconds),
-    // producing a unit mismatch. The manifest entry carries the authoritative
-    // geometry values in the correct units.
-    seg_config.window_secs = seg_entry.window_secs.unwrap_or(10.0);
-    seg_config.hop_secs = seg_entry.hop_secs.unwrap_or(2.0);
-    seg_config.sample_rate = seg_entry.sample_rate.unwrap_or(16000);
-    seg_config.pool_size = config.segmenter_pool_size();
-
-    let segmenter = polyvoice::PowersetSegmenter::with_config(&seg_model, seg_config, ExecutionProvider::Cpu)
-        .map_err(|e| format!("Failed to create segmenter: {}", e))?;
-
-    let embedder = polyvoice::embedder::ResNet34Adapter::new(
-        &emb_model,
-        config.embedder_pool_size(),
-        ExecutionProvider::Cpu,
-    )
-    .map_err(|e| format!("Failed to create embedder: {}", e))?;
+    // Enhanced-only engine family: segmentation and embedding construction
+    // error with clear messages when the bundled enhanced models are absent
+    // (no fallback to a standard/legacy model set).
+    let segmenter = crate::audio::segmentation::create_segmenter(models_dir, config.segmenter_pool_size())?;
+    let embedder = crate::audio::embedder::create_speaker_embedder(models_dir, config.embedder_pool_size())
+        .map_err(|e| format!("Failed to create embedder: {}", e))?;
+    let model_tag = embedder.model_tag();
+    let family_threshold = embedder.family_threshold();
+    log::info!("Diarizer using enhanced family tag={} threshold={}", model_tag, family_threshold);
 
     let max_clusters = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
     let clusterer: Box<dyn polyvoice::clusterer::Clusterer> = Box::new(
         polyvoice::clusterer::MinClusterSizeClusterer::new(
-            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
-                max_clusters,
-                polyvoice::DEFAULT_AHC_THRESHOLD,
-            )),
+            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(max_clusters, family_threshold)),
             2,
         ),
     );
 
-    Ok(PolyvoiceDiarizer {
-        segmenter,
-        embedder,
-        clusterer,
-    })
+    Ok(PolyvoiceDiarizer { segmenter, embedder, clusterer })
 }
 
 const DIARIZATION_SAMPLE_RATE: u32 = 16000;
 
 fn embed_segments(
-    embedder: &polyvoice::embedder::ResNet34Adapter,
+    embedder: &dyn crate::audio::embedder::SpeakerEmbedder,
     diar_samples: &[f32],
-    raw_segments: &[polyvoice::segmentation::RawSegment],
+    raw_segments: &[crate::audio::segmentation::Segment],
     _config: &DiarizationConfig,
 ) -> (Vec<DiarizationSegment>, Vec<Vec<f32>>) {
-    use polyvoice::embedder::Embedder as _;
-
     let mut segments: Vec<DiarizationSegment> = Vec::with_capacity(raw_segments.len());
     let mut slices: Vec<&[f32]> = Vec::with_capacity(raw_segments.len());
 
     for seg in raw_segments {
-        let start = (seg.time.start * DIARIZATION_SAMPLE_RATE as f64) as usize;
-        let end = ((seg.time.end * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
+        let start = (seg.start as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize;
+        let end = ((seg.end as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
         if end <= start {
             continue;
         }
-        segments.push(DiarizationSegment {
-            start: seg.time.start as f32,
-            end: seg.time.end as f32,
-            speaker: -1,
-        });
+        segments.push(DiarizationSegment { start: seg.start, end: seg.end, speaker: -1 });
         slices.push(&diar_samples[start..end]);
     }
 
@@ -685,15 +710,13 @@ fn embed_segments(
         }
     };
 
-    // If the batch/fallback produced fewer embeddings than segments, drop the
-    // trailing segments so clustering stays aligned with the embedding list.
     let valid_count = segments.len().min(embeddings.len());
     segments.truncate(valid_count);
     segments
         .into_iter()
         .zip(embeddings.into_iter().take(valid_count))
         .filter_map(|(seg, emb)| {
-            if emb.len() == embedder.dim() {
+            if emb.len() == embedder.input_dim() {
                 Some((seg, emb))
             } else {
                 warn!("Skipping embedding with mismatched dimension");
@@ -709,8 +732,6 @@ fn run_chunked_polyvoice_diarization(
     sample_rate: u32,
     config: &DiarizationConfig,
 ) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
-    use polyvoice::segmentation::Segmenter as _;
-
     let mut timings = StageTimings::default();
     let chunk_duration = config.chunk_duration_secs();
     let chunks = channel_chunks(samples, sample_rate, chunk_duration, config.chunk_overlap_secs);
@@ -758,7 +779,7 @@ fn run_chunked_polyvoice_diarization(
 
         let embed_start = Instant::now();
         let (mut chunk_segments, chunk_embeddings) =
-            embed_segments(&diarizer.embedder, &diar_samples, &raw_segments, config);
+            embed_segments(diarizer.embedder.as_ref(), &diar_samples, &raw_segments, config);
         timings.embedding_secs += embed_start.elapsed().as_secs_f64();
 
         // Adjust segment times so they are relative to the full channel.
@@ -1061,8 +1082,6 @@ fn run_channel_diarization_stream(
     mut pcm: PcmStream,
     config: &DiarizationConfig,
 ) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
-    use polyvoice::segmentation::Segmenter as _;
-
     let mut timings = StageTimings::default();
     let chunk_samples = (config.chunk_duration_secs() * DIARIZATION_SAMPLE_RATE as f32) as usize;
     let overlap_samples = (config.chunk_overlap_secs * DIARIZATION_SAMPLE_RATE as f32) as usize;
@@ -1104,7 +1123,7 @@ fn run_channel_diarization_stream(
         if !raw_segments.is_empty() {
             let embed_start = Instant::now();
             let (mut chunk_segments, chunk_embeddings) =
-                embed_segments(&diarizer.embedder, &window, &raw_segments, config);
+                embed_segments(diarizer.embedder.as_ref(), &window, &raw_segments, config);
             timings.embedding_secs += embed_start.elapsed().as_secs_f64();
 
             for seg in &mut chunk_segments {
@@ -1221,7 +1240,8 @@ fn group_cluster_embeddings(
 
 /// Persist each cluster's centroid + exemplar cache for one channel, then
 /// auto-assign recognized speakers from the provided prototypes. User
-/// bindings are preserved. `prototypes` is pre-loaded by the caller.
+/// bindings are preserved. `prototypes` is pre-loaded by the caller. All
+/// rows and recognition use the enhanced `titanet_large` family.
 async fn persist_channel_clusters(
     pool: &SqlitePool,
     meeting_id: &str,
@@ -1240,12 +1260,13 @@ async fn persist_channel_clusters(
             channel,
             &centroid,
             &exemplars,
-            SPEAKER_EMBEDDING_MODEL,
+            crate::audio::embedder::ENHANCED_MODEL_TAG,
         )
         .await
         .map_err(|e| format!("Failed to persist cluster cache: {}", e))?;
 
-        if let Some(m) = best_match(&centroid, Some(channel), prototypes) {
+        let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
+        if let Some(m) = crate::audio::speaker_recognition::best_match_with_threshold(&centroid, Some(channel), prototypes, threshold) {
             SpeakerRepository::set_auto_binding_if_unbound(
                 pool,
                 meeting_id,
@@ -1262,9 +1283,9 @@ async fn persist_channel_clusters(
 
 /// Persist per-cluster centroids + exemplar caches for both channels and
 /// auto-assign recognized speakers. The expected-speaker allowlist (or all
-/// speakers when empty) constrains candidates; prototypes are loaded once.
-/// Used by both the offline diarization path and the online recording
-/// stop-time finalize.
+/// speakers when empty) constrains candidates; prototypes are loaded once
+/// for the enhanced `titanet_large` family. Used by both the offline
+/// diarization path and the online recording stop-time finalize.
 pub async fn persist_and_recognize_session(
     pool: &SqlitePool,
     meeting_id: &str,
@@ -1287,7 +1308,7 @@ pub async fn persist_and_recognize_session(
     let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
         pool,
         candidates,
-        SPEAKER_EMBEDDING_MODEL,
+        crate::audio::embedder::ENHANCED_MODEL_TAG,
     )
     .await
     .map_err(|e| format!("Failed to load prototypes: {}", e))?
@@ -1503,40 +1524,24 @@ impl MemorySampler {
     }
 }
 
-// ===== Model management (polyvoice ModelRegistry) =====
-
-/// Resolve the balanced profile's model file paths under `models_dir`.
-/// The registry caches downloads directly in this directory.
-pub(crate) fn diarization_model_paths(
-    models_dir: &std::path::Path,
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let manifest = polyvoice::models::default_manifest();
-    let profile = manifest
-        .profile(polyvoice::Profile::Balanced.manifest_id())
-        .expect("balanced profile is present in the polyvoice manifest");
-    let segmenter = manifest
-        .model(&profile.segmenter)
-        .expect("balanced segmenter model is present in the polyvoice manifest");
-    let embedder = manifest
-        .model(&profile.embedder)
-        .expect("balanced embedder model is present in the polyvoice manifest");
-    (
-        models_dir.join(&segmenter.filename),
-        models_dir.join(&embedder.filename),
-    )
-}
+// ===== Model management (enhanced set bundled at build time) =====
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizationModelStatus {
     pub segmentation_ready: bool,
     pub embedding_ready: bool,
+    #[serde(default)]
+    pub ready: bool,
 }
 
-/// Removes stale sherpa-era model files that are no longer used.
+/// Removes stale model files that are no longer used: sherpa-era artifacts and
+/// the standard polyvoice set (`powerset_int8`/`resnet34_int8`).
 fn cleanup_legacy_models(models_dir: &std::path::Path) {
     let legacy: Vec<PathBuf> = [
         models_dir.join("sherpa-onnx-pyannote-segmentation-3-0"),
         models_dir.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
+        models_dir.join("powerset_int8.onnx"),
+        models_dir.join("resnet34_int8.onnx"),
     ]
     .into_iter()
     .filter(|p| p.exists())
@@ -1561,93 +1566,32 @@ pub async fn check_diarization_models<R: Runtime>(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?
         .join("models");
+    let resource_models = app.path().resource_dir().map(|p| p.join("models")).unwrap_or_else(|_| models_dir.clone());
+    let manifest_models = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
 
     cleanup_legacy_models(&models_dir);
 
-    let (segmentation, embedding) = diarization_model_paths(&models_dir);
+    // Enhanced-only readiness: verify the bundled segmentation-3.0 + TitaNet-Large
+    // files across app-data, bundled resources, and dev manifest locations.
+    let (enh_seg_ok_a, enh_emb_ok_a) = crate::audio::embedder::verify_enhanced_integrity(&models_dir);
+    let (enh_seg_ok_b, enh_emb_ok_b) = crate::audio::embedder::verify_enhanced_integrity(&resource_models);
+    let (enh_seg_ok_c, enh_emb_ok_c) = crate::audio::embedder::verify_enhanced_integrity(&manifest_models);
+    let segmentation_ready = enh_seg_ok_a || enh_seg_ok_b || enh_seg_ok_c;
+    let embedding_ready = enh_emb_ok_a || enh_emb_ok_b || enh_emb_ok_c;
+    let ready = crate::audio::embedder::is_enhanced_installed(&models_dir)
+        || crate::audio::embedder::is_enhanced_installed(&resource_models)
+        || crate::audio::embedder::is_enhanced_installed(&manifest_models);
     Ok(DiarizationModelStatus {
-        segmentation_ready: segmentation.exists(),
-        embedding_ready: embedding.exists(),
+        segmentation_ready,
+        embedding_ready,
+        ready,
     })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiarizationDownloadProgress {
-    pub progress: u32,
-    pub message: String,
-}
-
-#[tauri::command]
-pub async fn download_diarization_models<R: Runtime>(
-    app: AppHandle<R>,
-) -> Result<(), String> {
-    let models_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?
-        .join("models");
-
-    let app_for_progress = app.clone();
-    tokio::task::spawn_blocking(move || {
-        let registry = polyvoice::models::ModelRegistry::with_cache_dir(&models_dir)
-            .map_err(|e| format!("Failed to initialize model registry: {}", e))?;
-
-        let manifest = polyvoice::models::default_manifest();
-        let profile = manifest
-            .profile(polyvoice::Profile::Balanced.manifest_id())
-            .ok_or_else(|| "polyvoice manifest is missing the balanced profile".to_string())?;
-        let segmenter = manifest
-            .model(&profile.segmenter)
-            .ok_or_else(|| "polyvoice manifest is missing the segmenter model".to_string())?;
-        let embedder = manifest
-            .model(&profile.embedder)
-            .ok_or_else(|| "polyvoice manifest is missing the embedder model".to_string())?;
-
-        let _ = app_for_progress.emit(
-            "diarization-model-download-progress",
-            DiarizationDownloadProgress {
-                progress: 0,
-                message: format!(
-                    "Downloading segmentation model ({} MB)...",
-                    segmenter.size.unwrap_or(0) / 1_000_000
-                ),
-            },
-        );
-        registry
-            .ensure(&profile.segmenter)
-            .map_err(|e| format!("Failed to download segmentation model: {}", e))?;
-
-        let _ = app_for_progress.emit(
-            "diarization-model-download-progress",
-            DiarizationDownloadProgress {
-                progress: 50,
-                message: format!(
-                    "Downloading speaker embedding model ({} MB)...",
-                    embedder.size.unwrap_or(0) / 1_000_000
-                ),
-            },
-        );
-        registry
-            .ensure(&profile.embedder)
-            .map_err(|e| format!("Failed to download embedding model: {}", e))?;
-
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("Model download task panicked: {}", e))??;
-
-    let _ = app.emit(
-        "diarization-model-download-complete",
-        serde_json::json!({}),
-    );
-
-    Ok(())
 }
 
 // ===== Spike: polyvoice diarization engine verification (change: switch-to-polyvoice-diarization) =====
 //
-// polyvoice is the sole diarization engine: powerset segmentation +
-// ResNet34 INT8 embedding + AHC clustering (offline), and StreamingPipeline
+// polyvoice is the sole diarization engine: enhanced segmentation-3.0 +
+// TitaNet-Large embedding + AHC clustering (offline), and StreamingPipeline
 // with the same embedder (online). Tests skip gracefully when the models are
 // not present (e.g. offline CI).
 
@@ -1664,7 +1608,7 @@ mod spike_tests {
     fn find_models_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("MEETILY_MODELS_DIR") {
             let p = PathBuf::from(dir);
-            if p.join("powerset_int8.onnx").exists() && p.join("resnet34_int8.onnx").exists() {
+            if p.join("segmentation-3.0.onnx").exists() && p.join("titanet_large.onnx").exists() {
                 return Some(p);
             }
         }
@@ -1679,7 +1623,7 @@ mod spike_tests {
         .collect();
         candidates
             .into_iter()
-            .find(|p| p.join("powerset_int8.onnx").exists() && p.join("resnet34_int8.onnx").exists())
+            .find(|p| p.join("segmentation-3.0.onnx").exists() && p.join("titanet_large.onnx").exists())
     }
 
     fn synthetic_speech_16k() -> Vec<f32> {
@@ -1702,7 +1646,7 @@ mod spike_tests {
             return;
         };
         let diarizer = create_polyvoice_diarizer(&models_dir, None, &default_config())
-            .expect("polyvoice diarizer should initialize with the INT8 models");
+            .expect("polyvoice diarizer should initialize with the enhanced models");
         let samples = synthetic_speech_16k();
         let (segments, _, _) =
             run_chunked_polyvoice_diarization(&diarizer, &samples, 16000, &default_config())
@@ -1723,14 +1667,15 @@ mod spike_tests {
             eprintln!("SKIP: diarization models not found on this machine");
             return;
         };
-        let (_, emb_model) = diarization_model_paths(&models_dir);
-        let embedder = polyvoice::embedder::ResNet34Adapter::new(
+        let (_, emb_model) = crate::audio::embedder::enhanced_model_paths(&models_dir);
+        let embedder = polyvoice::fbank_onnx::FbankOnnxExtractor::new(
             &emb_model,
+            192,
             default_config().embedder_pool_size(),
             polyvoice::onnx::ExecutionProvider::Cpu,
         )
-        .expect("ResNet34Adapter should initialize with the INT8 model");
-        assert_eq!(embedder.dim(), 256, "resnet34_int8 embeds to 256 dims");
+        .expect("TitaNet extractor should initialize with the enhanced model");
+        assert_eq!(embedder.dim(), 192, "titanet_large embeds to 192 dims");
 
         // Probe embeddings from short windows — the Fast-mode streaming geometry.
         let samples = synthetic_speech_16k();
@@ -1745,7 +1690,7 @@ mod spike_tests {
                     .unwrap_or_else(|e| format!("error: {e}"))
             );
             if let Ok(e) = emb {
-                assert_eq!(e.len(), 256);
+                assert_eq!(e.len(), 192);
                 let norm: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
                 assert!((norm - 1.0).abs() < 1e-2, "embedding must be L2-normalized (got {norm})");
             }
@@ -1762,13 +1707,14 @@ mod spike_tests {
             eprintln!("SKIP: diarization models not found on this machine");
             return;
         };
-        let (_, emb_model) = diarization_model_paths(&models_dir);
-        let extractor = polyvoice::embedder::ResNet34Adapter::new(
+        let (_, emb_model) = crate::audio::embedder::enhanced_model_paths(&models_dir);
+        let extractor = polyvoice::fbank_onnx::FbankOnnxExtractor::new(
             &emb_model,
+            192,
             default_config().embedder_pool_size(),
             polyvoice::onnx::ExecutionProvider::Cpu,
         )
-        .expect("ResNet34Adapter should initialize");
+        .expect("TitaNet extractor should initialize");
 
         let vad = EnergyVad::new(-100.0, 16000, 512);
         let mut pipeline = StreamingPipeline::with_latency_preset(
@@ -1804,13 +1750,14 @@ mod spike_tests {
             eprintln!("SKIP: diarization models not found on this machine");
             return;
         };
-        let (_, emb_model) = diarization_model_paths(&models_dir);
-        let extractor = polyvoice::embedder::ResNet34Adapter::new(
+        let (_, emb_model) = crate::audio::embedder::enhanced_model_paths(&models_dir);
+        let extractor = polyvoice::fbank_onnx::FbankOnnxExtractor::new(
             &emb_model,
+            192,
             default_config().embedder_pool_size(),
             polyvoice::onnx::ExecutionProvider::Cpu,
         )
-        .expect("ResNet34Adapter should initialize");
+        .expect("TitaNet extractor should initialize");
 
         // Two distinct tone-burst signals simulate two speakers; embed per segment.
         let samples_a = synthetic_speech_16k();
@@ -1827,8 +1774,8 @@ mod spike_tests {
         for (start, seg) in [(0.0, &samples_a[..]), (2.0, &samples_b[..])] {
             let emb = extractor
                 .embed(seg)
-                .expect("embed should return a 256-dim embedding");
-            assert_eq!(emb.len(), 256);
+                .expect("embed should return a 192-dim embedding");
+            assert_eq!(emb.len(), 192);
             embeddings.push((start, start + seg.len() as f32 / 16000.0, emb));
         }
 
