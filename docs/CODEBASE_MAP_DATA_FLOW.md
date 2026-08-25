@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-08-14T12:09:00Z
+last_mapped: 2026-08-25T10:40:44Z
 section: data_flow
 ---
 

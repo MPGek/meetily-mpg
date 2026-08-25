@@ -1,6 +1,6 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-08-14T12:09:00Z
+last_mapped: 2026-08-25T10:40:44Z
 ---
 
 > Part of [Codebase Map](CODEBASE_MAP.md)
@@ -362,15 +362,20 @@ The Rust backend uses **tokio async runtime** extensively:
 - **GDPR-ready**: Data export and deletion support through database layer
 - **Privacy-by-design**: No data leaves the machine unless user explicitly configures cloud AI
 
-## Recent Changes (since 2026-08-05 mapping)
+## Recent Changes (since 2026-08-14 mapping)
 
 Highlights of what changed since the previous map:
 
 | Area | Change |
 |------|--------|
-| **Speaker diarization** | New `audio/diarization.rs` (offline, polyvoice: powerset segmentation + ResNet34 embeddings + AHC clustering, per-channel) and `audio/online_diarization.rs` (during-recording, Efficient buffer+cluster / Fast StreamingPipeline modes). Labels flow to `transcripts.speaker` / `meetings.diarization_status`; user names via `speaker_label`. |
-| **Streaming audio player** | New `audio/audio_file.rs` (`find_audio_file` + `prepare_audio_for_playback` FFmpeg WAV transcode) + frontend `AudioPlayer`/`useAudioPlayer`; `get_meeting_audio_path` + `prepare_audio_for_playback` commands. |
-| **Provider-aware model gate** | Recording start now dispatches model readiness per active transcript provider (`check_active_transcription_model_ready` + `validate_transcription_model_ready`). |
-| **GPU build tooling** | New `scripts/copy-cuda-libs.*`, `frontend/build-exe.bat` (exe-only), VS 2026 detection, incremental-build speed tuning (dev profile + rust-lld), sccache disabled for CUDA/MSVC. |
-| **LLM debug logging** | `summary/debug_log.rs` writes per-call JSON logs into the meeting folder (now committed). |
-| **DB schema** | `transcripts.speaker_label`, `meetings.diarization_status`, `meetings.speaker_names` (2026-08 migrations). |
+| **Diarization enhanced-only** | Removed `standard` models; only `segmentation-3.0` + `titanet_large` remain. Fixed ONNX pool `min(8, ceil(0.75*cores))`, batched `embed_batch()`, chunked long recordings (600s), ffmpeg streaming `16kHz f32le` pipe via `PcmStream`/`StreamWindows`, parallel stereo via Rayon, `cleanup_legacy_models`. Commit `2c2cebf`. |
+| **Speaker registry & voiceprints** | Global `speakers` + `speaker_embeddings` with `ENHANCED_MODEL_TAG=titanet_large`, `RECOGNITION_THRESHOLD=0.7`, `PER_PERSON_CAP=64`, `BEST_K=8`, provenance (`voiceprint-provenance` relaxation of two-owner CHECK), browser `list_voiceprints` + `reject_voiceprint` (permanent vs unbind) + `reconfirm`, `clear_all_voiceprints` also clears in-memory `PrototypeStore`. Commits `5f84df2`, `voiceprint-provenance-and-review`. |
+| **Live speaker labels persistence** | `transcripts.speaker_override_id` (D10 per-block override), `meeting_speakers.matched_by='user'` vs `'auto'`, commands `assign_live_speaker`/`assign_live_speaker_block`/`confirm_block_speaker`/`apply_block_speaker_to_cluster`/`finalize_online_session`, `rematch_meeting_speakers` (cache-only), `PrototypeStore::bind` channel-isolated seeding, fixes for revert (`fix-live-speaker-label-revert`, `fix-live-speaker-label-persistence`). |
+| **Incremental save durability** | Fix `recording_saver` loss (flush 4 sentinel chunks `chunk_id=MAX`, `force_flush_and_stop`), transcript timestamp drift anchoring via `TimelineMapper`/`vad_anchors`, `recording-save-durability` spec. Commit `2ec1abc`. |
+| **Audio encoding** | Optimized to VBR AAC (voice-optimized), `audio-encoding` spec. Commit `766a066`. |
+| **Mic gain & ducking** | Speech-driven system ducking, fix noise pumping when mic silent, `mic-gain-and-ducking` spec, RNNoise apply gated. Commit `aa0263d`. |
+| **Clip playback indicator** | Per-segment active highlight (`isAudioPlaying` + `activeSegmentId` binary search), `meeting-audio-player` spec extension. |
+| **Streaming audio player** | Already in 08-14 map: `audio/audio_file.rs` (`find_audio_file` + `prepare_audio_for_playback` FFmpeg 44100Hz WAV cache keyed by `DefaultHasher(path,mtime)`), frontend `AudioPlayer`/`useAudioPlayer`. Retained. |
+| **Provider-aware model gate** | Recording start dispatches per active transcript provider (`check_active_transcription_model_ready`). Retained. |
+| **GPU build tooling** | `scripts/copy-cuda-libs.*`, `frontend/build-exe.bat` (exe-only), VS 2026 detection, incremental-build speed tuning. Retained. |
+| **DB schema** | Added `speakers`, `speaker_embeddings`, `meeting_speakers`, `meeting_expected_speakers`, `transcripts.speaker_override_id`/`tokens`/`speaker_matched_by`/`speaker_match_score`, `meetings.diarization_status`/`speaker_names` (migrations through `20251006000000_add_audio_sync_fields`). See `CODEBASE_MAP_MODULE_DATABASE.md` for full DDL. |
