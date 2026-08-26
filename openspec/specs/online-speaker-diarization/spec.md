@@ -23,7 +23,7 @@ The system SHALL extract speaker embeddings from VAD-detected speech segments du
 
 #### Scenario: Embedding extracted from speech segment
 - **WHEN** the VAD detects a speech segment of at least 200ms duration during recording in Efficient mode
-- **THEN** the system SHALL resample the segment to 16 kHz if needed and extract a speaker embedding vector using the polyvoice `ResNet34Adapter`, storing it with the segment's start and end timestamps
+- **THEN** the system SHALL resample the segment to 16 kHz if needed and extract a speaker embedding vector using the enhanced TitaNet-Large embedder (192-d, layout-correct for `titanet_large`), storing it with the segment's start and end timestamps
 
 #### Scenario: Silence periods skipped
 - **WHEN** the VAD detects silence (no speech) for more than 500ms during recording in Efficient mode
@@ -83,15 +83,30 @@ The system SHALL keep microphone and system audio in separate diarization pipeli
 - **THEN** clusters from the microphone buffer SHALL map to `MIC_SPEAKER_NN` and clusters from the system buffer SHALL map to `SPEAKER_NN`
 
 ### Requirement: Graceful fallback to offline diarization
-The system SHALL fall back to the existing offline diarization pipeline if online processing fails for any reason.
+The system SHALL fall back to the existing offline diarization pipeline if online processing fails for any reason. Online initialization SHALL use the same 3-location enhanced model resolver as offline diarization (`app_data_dir/models` → `resource_dir/models` → `CARGO_MANIFEST_DIR/models`), and failures SHALL report all searched locations.
 
 #### Scenario: Streaming diarization initialization failure
-- **WHEN** the polyvoice `StreamingPipeline` fails to initialize (e.g., model download failure) in Fast mode
-- **THEN** the system SHALL log the error, emit a warning event to the frontend, and continue recording without diarization; offline diarization remains available after recording stops
+- **WHEN** the polyvoice `StreamingPipeline` fails to initialize in Fast mode because the bundled enhanced model files are absent or corrupt in all fallback locations
+- **THEN** the system SHALL log the error with all searched directories, emit a warning event to the frontend noting that the enhanced models are bundled at build time near the executable, and continue recording without diarization; offline diarization remains available after recording stops (but also fails if the enhanced models are missing in all locations)
 
 #### Scenario: Embedding extraction runtime error
-- **WHEN** the polyvoice embedding model fails during recording in Efficient mode
+- **WHEN** the enhanced embedding model fails during recording in Efficient mode
 - **THEN** the system SHALL log the error, clear the embedding buffer, and allow offline diarization to run after recording stops
+
+### Requirement: Online diarization resolves enhanced models from install locations
+The system SHALL resolve the enhanced model directory for online diarization (both Efficient and Fast modes) via the same 3-location fallback chain as offline diarization. `OnlineDiarizationProcessor::new` SHALL accept an `AppHandle` (or a resolved `PathBuf` from the shared resolver) instead of a raw `models_dir` that assumes AppData only. When the enhanced files are present in `resource_dir/models` but not in AppData, online diarization SHALL initialize from the bundled resources without copying.
+
+#### Scenario: Online init succeeds from bundled resources
+- **WHEN** a recording starts in Fast or Efficient mode and `app_data_dir/models` is empty but `resource_dir/models` contains verified `segmentation-3.0.onnx` + `titanet_large.onnx`
+- **THEN** `OnlineDiarizationProcessor::new` SHALL succeed using the resource location and online diarization SHALL be active for the session
+
+#### Scenario: Online init fails lists all locations
+- **WHEN** a recording starts with online diarization enabled but no fallback location contains verified enhanced files
+- **THEN** initialization SHALL fail with an error listing all three searched directories and the build-time bundling explanation, and recording SHALL continue without online diarization
+
+#### Scenario: Online and offline share resolver
+- **WHEN** `check_diarization_models` reports `ready=true`
+- **THEN** a subsequent `OnlineDiarizationProcessor::new` SHALL succeed using the same resolved directory
 
 ### Requirement: Multiple recordings cannot run online diarization simultaneously
 The system SHALL enforce that at most one online diarization session is active at a time, reusing the existing `DiarizationGuard` pattern.
@@ -102,7 +117,7 @@ The system SHALL enforce that at most one online diarization session is active a
 
 ### Requirement: Efficient mode clusters with the calibrated threshold
 
-The system SHALL cluster the buffered speaker embeddings at recording stop in Efficient mode using the same fixed cosine-similarity threshold (`0.45`) as offline diarization, so distinct speakers are assigned distinct labels and online/offline results stay consistent.
+The system SHALL cluster the buffered speaker embeddings at recording stop in Efficient mode using the same fixed cosine-similarity threshold as the enhanced TitaNet-Large offline family, so distinct speakers are assigned distinct labels and online/offline results stay consistent.
 
 #### Scenario: Multi-speaker recording produces distinct labels
 
@@ -112,7 +127,7 @@ The system SHALL cluster the buffered speaker embeddings at recording stop in Ef
 #### Scenario: Clustering matches offline label scheme
 
 - **WHEN** an online-Efficient-diarized meeting is re-analyzed with offline diarization
-- **THEN** both paths SHALL apply the same fixed threshold, producing the same `SPEAKER_NN` / `MIC_SPEAKER_NN` label scheme and comparable speaker counts
+- **THEN** both paths SHALL apply the same enhanced family threshold, producing the same `SPEAKER_NN` / `MIC_SPEAKER_NN` label scheme and comparable speaker counts
 
 ### Requirement: Efficient mode prunes singleton clusters
 
@@ -149,11 +164,11 @@ The system SHALL accept an optional list of expected registry speaker IDs when o
 - **THEN** recognition during and after the session SHALL consider all registry speakers
 
 ### Requirement: Fast mode extracts embeddings for recognition and enrollment
-In Fast mode, the system SHALL run its own ResNet34 embedding extraction on each VAD-filtered speech chunk per channel (in addition to the polyvoice StreamingPipeline, whose turns carry no embeddings) and buffer the embeddings with timestamps for the duration of the session. Efficient mode SHALL continue to buffer per-chunk embeddings as it already does. The buffered embeddings SHALL be attributable to a specific pipeline speaker identity and channel so they can be grouped for enrollment without mixing channels.
+In Fast mode, the system SHALL run its own enhanced TitaNet-Large embedding extraction (192-d, layout-correct) on each VAD-filtered speech chunk per channel (in addition to the polyvoice StreamingPipeline, whose turns carry no embeddings) and buffer the embeddings with timestamps for the duration of the session. Efficient mode SHALL continue to buffer per-chunk embeddings as it already does. The buffered embeddings SHALL be attributable to a specific pipeline speaker identity and channel so they can be grouped for enrollment without mixing channels.
 
 #### Scenario: Embeddings available at stop in both modes
 - **WHEN** a recording with online diarization (either mode) stops
-- **THEN** the system SHALL hold per-channel timestamped embeddings covering the session's speech chunks
+- **THEN** the system SHALL hold per-channel timestamped embeddings covering the session's speech chunks, each 192-d and produced with the TitaNet-correct layout
 
 #### Scenario: Embeddings carry channel provenance
 - **WHEN** buffered embeddings are grouped for enrollment at stop
@@ -188,4 +203,47 @@ At recording stop, the system SHALL enroll session cluster embeddings as prototy
 #### Scenario: Single-turn ground-truth block enrolled
 - **WHEN** a user relabels a single live turn to "Bob" at stop
 - **THEN** the embeddings overlapping that turn's time window SHALL be enrolled as Bob's prototypes alongside the per-transcript override
+
+### Requirement: Stop-time assignment uses token-level refinement
+At recording stop, when buffered transcript segments carry token timestamps, speaker matching SHALL refine ownership at token granularity before writing labels: tokens SHALL be attributed to the speaker of the covering turn, and a transcript segment spanning a speaker change SHALL be split into separate transcript rows at the boundary token. Segment overlap matching SHALL be used for segments without token timestamps. Results SHALL be written through the same `update_transcript_speaker` path as offline diarization.
+
+#### Scenario: Cross-speaker chunk split at stop
+- **WHEN** recording stops and a buffered transcript chunk with token timestamps spans `N≥2` distinct speakers detected by the online diarization turns
+- **THEN** the chunk SHALL be stored as `N` transcript rows, one per contiguous speaker block (each boundary requires ≥2 contiguous tokens of the new speaker), each labeled with its block's speaker and timestamps adjusted to that block's token span, via the same transcript write path used for segment-level matching
+
+#### Scenario: Single-speaker chunk labeled normally
+- **WHEN** recording stops and a buffered transcript chunk with token timestamps is covered by a single speaker's turns
+- **THEN** the chunk SHALL be labeled with that speaker without splitting
+
+#### Scenario: No token timestamps falls back to overlap
+- **WHEN** recording stops and a buffered transcript chunk has no token timestamps
+- **THEN** the chunk SHALL be labeled by maximum temporal overlap with the diarization turns, exactly as before this change
+
+### Requirement: Online TitaNet embedding layout correctness
+
+Online diarization (both Efficient and Fast modes) SHALL extract TitaNet-Large (192-d, `titanet_large`) embeddings using the same mel-as-dim-1 layout fix applied offline. Any per-chunk embedding buffered during recording and any stop-time embedding derived from those chunks SHALL be produced with the TitaNet-correct tensor layout, so recording-stop clustering does not replay the offline shape mismatch.
+
+#### Scenario: Efficient mode buffers valid TitaNet embeddings
+
+- **WHEN** a recording in Efficient mode captures several VAD speech chunks of varied length
+- **THEN** each chunk's embedding SHALL be produced without `Got invalid dimensions for input: audio_signal Expected:80` errors, and the buffered set SHALL be 192-d vectors usable for `AhcClusterer`
+
+#### Scenario: Fast mode stop-time grouping uses layout-correct embeddings
+
+- **WHEN** a Fast-mode recording stops and stop-time grouping derives per-cluster embeddings from the buffered per-chunk embeddings (grouped by pipeline speaker identity and channel)
+- **THEN** the derived embeddings SHALL be TitaNet-correct and SHALL not inflate clustering with layout-corrupted vectors
+
+#### Scenario: Online batch and single-chunk paths agree
+
+- **WHEN** online diarization embeds a batch of chunks versus one-by-one on the same audio
+- **THEN** both paths SHALL produce order-preserving 192-d outputs with the same layout, matching the offline contract
+
+### Requirement: Online diarization fails loudly when no valid embeddings buffered
+
+If online embedding produces zero valid embeddings for a channel (every chunk failed), that channel's stop-time clustering SHALL skip that channel distinctly and the overall diarization SHALL NOT report a silent `0 speakers` success for that channel without a warning log. When both channels have zero valid embeddings and at least one chunk existed, the run SHALL allow offline diarization to be the recovery path and SHALL log the layout/underlying error context.
+
+#### Scenario: No valid embeddings on a channel skips the channel
+
+- **WHEN** Efficient or Fast mode buffered chunks for the microphone channel but every embedding for that channel failed
+- **THEN** stop-time processing SHALL log a warning with the underlying error detail, SHALL NOT produce empty clusters for that channel, and SHALL still process the other channel's valid embeddings normally
 

@@ -22,9 +22,7 @@ pub struct SetExpectedSpeakersRequest {
 
 /// List all registry speakers (for the editor dropdown).
 #[tauri::command]
-pub async fn list_speakers(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<Speaker>, String> {
+pub async fn list_speakers(state: tauri::State<'_, AppState>) -> Result<Vec<Speaker>, String> {
     let pool = state.db_manager.pool();
     SpeakerRepository::list_speakers(pool)
         .await
@@ -45,17 +43,13 @@ pub async fn assign_speaker(
     let pool = state.db_manager.pool();
 
     let speaker: Speaker = match (speaker_id.as_ref(), new_name.as_ref()) {
-        (Some(id), _) => {
-            SpeakerRepository::get_speaker(pool, id)
-                .await
-                .map_err(|e| format!("Failed to load speaker: {}", e))?
-                .ok_or_else(|| format!("Speaker {} not found", id))?
-        }
-        (None, Some(name)) => {
-            SpeakerRepository::find_or_create_by_name(pool, name)
-                .await
-                .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?
-        }
+        (Some(id), _) => SpeakerRepository::get_speaker(pool, id)
+            .await
+            .map_err(|e| format!("Failed to load speaker: {}", e))?
+            .ok_or_else(|| format!("Speaker {} not found", id))?,
+        (None, Some(name)) => SpeakerRepository::find_or_create_by_name(pool, name)
+            .await
+            .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?,
         (None, None) => {
             return Err("Either speaker_id or new_name must be provided".to_string());
         }
@@ -104,17 +98,13 @@ pub async fn assign_block_speaker(
     let pool = state.db_manager.pool();
 
     let speaker: Speaker = match (speaker_id.as_ref(), new_name.as_ref()) {
-        (Some(id), _) => {
-            SpeakerRepository::get_speaker(pool, id)
-                .await
-                .map_err(|e| format!("Failed to load speaker: {}", e))?
-                .ok_or_else(|| format!("Speaker {} not found", id))?
-        }
-        (None, Some(name)) => {
-            SpeakerRepository::find_or_create_by_name(pool, name)
-                .await
-                .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?
-        }
+        (Some(id), _) => SpeakerRepository::get_speaker(pool, id)
+            .await
+            .map_err(|e| format!("Failed to load speaker: {}", e))?
+            .ok_or_else(|| format!("Speaker {} not found", id))?,
+        (None, Some(name)) => SpeakerRepository::find_or_create_by_name(pool, name)
+            .await
+            .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?,
         (None, None) => {
             return Err("Either speaker_id or new_name must be provided".to_string());
         }
@@ -128,16 +118,77 @@ pub async fn assign_block_speaker(
     }
 
     // Enroll the block's cluster cached exemplars as the speaker's prototypes.
-    // Resolve the transcript's (meeting_id, cluster_label) and reparent the
-    // best-K cache rows. No-op when the cluster has no cache (legacy meeting).
-    if let Some((meeting_id, Some(cluster_label))) =
-        SpeakerRepository::get_transcript_cluster(pool, &transcript_id)
-            .await
-            .map_err(|e| format!("Failed to load transcript cluster: {}", e))?
-    {
-        let _ = SpeakerRepository::enroll_cluster(pool, &meeting_id, &cluster_label, &speaker.id)
-            .await
-            .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
+    // First try to get the cluster label directly from the transcript.
+    let transcript_info = SpeakerRepository::get_transcript_cluster(pool, &transcript_id)
+        .await
+        .map_err(|e| format!("Failed to load transcript cluster: {}", e))?;
+
+    if let Some((meeting_id, cluster_label)) = transcript_info {
+        if let Some(cluster_label) = cluster_label {
+            // Transcript has a cluster label - use it directly
+            let enrolled =
+                SpeakerRepository::enroll_cluster(pool, &meeting_id, &cluster_label, &speaker.id)
+                    .await
+                    .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
+            if enrolled == 0 {
+                tracing::warn!(
+                    meeting_id = %meeting_id,
+                    cluster_label = %cluster_label,
+                    speaker_id = %speaker.id,
+                    "enroll_cluster returned 0: no exemplars reparented"
+                );
+            }
+        } else {
+            // Transcript has no cluster label (speaker column is NULL).
+            // Resolve the cluster by time-overlap matching against cached exemplars.
+            let time_info = SpeakerRepository::get_transcript_time_info(pool, &transcript_id)
+                .await
+                .map_err(|e| format!("Failed to load transcript time info: {}", e))?;
+
+            if let Some((_, Some(start), Some(end), source_device)) = time_info {
+                // Determine channel from source_device: "System" -> system, otherwise -> mic
+                let channel = if source_device.as_deref() == Some("System") {
+                    "system"
+                } else {
+                    "mic"
+                };
+
+                // Resolve cluster by time overlap
+                if let Some(resolved_cluster) = SpeakerRepository::resolve_cluster_by_time_overlap(
+                    pool,
+                    &meeting_id,
+                    channel,
+                    start,
+                    end,
+                )
+                .await
+                .map_err(|e| format!("Failed to resolve cluster by time overlap: {}", e))?
+                {
+                    let enrolled = SpeakerRepository::enroll_cluster(
+                        pool,
+                        &meeting_id,
+                        &resolved_cluster,
+                        &speaker.id,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
+                    if enrolled == 0 {
+                        tracing::warn!(
+                            meeting_id = %meeting_id,
+                            cluster_label = %resolved_cluster,
+                            speaker_id = %speaker.id,
+                            "enroll_cluster returned 0: no exemplars reparented (resolved by time overlap)"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        meeting_id = %meeting_id,
+                        transcript_id = %transcript_id,
+                        "no cluster found by time overlap for transcript with NULL speaker"
+                    );
+                }
+            }
+        }
     }
 
     Ok(AssignedBlockSpeaker {
@@ -170,17 +221,13 @@ pub async fn apply_block_speaker_to_cluster(
     })?;
 
     let speaker: Speaker = match (speaker_id.as_ref(), new_name.as_ref()) {
-        (Some(id), _) => {
-            SpeakerRepository::get_speaker(pool, id)
-                .await
-                .map_err(|e| format!("Failed to load speaker: {}", e))?
-                .ok_or_else(|| format!("Speaker {} not found", id))?
-        }
-        (None, Some(name)) => {
-            SpeakerRepository::find_or_create_by_name(pool, name)
-                .await
-                .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?
-        }
+        (Some(id), _) => SpeakerRepository::get_speaker(pool, id)
+            .await
+            .map_err(|e| format!("Failed to load speaker: {}", e))?
+            .ok_or_else(|| format!("Speaker {} not found", id))?,
+        (None, Some(name)) => SpeakerRepository::find_or_create_by_name(pool, name)
+            .await
+            .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?,
         (None, None) => {
             return Err("Either speaker_id or new_name must be provided".to_string());
         }

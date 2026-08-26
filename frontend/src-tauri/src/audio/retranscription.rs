@@ -1,11 +1,13 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
+use super::common::{
+    create_transcript_segments, create_transcript_segments_with_source, write_transcripts_json,
+};
 use crate::api::TranscriptSegment;
 use crate::audio::audio_file::find_audio_file;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::{get_speech_chunks_with_progress, merge_segments, VadConfig};
-use super::common::{create_transcript_segments, create_transcript_segments_with_source, write_transcripts_json};
-use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use crate::config::{DEFAULT_PARAKEET_MODEL, DEFAULT_WHISPER_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -97,7 +99,15 @@ pub async fn start_retranscription<R: Runtime>(
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
+    let result = run_retranscription(
+        app.clone(),
+        meeting_id.clone(),
+        meeting_folder_path,
+        language,
+        model,
+        provider,
+    )
+    .await;
 
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
@@ -161,11 +171,9 @@ async fn run_retranscription<R: Runtime>(
 
     // Decode the audio file (CPU-intensive, run in blocking task)
     let path_for_decode = audio_path.clone();
-    let decoded = tokio::task::spawn_blocking(move || {
-        decode_audio_file(&path_for_decode)
-    })
-    .await
-    .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
+    let decoded = tokio::task::spawn_blocking(move || decode_audio_file(&path_for_decode))
+        .await
+        .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
     let duration_seconds = decoded.duration_seconds;
 
     info!(
@@ -173,7 +181,13 @@ async fn run_retranscription<R: Runtime>(
         duration_seconds, decoded.sample_rate, decoded.channels
     );
 
-    emit_progress(&app, &meeting_id, "decoding", 15, "Converting audio format...");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "decoding",
+        15,
+        "Converting audio format...",
+    );
 
     // Check for cancellation
     if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
@@ -182,25 +196,40 @@ async fn run_retranscription<R: Runtime>(
 
     // Determine if audio is stereo or mono
     let is_stereo = decoded.channels == 2;
-    info!("Audio is {} ({} channels)", if is_stereo { "stereo" } else { "mono" }, decoded.channels);
+    info!(
+        "Audio is {} ({} channels)",
+        if is_stereo { "stereo" } else { "mono" },
+        decoded.channels
+    );
 
     // Extract channels and resample to 16kHz
     // For stereo: left=Microphone, right=System
     // For mono: single channel with source_device=None
     let (mic_samples, sys_samples) = if is_stereo {
-        emit_progress(&app, &meeting_id, "decoding", 17, "Extracting audio channels...");
+        emit_progress(
+            &app,
+            &meeting_id,
+            "decoding",
+            17,
+            "Extracting audio channels...",
+        );
 
         let decoded_for_extract = decoded.clone();
-        let (left, right) = tokio::task::spawn_blocking(move || {
-            decoded_for_extract.extract_channels()
-        })
-        .await
-        .map_err(|e| anyhow!("Channel extraction task panicked: {}", e))?;
+        let (left, right) =
+            tokio::task::spawn_blocking(move || decoded_for_extract.extract_channels())
+                .await
+                .map_err(|e| anyhow!("Channel extraction task panicked: {}", e))?;
 
         let left_samples = left.unwrap_or_default();
         let right_samples = right.unwrap_or_default();
 
-        emit_progress(&app, &meeting_id, "decoding", 18, "Resampling channels to 16kHz...");
+        emit_progress(
+            &app,
+            &meeting_id,
+            "decoding",
+            18,
+            "Resampling channels to 16kHz...",
+        );
 
         // Resample each channel independently in blocking tasks
         let sample_rate = decoded.sample_rate;
@@ -219,18 +248,22 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!("System resample task panicked: {}", e))?;
 
-        info!("Resampled mic channel: {} samples, system channel: {} samples",
-            mic_resampled.len(), sys_resampled.len());
+        info!(
+            "Resampled mic channel: {} samples, system channel: {} samples",
+            mic_resampled.len(),
+            sys_resampled.len()
+        );
 
         (Some(mic_resampled), Some(sys_resampled))
     } else {
         // Mono: convert to 16kHz using existing path
-        let mono_samples = tokio::task::spawn_blocking(move || {
-            decoded.to_whisper_format()
-        })
-        .await
-        .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
-        info!("Converted mono to 16kHz format: {} samples", mono_samples.len());
+        let mono_samples = tokio::task::spawn_blocking(move || decoded.to_whisper_format())
+            .await
+            .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
+        info!(
+            "Converted mono to 16kHz format: {} samples",
+            mono_samples.len()
+        );
         (Some(mono_samples), None)
     };
 
@@ -246,7 +279,13 @@ async fn run_retranscription<R: Runtime>(
         let mic_audio = mic_samples.as_ref().unwrap().clone();
         let sys_audio = sys_samples.as_ref().unwrap().clone();
 
-        emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech in microphone channel...");
+        emit_progress(
+            &app,
+            &meeting_id,
+            "vad",
+            20,
+            "Detecting speech in microphone channel...",
+        );
 
         let app_for_mic_vad = app.clone();
         let meeting_id_for_mic_vad = meeting_id.clone();
@@ -276,7 +315,13 @@ async fn run_retranscription<R: Runtime>(
             return Err(anyhow!("Retranscription cancelled"));
         }
 
-        emit_progress(&app, &meeting_id, "vad", 25, "Detecting speech in system channel...");
+        emit_progress(
+            &app,
+            &meeting_id,
+            "vad",
+            25,
+            "Detecting speech in system channel...",
+        );
 
         let app_for_sys_vad = app.clone();
         let meeting_id_for_sys_vad = meeting_id.clone();
@@ -301,8 +346,11 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("System VAD task panicked: {}", e))?
         .map_err(|e| anyhow!("System VAD processing failed: {}", e))?;
 
-        info!("VAD detected {} mic segments, {} system segments",
-            mic_segments.len(), sys_segments.len());
+        info!(
+            "VAD detected {} mic segments, {} system segments",
+            mic_segments.len(),
+            sys_segments.len()
+        );
 
         (mic_segments, sys_segments)
     } else {
@@ -324,7 +372,10 @@ async fn run_retranscription<R: Runtime>(
                         &meeting_id_for_vad,
                         "vad",
                         overall_progress,
-                        &format!("Detecting speech segments... {}% ({} found)", vad_progress, segments_found),
+                        &format!(
+                            "Detecting speech segments... {}% ({} found)",
+                            vad_progress, segments_found
+                        ),
                     );
                     !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
                 },
@@ -349,9 +400,18 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("No speech detected in audio file"));
     }
 
-    info!("Total VAD segments: {} (mic: {}, system: {})", total_segments, total_mic_segments, total_sys_segments);
+    info!(
+        "Total VAD segments: {} (mic: {}, system: {})",
+        total_segments, total_mic_segments, total_sys_segments
+    );
 
-    emit_progress(&app, &meeting_id, "transcribing", 30, "Loading transcription engine...");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "transcribing",
+        30,
+        "Loading transcription engine...",
+    );
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
@@ -370,9 +430,13 @@ async fn run_retranscription<R: Runtime>(
     let mic_merged = merge_segments(&mic_speech_segments, 2000.0, MAX_SEGMENT_SAMPLES);
     let sys_merged = merge_segments(&sys_speech_segments, 2000.0, MAX_SEGMENT_SAMPLES);
 
-    info!("After merge: mic {}→{} segments, sys {}→{} segments",
-        mic_speech_segments.len(), mic_merged.len(),
-        sys_speech_segments.len(), sys_merged.len());
+    info!(
+        "After merge: mic {}→{} segments, sys {}→{} segments",
+        mic_speech_segments.len(),
+        mic_merged.len(),
+        sys_speech_segments.len(),
+        sys_merged.len()
+    );
 
     let mic_processable = mic_merged;
     let sys_processable = sys_merged;
@@ -380,7 +444,10 @@ async fn run_retranscription<R: Runtime>(
     let mic_count = mic_processable.len();
     let sys_count = sys_processable.len();
     let total_processable = mic_count + sys_count;
-    info!("Processing {} segments (mic: {}, system: {})", total_processable, mic_count, sys_count);
+    info!(
+        "Processing {} segments (mic: {}, system: {})",
+        total_processable, mic_count, sys_count
+    );
 
     // Transcribe each channel's segments with progress updates
     // Progress range: 30-80% for transcription
@@ -404,11 +471,20 @@ async fn run_retranscription<R: Runtime>(
             &meeting_id,
             "transcribing",
             progress,
-            &format!("Transcribing mic segment {} of {} ({:.1}s)...", i + 1, mic_count, segment_duration_sec),
+            &format!(
+                "Transcribing mic segment {} of {} ({:.1}s)...",
+                i + 1,
+                mic_count,
+                segment_duration_sec
+            ),
         );
 
         if segment.samples.len() < 1600 {
-            debug!("Skipping short mic segment {} with {} samples", i, segment.samples.len());
+            debug!(
+                "Skipping short mic segment {} with {} samples",
+                i,
+                segment.samples.len()
+            );
             continue;
         }
 
@@ -418,12 +494,23 @@ async fn run_retranscription<R: Runtime>(
             &parakeet_engine,
             use_parakeet,
             language.clone(),
-        ).await?;
+        )
+        .await?;
 
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            debug!("Mic segment {}/{}: {:.1}s, conf={:.2}, text='{}'", i + 1, mic_count, segment_duration_sec, conf,
-                if trimmed.len() > 80 { &trimmed[..80] } else { trimmed });
+            debug!(
+                "Mic segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
+                i + 1,
+                mic_count,
+                segment_duration_sec,
+                conf,
+                if trimmed.len() > 80 {
+                    &trimmed[..80]
+                } else {
+                    trimmed
+                }
+            );
             mic_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
             total_confidence += conf;
             transcribed_count += 1;
@@ -439,17 +526,27 @@ async fn run_retranscription<R: Runtime>(
 
             // Progress: 55-80% for system
             let progress = 55 + ((i as f32 / sys_count.max(1) as f32) * 25.0) as u32;
-            let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
+            let segment_duration_sec =
+                (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
             emit_progress(
                 &app,
                 &meeting_id,
                 "transcribing",
                 progress,
-                &format!("Transcribing system segment {} of {} ({:.1}s)...", i + 1, sys_count, segment_duration_sec),
+                &format!(
+                    "Transcribing system segment {} of {} ({:.1}s)...",
+                    i + 1,
+                    sys_count,
+                    segment_duration_sec
+                ),
             );
 
             if segment.samples.len() < 1600 {
-                debug!("Skipping short system segment {} with {} samples", i, segment.samples.len());
+                debug!(
+                    "Skipping short system segment {} with {} samples",
+                    i,
+                    segment.samples.len()
+                );
                 continue;
             }
 
@@ -459,12 +556,23 @@ async fn run_retranscription<R: Runtime>(
                 &parakeet_engine,
                 use_parakeet,
                 language.clone(),
-            ).await?;
+            )
+            .await?;
 
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                debug!("System segment {}/{}: {:.1}s, conf={:.2}, text='{}'", i + 1, sys_count, segment_duration_sec, conf,
-                    if trimmed.len() > 80 { &trimmed[..80] } else { trimmed });
+                debug!(
+                    "System segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
+                    i + 1,
+                    sys_count,
+                    segment_duration_sec,
+                    conf,
+                    if trimmed.len() > 80 {
+                        &trimmed[..80]
+                    } else {
+                        trimmed
+                    }
+                );
                 sys_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
                 total_confidence += conf;
                 transcribed_count += 1;
@@ -491,14 +599,10 @@ async fn run_retranscription<R: Runtime>(
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
     // Create transcript segments with source_device labels
-    let mut mic_segments = create_transcript_segments_with_source(
-        &mic_transcripts,
-        Some("Microphone".to_string()),
-    );
-    let mut sys_segments = create_transcript_segments_with_source(
-        &sys_transcripts,
-        Some("System".to_string()),
-    );
+    let mut mic_segments =
+        create_transcript_segments_with_source(&mic_transcripts, Some("Microphone".to_string()));
+    let mut sys_segments =
+        create_transcript_segments_with_source(&sys_transcripts, Some("System".to_string()));
 
     // For mono, use None source_device
     if !is_stereo {
@@ -512,7 +616,9 @@ async fn run_retranscription<R: Runtime>(
     segments.sort_by(|a, b| {
         let a_time = a.audio_start_time.unwrap_or(0.0);
         let b_time = b.audio_start_time.unwrap_or(0.0);
-        a_time.partial_cmp(&b_time).unwrap_or(std::cmp::Ordering::Equal)
+        a_time
+            .partial_cmp(&b_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     info!("Merged and sorted {} transcript segments", segments.len());
@@ -524,7 +630,10 @@ async fn run_retranscription<R: Runtime>(
 
     // Wrap delete+insert+update in a transaction to prevent data loss
     let pool = app_state.db_manager.pool();
-    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| anyhow!("DB error: {}", e))?;
     let mut tx = sqlx::Connection::begin(&mut *conn)
         .await
         .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
@@ -553,7 +662,8 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
     }
 
-    tx.commit().await
+    tx.commit()
+        .await
         .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
 
     info!(
@@ -563,7 +673,13 @@ async fn run_retranscription<R: Runtime>(
     );
 
     // Write updated transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "saving",
+        90,
+        "Writing transcript files...",
+    );
 
     if let Err(e) = write_transcripts_json(&folder_path, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
@@ -576,16 +692,19 @@ async fn run_retranscription<R: Runtime>(
         .unwrap_or("audio.mp4")
         .to_string();
 
-    if let Err(e) = write_retranscription_metadata(
-        &folder_path,
-        &meeting_id,
-        duration_seconds,
-        &audio_filename,
-    ) {
+    if let Err(e) =
+        write_retranscription_metadata(&folder_path, &meeting_id, duration_seconds, &audio_filename)
+    {
         warn!("Failed to update metadata.json: {}", e);
     }
 
-    emit_progress(&app, &meeting_id, "complete", 100, "Retranscription complete");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "complete",
+        100,
+        "Retranscription complete",
+    );
 
     Ok(RetranscriptionResult {
         meeting_id,
@@ -651,7 +770,10 @@ async fn get_or_init_whisper<R: Runtime>(
                 // Discover available models first (populates the internal cache)
                 info!("Discovering available Whisper models...");
                 if let Err(discover_err) = e.discover_models().await {
-                    warn!("Error during model discovery (continuing anyway): {}", discover_err);
+                    warn!(
+                        "Error during model discovery (continuing anyway): {}",
+                        discover_err
+                    );
                 }
 
                 match e.load_model(&target_model).await {
@@ -660,8 +782,15 @@ async fn get_or_init_whisper<R: Runtime>(
                         Ok(e)
                     }
                     Err(load_err) => {
-                        error!("Failed to load Whisper model '{}': {}", target_model, load_err);
-                        Err(anyhow!("Failed to load Whisper model '{}': {}", target_model, load_err))
+                        error!(
+                            "Failed to load Whisper model '{}': {}",
+                            target_model, load_err
+                        );
+                        Err(anyhow!(
+                            "Failed to load Whisper model '{}': {}",
+                            target_model,
+                            load_err
+                        ))
                     }
                 }
             } else {
@@ -677,41 +806,47 @@ async fn get_or_init_whisper<R: Runtime>(
 async fn get_configured_whisper_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
     debug!("Getting configured Whisper model from database...");
 
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| {
-            error!("App state not available");
-            anyhow!("App state not available")
-        })?;
+    let app_state = app.try_state::<AppState>().ok_or_else(|| {
+        error!("App state not available");
+        anyhow!("App state not available")
+    })?;
 
     debug!("Querying transcript_settings table...");
 
     // Query the transcript settings from the database - get both provider and model
-    let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT provider, model FROM transcript_settings WHERE id = '1'"
-    )
-    .fetch_optional(app_state.db_manager.pool())
-    .await
-    .map_err(|e| {
-        error!("Failed to query transcript config: {}", e);
-        anyhow!("Failed to query transcript config: {}", e)
-    })?;
+    let result: Option<(String, String)> =
+        sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+            .fetch_optional(app_state.db_manager.pool())
+            .await
+            .map_err(|e| {
+                error!("Failed to query transcript config: {}", e);
+                anyhow!("Failed to query transcript config: {}", e)
+            })?;
 
     match result {
         Some((provider, model)) => {
-            info!("Found transcript config: provider={}, model={}", provider, model);
+            info!(
+                "Found transcript config: provider={}, model={}",
+                provider, model
+            );
 
             // Check if provider is Whisper-based
             if provider == "localWhisper" || provider == "whisper" {
                 Ok(model)
             } else {
-                error!("Retranscription requires Whisper provider, but configured provider is: {}", provider);
+                error!(
+                    "Retranscription requires Whisper provider, but configured provider is: {}",
+                    provider
+                );
                 Err(anyhow!("Retranscription requires Whisper. Current provider '{}' does not support retranscription with language selection.", provider))
             }
-        },
+        }
         None => {
             // Default to configured Whisper model if no config exists
-            warn!("No transcript config found, using default model '{}'", DEFAULT_WHISPER_MODEL);
+            warn!(
+                "No transcript config found, using default model '{}'",
+                DEFAULT_WHISPER_MODEL
+            );
             Ok(DEFAULT_WHISPER_MODEL.to_string())
         }
     }
@@ -753,7 +888,10 @@ async fn get_or_init_parakeet<R: Runtime>(
                 // Discover available models first
                 info!("Discovering available Parakeet models...");
                 if let Err(discover_err) = e.discover_models().await {
-                    warn!("Error during Parakeet model discovery (continuing anyway): {}", discover_err);
+                    warn!(
+                        "Error during Parakeet model discovery (continuing anyway): {}",
+                        discover_err
+                    );
                 }
 
                 match e.load_model(&target_model).await {
@@ -762,8 +900,15 @@ async fn get_or_init_parakeet<R: Runtime>(
                         Ok(e)
                     }
                     Err(load_err) => {
-                        error!("Failed to load Parakeet model '{}': {}", target_model, load_err);
-                        Err(anyhow!("Failed to load Parakeet model '{}': {}", target_model, load_err))
+                        error!(
+                            "Failed to load Parakeet model '{}': {}",
+                            target_model, load_err
+                        );
+                        Err(anyhow!(
+                            "Failed to load Parakeet model '{}': {}",
+                            target_model,
+                            load_err
+                        ))
                     }
                 }
             } else {
@@ -779,27 +924,27 @@ async fn get_or_init_parakeet<R: Runtime>(
 async fn get_configured_parakeet_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
     debug!("Getting configured Parakeet model from database...");
 
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| {
-            error!("App state not available");
-            anyhow!("App state not available")
-        })?;
+    let app_state = app.try_state::<AppState>().ok_or_else(|| {
+        error!("App state not available");
+        anyhow!("App state not available")
+    })?;
 
     // Query the transcript settings from the database
-    let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT provider, model FROM transcript_settings WHERE id = '1'"
-    )
-    .fetch_optional(app_state.db_manager.pool())
-    .await
-    .map_err(|e| {
-        error!("Failed to query transcript config: {}", e);
-        anyhow!("Failed to query transcript config: {}", e)
-    })?;
+    let result: Option<(String, String)> =
+        sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+            .fetch_optional(app_state.db_manager.pool())
+            .await
+            .map_err(|e| {
+                error!("Failed to query transcript config: {}", e);
+                anyhow!("Failed to query transcript config: {}", e)
+            })?;
 
     match result {
         Some((provider, model)) => {
-            info!("Found transcript config: provider={}, model={}", provider, model);
+            info!(
+                "Found transcript config: provider={}, model={}",
+                provider, model
+            );
 
             if provider == "parakeet" {
                 Ok(model)
@@ -808,7 +953,7 @@ async fn get_configured_parakeet_model<R: Runtime>(app: &AppHandle<R>) -> Result
                 warn!("Configured provider is not Parakeet, using default model");
                 Ok(DEFAULT_PARAKEET_MODEL.to_string())
             }
-        },
+        }
         None => {
             // Default to configured Parakeet model if no config exists
             warn!("No transcript config found, using default Parakeet model");
@@ -835,7 +980,10 @@ fn write_retranscription_metadata(
         if let Some(obj) = value.as_object_mut() {
             obj.insert("retranscribed_at".to_string(), serde_json::json!(now));
             obj.insert("status".to_string(), serde_json::json!("completed"));
-            obj.insert("transcript_file".to_string(), serde_json::json!("transcripts.json"));
+            obj.insert(
+                "transcript_file".to_string(),
+                serde_json::json!("transcripts.json"),
+            );
             obj.remove("detected_summary_language");
         }
         value
@@ -881,7 +1029,6 @@ pub async fn start_retranscription_command<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<RetranscriptionStarted, String> {
-
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
     if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
         return Err("Retranscription already in progress".to_string());
@@ -932,8 +1079,8 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 /// Resample a single channel to 16kHz mono format for VAD and transcription.
 /// Reuses the same normalization and resampling logic as DecodedAudio::to_whisper_format.
 fn resample_channel_to_16k(samples: &[f32], sample_rate: u32) -> Vec<f32> {
-    use crate::audio::decoder::normalize_audio_samples;
     use crate::audio::audio_processing::resample_audio;
+    use crate::audio::decoder::normalize_audio_samples;
 
     const WHISPER_SAMPLE_RATE: u32 = 16000;
 
@@ -1007,9 +1154,9 @@ mod tests {
     #[test]
     fn test_create_transcript_segments_multiple() {
         let transcripts = vec![
-            ("First segment".to_string(), 0.0, 2000.0),      // 0-2 seconds
-            ("Second segment".to_string(), 3000.0, 5000.0),  // 3-5 seconds
-            ("Third segment".to_string(), 6500.0, 8000.0),   // 6.5-8 seconds
+            ("First segment".to_string(), 0.0, 2000.0), // 0-2 seconds
+            ("Second segment".to_string(), 3000.0, 5000.0), // 3-5 seconds
+            ("Third segment".to_string(), 6500.0, 8000.0), // 6.5-8 seconds
         ];
         let segments = create_transcript_segments(&transcripts);
 
@@ -1036,9 +1183,7 @@ mod tests {
 
     #[test]
     fn test_create_transcript_segments_trims_whitespace() {
-        let transcripts = vec![
-            ("  Hello with spaces  ".to_string(), 0.0, 1000.0),
-        ];
+        let transcripts = vec![("  Hello with spaces  ".to_string(), 0.0, 1000.0)];
         let segments = create_transcript_segments(&transcripts);
 
         assert_eq!(segments.len(), 1);
@@ -1136,7 +1281,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = find_audio_file(dir.path());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No audio file found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No audio file found"));
     }
 
     #[test]

@@ -83,11 +83,13 @@ impl MeetingsRepository {
         if let Some(meeting) = meeting {
             // Get all transcripts for this meeting with display names resolved
             // via meeting_speakers -> speakers (legacy speaker_label fallback).
-            let transcripts =
-                sqlx::query_as::<_, Transcript>(&format!("{} WHERE t.meeting_id = ?", TRANSCRIPT_DISPLAY_SELECT))
-                    .bind(meeting_id)
-                    .fetch_all(&mut *transaction)
-                    .await?;
+            let transcripts = sqlx::query_as::<_, Transcript>(&format!(
+                "{} WHERE t.meeting_id = ?",
+                TRANSCRIPT_DISPLAY_SELECT
+            ))
+            .bind(meeting_id)
+            .fetch_all(&mut *transaction)
+            .await?;
 
             transaction.commit().await?;
 
@@ -158,18 +160,17 @@ impl MeetingsRepository {
         }
 
         // Get total count of transcripts for this meeting
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ?"
-        )
-        .bind(meeting_id)
-        .fetch_one(pool)
-        .await?;
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transcripts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await?;
 
         // Get paginated transcripts ordered by audio_start_time, with display
         // names resolved via meeting_speakers -> speakers (legacy fallback).
-        let transcripts = sqlx::query_as::<_, Transcript>(
-            &format!("{} WHERE t.meeting_id = ? ORDER BY t.audio_start_time ASC LIMIT ? OFFSET ?", TRANSCRIPT_DISPLAY_SELECT),
-        )
+        let transcripts = sqlx::query_as::<_, Transcript>(&format!(
+            "{} WHERE t.meeting_id = ? ORDER BY t.audio_start_time ASC LIMIT ? OFFSET ?",
+            TRANSCRIPT_DISPLAY_SELECT
+        ))
         .bind(meeting_id)
         .bind(limit)
         .bind(offset)
@@ -218,7 +219,7 @@ impl MeetingsRepository {
     ) -> Result<bool, SqlxError> {
         let mut transaction = pool.begin().await?;
         let rows = sqlx::query(
-            "UPDATE transcripts SET speaker_label = ? WHERE meeting_id = ? AND speaker = ?"
+            "UPDATE transcripts SET speaker_label = ? WHERE meeting_id = ? AND speaker = ?",
         )
         .bind(label)
         .bind(meeting_id)
@@ -231,19 +232,21 @@ impl MeetingsRepository {
             return Ok(false);
         }
 
-        let current_names: Option<String> = sqlx::query_scalar(
-            "SELECT speaker_names FROM meetings WHERE id = ?"
-        )
-        .bind(meeting_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .flatten();
+        let current_names: Option<String> =
+            sqlx::query_scalar("SELECT speaker_names FROM meetings WHERE id = ?")
+                .bind(meeting_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .flatten();
 
         let mut names_map: serde_json::Map<String, serde_json::Value> = match current_names {
             Some(json) => serde_json::from_str(&json).unwrap_or_default(),
             None => serde_json::Map::new(),
         };
-        names_map.insert(speaker.to_string(), serde_json::Value::String(label.to_string()));
+        names_map.insert(
+            speaker.to_string(),
+            serde_json::Value::String(label.to_string()),
+        );
 
         let updated_json = serde_json::to_string(&names_map).unwrap_or_default();
         sqlx::query("UPDATE meetings SET speaker_names = ? WHERE id = ?")
@@ -300,7 +303,7 @@ impl MeetingsRepository {
         meeting_id: &str,
     ) -> Result<Vec<Transcript>, SqlxError> {
         sqlx::query_as::<_, Transcript>(
-            "SELECT * FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC"
+            "SELECT * FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC",
         )
         .bind(meeting_id)
         .fetch_all(pool)

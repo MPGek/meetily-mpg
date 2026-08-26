@@ -131,20 +131,16 @@ pub fn best_match_with_threshold(
 
         match best {
             Some(ref b) if spk_best <= b.score => {}
-            _ => best = Some(MatchResult {
-                speaker_id: speaker_id.to_string(),
-                score: spk_best,
-            }),
+            _ => {
+                best = Some(MatchResult {
+                    speaker_id: speaker_id.to_string(),
+                    score: spk_best,
+                })
+            }
         }
     }
 
-    best.and_then(|m| {
-        if m.score > threshold {
-            Some(m)
-        } else {
-            None
-        }
-    })
+    best.and_then(|m| if m.score > threshold { Some(m) } else { None })
 }
 
 /// Convenience wrapper using the enhanced TitaNet recognition threshold.

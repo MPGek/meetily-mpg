@@ -43,12 +43,11 @@ async fn inspect_meeting_0818_1322() {
         .await
         .expect("count ms");
     println!("total meeting_speakers rows: {}", ms_total);
-    let ms_rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT meeting_id, COUNT(*) FROM meeting_speakers GROUP BY meeting_id",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("query ms counts");
+    let ms_rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT meeting_id, COUNT(*) FROM meeting_speakers GROUP BY meeting_id")
+            .fetch_all(&pool)
+            .await
+            .expect("query ms counts");
     println!("{:?}", ms_rows);
 
     println!("=== CACHE rows by meeting (speaker_embeddings, no speaker_id) ===");
@@ -61,12 +60,11 @@ async fn inspect_meeting_0818_1322() {
     println!("{:?}", caches);
 
     println!("=== SPEAKER_EMBEDDINGS ownership counts ===");
-    let own: Vec<(Option<String>, i64)> = sqlx::query_as(
-        "SELECT speaker_id, COUNT(*) FROM speaker_embeddings GROUP BY speaker_id",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("query emb");
+    let own: Vec<(Option<String>, i64)> =
+        sqlx::query_as("SELECT speaker_id, COUNT(*) FROM speaker_embeddings GROUP BY speaker_id")
+            .fetch_all(&pool)
+            .await
+            .expect("query emb");
     println!("by speaker: {:?}", own);
     let own2: Vec<(String, i64)> = sqlx::query_as(
         "SELECT meeting_id, COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL GROUP BY meeting_id",
@@ -84,10 +82,12 @@ async fn inspect_meeting_0818_1322() {
     println!("{:?}", sp);
 
     println!("=== MIGRATIONS ===");
-    let migs: Vec<(i64, String, String)> = sqlx::query_as("SELECT version, description, installed_on FROM _sqlx_migrations ORDER BY version")
-        .fetch_all(&pool)
-        .await
-        .expect("query migrations");
+    let migs: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, description, installed_on FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query migrations");
     for m in &migs {
         println!("{:?}", m);
     }
@@ -115,10 +115,11 @@ async fn inspect_meeting_0818_1322() {
     }
 
     println!("=== meeting_expected_speakers ===");
-    let exp: Vec<(String, String)> = sqlx::query_as("SELECT meeting_id, speaker_id FROM meeting_expected_speakers")
-        .fetch_all(&pool)
-        .await
-        .expect("query expected");
+    let exp: Vec<(String, String)> =
+        sqlx::query_as("SELECT meeting_id, speaker_id FROM meeting_expected_speakers")
+            .fetch_all(&pool)
+            .await
+            .expect("query expected");
     println!("{:?}", exp);
 
     println!("=== meetings diarization_status/speaker_names ===");
@@ -151,8 +152,10 @@ async fn inspect_meeting_0818_1322() {
         .await
         .expect("query transcripts");
         for r in &rows {
-            println!("id={} start={:?} end={:?} dev={:?} spk={:?} label={:?} | {}",
-                r.0, r.2, r.3, r.4, r.5, r.6, r.1);
+            println!(
+                "id={} start={:?} end={:?} dev={:?} spk={:?} label={:?} | {}",
+                r.0, r.2, r.3, r.4, r.5, r.6, r.1
+            );
         }
 
         let ms: Vec<(String, Option<String>, Option<String>, Option<f64>)> = sqlx::query_as(

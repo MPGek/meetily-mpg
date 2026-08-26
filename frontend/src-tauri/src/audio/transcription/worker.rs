@@ -20,7 +20,10 @@ static SPEECH_DETECTED_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Reset the speech detected flag for a new recording session
 pub fn reset_speech_detected_flag() {
     SPEECH_DETECTED_EMITTED.store(false, Ordering::SeqCst);
-    info!("🔍 SPEECH_DETECTED_EMITTED reset to: {}", SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst));
+    info!(
+        "🔍 SPEECH_DETECTED_EMITTED reset to: {}",
+        SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst)
+    );
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -35,7 +38,7 @@ pub struct TranscriptUpdate {
     // NEW: Recording-relative timestamps for playback sync
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
-    pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    pub duration: f64,         // Segment duration in seconds (e.g., 3.3)
     pub source_device: String, // "Microphone" or "System"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>, // Speaker ID from diarization (e.g., "SPEAKER_00")
@@ -56,7 +59,8 @@ pub fn start_transcription_task<R: Runtime>(
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
 
         // Initialize transcription engine (Whisper or Parakeet based on config)
-        let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
+        let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await
+        {
             Ok(engine) => engine,
             Err(e) => {
                 error!("Failed to initialize transcription engine: {}", e);
@@ -79,7 +83,11 @@ pub fn start_transcription_task<R: Runtime>(
         let chunks_completed = Arc::new(AtomicU64::new(0));
         let input_finished = Arc::new(AtomicBool::new(false));
 
-        info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
+        info!(
+            "📊 Starting {} transcription worker{} (serial mode for ordered emission)",
+            NUM_WORKERS,
+            if NUM_WORKERS == 1 { "" } else { "s" }
+        );
 
         // Spawn worker tasks
         let mut worker_handles = Vec::new();
@@ -113,7 +121,10 @@ pub fn start_transcription_task<R: Runtime>(
                         worker_id, engine_name, current_model
                     );
                 } else {
-                    warn!("⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped", worker_id, engine_name);
+                    warn!(
+                        "⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped",
+                        worker_id, engine_name
+                    );
                 }
 
                 // Previous transcription text for context forwarding (per source device)
@@ -157,10 +168,18 @@ pub fn start_transcription_task<R: Runtime>(
                             // Determine previous-text prompt for this source device
                             let prompt = match &chunk_device_type {
                                 crate::audio::RecordingDeviceType::Microphone => {
-                                    if last_mic_text.is_empty() { None } else { Some(last_mic_text.clone()) }
+                                    if last_mic_text.is_empty() {
+                                        None
+                                    } else {
+                                        Some(last_mic_text.clone())
+                                    }
                                 }
                                 crate::audio::RecordingDeviceType::System => {
-                                    if last_sys_text.is_empty() { None } else { Some(last_sys_text.clone()) }
+                                    if last_sys_text.is_empty() {
+                                        None
+                                    } else {
+                                        Some(last_sys_text.clone())
+                                    }
                                 }
                             };
 
@@ -176,7 +195,8 @@ pub fn start_transcription_task<R: Runtime>(
                                 Ok((transcript, tokens_opt, confidence_opt, is_partial)) => {
                                     // Provider-aware confidence threshold
                                     let confidence_threshold = match &engine_clone {
-                                        TranscriptionEngine::Whisper(_) | TranscriptionEngine::Provider(_) => 0.3,
+                                        TranscriptionEngine::Whisper(_)
+                                        | TranscriptionEngine::Provider(_) => 0.3,
                                         TranscriptionEngine::Parakeet(_) => 0.0, // Parakeet has no confidence, accept all
                                     };
 
@@ -189,7 +209,8 @@ pub fn start_transcription_task<R: Runtime>(
                                           worker_id, transcript, confidence_str, is_partial, confidence_threshold);
 
                                     // Check confidence threshold (or accept if no confidence provided)
-                                    let meets_threshold = confidence_opt.map_or(true, |c| c >= confidence_threshold);
+                                    let meets_threshold =
+                                        confidence_opt.map_or(true, |c| c >= confidence_threshold);
 
                                     if !transcript.trim().is_empty() && meets_threshold {
                                         // PERFORMANCE: Only log transcription results, not every processing step
@@ -198,7 +219,8 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         // Emit speech-detected event for frontend UX (only on first detection per session)
                                         // This is lightweight and provides better user feedback
-                                        let current_flag = SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst);
+                                        let current_flag =
+                                            SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst);
                                         info!("🔍 Checking speech-detected flag: current={}, will_emit={}", current_flag, !current_flag);
 
                                         if !current_flag {
@@ -224,7 +246,8 @@ pub fn start_transcription_task<R: Runtime>(
                                         }
 
                                         // Generate sequence ID and calculate timestamps FIRST
-                                        let sequence_id = SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                        let sequence_id =
+                                            SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
                                         let audio_start_time = chunk_timestamp; // Already in seconds from recording start
                                         let audio_end_time = chunk_timestamp + chunk_duration;
 
@@ -239,14 +262,20 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         // Offset chunk-relative token timestamps to recording-relative
                                         let tokens_recording = tokens_opt.map(|toks| {
-                                            toks.into_iter().map(|mut t| {
-                                                t.start += audio_start_time as f32;
-                                                t.end += audio_start_time as f32;
-                                                // Clamp to segment bounds
-                                                if t.end > audio_end_time as f32 { t.end = audio_end_time as f32; }
-                                                if t.start < audio_start_time as f32 { t.start = audio_start_time as f32; }
-                                                t
-                                            }).collect::<Vec<_>>()
+                                            toks.into_iter()
+                                                .map(|mut t| {
+                                                    t.start += audio_start_time as f32;
+                                                    t.end += audio_start_time as f32;
+                                                    // Clamp to segment bounds
+                                                    if t.end > audio_end_time as f32 {
+                                                        t.end = audio_end_time as f32;
+                                                    }
+                                                    if t.start < audio_start_time as f32 {
+                                                        t.start = audio_start_time as f32;
+                                                    }
+                                                    t
+                                                })
+                                                .collect::<Vec<_>>()
                                         });
 
                                         let update = TranscriptUpdate {
@@ -261,8 +290,12 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_end_time,
                                             duration: chunk_duration,
                                             source_device: match chunk_device_type {
-                                                crate::audio::RecordingDeviceType::Microphone => "Microphone".to_string(),
-                                                crate::audio::RecordingDeviceType::System => "System".to_string(),
+                                                crate::audio::RecordingDeviceType::Microphone => {
+                                                    "Microphone".to_string()
+                                                }
+                                                crate::audio::RecordingDeviceType::System => {
+                                                    "System".to_string()
+                                                }
                                             },
                                             speaker: None,
                                             tokens: tokens_recording,
@@ -294,13 +327,20 @@ pub fn start_transcription_task<R: Runtime>(
                                             continue;
                                         }
                                         TranscriptionError::ModelNotLoaded => {
-                                            warn!("Worker {}: Model unloaded during transcription", worker_id);
+                                            warn!(
+                                                "Worker {}: Model unloaded during transcription",
+                                                worker_id
+                                            );
                                             chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
                                             continue;
                                         }
                                         _ => {
-                                            warn!("Worker {}: Transcription failed: {}", worker_id, e);
-                                            let _ = app_clone.emit("transcription-warning", e.to_string());
+                                            warn!(
+                                                "Worker {}: Transcription failed: {}",
+                                                worker_id, e
+                                            );
+                                            let _ = app_clone
+                                                .emit("transcription-warning", e.to_string());
                                         }
                                     }
                                 }
@@ -459,7 +499,15 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
     chunk: AudioChunk,
     app: &AppHandle<R>,
     initial_prompt: Option<String>,
-) -> std::result::Result<(String, Option<Vec<crate::audio::token_assignment::Token>>, Option<f32>, bool), TranscriptionError> {
+) -> std::result::Result<
+    (
+        String,
+        Option<Vec<crate::audio::token_assignment::Token>>,
+        Option<f32>,
+        bool,
+    ),
+    TranscriptionError,
+> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
         crate::audio::audio_processing::resample_audio(&chunk.data, chunk.sample_rate, 16000)
@@ -513,7 +561,11 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         chunk.chunk_id, cleaned_text, tokens.len(), confidence, is_partial
                     );
 
-                    let tokens_opt = if tokens.is_empty() { None } else { Some(tokens) };
+                    let tokens_opt = if tokens.is_empty() {
+                        None
+                    } else {
+                        Some(tokens)
+                    };
                     Ok((cleaned_text, tokens_opt, Some(confidence), is_partial))
                 }
                 Err(e) => {

@@ -235,8 +235,9 @@ export function DiarizationSettings() {
           </div>
         )}
         <p className="text-xs text-gray-500 mt-2">
-          Bundled at build time from public Hugging Face (onnx-community + Recogment), both files required. No runtime
-          download and no remove control — diarization uses these models exclusively. Rebuild with network to update the
+          Bundled at build time from public Hugging Face (onnx-community + Recogment), both files required. Models are
+          resolved from AppData → bundled resources (near executable) → dev manifest; diarization fails with an error
+          listing all searched locations when none is found. No runtime download — rebuild with network to update the
           bundle.
         </p>
       </div>

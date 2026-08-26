@@ -14,22 +14,22 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
 
 use super::{
+    default_input_device,  // Get default microphone
+    default_output_device, // Get default system audio
     parse_audio_device,
-    default_input_device,   // Get default microphone
-    default_output_device,  // Get default system audio
-    RecordingManager,
     DeviceEvent,
-    DeviceMonitorType
+    DeviceMonitorType,
+    RecordingManager,
 };
 
-use super::online_diarization::{DiarizationMode, OnlineDiarizationProcessor, SpeakerAssignment, SpeakerTurn, OnlineClusterEmbeddings, PrototypeStore};
+use super::online_diarization::{
+    DiarizationMode, OnlineClusterEmbeddings, OnlineDiarizationProcessor, PrototypeStore,
+    SpeakerAssignment, SpeakerTurn,
+};
 use crate::database::repositories::speaker::SpeakerRepository;
 
 // Import transcription modules
-use super::transcription::{
-    self,
-    reset_speech_detected_flag,
-};
+use super::transcription::{self, reset_speech_detected_flag};
 
 // Re-export TranscriptUpdate for backward compatibility
 pub use super::transcription::TranscriptUpdate;
@@ -47,8 +47,9 @@ static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 // Online diarization worker: consumes embedding chunks and returns the
 // processor (for finalize) when the channel closes
-static ONLINE_DIARIZATION_TASK: Mutex<Option<JoinHandle<Result<Option<OnlineDiarizationProcessor>, String>>>> =
-    Mutex::new(None);
+static ONLINE_DIARIZATION_TASK: Mutex<
+    Option<JoinHandle<Result<Option<OnlineDiarizationProcessor>, String>>>,
+> = Mutex::new(None);
 
 // Shared prototype store for live Fast-mode recognition (design D6).
 // Created at recording start, shared between the processor task and the
@@ -100,7 +101,8 @@ static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
 // Shared transcript segments and meeting folder for event listener access.
 // These bypass RecordingManager to avoid cross-thread access to !Send types (cpal::Stream).
-static SHARED_SEGMENTS: Mutex<Option<Arc<Mutex<Vec<super::recording_saver::TranscriptSegment>>>>> = Mutex::new(None);
+static SHARED_SEGMENTS: Mutex<Option<Arc<Mutex<Vec<super::recording_saver::TranscriptSegment>>>>> =
+    Mutex::new(None);
 static SHARED_FOLDER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 // ============================================================================
@@ -176,10 +178,17 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             Ok(prefs) => {
                 info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
                       prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
-                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
+                (
+                    prefs.auto_save,
+                    prefs.preferred_mic_device,
+                    prefs.preferred_system_device,
+                )
             }
             Err(e) => {
-                warn!("Failed to load recording preferences, using defaults: {}", e);
+                warn!(
+                    "Failed to load recording preferences, using defaults: {}",
+                    e
+                );
                 (true, None, None)
             }
         };
@@ -196,7 +205,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     Some(Arc::new(device))
                 }
                 Err(e) => {
-                    warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
+                    warn!(
+                        "⚠️ Preferred microphone '{}' not available: {}",
+                        pref_name, e
+                    );
                     warn!("   Falling back to system default microphone...");
                     match default_input_device() {
                         Ok(device) => {
@@ -204,7 +216,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                             Some(Arc::new(device))
                         }
                         Err(default_err) => {
-                            error!("❌ No microphone available (preferred and default both failed)");
+                            error!(
+                                "❌ No microphone available (preferred and default both failed)"
+                            );
                             return Err(format!(
                                 "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
                                 pref_name, default_err
@@ -234,14 +248,20 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // ============================================================================
     let system_device = match preferred_system_name {
         Some(pref_name) => {
-            info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
+            info!(
+                "🔊 Attempting to use preferred system audio: '{}'",
+                pref_name
+            );
             match parse_audio_device(&pref_name) {
                 Ok(device) => {
                     info!("✅ Using preferred system audio: '{}'", device.name);
                     Some(Arc::new(device))
                 }
                 Err(e) => {
-                    warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
+                    warn!(
+                        "⚠️ Preferred system audio '{}' not available: {}",
+                        pref_name, e
+                    );
                     warn!("   Falling back to system default...");
                     match default_output_device() {
                         Ok(device) => {
@@ -277,10 +297,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         // Example: Meeting 2025-10-03_08-25
         let now = chrono::Local::now();
-        format!(
-            "Meeting {}",
-            now.format("%Y-%m-%d_%H-%M")
-        )
+        format!("Meeting {}", now.format("%Y-%m-%d_%H-%M"))
     });
     manager.set_meeting_name(Some(effective_meeting_name));
 
@@ -349,7 +366,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                 if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
                     if let Some(ref shared) = *segments_guard {
                         if let Ok(mut segs) = shared.lock() {
-                            if let Some(existing) = segs.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+                            if let Some(existing) = segs
+                                .iter_mut()
+                                .find(|s| s.sequence_id == segment.sequence_id)
+                            {
                                 *existing = segment.clone();
                             } else {
                                 segs.push(segment.clone());
@@ -363,7 +383,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     if let Some(ref folder) = *folder_guard {
                         if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
                             if let Some(ref shared) = *segments_guard {
-                                if let Err(e) = crate::audio::recording_saver::write_transcripts_to_disk(folder, shared) {
+                                if let Err(e) =
+                                    crate::audio::recording_saver::write_transcripts_to_disk(
+                                        folder, shared,
+                                    )
+                                {
                                     warn!("Failed to write incremental transcript update: {}", e);
                                 }
                             }
@@ -378,11 +402,15 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
 
     // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started successfully with parallel processing",
-        "devices": ["Default Microphone", "Default System Audio"],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
+    app.emit(
+        "recording-started",
+        serde_json::json!({
+            "message": "Recording started successfully with parallel processing",
+            "devices": ["Default Microphone", "Default System Audio"],
+            "workers": 3
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -398,7 +426,16 @@ pub async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None, None, None).await
+    start_recording_with_devices_and_meeting(
+        app,
+        mic_device_name,
+        system_device_name,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Start recording with specific devices and optional meeting name
@@ -450,10 +487,17 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             Ok(prefs) => {
                 info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
                       prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
-                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
+                (
+                    prefs.auto_save,
+                    prefs.preferred_mic_device,
+                    prefs.preferred_system_device,
+                )
             }
             Err(e) => {
-                warn!("Failed to load recording preferences, using defaults: {}", e);
+                warn!(
+                    "Failed to load recording preferences, using defaults: {}",
+                    e
+                );
                 (true, None, None)
             }
         };
@@ -461,9 +505,15 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Resolve devices with fallback: explicit name → saved preference → system default.
     // Microphone is required; system audio is optional (skipped only when no
     // default output device exists).
-    let mic_device = Some(resolve_microphone_device(mic_device_name.as_deref(), preferred_mic_name.as_deref())?);
+    let mic_device = Some(resolve_microphone_device(
+        mic_device_name.as_deref(),
+        preferred_mic_name.as_deref(),
+    )?);
 
-    let system_device = resolve_system_audio_device(system_device_name.as_deref(), preferred_system_name.as_deref());
+    let system_device = resolve_system_audio_device(
+        system_device_name.as_deref(),
+        preferred_system_name.as_deref(),
+    );
 
     // Async-first approach for custom devices - no more blocking operations!
     info!("🚀 Starting async recording initialization with custom devices");
@@ -518,13 +568,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             let state = app.state::<crate::state::AppState>();
             state.db_manager.pool().clone()
         };
-        let models_dir_for_store = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("Failed to get app data dir: {}", e))?
-            .join("models");
         let store_model_tag = crate::audio::embedder::ENHANCED_MODEL_TAG;
-        let prototype_store = match PrototypeStore::load_with_model(&pool, candidate_ids, has_system_device, store_model_tag).await
+        let prototype_store = match PrototypeStore::load_with_model(
+            &pool,
+            candidate_ids,
+            has_system_device,
+            store_model_tag,
+        )
+        .await
         {
             Ok(store) => {
                 let arc = Arc::new(RwLock::new(store));
@@ -540,20 +591,19 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             }
         };
 
-        let models_dir = models_dir_for_store;
+        let app_for_processor = app.clone();
         let app_for_event = app.clone();
         let task = tokio::task::spawn_blocking(
             move || -> Result<Option<OnlineDiarizationProcessor>, String> {
                 let max_speakers_usize = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
-                let mut processor = match OnlineDiarizationProcessor::new(
+                let mut processor = match OnlineDiarizationProcessor::new_with_app(
+                    &app_for_processor,
                     online_mode,
                     max_speakers_usize,
                     has_system_device,
-                    &models_dir,
                     Some(turn_sender),
                     prototype_store,
-                )
-                {
+                ) {
                     Ok(processor) => processor,
                     Err(e) => {
                         warn!("Online diarization unavailable: {}", e);
@@ -575,7 +625,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             let mut global_task = ONLINE_DIARIZATION_TASK.lock().unwrap();
             *global_task = Some(task);
         }
-        info!("🎙️ Online diarization processor spawned (mode: {:?})", online_mode);
+        info!(
+            "🎙️ Online diarization processor spawned (mode: {:?})",
+            online_mode
+        );
     } else {
         info!("ℹ️ Online diarization disabled (mode: {:?})", online_mode);
     }
@@ -583,10 +636,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         let now = chrono::Local::now();
-        format!(
-            "Meeting {}",
-            now.format("%Y-%m-%d_%H-%M")
-        )
+        format!("Meeting {}", now.format("%Y-%m-%d_%H-%M"))
     });
     manager.set_meeting_name(Some(effective_meeting_name));
 
@@ -655,7 +705,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
                     if let Some(ref shared) = *segments_guard {
                         if let Ok(mut segs) = shared.lock() {
-                            if let Some(existing) = segs.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+                            if let Some(existing) = segs
+                                .iter_mut()
+                                .find(|s| s.sequence_id == segment.sequence_id)
+                            {
                                 *existing = segment.clone();
                             } else {
                                 segs.push(segment.clone());
@@ -669,7 +722,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     if let Some(ref folder) = *folder_guard {
                         if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
                             if let Some(ref shared) = *segments_guard {
-                                if let Err(e) = crate::audio::recording_saver::write_transcripts_to_disk(folder, shared) {
+                                if let Err(e) =
+                                    crate::audio::recording_saver::write_transcripts_to_disk(
+                                        folder, shared,
+                                    )
+                                {
                                     warn!("Failed to write incremental transcript update: {}", e);
                                 }
                             }
@@ -684,14 +741,18 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
 
     // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started with custom devices and parallel processing",
-        "devices": [
-            mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
-            system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
-        ],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
+    app.emit(
+        "recording-started",
+        serde_json::json!({
+            "message": "Recording started with custom devices and parallel processing",
+            "devices": [
+                mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
+                system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
+            ],
+            "workers": 3
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -710,14 +771,20 @@ fn resolve_microphone_device(
     if let Some(name) = explicit_name {
         match parse_audio_device(name) {
             Ok(device) => return Ok(Arc::new(device)),
-            Err(e) => warn!("⚠️ Invalid microphone device '{}': {}, falling back...", name, e),
+            Err(e) => warn!(
+                "⚠️ Invalid microphone device '{}': {}, falling back...",
+                name, e
+            ),
         }
     }
 
     if let Some(pref_name) = preferred_name {
         match parse_audio_device(pref_name) {
             Ok(device) => return Ok(Arc::new(device)),
-            Err(e) => warn!("⚠️ Preferred microphone '{}' not available: {}, falling back...", pref_name, e),
+            Err(e) => warn!(
+                "⚠️ Preferred microphone '{}' not available: {}, falling back...",
+                pref_name, e
+            ),
         }
     }
 
@@ -735,21 +802,30 @@ fn resolve_system_audio_device(
     if let Some(name) = explicit_name {
         match parse_audio_device(name) {
             Ok(device) => return Some(Arc::new(device)),
-            Err(e) => warn!("⚠️ Invalid system device '{}': {}, falling back...", name, e),
+            Err(e) => warn!(
+                "⚠️ Invalid system device '{}': {}, falling back...",
+                name, e
+            ),
         }
     }
 
     if let Some(pref_name) = preferred_name {
         match parse_audio_device(pref_name) {
             Ok(device) => return Some(Arc::new(device)),
-            Err(e) => warn!("⚠️ Preferred system audio '{}' not available: {}, falling back...", pref_name, e),
+            Err(e) => warn!(
+                "⚠️ Preferred system audio '{}' not available: {}, falling back...",
+                pref_name, e
+            ),
         }
     }
 
     match default_output_device() {
         Ok(device) => Some(Arc::new(device)),
         Err(e) => {
-            warn!("⚠️ No default system audio available: {}, continuing with microphone only", e);
+            warn!(
+                "⚠️ No default system audio available: {}, continuing with microphone only",
+                e
+            );
             None
         }
     }
@@ -868,8 +944,10 @@ pub async fn stop_recording<R: Runtime>(
         // Wait up to 10 minutes for transcription completion to prevent indefinite hangs
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(600), // 10 minutes max
-            task_handle
-        ).await {
+            task_handle,
+        )
+        .await
+        {
             Ok(Ok(())) => {
                 info!("✅ ALL transcription chunks processed successfully - no data lost");
             }
@@ -897,7 +975,8 @@ pub async fn stop_recording<R: Runtime>(
         global_task.take()
     };
 
-    let speaker_assignments: Option<Vec<SpeakerAssignment>> = if let Some(task_handle) = online_task {
+    let speaker_assignments: Option<Vec<SpeakerAssignment>> = if let Some(task_handle) = online_task
+    {
         info!("⏳ Finalizing online diarization...");
         let processor = match task_handle.await {
             Ok(Ok(Some(processor))) => Some(processor),
@@ -930,10 +1009,7 @@ pub async fn stop_recording<R: Runtime>(
                     // Store cluster embeddings + live bindings for the
                     // frontend-initiated finalize_online_session call, which
                     // persists them once the meeting row exists.
-                    let stored_expected = ONLINE_EXPECTED_SPEAKER_IDS
-                        .lock()
-                        .unwrap()
-                        .clone();
+                    let stored_expected = ONLINE_EXPECTED_SPEAKER_IDS.lock().unwrap().clone();
                     {
                         let mut session_data = ONLINE_SESSION_DATA.lock().unwrap();
                         // Move the raw buffers out of the cluster embeddings so
@@ -997,11 +1073,7 @@ pub async fn stop_recording<R: Runtime>(
     // Determine which provider was used and unload the appropriate model (with timeout)
     let config = match tokio::time::timeout(
         tokio::time::Duration::from_secs(30), // 30 seconds max for DB operation
-        crate::api::api::api_get_transcript_config(
-            app.clone(),
-            app.clone().state(),
-            None,
-        )
+        crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None),
     )
     .await
     {
@@ -1035,7 +1107,10 @@ pub async fn stop_recording<R: Runtime>(
                 info!("Current Parakeet model before unload: '{}'", current_model);
 
                 if engine.unload_model().await {
-                    info!("✅ Parakeet model '{}' unloaded successfully", current_model);
+                    info!(
+                        "✅ Parakeet model '{}' unloaded successfully",
+                        current_model
+                    );
                 } else {
                     warn!("⚠️ Failed to unload Parakeet model '{}'", current_model);
                 }
@@ -1092,7 +1167,17 @@ pub async fn stop_recording<R: Runtime>(
     };
 
     // Now perform async analytics tracking without holding manager reference
-    if let Some((total_duration, active_duration, pause_duration, transcript_segments_count, had_fatal_error, mic_device_name, sys_device_name, chunks_processed)) = analytics_data {
+    if let Some((
+        total_duration,
+        active_duration,
+        pause_duration,
+        transcript_segments_count,
+        had_fatal_error,
+        mic_device_name,
+        sys_device_name,
+        chunks_processed,
+    )) = analytics_data
+    {
         info!("📊 Collecting analytics for meeting end");
 
         // Helper function to classify device type from device name (privacy-safe)
@@ -1104,7 +1189,8 @@ pub async fn stop_recording<R: Runtime>(
                 || name_lower.contains("beats")
                 || name_lower.contains("headphones")
                 || name_lower.contains("bt ")
-                || name_lower.contains("wireless") {
+                || name_lower.contains("wireless")
+            {
                 "Bluetooth"
             } else {
                 "Wired"
@@ -1123,23 +1209,20 @@ pub async fn stop_recording<R: Runtime>(
             _ => None,
         };
 
-        let (transcription_provider, transcription_model) = transcription_config
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        let (transcription_provider, transcription_model) =
+            transcription_config.unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         // Get summary model info from API
-        let summary_config = match crate::api::api::api_get_model_config(
-            app.clone(),
-            app.clone().state(),
-            None,
-        )
-        .await
-        {
-            Ok(Some(config)) => Some((config.provider, config.model)),
-            _ => None,
-        };
+        let summary_config =
+            match crate::api::api::api_get_model_config(app.clone(), app.clone().state(), None)
+                .await
+            {
+                Ok(Some(config)) => Some((config.provider, config.model)),
+                _ => None,
+            };
 
-        let (summary_provider, summary_model) = summary_config
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        let (summary_provider, summary_model) =
+            summary_config.unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         // Classify device types (privacy-safe)
         let microphone_device_type = mic_device_name
@@ -1194,8 +1277,10 @@ pub async fn stop_recording<R: Runtime>(
 
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
-            manager.save_recording_only(&app)
-        ).await {
+            manager.save_recording_only(&app),
+        )
+        .await
+        {
             Ok(Ok(_)) => {
                 info!("✅ Recording data saved successfully during cleanup");
             }
@@ -1226,10 +1311,7 @@ pub async fn stop_recording<R: Runtime>(
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.
     // This ensures the user sees all transcripts streaming in before the database save happens.
     let (folder_path_str, meeting_name_str) = match (&meeting_folder, &meeting_name) {
-        (Some(path), Some(name)) => (
-            Some(path.to_string_lossy().to_string()),
-            Some(name.clone()),
-        ),
+        (Some(path), Some(name)) => (Some(path.to_string_lossy().to_string()), Some(name.clone())),
         _ => (None, None),
     };
 
@@ -1404,7 +1486,9 @@ pub async fn get_recording_state() -> serde_json::Value {
 pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
-        Ok(manager.get_meeting_folder().map(|p| p.to_string_lossy().to_string()))
+        Ok(manager
+            .get_meeting_folder()
+            .map(|p| p.to_string_lossy().to_string()))
     } else {
         Ok(None)
     }
@@ -1413,7 +1497,8 @@ pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
 /// Get accumulated transcript segments from current recording session
 /// Used for syncing frontend state after page reload during active recording
 #[tauri::command]
-pub async fn get_transcript_history() -> Result<Vec<crate::audio::recording_saver::TranscriptSegment>, String> {
+pub async fn get_transcript_history(
+) -> Result<Vec<crate::audio::recording_saver::TranscriptSegment>, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
 
     if let Some(manager) = manager_guard.as_ref() {
@@ -1458,18 +1543,20 @@ pub enum DeviceEventResponse {
 impl From<DeviceEvent> for DeviceEventResponse {
     fn from(event: DeviceEvent) -> Self {
         match event {
-            DeviceEvent::DeviceDisconnected { device_name, device_type } => {
-                DeviceEventResponse::DeviceDisconnected {
-                    device_name,
-                    device_type: format!("{:?}", device_type),
-                }
-            }
-            DeviceEvent::DeviceReconnected { device_name, device_type } => {
-                DeviceEventResponse::DeviceReconnected {
-                    device_name,
-                    device_type: format!("{:?}", device_type),
-                }
-            }
+            DeviceEvent::DeviceDisconnected {
+                device_name,
+                device_type,
+            } => DeviceEventResponse::DeviceDisconnected {
+                device_name,
+                device_type: format!("{:?}", device_type),
+            },
+            DeviceEvent::DeviceReconnected {
+                device_name,
+                device_type,
+            } => DeviceEventResponse::DeviceReconnected {
+                device_name,
+                device_type: format!("{:?}", device_type),
+            },
             DeviceEvent::DeviceListChanged => DeviceEventResponse::DeviceListChanged,
         }
     }
@@ -1516,12 +1603,12 @@ pub async fn get_reconnection_status() -> Result<ReconnectionStatus, String> {
 
     if let Some(manager) = manager_guard.as_ref() {
         let state = manager.get_state();
-        let disconnected_device = state.get_disconnected_device().map(|(device, device_type)| {
-            DisconnectedDeviceInfo {
+        let disconnected_device = state
+            .get_disconnected_device()
+            .map(|(device, device_type)| DisconnectedDeviceInfo {
                 name: device.name.clone(),
                 device_type: format!("{:?}", device_type),
-            }
-        });
+            });
 
         Ok(ReconnectionStatus {
             is_reconnecting: manager.is_reconnecting(),
@@ -1572,7 +1659,9 @@ pub async fn attempt_device_reconnect(
         tokio::runtime::Handle::current().block_on(async {
             let mut manager_guard = RECORDING_MANAGER.lock().unwrap();
             if let Some(manager) = manager_guard.as_mut() {
-                manager.attempt_device_reconnect(&device_name, monitor_type).await
+                manager
+                    .attempt_device_reconnect(&device_name, monitor_type)
+                    .await
             } else {
                 Err(anyhow::anyhow!("Recording not active"))
             }
@@ -1670,15 +1759,13 @@ pub async fn finalize_online_session(
     // re-match (design D8: user bindings always win). Only binding rows are
     // written here; enrollment above already reparented the embeddings.
     for (cluster_label, speaker_id) in &session_data.live_bindings {
-        if let Err(e) = SpeakerRepository::set_user_binding(
-            pool,
-            &meeting_id,
-            cluster_label,
-            speaker_id,
-        )
-        .await
+        if let Err(e) =
+            SpeakerRepository::set_user_binding(pool, &meeting_id, cluster_label, speaker_id).await
         {
-            warn!("Failed to persist live user binding {label} → {speaker_id}: {e}", label = cluster_label);
+            warn!(
+                "Failed to persist live user binding {label} → {speaker_id}: {e}",
+                label = cluster_label
+            );
         }
         // Also write the user's identity onto the stored transcript rows of the
         // cluster, so each row resolves to the user via the override join even
@@ -1733,6 +1820,8 @@ pub async fn finalize_online_session(
             channel,
             buffer,
             (*start as f32, *end as f32),
+            &meeting_id,
+            cluster_label,
         )
         .await
         {
@@ -1803,17 +1892,13 @@ pub async fn assign_live_speaker(
 
     // Find or create the registry speaker.
     let speaker = match (speaker_id.as_ref(), new_name.as_ref()) {
-        (Some(id), _) => {
-            SpeakerRepository::get_speaker(pool, id)
-                .await
-                .map_err(|e| format!("Failed to load speaker: {}", e))?
-                .ok_or_else(|| format!("Speaker {} not found", id))?
-        }
-        (None, Some(name)) => {
-            SpeakerRepository::find_or_create_by_name(pool, name)
-                .await
-                .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?
-        }
+        (Some(id), _) => SpeakerRepository::get_speaker(pool, id)
+            .await
+            .map_err(|e| format!("Failed to load speaker: {}", e))?
+            .ok_or_else(|| format!("Speaker {} not found", id))?,
+        (None, Some(name)) => SpeakerRepository::find_or_create_by_name(pool, name)
+            .await
+            .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?,
         (None, None) => {
             return Err("Either speaker_id or new_name must be provided".to_string());
         }

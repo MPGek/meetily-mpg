@@ -682,6 +682,33 @@ jobs:
           projectPath: frontend
           args: --target x86_64-pc-windows-msvc --features vulkan ${{ steps.build-profile.outputs.args }}
 
+      - name: Verify bundled diarization models
+        shell: pwsh
+        run: |
+          Write-Host "Verifying bundled enhanced diarization models..."
+          if (Test-Path "frontend/src-tauri/models/segmentation-3.0.onnx" -and Test-Path "frontend/src-tauri/models/titanet_large.onnx") {
+            $segSize = (Get-Item "frontend/src-tauri/models/segmentation-3.0.onnx").Length
+            $embSize = (Get-Item "frontend/src-tauri/models/titanet_large.onnx").Length
+            Write-Host "✅ segmentation-3.0.onnx ($segSize bytes)"
+            Write-Host "✅ titanet_large.onnx ($embSize bytes)"
+            if ($segSize -le 1024 -or $embSize -le 1024) {
+              Write-Error "Bundled models too small — expected >1KB"
+              exit 1
+            }
+          } else {
+            Write-Host "⚠️ Enhanced models not found in frontend/src-tauri/models/"
+            if ("${{ steps.build-profile.outputs.profile }}" -eq "release") {
+              Write-Error "Release build requires bundled enhanced models (segmentation-3.0 + TitaNet-Large). Diarization will fail at runtime."
+              exit 1
+            } else {
+              Write-Host "Debug build — skipping strict bundling check"
+            }
+          }
+          # Also run the verify script if present
+          if (Test-Path "scripts/verify-bundled-models.ps1") {
+            & "scripts/verify-bundled-models.ps1"
+          }
+
       - name: Verify build artifacts
         shell: bash
         run: |

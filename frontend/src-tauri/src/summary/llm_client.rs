@@ -200,7 +200,10 @@ pub async fn generate_summary(
                     .parse()
                     .map_err(|_| "Invalid anthropic version".to_string())?,
             );
-            ("https://api.anthropic.com/v1/messages".to_string(), header_map)
+            (
+                "https://api.anthropic.com/v1/messages".to_string(),
+                header_map,
+            )
         }
         LLMProvider::BuiltInAI => {
             // This case is handled earlier with early returns
@@ -227,7 +230,8 @@ pub async fn generate_summary(
     // Build request body based on provider
     let request_body = if provider != &LLMProvider::Claude {
         // For CustomOpenAI, apply optional parameters if provided
-        let (max_tokens_val, temperature_val, top_p_val) = if provider == &LLMProvider::CustomOpenAI {
+        let (max_tokens_val, temperature_val, top_p_val) = if provider == &LLMProvider::CustomOpenAI
+        {
             (max_tokens, temperature, top_p)
         } else {
             (None, None, None)
@@ -262,7 +266,10 @@ pub async fn generate_summary(
     };
 
     let provider_name_str = provider_name(provider);
-    info!("🐞 LLM Request to {}: model={}", provider_name_str, model_name);
+    info!(
+        "🐞 LLM Request to {}: model={}",
+        provider_name_str, model_name
+    );
 
     let debug_entry = debug_log_dir.as_ref().map(|_| DebugLogEntry {
         start_timestamp: start_timestamp.clone(),

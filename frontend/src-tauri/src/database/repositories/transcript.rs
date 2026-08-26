@@ -79,7 +79,10 @@ impl TranscriptsRepository {
                 .await;
                 match res {
                     Ok(r) => Ok(r),
-                    Err(e) if e.to_string().contains("no such column") || e.to_string().contains("has no column named") => {
+                    Err(e)
+                        if e.to_string().contains("no such column")
+                            || e.to_string().contains("has no column named") =>
+                    {
                         // Pre-migration DB without tokens column: fallback without tokens
                         sqlx::query(
                             "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker)

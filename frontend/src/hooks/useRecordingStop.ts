@@ -383,7 +383,7 @@ export function useRecordingStop(
                 const modelStatus = await recordingService.checkDiarizationModels();
                 if (!modelStatus.ready) {
                   toast.error('Enhanced diarization models not bundled', {
-                    description: 'The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time; rebuild with network or install a build that includes them.',
+                    description: 'The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time near the executable; rebuild with network or install a build that includes them. Searched: AppData, bundled resources, and dev manifest.',
                     action: {
                       label: 'Open Settings',
                       onClick: () => router.push('/settings?tab=general'),

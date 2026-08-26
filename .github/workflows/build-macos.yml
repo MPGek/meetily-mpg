@@ -195,6 +195,31 @@ jobs:
           projectPath: frontend
           args: --target aarch64-apple-darwin ${{ steps.build-profile.outputs.args }}
 
+      - name: Verify bundled diarization models
+        run: |
+          echo "Verifying bundled enhanced diarization models..."
+          if [ -f "frontend/src-tauri/models/segmentation-3.0.onnx" ] && [ -f "frontend/src-tauri/models/titanet_large.onnx" ]; then
+            seg_size=$(wc -c < frontend/src-tauri/models/segmentation-3.0.onnx | tr -d ' ')
+            emb_size=$(wc -c < frontend/src-tauri/models/titanet_large.onnx | tr -d ' ')
+            echo "✅ segmentation-3.0.onnx ($seg_size bytes)"
+            echo "✅ titanet_large.onnx ($emb_size bytes)"
+            if [ "$seg_size" -le 1024 ] || [ "$emb_size" -le 1024 ]; then
+              echo "Bundled models too small — expected >1KB" >&2
+              exit 1
+            fi
+          else
+            echo "⚠️ Enhanced models not found in frontend/src-tauri/models/"
+            if [ "${{ steps.build-profile.outputs.profile }}" = "release" ]; then
+              echo "Release build requires bundled enhanced models (segmentation-3.0 + TitaNet-Large). Diarization will fail at runtime." >&2
+              exit 1
+            else
+              echo "Debug build — skipping strict bundling check"
+            fi
+          fi
+          if [ -f "scripts/verify-bundled-models.sh" ]; then
+            bash scripts/verify-bundled-models.sh
+          fi
+
       - name: Verify build artifacts
         run: |
           echo "Build artifacts:"

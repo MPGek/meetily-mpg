@@ -2,14 +2,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use app_lib::audio::decoder::decode_audio_file;
-use app_lib::audio::online_diarization::{DiarizationMode, OnlineDiarizationProcessor, OnlineClusterEmbeddings, PrototypeStore};
+use app_lib::audio::online_diarization::{
+    DiarizationMode, OnlineClusterEmbeddings, OnlineDiarizationProcessor, PrototypeStore,
+};
 use app_lib::audio::recording_saver::TranscriptSegment;
 use app_lib::audio::recording_state::{AudioChunk, DeviceType};
 use sqlx::SqlitePool;
-use tokio::sync::mpsc;
 use std::sync::RwLock;
+use tokio::sync::mpsc;
 
-fn make_chunks(mono: &[f32], sample_rate: u32, device: DeviceType, chunk_secs: f64) -> Vec<AudioChunk> {
+fn make_chunks(
+    mono: &[f32],
+    sample_rate: u32,
+    device: DeviceType,
+    chunk_secs: f64,
+) -> Vec<AudioChunk> {
     let chunk_len = (sample_rate as f64 * chunk_secs) as usize;
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -34,10 +41,12 @@ fn make_chunks(mono: &[f32], sample_rate: u32, device: DeviceType, chunk_secs: f
 
 #[tokio::test]
 async fn full_stop_flow_fast_1322() {
-    let db_path = "sqlite://C:/Users/VASILI~1.KOT/AppData/Local/Temp/kilo/meetily_test.sqlite?mode=rwc";
+    let db_path =
+        "sqlite://C:/Users/VASILI~1.KOT/AppData/Local/Temp/kilo/meetily_test.sqlite?mode=rwc";
     let pool = SqlitePool::connect(db_path).await.expect("open db");
     let meeting_id = "meeting-a7323df9-9601-47c1-baa3-be22588af544";
-    let audio = "C:/Users/vasiliy.kotov/Music/meetily-recordings/Meeting 2026-08-18_13-22/audio.mp4";
+    let audio =
+        "C:/Users/vasiliy.kotov/Music/meetily-recordings/Meeting 2026-08-18_13-22/audio.mp4";
 
     let decoded = decode_audio_file(Path::new(audio)).expect("decode");
     let (left, right) = decoded.extract_channels();
@@ -75,7 +84,11 @@ async fn full_stop_flow_fast_1322() {
         .collect();
 
     // Load prototype store like the real app (empty registry is fine).
-    let store = Arc::new(RwLock::new(PrototypeStore::load(&pool, None, true).await.expect("store")));
+    let store = Arc::new(RwLock::new(
+        PrototypeStore::load(&pool, None, true)
+            .await
+            .expect("store"),
+    ));
 
     let (turn_sender, _turn_rx) = mpsc::unbounded_channel();
     let models_dir = "C:/Users/vasiliy.kotov/AppData/Roaming/com.meetily.ai/models";
@@ -102,25 +115,35 @@ async fn full_stop_flow_fast_1322() {
 
     match processor.finalize(&transcripts) {
         Ok((assignments, clusters, bindings)) => {
-            println!("finalize OK: {} assignments, mic={}, sys={}, bindings={}",
-                assignments.len(), clusters.mic.len(), clusters.sys.len(), bindings.len());
+            println!(
+                "finalize OK: {} assignments, mic={}, sys={}, bindings={}",
+                assignments.len(),
+                clusters.mic.len(),
+                clusters.sys.len(),
+                bindings.len()
+            );
             for a in &assignments {
                 println!("  seq {} -> {}", a.sequence_id, a.speaker);
             }
 
             // Now persist like finalize_online_session does:
             app_lib::audio::diarization::persist_and_recognize_session(
-                &pool, meeting_id, &clusters.mic, &clusters.sys, clusters.saw_system_audio,
+                &pool,
+                meeting_id,
+                &clusters.mic,
+                &clusters.sys,
+                clusters.saw_system_audio,
             )
             .await
             .expect("persist");
             println!("persist OK");
 
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meeting_speakers WHERE meeting_id = ?")
-                .bind(meeting_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count");
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM meeting_speakers WHERE meeting_id = ?")
+                    .bind(meeting_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count");
             println!("meeting_speakers rows after persist: {}", count);
         }
         Err(e) => println!("FINALIZE FAILED: {}", e),

@@ -54,7 +54,10 @@ pub struct ParakeetModel {
 
 impl Drop for ParakeetModel {
     fn drop(&mut self) {
-        log::debug!("Dropping ParakeetModel with {} vocab tokens", self.vocab.len());
+        log::debug!(
+            "Dropping ParakeetModel with {} vocab tokens",
+            self.vocab.len()
+        );
     }
 }
 
@@ -96,7 +99,10 @@ impl ParakeetModel {
             let quantized_name = format!("{}.int8.onnx", model_name);
             let quantized_path = model_dir.as_ref().join(&quantized_name);
             if quantized_path.exists() {
-                log::info!("Loading quantized Parakeet model from {}...", quantized_name);
+                log::info!(
+                    "Loading quantized Parakeet model from {}...",
+                    quantized_name
+                );
                 quantized_name
             } else {
                 let regular_name = format!("{}.onnx", model_name);
@@ -329,22 +335,41 @@ impl ParakeetModel {
         waveforms: &ArrayViewD<f32>,
         waveforms_len: &ArrayViewD<i64>,
     ) -> Result<Vec<TimestampedResult>, ParakeetError> {
-        log::info!("Parakeet recognize_batch: waveforms shape {:?}, len {:?}", waveforms.shape(), waveforms_len);
+        log::info!(
+            "Parakeet recognize_batch: waveforms shape {:?}, len {:?}",
+            waveforms.shape(),
+            waveforms_len
+        );
 
         // Preprocess and encode
         let (features, features_lens) = self.preprocess(waveforms, waveforms_len)?;
-        log::info!("Parakeet preprocessor output: features shape {:?}, lens shape {:?}",
-                   features.shape(), features_lens.shape());
+        log::info!(
+            "Parakeet preprocessor output: features shape {:?}, lens shape {:?}",
+            features.shape(),
+            features_lens.shape()
+        );
 
         let (encoder_out, encoder_out_lens) =
             self.encode(&features.view(), &features_lens.view())?;
-        log::info!("Parakeet encoder output: shape {:?}, lens shape {:?}",
-                   encoder_out.shape(), encoder_out_lens.shape());
+        log::info!(
+            "Parakeet encoder output: shape {:?}, lens shape {:?}",
+            encoder_out.shape(),
+            encoder_out_lens.shape()
+        );
 
         // Decode for each batch item
         let mut results = Vec::new();
-        for (i, (encodings, &encodings_len)) in encoder_out.outer_iter().zip(encoder_out_lens.iter()).enumerate() {
-            log::info!("Parakeet decoding batch item {}: encoding shape {:?}, len={}", i, encodings.shape(), encodings_len);
+        for (i, (encodings, &encodings_len)) in encoder_out
+            .outer_iter()
+            .zip(encoder_out_lens.iter())
+            .enumerate()
+        {
+            log::info!(
+                "Parakeet decoding batch item {}: encoding shape {:?}, len={}",
+                i,
+                encodings.shape(),
+                encodings_len
+            );
             let (tokens, timestamps) =
                 self.decode_sequence(&encodings.view(), encodings_len as usize)?;
             let result = self.decode_tokens(tokens, timestamps);
@@ -371,7 +396,8 @@ impl ParakeetModel {
 
         log::info!(
             "Parakeet decode_sequence: {} frames, vocab_size={}",
-            encodings_len, self.vocab_size
+            encodings_len,
+            self.vocab_size
         );
 
         while t < encodings_len {
@@ -394,7 +420,11 @@ impl ParakeetModel {
 
             // Log tensor shapes on first frame for debugging
             if t == 0 {
-                log::info!("Parakeet decoder output shape: {:?}, len={}", probs.shape(), probs.len());
+                log::info!(
+                    "Parakeet decoder output shape: {:?}, len={}",
+                    probs.shape(),
+                    probs.len()
+                );
             }
 
             // For TDT models, split output into vocab logits and duration logits.
@@ -416,29 +446,39 @@ impl ParakeetModel {
             let token = if is_tdt {
                 if let Some(slice) = probs.as_slice() {
                     let (vocab, _) = slice.split_at(self.vocab_size);
-                    vocab.iter()
+                    vocab
+                        .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx as i32)
                         .unwrap_or(self.blank_idx)
                 } else {
                     (0..self.vocab_size)
                         .map(|i| (i, probs[i]))
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx as i32)
                         .unwrap_or(self.blank_idx)
                 }
             } else {
                 if let Some(slice) = probs.as_slice() {
-                    slice.iter()
+                    slice
+                        .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx as i32)
                         .unwrap_or(self.blank_idx)
                 } else {
                     (0..total_logits)
                         .map(|i| (i, probs[i]))
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx as i32)
                         .unwrap_or(self.blank_idx)
                 }
@@ -455,9 +495,12 @@ impl ParakeetModel {
                 // TDT: advance by the model's predicted duration (frames to skip).
                 let dur_idx = if let Some(slice) = probs.as_slice() {
                     let (_, duration) = slice.split_at(self.vocab_size);
-                    duration.iter()
+                    duration
+                        .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx)
                         .unwrap_or(0)
                 } else {
@@ -467,7 +510,9 @@ impl ParakeetModel {
                     let actual_bins = max_dur_bins.min(5);
                     (0..actual_bins)
                         .map(|i| (i, probs[self.vocab_size + i]))
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx)
                         .unwrap_or(0)
                 };
@@ -574,7 +619,8 @@ impl ParakeetModel {
 
         // Create waveforms array [batch_size, samples_len]
         let waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)
-            .map_err(|e| ParakeetError::Shape(e))?.into_dyn();
+            .map_err(|e| ParakeetError::Shape(e))?
+            .into_dyn();
 
         // Create waveforms_lens array [batch_size] with the actual length
         let waveforms_lens = Array1::from_vec(vec![samples_len as i64]).into_dyn();

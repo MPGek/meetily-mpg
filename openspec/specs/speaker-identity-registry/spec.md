@@ -15,15 +15,15 @@ The system SHALL maintain a global registry of known speakers (`speakers` table:
 - **THEN** the new name SHALL be displayed for that speaker in every meeting where they are linked, without per-meeting edits
 
 ### Requirement: Voiceprint storage
-The system SHALL store speaker voiceprints in a `speaker_embeddings` table where each row holds a 256-dimensional f32 embedding blob, a `model` tag identifying the extractor model, the capture `channel` ('mic' or 'system'), and the source segment duration. Each row SHALL be owned either by a registry speaker (`speaker_id`, enrolled prototype) or by a meeting cluster (`meeting_id` + `cluster_label`, unassigned cache), enforced by a CHECK constraint. Voiceprint rows SHALL be retained indefinitely.
+The system SHALL store speaker voiceprints in a `speaker_embeddings` table where each row holds a 192-dimensional f32 embedding blob from the enhanced TitaNet-Large extractor, a `model` tag identifying the extractor model (always `titanet_large` for new rows), the capture `channel` ('mic' or 'system'), and the source segment duration. Each row SHALL be owned either by a registry speaker (`speaker_id`, enrolled prototype) or by a meeting cluster (`meeting_id` + `cluster_label`, unassigned cache), enforced by a CHECK constraint. Voiceprint rows SHALL be retained indefinitely. Standard-model rows (`resnet34_int8`, 256-d) SHALL remain stored but SHALL NOT participate in recognition, enrollment seeding, or any matching operation.
 
 #### Scenario: Cache written at diarization time
-- **WHEN** any diarization path (offline or online) completes clustering for a meeting
+- **WHEN** any diarization path (offline or online) completes clustering for a meeting using the enhanced model set
 - **THEN** the system SHALL persist per-cluster exemplar embeddings as unassigned cache rows and the cluster centroid, so enrollment later requires no audio re-processing
 
 #### Scenario: Model guard
 - **WHEN** the system matches voiceprints for recognition
-- **THEN** it SHALL only compare embeddings whose `model` tag equals the currently configured extractor model
+- **THEN** it SHALL compare only embeddings whose `model` tag equals `titanet_large`, the current extractor model; `resnet34_int8` standard-model rows SHALL be ignored entirely
 
 ### Requirement: Per-meeting cluster-to-person mapping
 The system SHALL record the link between a meeting's speaker cluster label and a registry speaker in a `meeting_speakers` table (meeting_id, cluster_label, speaker_id, centroid, `matched_by` ('auto' or 'user'), match score). This table SHALL be the source of truth for speaker identity within a meeting; legacy `speaker_names` JSON and `transcripts.speaker_label` SHALL be retained only as display fallback and SHALL NOT be written by new flows.
@@ -33,7 +33,7 @@ The system SHALL record the link between a meeting's speaker cluster label and a
 - **THEN** the system SHALL NOT overwrite the user's binding
 
 ### Requirement: Speaker enrollment on assignment
-When a user links a meeting cluster to a registry speaker (existing or newly created), the system SHALL enroll that cluster's cached exemplar embeddings as prototypes of the speaker by reparenting the best rows (longest duration first, capped at K=8 per enrollment). When a user assigns a speaker to a transcript block (live or offline, single-block or cluster-wide), the embeddings whose time windows cover that block SHALL additionally be enrolled into that speaker's global prototype set as ground truth, so the person is recognized across future meetings. Enrollment seeding SHALL be keyed by the underlying pipeline speaker identity and capture channel — embeddings from microphone and system channels SHALL never be mixed into the same seed set. Per-person prototype count SHALL be capped (64), pruning lowest-quality rows.
+When a user links a meeting cluster to a registry speaker (existing or newly created), the system SHALL enroll that cluster's cached exemplar embeddings as prototypes of the speaker by reparenting the best rows (longest duration first, capped at K=8 per enrollment). When a user assigns a speaker to a transcript block (live or offline, single-block or cluster-wide), the embeddings whose time windows cover that block SHALL additionally be enrolled into that speaker's global prototype set as ground truth, so the person is recognized across future meetings. Every enrolled prototype row SHALL carry full provenance: `meeting_id`, `cluster_label`, `audio_start_time`, and `audio_end_time` of the source audio, so the prototype is playable and navigable in the Voiceprint Browser. Enrollment seeding SHALL be keyed by the underlying pipeline speaker identity and capture channel — embeddings from microphone and system channels SHALL never be mixed into the same seed set. Per-person prototype count SHALL be capped (64), pruning lowest-quality rows.
 
 #### Scenario: Naming enrolls voiceprint
 - **WHEN** user assigns the name "Alice" to cluster `SPEAKER_00` of a diarized meeting
@@ -46,6 +46,10 @@ When a user links a meeting cluster to a registry speaker (existing or newly cre
 #### Scenario: Ground-truth block assignment enrolls its covering embeddings
 - **WHEN** a user assigns "Alice" to a single transcript block whose time window is covered by session embeddings
 - **THEN** the embeddings overlapping that block's time window SHALL be enrolled as prototypes of Alice at the same time as the block's identity is saved
+
+#### Scenario: Ground-truth enrollment preserves provenance
+- **WHEN** a user assigns "Alice" to a single transcript block of meeting M, cluster C
+- **THEN** the enrolled prototype rows SHALL carry `meeting_id` = M, `cluster_label` = C, and the audio timecodes of the source embeddings, so the Voiceprint Browser can display the source meeting and play the audio clip
 
 #### Scenario: Enrollment seeding keeps channels separate
 - **WHEN** a user assigns a microphone-channel block to "Alice" and a system-channel block to "Bob" in the same session
@@ -67,7 +71,7 @@ The system SHALL allow users to select, per meeting, a set of expected speakers 
 - **THEN** the user SHALL still be able to assign Carol (or a new name) to her cluster via the speaker editor
 
 ### Requirement: Automatic speaker recognition
-After clustering completes on any diarization path, the system SHALL match each cluster against candidate prototypes (expected speakers, or all if no allowlist) using cosine similarity over embeddings of the current model tag: score = maximum similarity over the candidate's prototypes; the best-scoring candidate with score above threshold τ=0.7 SHALL be auto-assigned with `matched_by='auto'` and the score recorded. When both channels' prototypes exist, same-channel prototypes SHALL be preferred.
+After clustering completes on any diarization path, the system SHALL match each cluster against candidate prototypes (expected speakers, or all if no allowlist) using cosine similarity over 192-d embeddings tagged `titanet_large`: score = maximum similarity over the candidate's prototypes; the best-scoring candidate with score above threshold τ=0.7 SHALL be auto-assigned with `matched_by='auto'` and the score recorded. When both channels' prototypes exist, same-channel prototypes SHALL be preferred. Legacy `resnet34_int8` (256-d) voiceprints and centroids SHALL NOT be loaded as match candidates.
 
 #### Scenario: Known voice auto-labeled
 - **WHEN** offline diarization completes on a meeting whose expected speakers include Alice, and a cluster centroid matches an Alice prototype with score 0.78
@@ -76,6 +80,10 @@ After clustering completes on any diarization path, the system SHALL match each 
 #### Scenario: Unknown voice stays anonymous
 - **WHEN** no candidate scores above threshold for a cluster
 - **THEN** the cluster SHALL remain unidentified and display its formatted cluster label
+
+#### Scenario: Standard-model voiceprints ignored
+- **WHEN** recognition runs and a registry speaker's only enrolled prototypes are tagged `resnet34_int8` (256-d)
+- **THEN** those prototypes SHALL be treated as absent, and the speaker SHALL NOT be auto-matched until re-enrolled with enhanced embeddings
 
 ### Requirement: Instant re-match on allowlist change
 Because cluster centroids are cached in `meeting_speakers`, the system SHALL provide a re-match operation that re-runs recognition for a meeting from cached centroids only, without reading or processing audio. User bindings (`matched_by='user'`) SHALL be preserved.

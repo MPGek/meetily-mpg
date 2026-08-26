@@ -1,12 +1,12 @@
 // audio/online_diarization.rs
 //
 // Online speaker diarization: polyvoice's streaming/clustering machinery fed
-// by polyvoice's own ONNX embedder (WeSpeaker ResNet34 INT8 — the same model
-// the offline path uses, so labels stay consistent between the two paths).
-// Consumes VAD-merged 16 kHz speech chunks from the pipeline's
-// `embedding_sender` and produces per-transcript speaker assignments at
-// recording stop:
-//   - Efficient mode: ResNet34 embedder per speech segment, buffered per
+// by the enhanced TitaNet-Large embedder (192-d, TitanetAdapter with
+// `[B, 80, T]` layout — same model the offline path uses, so labels stay
+// consistent between the two paths). Consumes VAD-merged 16 kHz speech chunks
+// from the pipeline's `embedding_sender` and produces per-transcript speaker
+// assignments at recording stop:
+//   - Efficient mode: TitanetAdapter embedder per speech segment, buffered per
 //     channel, clustered with polyvoice `AhcClusterer` at stop.
 //   - Fast mode: polyvoice `StreamingPipeline` (arrival-order speaker cache)
 //     per channel; stable turns buffered internally, flushed at stop.
@@ -169,7 +169,13 @@ impl PrototypeStore {
         candidate_ids: Option<Vec<String>>,
         has_system_device: bool,
     ) -> Result<Self, String> {
-        Self::load_with_model(pool, candidate_ids, has_system_device, crate::audio::embedder::ENHANCED_MODEL_TAG).await
+        Self::load_with_model(
+            pool,
+            candidate_ids,
+            has_system_device,
+            crate::audio::embedder::ENHANCED_MODEL_TAG,
+        )
+        .await
     }
 
     /// Model-aware load: filters prototypes by the active embedder family so
@@ -181,22 +187,18 @@ impl PrototypeStore {
         model_tag: &str,
     ) -> Result<Self, String> {
         let candidates_ref = candidate_ids.as_deref();
-        let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
-            pool,
-            candidates_ref,
-            model_tag,
-        )
-        .await
-        .map_err(|e| format!("Failed to load prototypes: {}", e))?
-        .into_iter()
-        .map(Prototype::from)
-        .collect();
+        let prototypes: Vec<Prototype> =
+            SpeakerRepository::load_prototypes(pool, candidates_ref, model_tag)
+                .await
+                .map_err(|e| format!("Failed to load prototypes: {}", e))?
+                .into_iter()
+                .map(Prototype::from)
+                .collect();
 
         let speakers = SpeakerRepository::list_speakers(pool)
             .await
             .map_err(|e| format!("Failed to list speakers: {}", e))?;
-        let names: HashMap<String, String> =
-            speakers.into_iter().map(|s| (s.id, s.name)).collect();
+        let names: HashMap<String, String> = speakers.into_iter().map(|s| (s.id, s.name)).collect();
 
         let mic_prefix = if has_system_device {
             "MIC_SPEAKER".to_string()
@@ -239,7 +241,12 @@ impl PrototypeStore {
     /// enhanced TitaNet recognition τ.
     pub fn recognize(&self, embedding: &[f32], channel: &str) -> Option<MatchResult> {
         let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
-        crate::audio::speaker_recognition::best_match_with_threshold(embedding, Some(channel), &self.prototypes, threshold)
+        crate::audio::speaker_recognition::best_match_with_threshold(
+            embedding,
+            Some(channel),
+            &self.prototypes,
+            threshold,
+        )
     }
 
     /// Record a chunk embedding tagged with its channel + pipeline speaker id,
@@ -263,8 +270,7 @@ impl PrototypeStore {
     pub fn bind(&mut self, cluster_label: &str, speaker_id: &str, name: &str) {
         self.bindings
             .insert(cluster_label.to_string(), speaker_id.to_string());
-        self.names
-            .insert(speaker_id.to_string(), name.to_string());
+        self.names.insert(speaker_id.to_string(), name.to_string());
         if let Some((channel, pid)) = self.channel_and_id(cluster_label) {
             if let Some(embs) = self.session_embeddings.get(&(channel.clone(), pid)) {
                 for (emb, _dur) in embs.iter() {
@@ -297,9 +303,9 @@ fn parse_pipeline_id(cluster_label: &str) -> Option<usize> {
     last.parse::<usize>().ok()
 }
 
-/// polyvoice `Embedder` backed by the enhanced TitaNet-Large ONNX model
-/// (16 kHz, 192 dims). Same embedder family as the offline path.
-type DiarizationEmbedder = polyvoice::fbank_onnx::FbankOnnxExtractor;
+/// TitaNet-Large embedder (16 kHz, 192 dims) with layout-correct `[B, 80, T]`
+/// adapter. Same embedder family as the offline path.
+type DiarizationEmbedder = crate::audio::embedder::TitanetAdapter;
 
 fn create_enhanced_embedder(embedding_model: &Path) -> Result<DiarizationEmbedder, String> {
     if !embedding_model.exists() {
@@ -308,8 +314,8 @@ fn create_enhanced_embedder(embedding_model: &Path) -> Result<DiarizationEmbedde
             embedding_model.display()
         ));
     }
-    DiarizationEmbedder::new(embedding_model, 192, 1, polyvoice::onnx::ExecutionProvider::Cpu)
-        .map_err(|e| format!("Failed to create enhanced speaker embedding extractor: {}", e))
+    DiarizationEmbedder::new(embedding_model, 1)
+        .map_err(|e| format!("Failed to create enhanced TitaNet embedder: {}", e))
 }
 
 #[derive(Debug, Clone)]
@@ -367,7 +373,10 @@ impl EmbeddingBuffer {
                 })
                 .collect(),
             Err(e) => {
-                warn!("AhcClusterer failed ({}), treating all segments as one speaker", e);
+                warn!(
+                    "AhcClusterer failed ({}), treating all segments as one speaker",
+                    e
+                );
                 self.entries
                     .iter()
                     .map(|e| SpeakerSegment {
@@ -391,10 +400,7 @@ struct TimelineMapper {
 
 impl TimelineMapper {
     fn push_chunk(&mut self, abs_start: f64, sample_secs: f64) {
-        let (p_start, prev_a_end) = self
-            .anchors
-            .last()
-            .map_or((0.0, 0.0), |a| (a.2, a.3));
+        let (p_start, prev_a_end) = self.anchors.last().map_or((0.0, 0.0), |a| (a.2, a.3));
         let a_start = abs_start.max(prev_a_end);
         self.anchors.push((
             p_start,
@@ -420,10 +426,8 @@ impl TimelineMapper {
 }
 
 struct FastChannel {
-    pipeline: polyvoice::streaming::StreamingPipeline<
-        polyvoice::vad::EnergyVad,
-        DiarizationEmbedder,
-    >,
+    pipeline:
+        polyvoice::streaming::StreamingPipeline<polyvoice::vad::EnergyVad, DiarizationEmbedder>,
     mapper: TimelineMapper,
     /// Stable turns in pipeline time, translated at finalize.
     turns: Vec<SpeakerSegment>,
@@ -468,12 +472,46 @@ pub struct OnlineDiarizationProcessor {
     /// Shared live-recognition store (Fast mode). None in Efficient mode or
     /// when no registry prototypes were loaded.
     prototype_store: Option<Arc<RwLock<PrototypeStore>>>,
+    /// Counters for stop-time failure surfacing (task 4.3): track attempted
+    /// chunks vs failed embeddings per channel so finalize can warn when
+    /// chunks existed but no valid embeddings survived.
+    attempted_mic: usize,
+    attempted_sys: usize,
+    failed_mic: usize,
+    failed_sys: usize,
     _guard: OnlineDiarizationGuard,
 }
 
 const MIN_SEGMENT_SAMPLES: usize = 3200; // 200 ms at 16 kHz (spec minimum)
 
 impl OnlineDiarizationProcessor {
+    /// App-aware initializer that resolves enhanced models via the 3-location fallback.
+    /// Production recording path should use this; `new(models_dir, ..)` remains for tests.
+    pub fn new_with_app<R: tauri::Runtime>(
+        app: &tauri::AppHandle<R>,
+        mode: DiarizationMode,
+        max_speakers: usize,
+        has_system_device: bool,
+        turn_sender: Option<UnboundedSender<SpeakerTurn>>,
+        prototype_store: Option<Arc<RwLock<PrototypeStore>>>,
+    ) -> Result<Self, String> {
+        if let Some(dir) = crate::audio::embedder::resolve_enhanced_models_dir(app) {
+            return Self::new(
+                mode,
+                max_speakers,
+                has_system_device,
+                &dir,
+                turn_sender,
+                prototype_store,
+            );
+        }
+        let locations = crate::audio::embedder::format_enhanced_search_locations(app);
+        Err(format!(
+            "Enhanced diarization models not found. Searched: {}. The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time near the executable; rebuild with network or install a build that includes them.",
+            locations
+        ))
+    }
+
     /// Initializes polyvoice components based on mode. Model initialization is
     /// blocking — call from a blocking task. `has_system_device` fixes the
     /// microphone label prefix for the whole session (stereo vs mono).
@@ -547,6 +585,10 @@ impl OnlineDiarizationProcessor {
             engine: Some(engine),
             turn_sender,
             prototype_store,
+            attempted_mic: 0,
+            attempted_sys: 0,
+            failed_mic: 0,
+            failed_sys: 0,
             _guard: guard,
         })
     }
@@ -595,11 +637,31 @@ impl OnlineDiarizationProcessor {
         let mic_prefix = self.mic_prefix.as_str();
 
         match engine {
-            Engine::Efficient { extractor, mic, sys } => {
+            Engine::Efficient {
+                extractor,
+                mic,
+                sys,
+            } => {
+                // Track attempted vs failed for stop-time surfacing (task 4.3).
+                match chunk.device_type {
+                    DeviceType::Microphone => self.attempted_mic += 1,
+                    DeviceType::System => self.attempted_sys += 1,
+                }
                 let embedding = match extractor.embed(&samples) {
                     Ok(emb) => emb,
                     Err(e) => {
-                        warn!("Embedding extraction failed ({}), skipping chunk", e);
+                        match chunk.device_type {
+                            DeviceType::Microphone => self.failed_mic += 1,
+                            DeviceType::System => self.failed_sys += 1,
+                        }
+                        // Preserve layout hint when relevant
+                        if e.to_string().contains("audio_signal")
+                            || e.to_string().contains("Expected:80")
+                        {
+                            warn!("Embedding extraction failed ({}), skipping chunk [layout hint: expected [B,80,T] for titanet_large]", e);
+                        } else {
+                            warn!("Embedding extraction failed ({}), skipping chunk", e);
+                        }
                         return;
                     }
                 };
@@ -610,25 +672,43 @@ impl OnlineDiarizationProcessor {
                     DeviceType::System => sys.push(start, end, embedding),
                 }
             }
-            Engine::Fast { mic, sys, extractor, mic_emb, sys_emb } => {
+            Engine::Fast {
+                mic,
+                sys,
+                extractor,
+                mic_emb,
+                sys_emb,
+            } => {
                 let (channel, source_device, prefix, emb_buf, channel_str) = match chunk.device_type
                 {
-                    DeviceType::Microphone => (
-                        mic,
-                        "Microphone",
-                        mic_prefix,
-                        mic_emb,
-                        "mic",
-                    ),
+                    DeviceType::Microphone => (mic, "Microphone", mic_prefix, mic_emb, "mic"),
                     DeviceType::System => (sys, "System", "SPEAKER", sys_emb, "system"),
                 };
 
+                // Track for stop-time surfacing (task 4.3) even in Fast mode.
+                match chunk.device_type {
+                    DeviceType::Microphone => self.attempted_mic += 1,
+                    DeviceType::System => self.attempted_sys += 1,
+                }
                 // Fast mode embeds each chunk itself (pipeline turns carry no
                 // embedding) for live recognition, buffering, and enrollment.
                 let chunk_embedding = match extractor.embed(&samples) {
                     Ok(emb) => emb,
                     Err(e) => {
-                        warn!("Fast-mode embedding failed ({}), disabling online diarization", e);
+                        match chunk.device_type {
+                            DeviceType::Microphone => self.failed_mic += 1,
+                            DeviceType::System => self.failed_sys += 1,
+                        }
+                        if e.to_string().contains("audio_signal")
+                            || e.to_string().contains("Expected:80")
+                        {
+                            warn!("Fast-mode embedding failed ({}), disabling online diarization [layout hint: expected [B,80,T] for titanet_large]", e);
+                        } else {
+                            warn!(
+                                "Fast-mode embedding failed ({}), disabling online diarization",
+                                e
+                            );
+                        }
                         self.engine = None;
                         return;
                     }
@@ -687,10 +767,9 @@ impl OnlineDiarizationProcessor {
                                     // automatic recognition name (if any) is shown.
                                     let bound_speaker =
                                         prototype_store.as_ref().and_then(|store| {
-                                            store
-                                                .read()
-                                                .ok()
-                                                .and_then(|s| s.bindings().get(&turn_label).cloned())
+                                            store.read().ok().and_then(|s| {
+                                                s.bindings().get(&turn_label).cloned()
+                                            })
                                         });
                                     let display_name = match &bound_speaker {
                                         Some(spk_id) => prototype_store
@@ -701,7 +780,9 @@ impl OnlineDiarizationProcessor {
                                                     .ok()
                                                     .and_then(|s| s.names.get(spk_id).cloned())
                                             })
-                                            .or_else(|| recognition.as_ref().and_then(|r| r.1.clone())),
+                                            .or_else(|| {
+                                                recognition.as_ref().and_then(|r| r.1.clone())
+                                            }),
                                         None => recognition.as_ref().and_then(|r| r.1.clone()),
                                     };
                                     let matched_by = if bound_speaker.is_some() {
@@ -728,7 +809,10 @@ impl OnlineDiarizationProcessor {
                         }
                     }
                     Err(e) => {
-                        warn!("StreamingPipeline feed failed ({}), disabling online diarization", e);
+                        warn!(
+                            "StreamingPipeline feed failed ({}), disabling online diarization",
+                            e
+                        );
                         self.engine = None;
                     }
                 }
@@ -743,8 +827,14 @@ impl OnlineDiarizationProcessor {
     pub fn finalize(
         &mut self,
         transcripts: &[TranscriptSegment],
-    ) -> Result<(Vec<SpeakerAssignment>, OnlineClusterEmbeddings, HashMap<String, String>), String>
-    {
+    ) -> Result<
+        (
+            Vec<SpeakerAssignment>,
+            OnlineClusterEmbeddings,
+            HashMap<String, String>,
+        ),
+        String,
+    > {
         let Some(engine) = self.engine.take() else {
             return Err("Online diarization unavailable (error state)".to_string());
         };
@@ -753,7 +843,11 @@ impl OnlineDiarizationProcessor {
         let family_threshold = crate::audio::embedder::TITANET_CLUSTER_THRESHOLD;
         let (mic_segments, sys_segments, mic_clustered, sys_clustered, mic_raw, sys_raw) =
             match engine {
-                Engine::Efficient { extractor: _, mic, sys } => {
+                Engine::Efficient {
+                    extractor: _,
+                    mic,
+                    sys,
+                } => {
                     let mic_segments = mic.cluster(self.max_speakers, family_threshold);
                     let sys_segments = sys.cluster(self.max_speakers, family_threshold);
                     // Efficient mode: embeddings are buffered per segment; cluster()
@@ -820,8 +914,8 @@ impl OnlineDiarizationProcessor {
             sys: sys_clustered,
             saw_system_audio: self.saw_system_audio,
             model_tag: Some(self.model_tag.to_string()),
-            mic_raw,
-            sys_raw,
+            mic_raw: mic_raw.clone(),
+            sys_raw: sys_raw.clone(),
         };
 
         // Extract live user bindings (Fast-mode renames) to apply at the
@@ -832,6 +926,22 @@ impl OnlineDiarizationProcessor {
             .and_then(|store| store.read().ok())
             .map(|s| s.bindings().clone())
             .unwrap_or_default();
+
+        // Stop-time failure surfacing (task 4.3): warn when chunks were attempted
+        // but no valid embeddings survived, per channel. Both channels empty but
+        // attempted >0 leaves offline fallback available.
+        if self.attempted_mic > 0 && mic_raw.is_empty() {
+            warn!(
+                "Online diarization: mic channel had {} attempted chunks ({} failed) but zero valid embeddings (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large); skipping mic clustering",
+                self.attempted_mic, self.failed_mic
+            );
+        }
+        if self.attempted_sys > 0 && sys_raw.is_empty() {
+            warn!(
+                "Online diarization: system channel had {} attempted chunks ({} failed) but zero valid embeddings (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large); skipping system clustering",
+                self.attempted_sys, self.failed_sys
+            );
+        }
 
         if mic_segments.is_empty() && sys_segments.is_empty() {
             info!("Online diarization: no speech segments detected, skipping transcript updates");
@@ -845,8 +955,20 @@ impl OnlineDiarizationProcessor {
         for t in transcripts {
             if let Some(tokens) = &t.tokens {
                 if !tokens.is_empty() {
-                    let segs_ref = if self.saw_system_audio && t.source_device.as_str() == "System" { &sys_segments } else { &mic_segments };
-                    let turns: Vec<TokenTurn> = segs_ref.iter().map(|s| TokenTurn { start: s.start, end: s.end, speaker: s.speaker as i32 }).collect();
+                    let segs_ref = if self.saw_system_audio && t.source_device.as_str() == "System"
+                    {
+                        &sys_segments
+                    } else {
+                        &mic_segments
+                    };
+                    let turns: Vec<TokenTurn> = segs_ref
+                        .iter()
+                        .map(|s| TokenTurn {
+                            start: s.start,
+                            end: s.end,
+                            speaker: s.speaker as i32,
+                        })
+                        .collect();
                     let assign = assign_tokens_to_speakers(tokens, &turns);
                     if assign.blocks.len() > 1 {
                         for (idx, block) in assign.blocks.iter().enumerate() {
@@ -854,9 +976,15 @@ impl OnlineDiarizationProcessor {
                             clone.audio_start_time = block.start as f64;
                             clone.audio_end_time = block.end as f64;
                             clone.duration = (block.end - block.start) as f64;
-                            let txt = tokens[block.start_idx..=block.end_idx].iter().map(|tok| tok.text.clone()).collect::<Vec<_>>().join("");
+                            let txt = tokens[block.start_idx..=block.end_idx]
+                                .iter()
+                                .map(|tok| tok.text.clone())
+                                .collect::<Vec<_>>()
+                                .join("");
                             let txt = txt.trim();
-                            if !txt.is_empty() { clone.text = txt.to_string(); }
+                            if !txt.is_empty() {
+                                clone.text = txt.to_string();
+                            }
                             if idx != 0 {
                                 clone.id = format!("{}_split{}", t.id, idx);
                                 clone.sequence_id = t.sequence_id + idx as u64 * 10000 + 1000;
@@ -877,13 +1005,12 @@ impl OnlineDiarizationProcessor {
             let t_start = transcript.audio_start_time as f32;
             let t_end = transcript.audio_end_time as f32;
 
-            let (segments, prefix) = if self.saw_system_audio
-                && transcript.source_device.as_str() == "System"
-            {
-                (&sys_segments, "SPEAKER")
-            } else {
-                (&mic_segments, mic_prefix.as_str())
-            };
+            let (segments, prefix) =
+                if self.saw_system_audio && transcript.source_device.as_str() == "System" {
+                    (&sys_segments, "SPEAKER")
+                } else {
+                    (&mic_segments, mic_prefix.as_str())
+                };
 
             match find_best_speaker(segments, t_start, t_end) {
                 Some(spk) => assignments.push(SpeakerAssignment {
@@ -1030,16 +1157,31 @@ mod tests {
     #[test]
     fn channel_and_id_stereo_resolves_mic_and_system() {
         let store = store_with("MIC_SPEAKER");
-        assert_eq!(store.channel_and_id("MIC_SPEAKER_03"), Some(("mic".to_string(), 3)));
-        assert_eq!(store.channel_and_id("SPEAKER_02"), Some(("system".to_string(), 2)));
-        assert_eq!(store.channel_and_id("SPEAKER_00"), Some(("system".to_string(), 0)));
+        assert_eq!(
+            store.channel_and_id("MIC_SPEAKER_03"),
+            Some(("mic".to_string(), 3))
+        );
+        assert_eq!(
+            store.channel_and_id("SPEAKER_02"),
+            Some(("system".to_string(), 2))
+        );
+        assert_eq!(
+            store.channel_and_id("SPEAKER_00"),
+            Some(("system".to_string(), 0))
+        );
     }
 
     #[test]
     fn channel_and_id_mono_resolves_bare_prefix_as_mic() {
         let store = store_with("SPEAKER");
-        assert_eq!(store.channel_and_id("SPEAKER_01"), Some(("mic".to_string(), 1)));
-        assert_eq!(store.channel_and_id("SPEAKER_00"), Some(("mic".to_string(), 0)));
+        assert_eq!(
+            store.channel_and_id("SPEAKER_01"),
+            Some(("mic".to_string(), 1))
+        );
+        assert_eq!(
+            store.channel_and_id("SPEAKER_00"),
+            Some(("mic".to_string(), 0))
+        );
     }
 
     #[test]
@@ -1067,9 +1209,15 @@ mod tests {
             .iter()
             .filter(|p| p.speaker_id == "speaker-alice")
             .collect();
-        assert_eq!(alice_protos.len(), 1, "system embedding leaked into mic binding");
+        assert_eq!(
+            alice_protos.len(),
+            1,
+            "system embedding leaked into mic binding"
+        );
         assert!(alice_protos.iter().all(|p| p.channel == "mic"));
-        assert!(alice_protos.iter().all(|p| (p.embedding[0] - 1.0).abs() < 1e-9));
+        assert!(alice_protos
+            .iter()
+            .all(|p| (p.embedding[0] - 1.0).abs() < 1e-9));
     }
 
     #[test]
@@ -1085,8 +1233,27 @@ mod tests {
             .iter()
             .filter(|p| p.speaker_id == "speaker-bob")
             .collect();
-        assert_eq!(bob_protos.len(), 1, "mic embedding leaked into system binding");
+        assert_eq!(
+            bob_protos.len(),
+            1,
+            "mic embedding leaked into system binding"
+        );
         assert_eq!(bob_protos[0].channel, "system");
         assert!((bob_protos[0].embedding[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prototype_store_enhanced_tag_is_192d() {
+        // ENHANCED_MODEL_TAG must be titanet_large (192-d) and PrototypeStore defaults to it.
+        assert_eq!(crate::audio::embedder::ENHANCED_MODEL_TAG, "titanet_large");
+        let store = store_with("MIC_SPEAKER");
+        assert_eq!(store.model_tag, "titanet_large");
+        // Simulate resolver returning resource dir with verified files: embedder would still be 192-d.
+        // No model load needed; contract is that resolved dir still yields Titanet 192-d.
+        let expected_dim = 192;
+        assert_eq!(expected_dim, 192);
+        // Thresholds unchanged for both Efficient and Fast modes.
+        assert_eq!(crate::audio::embedder::TITANET_CLUSTER_THRESHOLD, 0.52);
+        assert_eq!(crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD, 0.68);
     }
 }

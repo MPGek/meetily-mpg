@@ -3,12 +3,69 @@
 ## Purpose
 Speaker identification ("who spoke when") using ONNX-based diarization models running locally as a post-processing step on recorded meetings.
 ## Requirements
+### Requirement: Diarization requires the enhanced model set
+The system SHALL run speaker diarization exclusively on the enhanced model set (pyannote `segmentation-3.0` segmentation + NVIDIA TitaNet-Large embedding, bundled at build time). When either enhanced file is missing or corrupt, diarization SHALL fail with a clear, actionable error rather than falling back to any other model set.
+
+#### Scenario: Enhanced models missing fails offline diarization
+- **WHEN** offline diarization is triggered but the bundled enhanced model files are absent or corrupt
+- **THEN** the system SHALL return an error explaining that the enhanced diarization models are required (and are bundled at build time), and SHALL NOT attempt segmentation or embedding with any standard/legacy model
+
+#### Scenario: Enhanced models missing disables online diarization
+- **WHEN** online diarization (Fast or Efficient mode) is active for a recording but the bundled enhanced model files are absent or corrupt
+- **THEN** the system SHALL log the error, notify the frontend that the enhanced models are required, and SHALL NOT run diarization with a fallback model set
+
+### Requirement: Diarization model management
+The system SHALL support the enhanced diarization model set (pyannote `segmentation-3.0` + TitaNet-Large) bundled at build time, resolving model files through a 3-location fallback chain — `app_data_dir/models` → `resource_dir/models` → `CARGO_MANIFEST_DIR/models` (dev) — and verified by file existence and size (>1 KB; SHA-256 when published). There SHALL be no runtime download or removal capability. The `check_diarization_models` command and the diarization engine SHALL use the same resolver so their readiness decisions never disagree. The system SHALL remove stale model files from the model directory when model status is checked.
+
+#### Scenario: Download diarization models
+- **WHEN** user opens the diarization settings section
+- **THEN** the UI SHALL show read-only verification status for the bundled enhanced segmentation and embedding files (per-file ✓/○ + ready badge) with no "Download Models", "Re-download Models", or remove controls, and no `download_diarization_models` runtime flow SHALL exist to invoke
+
+#### Scenario: Model download progress reporting
+- **WHEN** the bundled enhanced model files are present in any of the three fallback locations (app_data, bundled resources, or dev manifest)
+- **THEN** the system SHALL report `segmentation_ready=true` and `embedding_ready=true` (and `ready=true` only when both files verify in the same location) via the shared resolver
+
+#### Scenario: Re-download models
+- **WHEN** user inspects diarization settings and the bundled enhanced set is present in `resource_dir/models` but missing in `app_data_dir/models`
+- **THEN** diarization SHALL still succeed by loading from the bundled resource location without requiring a copy or re-download
+
+#### Scenario: Legacy model files cleaned up
+- **WHEN** model checking runs and stale files are present in the app-data model directory (sherpa-era `pyannote`/`3dspeaker` files, or standard polyvoice `powerset_int8.onnx` / `resnet34_int8.onnx`)
+- **THEN** the system SHALL remove the stale files so only the enhanced model files remain
+
+#### Scenario: Missing or corrupt model detected
+- **WHEN** a required enhanced model file is missing or fails verification in all three fallback locations
+- **THEN** the system SHALL report the model as unavailable in the settings panel and diarization SHALL fail with a clear error listing all searched locations and noting that the models are bundled at build time near the executable
+
+### Requirement: Enhanced model resolution across install locations
+The system SHALL resolve the enhanced diarization model directory by searching `app_data_dir/models`, then `resource_dir/models` (Tauri bundled resources next to the executable), then `CARGO_MANIFEST_DIR/models` (dev), in that priority order. The first location where *both* `segmentation-3.0.onnx` and `titanet_large.onnx` pass `verify_enhanced_integrity` (existence + size >1 KB) SHALL be selected as the active models directory. `app_data` takes priority so a user-placed override wins; `resource_dir` is the production bundle location; `manifest` is dev fallback.
+
+#### Scenario: Resolve from bundled resources when AppData empty
+- **WHEN** offline diarization is triggered and `app_data_dir/models` does not contain the enhanced files but `resource_dir/models` does
+- **THEN** the system SHALL load segmentation and embedding directly from `resource_dir/models` and diarization SHALL succeed without copying files
+
+#### Scenario: Resolve from AppData when both locations present
+- **WHEN** both `app_data_dir/models` and `resource_dir/models` contain verified enhanced files
+- **THEN** the system SHALL load from `app_data_dir/models`
+
+#### Scenario: All locations missing lists searched paths
+- **WHEN** offline diarization is triggered and no fallback location contains verified enhanced files
+- **THEN** the error SHALL name all three searched directories and explain that the models are bundled at build time near the executable and that a rebuild with network or an installer that includes them is required
+
+#### Scenario: Settings and engine agree
+- **WHEN** `check_diarization_models` reports `ready=true`
+- **THEN** a subsequent diarization run SHALL succeed (and vice versa: `ready=false` implies diarization will fail), because both use the same resolver and verification logic
+
+#### Scenario: Dev manifest fallback
+- **WHEN** the app runs in development (`cargo tauri dev`) and the enhanced files are present only in `frontend/src-tauri/models/`
+- **THEN** diarization SHALL succeed via the manifest fallback location without requiring files in AppData or resources
+
 ### Requirement: Speaker diarization pipeline
-The system SHALL provide a speaker diarization pipeline using polyvoice ONNX models (powerset segmentation, speaker embedding extraction, and agglomerative clustering) that processes recorded audio and assigns speaker labels to transcript segments. The pipeline SHALL utilize multiple CPU cores during embedding extraction, process stereo channels concurrently, and cap memory growth for long recordings.
+The system SHALL provide a speaker diarization pipeline using the enhanced polyvoice ONNX model set (pyannote `segmentation-3.0` segmentation, TitaNet-Large speaker embedding, and agglomerative clustering) that processes recorded audio and assigns speaker labels to transcript segments. The pipeline SHALL resolve its segmentation and embedding models through the 3-location fallback chain and SHALL utilize multiple CPU cores during embedding extraction, process stereo channels concurrently, and cap memory growth for long recordings.
 
 #### Scenario: Successful diarization of a meeting
-- **WHEN** diarization is triggered for a saved meeting with valid audio
-- **THEN** the system runs segmentation, embedding extraction, and clustering, and assigns `speaker` values ("SPEAKER_00", "SPEAKER_01", etc.) to matching transcript segments
+- **WHEN** diarization is triggered for a saved meeting with valid audio and the enhanced models are present in any fallback location
+- **THEN** the system runs segmentation, embedding extraction, and clustering via the resolved model directory, and assigns `speaker` values ("SPEAKER_00", "SPEAKER_01", etc.) to matching transcript segments
 
 #### Scenario: Diarization handles missing audio file
 - **WHEN** diarization is triggered but the meeting has no audio file
@@ -16,7 +73,7 @@ The system SHALL provide a speaker diarization pipeline using polyvoice ONNX mod
 
 #### Scenario: Online diarization uses the same engine family
 - **WHEN** online diarization runs during recording
-- **THEN** the system SHALL use polyvoice components (streaming pipeline with a polyvoice ONNX embedder and AHC clustering) with no sherpa-onnx code or models in any diarization path
+- **THEN** the system SHALL use the same enhanced model set (segmentation-3.0, TitaNet-Large, AHC clustering) resolved via the shared 3-location fallback with no sherpa-onnx code or models in any diarization path
 
 #### Scenario: Embedding extraction uses multiple cores
 - **WHEN** offline diarization runs on a meeting with more than one detected speech segment
@@ -29,29 +86,6 @@ The system SHALL provide a speaker diarization pipeline using polyvoice ONNX mod
 #### Scenario: Long recordings process without unbounded memory growth
 - **WHEN** offline diarization runs on a recording of any length
 - **THEN** the system SHALL process each channel in overlapping chunks, accumulating only embeddings and segment metadata between chunks, so peak memory does not grow linearly with recording duration
-
-### Requirement: Diarization model management
-The system SHALL support downloading and configuring speaker diarization ONNX models through the settings interface, with model files obtained and verified via the polyvoice ModelRegistry (SHA-256 checksum and minisign signature) in the app's model directory.
-
-#### Scenario: Download diarization models
-- **WHEN** user clicks "Download Models" in the diarization settings section
-- **THEN** the system downloads the powerset segmentation model `powerset_int8` (~1.6MB) and the speaker embedding model `resnet34_int8` (~6.8MB) to the app's model directory via the polyvoice ModelRegistry, verifying checksums and signatures
-
-#### Scenario: Model download progress reporting
-- **WHEN** models are being downloaded
-- **THEN** the system SHALL emit progress events per model with the model name and an overall percentage across the two models
-
-#### Scenario: Re-download models
-- **WHEN** user clicks download and models already exist on disk
-- **THEN** the system SHALL re-download and overwrite existing files, showing a confirmation prompt first
-
-#### Scenario: Legacy model files cleaned up
-- **WHEN** model checking or download runs and stale sherpa-era files (pyannote `model.int8.onnx`, 3D-Speaker `3dspeaker_*.onnx`) are present in the model directory
-- **THEN** the system SHALL remove the stale files so only polyvoice registry models remain
-
-#### Scenario: Missing or corrupt model detected
-- **WHEN** a required model file is missing or fails its checksum/signature verification
-- **THEN** the system SHALL report the model as unavailable in the settings panel and request a re-download before diarization can run
 
 ### Requirement: Diarization trigger modes
 The system SHALL support automatic diarization after recording stops (when enabled) and manual diarization on any past meeting.
@@ -85,12 +119,22 @@ The system SHALL emit progress events during diarization so the frontend can dis
 
 ### Requirement: Speaker label assignment
 
-The system SHALL assign speaker labels to transcript segments by matching diarization time ranges to transcript timestamps, filling short gaps with the nearest speaker.
+The system SHALL assign speaker labels to transcript segments by matching diarization time ranges to transcript timestamps, filling short gaps with the nearest speaker. When the ASR engine provides token-level timestamps for a transcript segment, the system SHALL refine the assignment at token granularity: tokens SHALL be attributed to the speaker whose diarization turn covers each token, and a transcript segment whose tokens span a speaker change SHALL be split into separate transcript rows at the boundary token, each labeled with its own speaker. Segment-level overlap matching SHALL remain the fallback when token timestamps are unavailable.
 
 #### Scenario: Overlap-based speaker matching
 
-- **WHEN** diarization produces speaker turns with start/end times
+- **WHEN** diarization produces speaker turns with start/end times and no token timestamps are available for a segment
 - **THEN** each transcript segment SHALL be assigned the speaker whose time range has the maximum overlap with the segment's `audio_start_time` to `audio_end_time`
+
+#### Scenario: Token-level assignment splits a cross-speaker segment
+
+- **WHEN** a transcript segment has token timestamps and its tokens span `N≥2` distinct speakers (e.g. A→B→A or A→B→C mid-utterance)
+- **THEN** the segment SHALL be split into `N` transcript rows, one per contiguous speaker block (each boundary requires ≥2 contiguous tokens of the new speaker), each row labeled with its block's speaker and `audio_start_time`/`audio_end_time` adjusted to that block's token span; `source_device` and other columns SHALL be preserved per row with contiguous, gap-free ordering
+
+#### Scenario: Token-level assignment within one speaker
+
+- **WHEN** a transcript segment has token timestamps and all its tokens fall within turns of a single speaker (or turns of the same speaker with short gaps)
+- **THEN** the segment SHALL keep a single speaker label from token assignment, matching the speaker of the covering turns
 
 #### Scenario: Unmatched transcript segments
 
@@ -201,7 +245,7 @@ The system SHALL persist diarization configuration in user settings.
 
 ### Requirement: Clustering distinguishes distinct speakers
 
-The system SHALL cluster speaker embeddings with a fixed cosine-similarity threshold calibrated to the Balanced profile (`0.45`), so that distinct speakers in the audio are assigned distinct speaker labels rather than being merged into a single cluster.
+The system SHALL cluster speaker embeddings with a fixed cosine-similarity threshold calibrated to the enhanced TitaNet-Large model family, so that distinct speakers in the audio are assigned distinct speaker labels rather than being merged into a single cluster.
 
 #### Scenario: Multi-speaker meeting produces distinct labels
 
@@ -324,4 +368,61 @@ After clustering and cache persistence, offline diarization SHALL match each clu
 #### Scenario: No candidates leaves clusters anonymous
 - **WHEN** the registry is empty or no candidate exceeds the threshold
 - **THEN** diarization results SHALL be unchanged from current behavior (cluster labels only)
+
+### Requirement: Enhanced diarization models default when installed
+When the enhanced model set is installed, offline diarization SHALL use it by default for new and re-run diarization; the legacy polyvoice set SHALL remain bundled and serve as the automatic fallback. Diarization SHALL never require the user to have the enhanced models installed.
+
+#### Scenario: Enhanced models used once bundled at build
+- **WHEN** diarization runs after the enhanced model set has been bundled at build time
+- **THEN** the pipeline SHALL use the enhanced segmentation and embedding models without further configuration, and the results SHALL be tagged with the enhanced model family so recognition, caching, and enrollment treat their embeddings correctly
+
+#### Scenario: Legacy models until bundled
+- **WHEN** diarization runs when the enhanced model set is not bundled
+- **THEN** the pipeline SHALL use the bundled polyvoice models and SHALL produce the same behavior as before this change
+
+#### Scenario: Re-run after enhanced models not bundled (rebuild without)
+- **WHEN** the enhanced models are not bundled (rebuild without them) and diarization re-runs on a previously enhanced-analyzed meeting
+- **THEN** the pipeline SHALL fall back to the legacy models and overwrite transcript speaker labels with legacy-family results, consistent with current re-analysis behavior
+
+### Requirement: TitaNet embedding input layout correctness
+
+The system's offline diarization pipeline SHALL produce TitaNet-Large (192-d, `titanet_large`) embeddings using the input layout the bundled ONNX graph expects (`audio_signal` dimension 1 is 80 mel bins). The fbank front-end remains 80-bin log-mel at 16 kHz, but the tensor handed to ONNX for TitaNet SHALL present mel as dimension 1 (e.g. `[B, 80, T]` or model-equivalent), not the WeSpeaker `[B, T, 80]` ordering used by the generic `FbankOnnxExtractor`. The requirement applies to both batched and per-segment fallback embedding calls.
+
+#### Scenario: Short and long segments embed without layout error
+
+- **WHEN** offline diarization runs on a meeting whose segmentation produces segments of varied duration (e.g. from <200 ms to >8 s)
+- **THEN** no segment SHALL fail with `Got invalid dimensions for input: audio_signal index:1 Got:<T> Expected:80`, and embeddings SHALL be returned for all segments that are at least one fbank window long
+
+#### Scenario: Batched layout matches per-segment layout
+
+- **WHEN** the pipeline embeds N segments via the batch interface and via sequential single-segment calls on the same audio
+- **THEN** both paths SHALL produce N embeddings (order-preserving) and SHALL use the same Mel-as-dim-1 layout, so batch and fallback do not diverge
+
+#### Scenario: WeSpeaker contract unchanged for non-TitaNet paths
+
+- **WHEN** a non-TitaNet ONNX model is used with the same fbank (if ever re-enabled for testing)
+- **THEN** that model SHALL continue to receive `[B, T, 80]` as documented by `polyvoice::fbank_onnx`, and the TitaNet transpose SHALL NOT apply to it
+
+### Requirement: Diarization surfaces embedding failure instead of silent empty success
+
+When embedding extraction produces zero valid embeddings (all batch and per-segment attempts fail), offline diarization SHALL NOT report `segments_labeled=0, speakers=0, status=complete`. It SHALL treat the run as a failure: set `diarization_status=failed` on the meeting, emit a `diarization-progress` event with `status=failed`, and return an error that preserves the underlying ONNX/layout detail.
+
+#### Scenario: All-embeddings-failed is a failure
+
+- **WHEN** segmentation finds speech segments but every embedding attempt errors
+- **THEN** the run SHALL end with `status=failed`, SHALL NOT write empty cluster caches, and SHALL surface a message containing `audio_signal` / layout context rather than "Labeled 0 segments from 0 speakers"
+
+#### Scenario: Partial failure still clusters the valid subset
+
+- **WHEN** some segments fail embedding but at least one valid embedding remains
+- **THEN** the run SHALL cluster only the valid subset, SHALL persist only those embeddings' caches, and SHALL still report success with the count of labeled segments
+
+### Requirement: Offline TitaNet recognition stays model-tagged
+
+Offline diarization's post-clustering recognition and cache persistence SHALL remain tagged `titanet_large` (192-d) and thresholds `0.52` (clustering) / `0.68` (recognition) as already specified for the enhanced-only family. This delta does not change thresholds, only enforces that embeddings reaching clustering were produced with the correct layout.
+
+#### Scenario: Centroids are 192-d TitaNet vectors
+
+- **WHEN** offline diarization completes successfully after this fix
+- **THEN** each persisted centroid in `meeting_speakers` SHALL be 192-dimensional, `model='titanet_large'`, and cosine-similarity against enrolled TitaNet prototypes SHALL be meaningful (not a layout-corrupted vector)
 

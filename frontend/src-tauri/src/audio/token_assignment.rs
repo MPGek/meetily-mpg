@@ -75,10 +75,17 @@ pub fn assign_tokens_to_speakers(tokens: &[Token], turns: &[SpeakerTurn]) -> Tok
         };
     }
 
-    let per_token: Vec<Option<i32>> = tokens.iter().map(|tok| best_speaker_for_token(tok, turns)).collect();
+    let per_token: Vec<Option<i32>> = tokens
+        .iter()
+        .map(|tok| best_speaker_for_token(tok, turns))
+        .collect();
     let blocks = group_into_blocks(&per_token, tokens);
     let should_split = blocks.len() > 1;
-    let split_token_idx = if should_split { Some(blocks[1].start_idx) } else { None };
+    let split_token_idx = if should_split {
+        Some(blocks[1].start_idx)
+    } else {
+        None
+    };
 
     TokenAssignment {
         per_token,
@@ -246,7 +253,10 @@ pub fn split_span_at_token(tokens: &[Token], split_idx: usize) -> Option<((f32, 
 }
 
 /// N-way: return per-block (start,end,text) spans derived from blocks.
-pub fn split_into_blocks(tokens: &[Token], assignment: &TokenAssignment) -> Vec<(f32, f32, String)> {
+pub fn split_into_blocks(
+    tokens: &[Token],
+    assignment: &TokenAssignment,
+) -> Vec<(f32, f32, String)> {
     let mut out = Vec::new();
     for b in &assignment.blocks {
         let text = tokens[b.start_idx..=b.end_idx]
@@ -256,7 +266,15 @@ pub fn split_into_blocks(tokens: &[Token], assignment: &TokenAssignment) -> Vec<
             .join("");
         // Preserve spacing as tokens include their own spacing? Join with empty and rely on token text containing spaces.
         // Fallback: join with space if tokens don't contain leading space.
-        let text = if text.contains(' ') { text } else { tokens[b.start_idx..=b.end_idx].iter().map(|t| t.text.clone()).collect::<Vec<_>>().join(" ") };
+        let text = if text.contains(' ') {
+            text
+        } else {
+            tokens[b.start_idx..=b.end_idx]
+                .iter()
+                .map(|t| t.text.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         out.push((b.start, b.end, text));
     }
     out
@@ -267,15 +285,27 @@ mod tests {
     use super::*;
 
     fn tok(text: &str, s: f32, e: f32) -> Token {
-        Token { text: text.to_string(), start: s, end: e }
+        Token {
+            text: text.to_string(),
+            start: s,
+            end: e,
+        }
     }
     fn turn(s: f32, e: f32, spk: i32) -> SpeakerTurn {
-        SpeakerTurn { start: s, end: e, speaker: spk }
+        SpeakerTurn {
+            start: s,
+            end: e,
+            speaker: spk,
+        }
     }
 
     #[test]
     fn single_speaker_no_split() {
-        let tokens = vec![tok("hello", 0.0, 0.5), tok(" world", 0.5, 1.0), tok(" test", 1.0, 1.5)];
+        let tokens = vec![
+            tok("hello", 0.0, 0.5),
+            tok(" world", 0.5, 1.0),
+            tok(" test", 1.0, 1.5),
+        ];
         let turns = vec![turn(0.0, 10.0, 0)];
         let a = assign_tokens_to_speakers(&tokens, &turns);
         assert_eq!(a.per_token, vec![Some(0), Some(0), Some(0)]);
@@ -286,7 +316,12 @@ mod tests {
 
     #[test]
     fn cross_speaker_requires_two_contiguous() {
-        let tokens = vec![tok("a", 0.0, 1.0), tok("b", 1.0, 2.0), tok("c", 2.0, 3.0), tok("d", 3.0, 4.0)];
+        let tokens = vec![
+            tok("a", 0.0, 1.0),
+            tok("b", 1.0, 2.0),
+            tok("c", 2.0, 3.0),
+            tok("d", 3.0, 4.0),
+        ];
         let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 10.0, 1)];
         let a = assign_tokens_to_speakers(&tokens, &turns);
         assert_eq!(a.per_token, vec![Some(0), Some(0), Some(1), Some(1)]);
@@ -301,7 +336,12 @@ mod tests {
 
     #[test]
     fn single_token_of_new_speaker_no_split() {
-        let tokens = vec![tok("a", 0.0, 1.0), tok("b", 1.0, 2.0), tok("c", 2.0, 3.0), tok("d", 3.0, 4.0)];
+        let tokens = vec![
+            tok("a", 0.0, 1.0),
+            tok("b", 1.0, 2.0),
+            tok("c", 2.0, 3.0),
+            tok("d", 3.0, 4.0),
+        ];
         let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 3.0, 1), turn(3.0, 10.0, 0)];
         let a = assign_tokens_to_speakers(&tokens, &turns);
         assert_eq!(a.per_token[2], Some(1));
@@ -322,7 +362,10 @@ mod tests {
         ];
         let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 4.0, 1), turn(4.0, 6.0, 0)];
         let a = assign_tokens_to_speakers(&tokens, &turns);
-        assert_eq!(a.per_token, vec![Some(0), Some(0), Some(1), Some(1), Some(0), Some(0)]);
+        assert_eq!(
+            a.per_token,
+            vec![Some(0), Some(0), Some(1), Some(1), Some(0), Some(0)]
+        );
         assert_eq!(a.blocks.len(), 3);
         assert_eq!(a.blocks[0].speaker, 0);
         assert_eq!(a.blocks[1].speaker, 1);
@@ -376,7 +419,12 @@ mod tests {
 
     #[test]
     fn split_into_blocks_produces_contiguous() {
-        let tokens = vec![tok("a", 0.0, 1.0), tok("b", 1.0, 2.0), tok("c", 2.0, 3.0), tok("d", 3.0, 4.0)];
+        let tokens = vec![
+            tok("a", 0.0, 1.0),
+            tok("b", 1.0, 2.0),
+            tok("c", 2.0, 3.0),
+            tok("d", 3.0, 4.0),
+        ];
         let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 4.0, 1)];
         let a = assign_tokens_to_speakers(&tokens, &turns);
         let spans = split_into_blocks(&tokens, &a);

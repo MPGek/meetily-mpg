@@ -6,7 +6,12 @@ use app_lib::audio::recording_saver::TranscriptSegment;
 use app_lib::audio::recording_state::{AudioChunk, DeviceType};
 use tokio::sync::mpsc;
 
-fn make_chunks(mono: &[f32], sample_rate: u32, device: DeviceType, chunk_secs: f64) -> Vec<AudioChunk> {
+fn make_chunks(
+    mono: &[f32],
+    sample_rate: u32,
+    device: DeviceType,
+    chunk_secs: f64,
+) -> Vec<AudioChunk> {
     let chunk_len = (sample_rate as f64 * chunk_secs) as usize;
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -54,7 +59,11 @@ async fn run_mode(
         make_chunks(&mic, decoded.sample_rate, DeviceType::Microphone, 0.6),
         make_chunks(&sys, decoded.sample_rate, DeviceType::System, 0.6),
     );
-    println!("  chunks: mic={} sys={}", mic_chunks.len(), sys_chunks.len());
+    println!(
+        "  chunks: mic={} sys={}",
+        mic_chunks.len(),
+        sys_chunks.len()
+    );
 
     let (turn_sender, mut turn_rx) = mpsc::unbounded_channel();
     let models_dir = std::env::var("MEETILY_MODELS_DIR").unwrap_or_else(|_| {
@@ -86,7 +95,10 @@ async fn run_mode(
             processor.process_chunk(c.clone());
         }
     }
-    println!("  fed all chunks; error state: {}", processor.is_in_error_state());
+    println!(
+        "  fed all chunks; error state: {}",
+        processor.is_in_error_state()
+    );
 
     // Drain any pending turns
     let mut turns = Vec::new();
@@ -116,8 +128,10 @@ async fn run_mode(
 
 #[tokio::test]
 async fn reproduce_online_diarization_failures() {
-    let fast_audio = "C:/Users/vasiliy.kotov/Music/meetily-recordings/Meeting 2026-08-18_13-22/audio.mp4";
-    let eff_audio = "C:/Users/vasiliy.kotov/Music/meetily-recordings/Meeting 2026-08-18_13-21/audio.mp4";
+    let fast_audio =
+        "C:/Users/vasiliy.kotov/Music/meetily-recordings/Meeting 2026-08-18_13-22/audio.mp4";
+    let eff_audio =
+        "C:/Users/vasiliy.kotov/Music/meetily-recordings/Meeting 2026-08-18_13-21/audio.mp4";
 
     // Transcripts from the DB (meeting a7323df9 - Fast meeting)
     let fast_transcripts = vec![
@@ -138,32 +152,90 @@ async fn reproduce_online_diarization_failures() {
     ];
 
     println!("### FAST MODE (13-22 meeting) ###");
-    run_mode(DiarizationMode::Fast, Path::new(fast_audio), &fast_transcripts, "13-22").await;
+    run_mode(
+        DiarizationMode::Fast,
+        Path::new(fast_audio),
+        &fast_transcripts,
+        "13-22",
+    )
+    .await;
 
     println!();
     println!("### EFFICIENT MODE (13-21 meeting) ###");
-    run_mode(DiarizationMode::Efficient, Path::new(eff_audio), &eff_transcripts, "13-21").await;
+    run_mode(
+        DiarizationMode::Efficient,
+        Path::new(eff_audio),
+        &eff_transcripts,
+        "13-21",
+    )
+    .await;
     println!();
     println!("### EFFICIENT MODE max_speakers=0 (13-21) ###");
-    run_mode_ms(DiarizationMode::Efficient, Path::new(eff_audio), &eff_transcripts, "13-21-ms0", 0).await;
+    run_mode_ms(
+        DiarizationMode::Efficient,
+        Path::new(eff_audio),
+        &eff_transcripts,
+        "13-21-ms0",
+        0,
+    )
+    .await;
     println!();
     println!("### FAST MODE max_speakers=0 (13-22) ###");
-    run_mode_ms(DiarizationMode::Fast, Path::new(fast_audio), &fast_transcripts, "13-22-ms0", 0).await;
+    run_mode_ms(
+        DiarizationMode::Fast,
+        Path::new(fast_audio),
+        &fast_transcripts,
+        "13-22-ms0",
+        0,
+    )
+    .await;
     println!();
     println!("### EFFICIENT MODE long chunks (13-21) ###");
-    run_mode_long(DiarizationMode::Efficient, Path::new(eff_audio), &eff_transcripts, "13-21-long").await;
+    run_mode_long(
+        DiarizationMode::Efficient,
+        Path::new(eff_audio),
+        &eff_transcripts,
+        "13-21-long",
+    )
+    .await;
     println!();
     println!("### FAST MODE long chunks (13-22) ###");
-    run_mode_long(DiarizationMode::Fast, Path::new(fast_audio), &fast_transcripts, "13-22-long").await;
+    run_mode_long(
+        DiarizationMode::Fast,
+        Path::new(fast_audio),
+        &fast_transcripts,
+        "13-22-long",
+    )
+    .await;
     println!();
     println!("### EFFICIENT MODE 16kHz 25s chunks (13-21) ###");
-    run_mode_16k(DiarizationMode::Efficient, Path::new(eff_audio), &eff_transcripts, "13-21-16k25s", 25.0).await;
+    run_mode_16k(
+        DiarizationMode::Efficient,
+        Path::new(eff_audio),
+        &eff_transcripts,
+        "13-21-16k25s",
+        25.0,
+    )
+    .await;
     println!();
     println!("### FAST MODE 16kHz 25s chunks (13-22) ###");
-    run_mode_16k(DiarizationMode::Fast, Path::new(fast_audio), &fast_transcripts, "13-22-16k25s", 25.0).await;
+    run_mode_16k(
+        DiarizationMode::Fast,
+        Path::new(fast_audio),
+        &fast_transcripts,
+        "13-22-16k25s",
+        25.0,
+    )
+    .await;
     println!();
     println!("### SHORT-CHUNK KILL TEST (Efficient) ###");
-    run_mode_short(DiarizationMode::Efficient, Path::new(eff_audio), &eff_transcripts, "short-kill").await;
+    run_mode_short(
+        DiarizationMode::Efficient,
+        Path::new(eff_audio),
+        &eff_transcripts,
+        "short-kill",
+    )
+    .await;
 }
 
 async fn run_mode_short(
@@ -172,7 +244,10 @@ async fn run_mode_short(
     transcripts: &[TranscriptSegment],
     label: &str,
 ) {
-    println!("===== MODE {:?} SHORT-CHUNK KILL TEST ({}) =====", mode, label);
+    println!(
+        "===== MODE {:?} SHORT-CHUNK KILL TEST ({}) =====",
+        mode, label
+    );
     let decoded = match decode_audio_file(audio_path) {
         Ok(d) => d,
         Err(e) => {
@@ -190,7 +265,11 @@ async fn run_mode_short(
     let mut i = 0usize;
     let mut idx = 0u64;
     while i < mic.len() {
-        let len = if idx % 5 == 0 { chunk_len_short } else { chunk_len_norm };
+        let len = if idx % 5 == 0 {
+            chunk_len_short
+        } else {
+            chunk_len_norm
+        };
         let end = (i + len).min(mic.len());
         if end > i {
             chunks.push(AudioChunk {
@@ -227,7 +306,12 @@ async fn run_mode_short(
     for c in &chunks {
         processor.process_chunk(c.clone());
         if processor.is_in_error_state() {
-            println!("  ENGINE DIED on chunk {} (t={:.1}s, len={})", c.chunk_id, c.timestamp, c.data.len());
+            println!(
+                "  ENGINE DIED on chunk {} (t={:.1}s, len={})",
+                c.chunk_id,
+                c.timestamp,
+                c.data.len()
+            );
             break;
         }
     }
@@ -235,7 +319,9 @@ async fn run_mode_short(
     match processor.finalize(transcripts) {
         Ok((assignments, clusters, _)) => println!(
             "  finalize OK: {} assignments, mic clusters {}, sys clusters {}",
-            assignments.len(), clusters.mic.len(), clusters.sys.len()
+            assignments.len(),
+            clusters.mic.len(),
+            clusters.sys.len()
         ),
         Err(e) => println!("  FINALIZE FAILED: {}", e),
     }
@@ -248,7 +334,10 @@ async fn run_mode_16k(
     label: &str,
     chunk_secs: f64,
 ) {
-    println!("===== MODE {:?} 16kHz {:.0}s chunks ({}) =====", mode, chunk_secs, label);
+    println!(
+        "===== MODE {:?} 16kHz {:.0}s chunks ({}) =====",
+        mode, chunk_secs, label
+    );
     let decoded = match decode_audio_file(audio_path) {
         Ok(d) => d,
         Err(e) => {
@@ -260,13 +349,19 @@ async fn run_mode_16k(
     let mic = left.unwrap_or_default();
     let sys = right.unwrap_or_default();
     // Resample 48k -> 16k like the pipeline does before sending.
-    let mic16 = app_lib::audio::audio_processing::resample(&mic, decoded.sample_rate, 16000).unwrap_or_default();
-    let sys16 = app_lib::audio::audio_processing::resample(&sys, decoded.sample_rate, 16000).unwrap_or_default();
+    let mic16 = app_lib::audio::audio_processing::resample(&mic, decoded.sample_rate, 16000)
+        .unwrap_or_default();
+    let sys16 = app_lib::audio::audio_processing::resample(&sys, decoded.sample_rate, 16000)
+        .unwrap_or_default();
     let (mic_chunks, sys_chunks) = (
         make_chunks(&mic16, 16000, DeviceType::Microphone, chunk_secs),
         make_chunks(&sys16, 16000, DeviceType::System, chunk_secs),
     );
-    println!("  chunks: mic={} sys={} (16k)", mic_chunks.len(), sys_chunks.len());
+    println!(
+        "  chunks: mic={} sys={} (16k)",
+        mic_chunks.len(),
+        sys_chunks.len()
+    );
     let (turn_sender, mut turn_rx) = mpsc::unbounded_channel();
     let models_dir = std::env::var("MEETILY_MODELS_DIR").unwrap_or_else(|_| {
         "C:/Users/vasiliy.kotov/AppData/Roaming/com.meetily.ai/models".to_string()
@@ -294,7 +389,10 @@ async fn run_mode_16k(
             processor.process_chunk(c.clone());
         }
     }
-    println!("  fed all chunks; error state: {}", processor.is_in_error_state());
+    println!(
+        "  fed all chunks; error state: {}",
+        processor.is_in_error_state()
+    );
     let mut turns = Vec::new();
     while let Ok(t) = turn_rx.try_recv() {
         turns.push(t);
@@ -340,7 +438,11 @@ async fn run_mode_long(
         make_chunks(&mic, decoded.sample_rate, DeviceType::Microphone, 8.0),
         make_chunks(&sys, decoded.sample_rate, DeviceType::System, 8.0),
     );
-    println!("  chunks: mic={} sys={}", mic_chunks.len(), sys_chunks.len());
+    println!(
+        "  chunks: mic={} sys={}",
+        mic_chunks.len(),
+        sys_chunks.len()
+    );
     let (turn_sender, mut turn_rx) = mpsc::unbounded_channel();
     let models_dir = std::env::var("MEETILY_MODELS_DIR").unwrap_or_else(|_| {
         "C:/Users/vasiliy.kotov/AppData/Roaming/com.meetily.ai/models".to_string()
@@ -368,7 +470,10 @@ async fn run_mode_long(
             processor.process_chunk(c.clone());
         }
     }
-    println!("  fed all chunks; error state: {}", processor.is_in_error_state());
+    println!(
+        "  fed all chunks; error state: {}",
+        processor.is_in_error_state()
+    );
     let mut turns = Vec::new();
     while let Ok(t) = turn_rx.try_recv() {
         turns.push(t);
@@ -396,7 +501,10 @@ async fn run_mode_ms(
     label: &str,
     max_speakers: usize,
 ) {
-    println!("===== MODE {:?} ms={} ({}) =====", mode, max_speakers, label);
+    println!(
+        "===== MODE {:?} ms={} ({}) =====",
+        mode, max_speakers, label
+    );
     let decoded = match decode_audio_file(audio_path) {
         Ok(d) => d,
         Err(e) => {
@@ -438,7 +546,10 @@ async fn run_mode_ms(
             processor.process_chunk(c.clone());
         }
     }
-    println!("  fed all chunks; error state: {}", processor.is_in_error_state());
+    println!(
+        "  fed all chunks; error state: {}",
+        processor.is_in_error_state()
+    );
     match processor.finalize(transcripts) {
         Ok((assignments, clusters, _)) => {
             println!(

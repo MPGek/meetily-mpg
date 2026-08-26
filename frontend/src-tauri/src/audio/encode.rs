@@ -253,16 +253,16 @@ mod tests {
             .stdin(Stdio::null());
 
         let started = std::time::Instant::now();
-        let result = run_ffmpeg_with_timeout(
-            command,
-            None,
-            std::time::Duration::from_millis(500),
-        );
+        let result = run_ffmpeg_with_timeout(command, None, std::time::Duration::from_millis(500));
         let elapsed = started.elapsed();
 
         // A hung child must be abandoned within the bound, not waited on forever.
         assert!(result.is_err());
-        assert!(elapsed < std::time::Duration::from_secs(10), "timeout wait took {:?}", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timeout wait took {:?}",
+            elapsed
+        );
         assert!(
             result.unwrap_err().to_string().contains("timed out"),
             "expected a timed-out error"
@@ -276,7 +276,14 @@ mod tests {
 
         // Mix of clean audio and NaN / ±Inf samples.
         let data: Vec<f32> = vec![
-            0.5, -0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.25, 0.0, -1.0,
+            0.5,
+            -0.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.25,
+            0.0,
+            -1.0,
         ];
         let result = encode_single_audio(&data, 48000, 2, &output_path);
 

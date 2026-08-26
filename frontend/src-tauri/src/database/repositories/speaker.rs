@@ -214,10 +214,7 @@ impl SpeakerRepository {
     }
 
     /// Case-insensitive name lookup.
-    pub async fn find_by_name(
-        pool: &SqlitePool,
-        name: &str,
-    ) -> Result<Option<Speaker>, SqlxError> {
+    pub async fn find_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Speaker>, SqlxError> {
         sqlx::query_as::<_, Speaker>(
             "SELECT id, name, is_me, created_at, updated_at FROM speakers WHERE name = ? COLLATE NOCASE LIMIT 1",
         )
@@ -238,14 +235,12 @@ impl SpeakerRepository {
             return Err(SqlxError::Protocol("speaker name cannot be empty".into()));
         }
         let now = Utc::now();
-        let rows = sqlx::query(
-            "UPDATE speakers SET name = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(trimmed)
-        .bind(now)
-        .bind(speaker_id)
-        .execute(pool)
-        .await?;
+        let rows = sqlx::query("UPDATE speakers SET name = ?, updated_at = ? WHERE id = ?")
+            .bind(trimmed)
+            .bind(now)
+            .bind(speaker_id)
+            .execute(pool)
+            .await?;
         Ok(rows.rows_affected() > 0)
     }
 
@@ -523,13 +518,18 @@ impl SpeakerRepository {
     /// time window overlaps `[window.0, window.1]` and inserts them as direct
     /// prototypes of the speaker (no cluster ownership), enforcing the
     /// per-person cap. Used to make user-chosen block assignments improve
-    /// the speaker's global voiceprint set.
+    /// the speaker's global voiceprint set. Each enrolled prototype row
+    /// carries full provenance (`meeting_id`, `cluster_label`, audio timecodes)
+    /// so the Voiceprint Browser can display the source meeting and play the
+    /// audio clip.
     pub async fn enroll_embeddings_from_buffer(
         pool: &SqlitePool,
         speaker_id: &str,
         channel: &str,
         embeddings: &[(f32, f32, Vec<f32>)],
         window: (f32, f32),
+        meeting_id: &str,
+        cluster_label: &str,
     ) -> Result<usize, SqlxError> {
         let (win_start, win_end) = window;
         if win_end <= win_start {
@@ -553,10 +553,14 @@ impl SpeakerRepository {
             let id = format!("emb-{}", Uuid::new_v4());
             let emb_bytes = embedding_to_bytes(&emb);
             // Model-aware: infer family from embedding dimension (192 = TitaNet, 256 = legacy).
-            let model_tag = if emb.len() == 192 { "titanet_large" } else { SPEAKER_EMBEDDING_MODEL };
+            let model_tag = if emb.len() == 192 {
+                "titanet_large"
+            } else {
+                SPEAKER_EMBEDDING_MODEL
+            };
             sqlx::query(
-                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, audio_start_time, audio_end_time, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(&emb_bytes)
@@ -564,6 +568,8 @@ impl SpeakerRepository {
             .bind(channel)
             .bind(dur)
             .bind(speaker_id)
+            .bind(meeting_id)
+            .bind(cluster_label)
             .bind(start as f64)
             .bind(end as f64)
             .bind(now)
@@ -613,7 +619,9 @@ impl SpeakerRepository {
                 };
                 let mut q = sqlx::query_as::<_, SpeakerEmbedding>(&sql);
                 if is_legacy {
-                    q = q.bind(SPEAKER_EMBEDDING_MODEL).bind(SPEAKER_EMBEDDING_MODEL_LEGACY_DASH);
+                    q = q
+                        .bind(SPEAKER_EMBEDDING_MODEL)
+                        .bind(SPEAKER_EMBEDDING_MODEL_LEGACY_DASH);
                 } else {
                     q = q.bind(model);
                 }
@@ -640,7 +648,9 @@ impl SpeakerRepository {
                 };
                 let mut q = sqlx::query_as::<_, SpeakerEmbedding>(sql);
                 if is_legacy_all {
-                    q = q.bind(SPEAKER_EMBEDDING_MODEL).bind(SPEAKER_EMBEDDING_MODEL_LEGACY_DASH);
+                    q = q
+                        .bind(SPEAKER_EMBEDDING_MODEL)
+                        .bind(SPEAKER_EMBEDDING_MODEL_LEGACY_DASH);
                 } else {
                     q = q.bind(model);
                 }
@@ -750,7 +760,9 @@ impl SpeakerRepository {
 
         if !unconfirmed_only {
             // Fetch speakers (filtered or paginated)
-            let speakers: Vec<crate::database::models::Speaker> = if let Some(sid) = speaker_id_filter {
+            let speakers: Vec<crate::database::models::Speaker> = if let Some(sid) =
+                speaker_id_filter
+            {
                 sqlx::query_as::<_, crate::database::models::Speaker>(
                     "SELECT id, name, is_me, created_at, updated_at FROM speakers WHERE id = ?",
                 )
@@ -817,8 +829,15 @@ impl SpeakerRepository {
             let mut grouped: BTreeMap<String, (String, Vec<VoiceprintRow>)> = BTreeMap::new();
             for row in cache_rows {
                 let mid = row.meeting_id.clone().unwrap_or_default();
-                let title = row.meeting_title.clone().unwrap_or_else(|| "deleted meeting".to_string());
-                grouped.entry(mid.clone()).or_insert_with(|| (title.clone(), Vec::new())).1.push(row);
+                let title = row
+                    .meeting_title
+                    .clone()
+                    .unwrap_or_else(|| "deleted meeting".to_string());
+                grouped
+                    .entry(mid.clone())
+                    .or_insert_with(|| (title.clone(), Vec::new()))
+                    .1
+                    .push(row);
                 // ensure title updated if first row had fallback
                 if let Some(entry) = grouped.get_mut(&mid) {
                     if entry.0 == "deleted meeting" && title != "deleted meeting" {
@@ -884,10 +903,11 @@ impl SpeakerRepository {
                         .execute(pool)
                         .await?;
                 } else {
-                    let res = sqlx::query("UPDATE speaker_embeddings SET speaker_id = NULL WHERE id = ?")
-                        .bind(id)
-                        .execute(pool)
-                        .await;
+                    let res =
+                        sqlx::query("UPDATE speaker_embeddings SET speaker_id = NULL WHERE id = ?")
+                            .bind(id)
+                            .execute(pool)
+                            .await;
                     if let Err(SqlxError::Database(ref db)) = res {
                         // CHECK violation fallback to delete
                         if db.message().contains("CHECK") {
@@ -906,16 +926,20 @@ impl SpeakerRepository {
         }
 
         let remaining = if let Some(ref sid) = speaker_id {
-            let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
-                .bind(sid)
-                .fetch_one(pool)
-                .await?;
+            let (cnt,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                    .bind(sid)
+                    .fetch_one(pool)
+                    .await?;
             cnt
         } else {
             0
         };
 
-        Ok(RejectResult { speaker_id, remaining_prototypes: remaining })
+        Ok(RejectResult {
+            speaker_id,
+            remaining_prototypes: remaining,
+        })
     }
 
     /// Reconfirm a cache (or demoted) voiceprint as a speaker's prototype.
@@ -968,11 +992,13 @@ impl SpeakerRepository {
         // Count transcripts that would be affected (for reporting)
         let mut affected_transcripts_count: i64 = 0;
         for (mid, cluster) in &affected_clusters {
-            let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?")
-                .bind(mid)
-                .bind(cluster)
-                .fetch_one(&mut *tx)
-                .await?;
+            let (cnt,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?",
+            )
+            .bind(mid)
+            .bind(cluster)
+            .fetch_one(&mut *tx)
+            .await?;
             affected_transcripts_count += cnt;
         }
 
@@ -1025,7 +1051,9 @@ impl SpeakerRepository {
 
         // Re-match affected meetings from centroids (outside transaction, best-effort)
         for meeting_id in affected_meetings_set {
-            let centroids = SpeakerRepository::get_cluster_centroids(pool, &meeting_id).await.unwrap_or_default();
+            let centroids = SpeakerRepository::get_cluster_centroids(pool, &meeting_id)
+                .await
+                .unwrap_or_default();
             if centroids.is_empty() {
                 continue;
             }
@@ -1038,7 +1066,9 @@ impl SpeakerRepository {
                     .map(crate::audio::speaker_recognition::Prototype::from)
                     .collect();
             // Load current bindings to preserve user ones
-            let existing_rows = SpeakerRepository::get_meeting_speakers(pool, &meeting_id).await.unwrap_or_default();
+            let existing_rows = SpeakerRepository::get_meeting_speakers(pool, &meeting_id)
+                .await
+                .unwrap_or_default();
             let existing: std::collections::HashMap<String, Option<String>> = existing_rows
                 .into_iter()
                 .map(|r| (r.cluster_label.clone(), r.matched_by.clone()))
@@ -1049,8 +1079,19 @@ impl SpeakerRepository {
                         continue;
                     }
                 }
-                if let Some(m) = crate::audio::speaker_recognition::best_match(&c.centroid, c.channel.as_deref(), &prototypes) {
-                    let _ = SpeakerRepository::set_auto_binding_if_unbound(pool, &meeting_id, &c.cluster_label, &m.speaker_id, m.score as f64).await;
+                if let Some(m) = crate::audio::speaker_recognition::best_match(
+                    &c.centroid,
+                    c.channel.as_deref(),
+                    &prototypes,
+                ) {
+                    let _ = SpeakerRepository::set_auto_binding_if_unbound(
+                        pool,
+                        &meeting_id,
+                        &c.cluster_label,
+                        &m.speaker_id,
+                        m.score as f64,
+                    )
+                    .await;
                 }
             }
         }
@@ -1079,12 +1120,13 @@ impl SpeakerRepository {
         }
         let mut affected_transcripts_count: i64 = 0;
         for (mid, cluster) in &affected_clusters {
-            let (cnt,): (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?")
-                    .bind(mid)
-                    .bind(cluster)
-                    .fetch_one(pool)
-                    .await?;
+            let (cnt,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?",
+            )
+            .bind(mid)
+            .bind(cluster)
+            .fetch_one(pool)
+            .await?;
             affected_transcripts_count += cnt;
         }
         Ok(ReplaceResult {
@@ -1139,6 +1181,81 @@ impl SpeakerRepository {
         .bind(transcript_id)
         .fetch_optional(pool)
         .await
+    }
+
+    /// Read the transcript's meeting id, time range, and source device for
+    /// cluster resolution when the transcript has no cluster label.
+    /// Returns (meeting_id, audio_start_time, audio_end_time, source_device).
+    /// Returns None when the transcript does not exist.
+    pub async fn get_transcript_time_info(
+        pool: &SqlitePool,
+        transcript_id: &str,
+    ) -> Result<Option<(String, Option<f64>, Option<f64>, Option<String>)>, SqlxError> {
+        sqlx::query_as::<_, (String, Option<f64>, Option<f64>, Option<String>)>(
+            "SELECT meeting_id, audio_start_time, audio_end_time, source_device FROM transcripts WHERE id = ?",
+        )
+        .bind(transcript_id)
+        .fetch_optional(pool)
+        .await
+    }
+
+    /// Resolve the best-matching cluster label for a transcript whose speaker
+    /// column is NULL by finding unassigned cache rows whose time windows
+    /// overlap the given time range. Groups by cluster_label and returns the
+    /// cluster with the longest total overlap duration. Filters by channel
+    /// to maintain channel separation.
+    pub async fn resolve_cluster_by_time_overlap(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        channel: &str,
+        time_start: f64,
+        time_end: f64,
+    ) -> Result<Option<String>, SqlxError> {
+        if time_end <= time_start {
+            return Ok(None);
+        }
+
+        // Query unassigned cache rows overlapping the time range
+        let rows: Vec<(String, f64, f64)> = sqlx::query_as(
+            "SELECT cluster_label, audio_start_time, audio_end_time
+             FROM speaker_embeddings
+             WHERE meeting_id = ?
+               AND channel = ?
+               AND speaker_id IS NULL
+               AND cluster_label IS NOT NULL
+               AND audio_start_time < ?
+               AND audio_end_time > ?
+               AND audio_start_time IS NOT NULL
+               AND audio_end_time IS NOT NULL",
+        )
+        .bind(meeting_id)
+        .bind(channel)
+        .bind(time_end)
+        .bind(time_start)
+        .fetch_all(pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        // Group by cluster_label and calculate total overlap duration
+        let mut cluster_overlaps: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (cluster_label, emb_start, emb_end) in rows {
+            let overlap_start = time_start.max(emb_start);
+            let overlap_end = time_end.min(emb_end);
+            if overlap_end > overlap_start {
+                let overlap = overlap_end - overlap_start;
+                *cluster_overlaps.entry(cluster_label).or_insert(0.0) += overlap;
+            }
+        }
+
+        // Return the cluster with the longest total overlap
+        Ok(cluster_overlaps
+            .into_iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(label, _)| label))
     }
 
     /// Resolve a transcript's display name with override precedence
@@ -1246,19 +1363,21 @@ impl SpeakerRepository {
     /// NOT deleted. Callers should also clear any in-memory `PrototypeStore`
     /// after this completes.
     pub async fn clear_all_voiceprints(pool: &SqlitePool) -> Result<ClearAllResult, SqlxError> {
-        let proto: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NOT NULL",
-        )
-        .fetch_one(pool)
-        .await?;
+        let proto: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
         let caches: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL AND meeting_id IS NOT NULL",
         )
         .fetch_one(pool)
         .await?;
-        let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings").fetch_one(pool).await?;
-        sqlx::query("DELETE FROM speaker_embeddings").execute(pool).await?;
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings")
+            .fetch_one(pool)
+            .await?;
+        sqlx::query("DELETE FROM speaker_embeddings")
+            .execute(pool)
+            .await?;
         Ok(ClearAllResult {
             deleted_prototypes: proto.0,
             deleted_caches: caches.0,
@@ -1301,11 +1420,17 @@ mod tests {
     async fn find_or_create_is_idempotent_and_case_insensitive() {
         let pool = setup_pool().await;
 
-        let a = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let a2 = SpeakerRepository::find_or_create_by_name(&pool, "alice").await.unwrap();
+        let a = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let a2 = SpeakerRepository::find_or_create_by_name(&pool, "alice")
+            .await
+            .unwrap();
         assert_eq!(a.id, a2.id, "case-insensitive lookup returns same row");
 
-        let b = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let b = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
         assert_ne!(a.id, b.id, "distinct names create distinct speakers");
 
         let list = SpeakerRepository::list_speakers(&pool).await.unwrap();
@@ -1315,9 +1440,18 @@ mod tests {
     #[tokio::test]
     async fn rename_speaker_updates_name() {
         let pool = setup_pool().await;
-        let a = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        assert!(SpeakerRepository::rename_speaker(&pool, &a.id, "Alice Smith").await.unwrap());
-        let found = SpeakerRepository::find_by_name(&pool, "alice smith").await.unwrap().unwrap();
+        let a = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        assert!(
+            SpeakerRepository::rename_speaker(&pool, &a.id, "Alice Smith")
+                .await
+                .unwrap()
+        );
+        let found = SpeakerRepository::find_by_name(&pool, "alice smith")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, a.id);
         assert_eq!(found.name, "Alice Smith");
     }
@@ -1326,7 +1460,9 @@ mod tests {
     async fn write_cache_and_enroll_reparents_best_k() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
 
         // 12 exemplars with ascending durations; only best K=8 should enroll.
         let exemplars: Vec<Exemplar> = (0..12)
@@ -1339,7 +1475,13 @@ mod tests {
             .collect();
         let centroid = emb(&[99.0, 0.0, 0.0, 0.0]);
         SpeakerRepository::write_cluster_cache(
-            &pool, "m1", "SPEAKER_00", "mic", &centroid, &exemplars, SPEAKER_EMBEDDING_MODEL,
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &centroid,
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
         )
         .await
         .unwrap();
@@ -1349,7 +1491,9 @@ mod tests {
         assert_eq!(stats_before.cache_count, 12);
         assert_eq!(stats_before.prototype_count, 0);
 
-        let n = SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        let n = SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
         assert_eq!(n, ENROLLMENT_BEST_K, "exactly best-K prototypes enrolled");
 
         let stats_after = SpeakerRepository::storage_stats(&pool).await.unwrap();
@@ -1358,13 +1502,19 @@ mod tests {
         assert_eq!(stats_after.cache_count, 4);
 
         // Enrolled prototypes should be the 8 longest-duration (indices 4..12).
-        let protos =
-            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
-                .await
-                .unwrap();
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert_eq!(protos.len(), ENROLLMENT_BEST_K);
         for p in &protos {
-            assert!(p.embedding[0] >= 4.0, "lowest-duration rows must not enroll");
+            assert!(
+                p.embedding[0] >= 4.0,
+                "lowest-duration rows must not enroll"
+            );
         }
 
         // Enrolled prototypes must retain provenance (meeting_id, cluster_label, times)
@@ -1379,15 +1529,25 @@ mod tests {
         for r in &rows {
             assert_eq!(r.meeting_id.as_deref(), Some("m1"));
             assert_eq!(r.cluster_label.as_deref(), Some("SPEAKER_00"));
-            assert!(r.audio_start_time.is_some(), "provenance start time must be retained");
-            assert!(r.audio_end_time.is_some(), "provenance end time must be retained");
+            assert!(
+                r.audio_start_time.is_some(),
+                "provenance start time must be retained"
+            );
+            assert!(
+                r.audio_end_time.is_some(),
+                "provenance end time must be retained"
+            );
         }
         // load_prototypes still returns them (filter behavior unchanged)
         assert_eq!(
-            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
-                .await
-                .unwrap()
-                .len(),
+            SpeakerRepository::load_prototypes(
+                &pool,
+                Some(&[alice.id.clone()]),
+                SPEAKER_EMBEDDING_MODEL
+            )
+            .await
+            .unwrap()
+            .len(),
             ENROLLMENT_BEST_K
         );
     }
@@ -1398,7 +1558,9 @@ mod tests {
         // enroll the block's cluster cached exemplars (reparent).
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
         let exemplars: Vec<Exemplar> = (0..5)
@@ -1410,24 +1572,43 @@ mod tests {
             })
             .collect();
         SpeakerRepository::write_cluster_cache(
-            &pool, "m1", "SPEAKER_00", "mic", &emb(&[99.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[99.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
         )
         .await
         .unwrap();
 
         // The single-block correction path: set override + enroll cluster.
-        assert!(SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id).await.unwrap());
-        let (meeting_id, cluster_label) =
-            SpeakerRepository::get_transcript_cluster(&pool, "t1").await.unwrap().unwrap();
+        assert!(
+            SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+                .await
+                .unwrap()
+        );
+        let (meeting_id, cluster_label) = SpeakerRepository::get_transcript_cluster(&pool, "t1")
+            .await
+            .unwrap()
+            .unwrap();
         let cluster_label = cluster_label.unwrap();
         let n = SpeakerRepository::enroll_cluster(&pool, &meeting_id, &cluster_label, &bob.id)
             .await
             .unwrap();
-        assert_eq!(n, 5, "all cached exemplars of the block's cluster are enrolled");
+        assert_eq!(
+            n, 5,
+            "all cached exemplars of the block's cluster are enrolled"
+        );
 
-        let protos = SpeakerRepository::load_prototypes(&pool, Some(&[bob.id.clone()]), SPEAKER_EMBEDDING_MODEL)
-            .await
-            .unwrap();
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[bob.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert_eq!(protos.len(), 5);
 
         // Enrolled prototypes retain provenance (meeting_id, cluster_label).
@@ -1446,7 +1627,10 @@ mod tests {
 
         // The block override must still resolve to Bob.
         assert_eq!(
-            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            SpeakerRepository::get_transcript_display_name(&pool, "t1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Bob")
         );
     }
@@ -1457,14 +1641,20 @@ mod tests {
         // rows returns 0 without error, so the label still applies.
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
-        let (meeting_id, cluster_label) =
-            SpeakerRepository::get_transcript_cluster(&pool, "t1").await.unwrap().unwrap();
+        let (meeting_id, cluster_label) = SpeakerRepository::get_transcript_cluster(&pool, "t1")
+            .await
+            .unwrap()
+            .unwrap();
         let cluster_label = cluster_label.unwrap();
 
-        let n = SpeakerRepository::enroll_cluster(&pool, &meeting_id, &cluster_label, &bob.id).await.unwrap();
+        let n = SpeakerRepository::enroll_cluster(&pool, &meeting_id, &cluster_label, &bob.id)
+            .await
+            .unwrap();
         assert_eq!(n, 0, "no cache rows -> zero prototypes enrolled, no error");
 
         let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
@@ -1475,7 +1665,9 @@ mod tests {
     async fn enrollment_enforces_per_person_cap() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
 
         // Enroll many clusters so total prototypes exceed the per-person cap.
         for c in 0..(PER_PERSON_PROTOTYPE_CAP / ENROLLMENT_BEST_K + 2) {
@@ -1485,21 +1677,35 @@ mod tests {
                     embedding: emb(&[c as f32, i as f32, 0.0, 0.0]),
                     duration_secs: (c * ENROLLMENT_BEST_K + i) as f64,
                     start_secs: Some((c * ENROLLMENT_BEST_K + i) as f32 * 10.0),
-                    end_secs: Some((c * ENROLLMENT_BEST_K + i) as f32 * 10.0 + (c * ENROLLMENT_BEST_K + i) as f32),
+                    end_secs: Some(
+                        (c * ENROLLMENT_BEST_K + i) as f32 * 10.0
+                            + (c * ENROLLMENT_BEST_K + i) as f32,
+                    ),
                 })
                 .collect();
             SpeakerRepository::write_cluster_cache(
-                &pool, "m1", &label, "mic", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+                &pool,
+                "m1",
+                &label,
+                "mic",
+                &emb(&[0.0; 4]),
+                &exemplars,
+                SPEAKER_EMBEDDING_MODEL,
             )
             .await
             .unwrap();
-            SpeakerRepository::enroll_cluster(&pool, "m1", &label, &alice.id).await.unwrap();
-        }
-
-        let protos =
-            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
+            SpeakerRepository::enroll_cluster(&pool, "m1", &label, &alice.id)
                 .await
                 .unwrap();
+        }
+
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert!(
             protos.len() <= PER_PERSON_PROTOTYPE_CAP,
             "prototype count {} exceeds cap {}",
@@ -1511,7 +1717,11 @@ mod tests {
     #[tokio::test]
     async fn enroll_embeddings_from_buffer_takes_overlapping_best_n() {
         let pool = setup_pool().await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let meeting_id = "meeting-1";
+        insert_meeting(&pool, meeting_id).await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
 
         // Buffer: two chunks overlapping [1.0, 5.0], one far outside.
         let buffer = vec![
@@ -1521,18 +1731,28 @@ mod tests {
             (0.0f32, 6.0f32, emb(&[4.0, 0.0, 0.0, 0.0])), // overlaps (longest dur)
         ];
 
+        let cluster_label = "MIC_SPEAKER_00";
         let n = SpeakerRepository::enroll_embeddings_from_buffer(
-            &pool, &alice.id, "mic", &buffer, (1.0, 5.0),
+            &pool,
+            &alice.id,
+            "mic",
+            &buffer,
+            (1.0, 5.0),
+            meeting_id,
+            cluster_label,
         )
         .await
         .unwrap();
         assert_eq!(n, 3, "only window-overlapping chunks enroll");
         assert_eq!(buffer.len() as usize - 1, n);
 
-        let protos =
-            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
-                .await
-                .unwrap();
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert_eq!(protos.len(), 3);
         assert!(protos.iter().all(|p| p.channel == "mic"));
         // The longest-overlapping chunk (duration 6, x=4.0) must be included.
@@ -1541,23 +1761,47 @@ mod tests {
             protos.iter().all(|p| p.embedding[0] != 3.0),
             "non-overlapping chunk must not enroll"
         );
+        // Verify provenance is preserved
+        let rows: Vec<SpeakerEmbedding> = sqlx::query_as::<_, SpeakerEmbedding>(
+            "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at FROM speaker_embeddings WHERE speaker_id = ?"
+        )
+        .bind(&alice.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.meeting_id.as_deref() == Some(meeting_id)));
+        assert!(rows.iter().all(|r| r.cluster_label.as_deref() == Some(cluster_label)));
     }
 
     #[tokio::test]
     async fn enroll_embeddings_from_buffer_keeps_channels_clean() {
         let pool = setup_pool().await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let meeting_id = "meeting-2";
+        insert_meeting(&pool, meeting_id).await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
 
         let _ = SpeakerRepository::enroll_embeddings_from_buffer(
-            &pool, &alice.id, "mic", &[(0.0, 4.0, emb(&[1.0, 0.0, 0.0, 0.0]))], (0.0, 4.0),
+            &pool,
+            &alice.id,
+            "mic",
+            &[(0.0, 4.0, emb(&[1.0, 0.0, 0.0, 0.0]))],
+            (0.0, 4.0),
+            meeting_id,
+            "MIC_SPEAKER_00",
         )
         .await
         .unwrap();
 
-        let protos =
-            SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL)
-                .await
-                .unwrap();
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert_eq!(protos.len(), 1);
         assert_eq!(protos[0].channel, "mic");
     }
@@ -1566,38 +1810,60 @@ mod tests {
     async fn expected_speakers_round_trip() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
 
         SpeakerRepository::set_expected_speakers(&pool, "m1", &[alice.id.clone(), bob.id.clone()])
             .await
             .unwrap();
-        let mut ids = SpeakerRepository::get_expected_speakers(&pool, "m1").await.unwrap();
+        let mut ids = SpeakerRepository::get_expected_speakers(&pool, "m1")
+            .await
+            .unwrap();
         ids.sort();
         let mut expected = vec![alice.id, bob.id];
         expected.sort();
         assert_eq!(ids, expected);
 
         // Empty set = match-all.
-        SpeakerRepository::set_expected_speakers(&pool, "m1", &[]).await.unwrap();
-        assert!(SpeakerRepository::get_expected_speakers(&pool, "m1").await.unwrap().is_empty());
+        SpeakerRepository::set_expected_speakers(&pool, "m1", &[])
+            .await
+            .unwrap();
+        assert!(SpeakerRepository::get_expected_speakers(&pool, "m1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn auto_binding_does_not_overwrite_user_binding() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
 
-        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
         // Re-match tries to auto-assign Bob; user binding to Alice must win.
         SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &bob.id, 0.9)
             .await
             .unwrap();
 
-        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1").await.unwrap();
-        let row = rows.iter().find(|r| r.cluster_label == "SPEAKER_00").unwrap();
+        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1")
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.cluster_label == "SPEAKER_00")
+            .unwrap();
         assert_eq!(row.speaker_id.as_deref(), Some(alice.id.as_str()));
         assert_eq!(row.matched_by.as_deref(), Some("user"));
     }
@@ -1606,7 +1872,9 @@ mod tests {
     async fn confirm_cluster_binding_clears_score_and_sets_user() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
         // Auto-recognized cluster with a score.
@@ -1615,21 +1883,41 @@ mod tests {
             .unwrap();
 
         // scope_all=true confirms the whole cluster.
-        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", true).await.unwrap();
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", true)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
 
-        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1").await.unwrap();
-        let row = rows.iter().find(|r| r.cluster_label == "SPEAKER_00").unwrap();
-        assert_eq!(row.matched_by.as_deref(), Some("user"), "cluster flips to user");
-        assert_eq!(row.match_score, None, "match score is cleared so (auto) drops");
-        assert_eq!(row.speaker_id.as_deref(), Some(alice.id.as_str()), "speaker name unchanged");
+        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1")
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.cluster_label == "SPEAKER_00")
+            .unwrap();
+        assert_eq!(
+            row.matched_by.as_deref(),
+            Some("user"),
+            "cluster flips to user"
+        );
+        assert_eq!(
+            row.match_score, None,
+            "match score is cleared so (auto) drops"
+        );
+        assert_eq!(
+            row.speaker_id.as_deref(),
+            Some(alice.id.as_str()),
+            "speaker name unchanged"
+        );
     }
 
     #[tokio::test]
     async fn confirm_single_block_sets_override() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
         SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.65)
@@ -1637,12 +1925,17 @@ mod tests {
             .unwrap();
 
         // scope_all=false confirms only this block.
-        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", false).await.unwrap();
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", false)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
 
         // Block resolves as user provenance via the override, still to Alice.
         assert_eq!(
-            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            SpeakerRepository::get_transcript_display_name(&pool, "t1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Alice")
         );
         let override_id = sqlx::query_scalar::<_, Option<String>>(
@@ -1652,36 +1945,66 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(override_id.as_deref(), Some(alice.id.as_str()), "single block marked user-owned");
+        assert_eq!(
+            override_id.as_deref(),
+            Some(alice.id.as_str()),
+            "single block marked user-owned"
+        );
     }
 
     #[tokio::test]
     async fn confirm_does_not_duplicate_prototypes() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
         // Seed the cluster cache + enroll so Alice has prototypes.
-        let exemplars = vec![Exemplar { embedding: emb(&[1.0, 2.0, 3.0, 4.0]), duration_secs: 1.0, start_secs: Some(10.0), end_secs: Some(11.0) }];
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 2.0, 3.0, 4.0]),
+            duration_secs: 1.0,
+            start_secs: Some(10.0),
+            end_secs: Some(11.0),
+        }];
         SpeakerRepository::write_cluster_cache(
-            &pool, "m1", "SPEAKER_00", "mic", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
         )
         .await
         .unwrap();
-        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
 
         // Auto-recognition also binds the cluster (score recorded on unused cache? no - binding).
         SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.9)
             .await
             .unwrap();
-        let before = SpeakerRepository::storage_stats(&pool).await.unwrap().prototype_count;
+        let before = SpeakerRepository::storage_stats(&pool)
+            .await
+            .unwrap()
+            .prototype_count;
 
-        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", true).await.unwrap();
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", true)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
 
-        let after = SpeakerRepository::storage_stats(&pool).await.unwrap().prototype_count;
-        assert_eq!(after, before, "confirming must not create new speaker_embeddings");
+        let after = SpeakerRepository::storage_stats(&pool)
+            .await
+            .unwrap()
+            .prototype_count;
+        assert_eq!(
+            after, before,
+            "confirming must not create new speaker_embeddings"
+        );
     }
 
     #[tokio::test]
@@ -1690,7 +2013,9 @@ mod tests {
         insert_meeting(&pool, "m1").await;
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
-        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", false).await.unwrap();
+        let n = SpeakerRepository::confirm_speaker_binding(&pool, "t1", false)
+            .await
+            .unwrap();
         assert_eq!(n, 0, "no cluster binding -> nothing confirmed, no error");
     }
 
@@ -1701,15 +2026,27 @@ mod tests {
         // Reopening the meeting must show the user's name with user provenance.
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
         insert_transcript(&pool, "t2", "m1", "SPEAKER_00").await;
 
-        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
-        let n = SpeakerRepository::apply_cluster_binding_overrides(&pool, "m1", "SPEAKER_00", &alice.id)
+        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id)
             .await
             .unwrap();
-        assert_eq!(n, 2, "both transcripts of the cluster carry the user's identity");
+        let n = SpeakerRepository::apply_cluster_binding_overrides(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            &alice.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 2,
+            "both transcripts of the cluster carry the user's identity"
+        );
 
         for tid in ["t1", "t2"] {
             assert_eq!(
@@ -1720,14 +2057,17 @@ mod tests {
                 Some("Alice"),
                 "stored row resolves to the user's name after reopen"
             );
-            let override_id: Option<String> = sqlx::query_scalar(
-                "SELECT speaker_override_id FROM transcripts WHERE id = ?",
-            )
-            .bind(tid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(override_id.as_deref(), Some(alice.id.as_str()), "row is user-confirmed");
+            let override_id: Option<String> =
+                sqlx::query_scalar("SELECT speaker_override_id FROM transcripts WHERE id = ?")
+                    .bind(tid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                override_id.as_deref(),
+                Some(alice.id.as_str()),
+                "row is user-confirmed"
+            );
         }
     }
 
@@ -1735,18 +2075,38 @@ mod tests {
     async fn storage_stats_match_raw_sum() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
 
         let exemplars = vec![
-            Exemplar { embedding: emb(&[1.0, 2.0, 3.0, 4.0]), duration_secs: 1.0, start_secs: Some(10.0), end_secs: Some(11.0) },
-            Exemplar { embedding: emb(&[5.0, 6.0, 7.0, 8.0]), duration_secs: 2.0, start_secs: Some(20.0), end_secs: Some(22.0) },
+            Exemplar {
+                embedding: emb(&[1.0, 2.0, 3.0, 4.0]),
+                duration_secs: 1.0,
+                start_secs: Some(10.0),
+                end_secs: Some(11.0),
+            },
+            Exemplar {
+                embedding: emb(&[5.0, 6.0, 7.0, 8.0]),
+                duration_secs: 2.0,
+                start_secs: Some(20.0),
+                end_secs: Some(22.0),
+            },
         ];
         SpeakerRepository::write_cluster_cache(
-            &pool, "m1", "SPEAKER_00", "mic", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
         )
         .await
         .unwrap();
-        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
 
         let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
         // Each 4-d f32 embedding is 16 bytes; 2 rows total (both reparented, provenance retained but not counted as cache).
@@ -1762,12 +2122,20 @@ mod tests {
         insert_meeting(&pool, "m1").await;
         let centroid = emb(&[0.1, 0.2, 0.3, 0.4]);
         SpeakerRepository::write_cluster_cache(
-            &pool, "m1", "SPEAKER_00", "system", &centroid, &[], SPEAKER_EMBEDDING_MODEL,
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "system",
+            &centroid,
+            &[],
+            SPEAKER_EMBEDDING_MODEL,
         )
         .await
         .unwrap();
 
-        let centroids = SpeakerRepository::get_cluster_centroids(&pool, "m1").await.unwrap();
+        let centroids = SpeakerRepository::get_cluster_centroids(&pool, "m1")
+            .await
+            .unwrap();
         assert_eq!(centroids.len(), 1);
         assert_eq!(centroids[0].cluster_label, "SPEAKER_00");
         assert_eq!(centroids[0].channel.as_deref(), Some("system"));
@@ -1795,32 +2163,55 @@ mod tests {
     async fn block_override_takes_precedence_over_cluster_mapping() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
         // Cluster maps to Alice; no override yet -> Alice is displayed.
-        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
         assert_eq!(
-            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            SpeakerRepository::get_transcript_display_name(&pool, "t1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Alice")
         );
 
         // Single-block override to Bob -> Bob wins over the cluster mapping.
-        assert!(SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id).await.unwrap());
+        assert!(
+            SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+                .await
+                .unwrap()
+        );
         assert_eq!(
-            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            SpeakerRepository::get_transcript_display_name(&pool, "t1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Bob")
         );
 
         // meeting_speakers must be untouched by the override.
-        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1").await.unwrap();
+        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1")
+            .await
+            .unwrap();
         assert_eq!(rows[0].speaker_id.as_deref(), Some(alice.id.as_str()));
 
         // Clearing the override falls back to the cluster mapping.
-        assert!(SpeakerRepository::clear_transcript_override(&pool, "t1").await.unwrap());
+        assert!(SpeakerRepository::clear_transcript_override(&pool, "t1")
+            .await
+            .unwrap());
         assert_eq!(
-            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            SpeakerRepository::get_transcript_display_name(&pool, "t1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Alice")
         );
     }
@@ -1829,17 +2220,34 @@ mod tests {
     async fn block_override_survives_rematch() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
 
-        SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id).await.unwrap();
+        SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+            .await
+            .unwrap();
 
         // Re-match writes a fresh cluster cache + auto-binding; it must not
         // touch the transcript-level override.
-        let exemplars = vec![Exemplar { embedding: emb(&[1.0, 2.0, 3.0, 4.0]), duration_secs: 1.0, start_secs: Some(5.0), end_secs: Some(6.0) }];
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 2.0, 3.0, 4.0]),
+            duration_secs: 1.0,
+            start_secs: Some(5.0),
+            end_secs: Some(6.0),
+        }];
         SpeakerRepository::write_cluster_cache(
-            &pool, "m1", "SPEAKER_00", "mic", &emb(&[0.5; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL,
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.5; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
         )
         .await
         .unwrap();
@@ -1848,7 +2256,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            SpeakerRepository::get_transcript_display_name(&pool, "t1").await.unwrap().as_deref(),
+            SpeakerRepository::get_transcript_display_name(&pool, "t1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Bob"),
             "override must survive re-match / cache rewrite"
         );
@@ -1858,23 +2269,70 @@ mod tests {
     async fn storage_stats_disambiguates_provenanced_prototype_and_cache() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
         // Two clusters, 2 exemplars each
         let exemplars0 = vec![
-            Exemplar { embedding: emb(&[1.0, 0.0, 0.0, 0.0]), duration_secs: 1.0, start_secs: Some(10.0), end_secs: Some(11.0) },
-            Exemplar { embedding: emb(&[2.0, 0.0, 0.0, 0.0]), duration_secs: 2.0, start_secs: Some(12.0), end_secs: Some(14.0) },
+            Exemplar {
+                embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+                duration_secs: 1.0,
+                start_secs: Some(10.0),
+                end_secs: Some(11.0),
+            },
+            Exemplar {
+                embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+                duration_secs: 2.0,
+                start_secs: Some(12.0),
+                end_secs: Some(14.0),
+            },
         ];
         let exemplars1 = vec![
-            Exemplar { embedding: emb(&[3.0, 0.0, 0.0, 0.0]), duration_secs: 1.5, start_secs: Some(20.0), end_secs: Some(21.5) },
-            Exemplar { embedding: emb(&[4.0, 0.0, 0.0, 0.0]), duration_secs: 2.5, start_secs: Some(22.0), end_secs: Some(24.5) },
+            Exemplar {
+                embedding: emb(&[3.0, 0.0, 0.0, 0.0]),
+                duration_secs: 1.5,
+                start_secs: Some(20.0),
+                end_secs: Some(21.5),
+            },
+            Exemplar {
+                embedding: emb(&[4.0, 0.0, 0.0, 0.0]),
+                duration_secs: 2.5,
+                start_secs: Some(22.0),
+                end_secs: Some(24.5),
+            },
         ];
-        SpeakerRepository::write_cluster_cache(&pool, "m1", "SPEAKER_00", "mic", &emb(&[0.0; 4]), &exemplars0, SPEAKER_EMBEDDING_MODEL).await.unwrap();
-        SpeakerRepository::write_cluster_cache(&pool, "m1", "SPEAKER_01", "mic", &emb(&[0.0; 4]), &exemplars1, SPEAKER_EMBEDDING_MODEL).await.unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars0,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_01",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars1,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         // Enroll only SPEAKER_00 -> 2 prototypes retaining meeting_id, but cache count must exclude them
-        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
         let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
         assert_eq!(stats.prototype_count, 2);
-        assert_eq!(stats.cache_count, 2, "only unassigned SPEAKER_01 caches count");
+        assert_eq!(
+            stats.cache_count, 2,
+            "only unassigned SPEAKER_01 caches count"
+        );
     }
 
     #[tokio::test]
@@ -1882,27 +2340,70 @@ mod tests {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
         insert_meeting(&pool, "m2").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let exemplars = vec![Exemplar { embedding: emb(&[1.0, 0.0, 0.0, 0.0]), duration_secs: 1.0, start_secs: Some(5.0), end_secs: Some(6.0) }];
-        SpeakerRepository::write_cluster_cache(&pool, "m1", "SPEAKER_00", "mic", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL).await.unwrap();
-        SpeakerRepository::write_cluster_cache(&pool, "m2", "SPEAKER_01", "system", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL).await.unwrap();
-        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 1.0,
+            start_secs: Some(5.0),
+            end_secs: Some(6.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m2",
+            "SPEAKER_01",
+            "system",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
 
-        let browser = SpeakerRepository::list_voiceprints(&pool, None, false, None, None).await.unwrap();
+        let browser = SpeakerRepository::list_voiceprints(&pool, None, false, None, None)
+            .await
+            .unwrap();
         // One speaker with 1 prototype
         assert_eq!(browser.speakers.len(), 1);
         assert_eq!(browser.speakers[0].prototype_count, 1);
-        assert_eq!(browser.speakers[0].prototypes[0].meeting_id.as_deref(), Some("m1"));
-        assert_eq!(browser.speakers[0].prototypes[0].audio_start_time, Some(5.0));
+        assert_eq!(
+            browser.speakers[0].prototypes[0].meeting_id.as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            browser.speakers[0].prototypes[0].audio_start_time,
+            Some(5.0)
+        );
         // Unconfirmed branch grouped by meeting (m2 only, m1's prototypes not counted)
         assert_eq!(browser.unconfirmed.len(), 1);
         assert_eq!(browser.unconfirmed[0].meeting_id, "m2");
         assert_eq!(browser.unconfirmed[0].caches.len(), 1);
 
         // Filtered by speaker
-        let filtered = SpeakerRepository::list_voiceprints(&pool, Some(&alice.id), false, None, None).await.unwrap();
+        let filtered =
+            SpeakerRepository::list_voiceprints(&pool, Some(&alice.id), false, None, None)
+                .await
+                .unwrap();
         assert_eq!(filtered.speakers.len(), 1);
-        assert!(filtered.unconfirmed.is_empty(), "speaker filter must not include unconfirmed");
+        assert!(
+            filtered.unconfirmed.is_empty(),
+            "speaker filter must not include unconfirmed"
+        );
 
         // Legacy row with NULL provenance should be represented with None
         let id = format!("emb-{}", uuid::Uuid::new_v4());
@@ -1917,19 +2418,52 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let browser2 = SpeakerRepository::list_voiceprints(&pool, None, false, None, None).await.unwrap();
-        let alice_rows = browser2.speakers.iter().find(|s| s.speaker_id == alice.id).unwrap();
-        assert!(alice_rows.prototypes.iter().any(|r| r.meeting_id.is_none() && r.audio_start_time.is_none()), "legacy row must have NULL provenance");
+        let browser2 = SpeakerRepository::list_voiceprints(&pool, None, false, None, None)
+            .await
+            .unwrap();
+        let alice_rows = browser2
+            .speakers
+            .iter()
+            .find(|s| s.speaker_id == alice.id)
+            .unwrap();
+        assert!(
+            alice_rows
+                .prototypes
+                .iter()
+                .any(|r| r.meeting_id.is_none() && r.audio_start_time.is_none()),
+            "legacy row must have NULL provenance"
+        );
     }
 
     #[tokio::test]
     async fn reject_demote_and_reconfirm_enforces_cap() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let exemplars: Vec<Exemplar> = (0..3).map(|i| Exemplar { embedding: emb(&[i as f32, 0.0, 0.0, 0.0]), duration_secs: i as f64 + 1.0, start_secs: Some(i as f32 * 10.0), end_secs: Some(i as f32 * 10.0 + 1.0) }).collect();
-        SpeakerRepository::write_cluster_cache(&pool, "m1", "SPEAKER_00", "mic", &emb(&[0.0; 4]), &exemplars, SPEAKER_EMBEDDING_MODEL).await.unwrap();
-        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let exemplars: Vec<Exemplar> = (0..3)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: i as f64 + 1.0,
+                start_secs: Some(i as f32 * 10.0),
+                end_secs: Some(i as f32 * 10.0 + 1.0),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
         let rows: Vec<SpeakerEmbedding> = sqlx::query_as::<_, SpeakerEmbedding>("SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at FROM speaker_embeddings WHERE speaker_id = ? ORDER BY created_at DESC")
             .bind(&alice.id)
             .fetch_all(&pool)
@@ -1937,12 +2471,25 @@ mod tests {
             .unwrap();
         let first_id = rows[0].id.clone();
         // Demote (not permanent) -> should become unconfirmed cache
-        let res = SpeakerRepository::reject_voiceprint(&pool, &first_id, false).await.unwrap();
+        let res = SpeakerRepository::reject_voiceprint(&pool, &first_id, false)
+            .await
+            .unwrap();
         assert_eq!(res.speaker_id.as_deref(), Some(alice.id.as_str()));
-        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?").bind(&alice.id).fetch_one(&pool).await.unwrap();
+        let remaining: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&alice.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(remaining.0, 2);
         // Must be excluded from recognition
-        let protos = SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL).await.unwrap();
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert_eq!(protos.len(), 2);
         // Row should now be unassigned cache with same provenance
         let demoted: SpeakerEmbedding = sqlx::query_as::<_, SpeakerEmbedding>("SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at FROM speaker_embeddings WHERE id = ?")
@@ -1954,8 +2501,16 @@ mod tests {
         assert_eq!(demoted.meeting_id.as_deref(), Some("m1"));
 
         // Reconfirm it back to Alice (should enforce cap but we are far from 64)
-        SpeakerRepository::reconfirm_voiceprint(&pool, &first_id, &alice.id).await.unwrap();
-        let protos2 = SpeakerRepository::load_prototypes(&pool, Some(&[alice.id.clone()]), SPEAKER_EMBEDDING_MODEL).await.unwrap();
+        SpeakerRepository::reconfirm_voiceprint(&pool, &first_id, &alice.id)
+            .await
+            .unwrap();
+        let protos2 = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
         assert_eq!(protos2.len(), 3);
 
         // Cap enforcement: fill to cap and try to exceed
@@ -1990,8 +2545,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        SpeakerRepository::reconfirm_voiceprint(&pool, &cache_id, &alice.id).await.unwrap();
-        let cnt: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?").bind(&alice.id).fetch_one(&pool).await.unwrap();
+        SpeakerRepository::reconfirm_voiceprint(&pool, &cache_id, &alice.id)
+            .await
+            .unwrap();
+        let cnt: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&alice.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(cnt.0 <= PER_PERSON_PROTOTYPE_CAP as i64);
     }
 
@@ -1999,34 +2561,577 @@ mod tests {
     async fn replace_preserves_user_binding_and_override_and_is_atomic() {
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
-        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
-        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
         insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
         insert_transcript(&pool, "t2", "m1", "SPEAKER_01").await;
         // Alice auto-bound to SPEAKER_00, Bob user-bound to SPEAKER_01
-        SpeakerRepository::write_cluster_cache(&pool, "m1", "SPEAKER_00", "mic", &emb(&[0.1; 4]), &vec![Exemplar { embedding: emb(&[0.1; 4]), duration_secs: 1.0, start_secs: Some(1.0), end_secs: Some(2.0) }], SPEAKER_EMBEDDING_MODEL).await.unwrap();
-        SpeakerRepository::write_cluster_cache(&pool, "m1", "SPEAKER_01", "mic", &emb(&[0.2; 4]), &vec![Exemplar { embedding: emb(&[0.2; 4]), duration_secs: 1.0, start_secs: Some(3.0), end_secs: Some(4.0) }], SPEAKER_EMBEDDING_MODEL).await.unwrap();
-        SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.9).await.unwrap();
-        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_01", &bob.id).await.unwrap();
-        SpeakerRepository::set_transcript_override(&pool, "t2", &bob.id).await.unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.1; 4]),
+            &vec![Exemplar {
+                embedding: emb(&[0.1; 4]),
+                duration_secs: 1.0,
+                start_secs: Some(1.0),
+                end_secs: Some(2.0),
+            }],
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_01",
+            "mic",
+            &emb(&[0.2; 4]),
+            &vec![Exemplar {
+                embedding: emb(&[0.2; 4]),
+                duration_secs: 1.0,
+                start_secs: Some(3.0),
+                end_secs: Some(4.0),
+            }],
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::set_auto_binding_if_unbound(&pool, "m1", "SPEAKER_00", &alice.id, 0.9)
+            .await
+            .unwrap();
+        SpeakerRepository::set_user_binding(&pool, "m1", "SPEAKER_01", &bob.id)
+            .await
+            .unwrap();
+        SpeakerRepository::set_transcript_override(&pool, "t2", &bob.id)
+            .await
+            .unwrap();
         // Enroll Alice's prototype so she has voiceprint to delete
-        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id).await.unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
 
-        let res = SpeakerRepository::replace_speaker(&pool, &alice.id, Some(&bob.id)).await.unwrap();
+        let res = SpeakerRepository::replace_speaker(&pool, &alice.id, Some(&bob.id))
+            .await
+            .unwrap();
         assert!(res.affected_meetings >= 1);
         assert!(res.affected_clusters >= 1);
         // User binding must survive
-        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1").await.unwrap();
-        let sp01 = rows.iter().find(|r| r.cluster_label == "SPEAKER_01").unwrap();
+        let rows = SpeakerRepository::get_meeting_speakers(&pool, "m1")
+            .await
+            .unwrap();
+        let sp01 = rows
+            .iter()
+            .find(|r| r.cluster_label == "SPEAKER_01")
+            .unwrap();
         assert_eq!(sp01.speaker_id.as_deref(), Some(bob.id.as_str()));
         assert_eq!(sp01.matched_by.as_deref(), Some("user"));
         // Auto row should now be Bob
-        let sp00 = rows.iter().find(|r| r.cluster_label == "SPEAKER_00").unwrap();
+        let sp00 = rows
+            .iter()
+            .find(|r| r.cluster_label == "SPEAKER_00")
+            .unwrap();
         assert_eq!(sp00.speaker_id.as_deref(), Some(bob.id.as_str()));
         // Transcript override preserved
-        assert_eq!(SpeakerRepository::get_transcript_display_name(&pool, "t2").await.unwrap().as_deref(), Some("Bob"));
+        assert_eq!(
+            SpeakerRepository::get_transcript_display_name(&pool, "t2")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Bob")
+        );
         // Source prototypes deleted
-        let cnt: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?").bind(&alice.id).fetch_one(&pool).await.unwrap();
+        let cnt: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&alice.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(cnt.0, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_cluster_by_time_overlap_single_match() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        // Create cluster cache with exemplars at specific time ranges
+        let exemplars = vec![
+            Exemplar {
+                embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+                duration_secs: 2.0,
+                start_secs: Some(10.0),
+                end_secs: Some(12.0),
+            },
+            Exemplar {
+                embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+                duration_secs: 3.0,
+                start_secs: Some(13.0),
+                end_secs: Some(16.0),
+            },
+        ];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Query overlapping the first exemplar
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 10.5, 11.5)
+                .await
+                .unwrap();
+        assert_eq!(result.as_deref(), Some("SPEAKER_00"));
+
+        // Query overlapping both exemplars
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 11.0, 14.0)
+                .await
+                .unwrap();
+        assert_eq!(result.as_deref(), Some("SPEAKER_00"));
+    }
+
+    #[tokio::test]
+    async fn resolve_cluster_by_time_overlap_multiple_clusters() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        // SPEAKER_00: exemplars at 10-12 (2s) and 13-16 (3s) = 5s total
+        let exemplars0 = vec![
+            Exemplar {
+                embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+                duration_secs: 2.0,
+                start_secs: Some(10.0),
+                end_secs: Some(12.0),
+            },
+            Exemplar {
+                embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+                duration_secs: 3.0,
+                start_secs: Some(13.0),
+                end_secs: Some(16.0),
+            },
+        ];
+        // SPEAKER_01: exemplars at 11-15 (4s) = 4s total
+        let exemplars1 = vec![Exemplar {
+            embedding: emb(&[3.0, 0.0, 0.0, 0.0]),
+            duration_secs: 4.0,
+            start_secs: Some(11.0),
+            end_secs: Some(15.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars0,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_01",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars1,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Query 10-16: SPEAKER_00 has 5s overlap, SPEAKER_01 has 4s overlap -> SPEAKER_00 wins
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 10.0, 16.0)
+                .await
+                .unwrap();
+        assert_eq!(result.as_deref(), Some("SPEAKER_00"));
+
+        // Query 11-15: SPEAKER_00 has 4s overlap (11-12 + 13-15), SPEAKER_01 has 4s overlap -> tie, either is acceptable
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 11.0, 15.0)
+                .await
+                .unwrap();
+        assert!(result.is_some(), "should resolve to a cluster on tie");
+    }
+
+    #[tokio::test]
+    async fn resolve_cluster_by_time_overlap_no_match() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Query outside the exemplar time range
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 20.0, 25.0)
+                .await
+                .unwrap();
+        assert!(result.is_none(), "no overlap should return None");
+
+        // Query with invalid time range (end <= start)
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 15.0, 10.0)
+                .await
+                .unwrap();
+        assert!(result.is_none(), "invalid time range should return None");
+
+        // Query for non-existent meeting
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m999", "mic", 10.0, 12.0)
+                .await
+                .unwrap();
+        assert!(result.is_none(), "non-existent meeting should return None");
+    }
+
+    #[tokio::test]
+    async fn resolve_cluster_by_time_overlap_channel_filtering() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        // Mic channel: exemplar at 10-12
+        let exemplars_mic = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        // System channel: exemplar at 10-12 (same time, different channel)
+        let exemplars_sys = vec![Exemplar {
+            embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "MIC_SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars_mic,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "system",
+            &emb(&[0.0; 4]),
+            &exemplars_sys,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Query mic channel -> should get MIC_SPEAKER_00
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 10.5, 11.5)
+                .await
+                .unwrap();
+        assert_eq!(result.as_deref(), Some("MIC_SPEAKER_00"));
+
+        // Query system channel -> should get SPEAKER_00
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "system", 10.5, 11.5)
+                .await
+                .unwrap();
+        assert_eq!(result.as_deref(), Some("SPEAKER_00"));
+    }
+
+    #[tokio::test]
+    async fn resolve_cluster_by_time_overlap_ignores_enrolled_prototypes() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        // Create cache and enroll it (becomes prototype with speaker_id set)
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+
+        // Query should return None because the exemplar is now a prototype (speaker_id is set)
+        let result =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", "mic", 10.5, 11.5)
+                .await
+                .unwrap();
+        assert!(
+            result.is_none(),
+            "enrolled prototypes should not be resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_block_speaker_with_null_cluster_enrolls_via_time_overlap() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        // Insert transcript with NULL speaker (cluster label)
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, source_device) VALUES (?, ?, 'text', '2026-01-01T00:00:00Z', ?, ?, ?)",
+        )
+        .bind("t1")
+        .bind("m1")
+        .bind(10.0)
+        .bind(12.0)
+        .bind("Microphone")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create cluster cache with exemplars overlapping the transcript time range
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Verify transcript has NULL speaker
+        let cluster = SpeakerRepository::get_transcript_cluster(&pool, "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            cluster.1.is_none(),
+            "transcript should have NULL cluster label"
+        );
+
+        // Set the override (simulating assign_block_speaker's first step)
+        SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+            .await
+            .unwrap();
+
+        // Now resolve cluster by time overlap and enroll
+        let time_info = SpeakerRepository::get_transcript_time_info(&pool, "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, Some(start), Some(end), Some(source_device)) = time_info else {
+            panic!("expected time info with all fields");
+        };
+        let channel = if source_device == "System" {
+            "system"
+        } else {
+            "mic"
+        };
+        let resolved =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", channel, start, end)
+                .await
+                .unwrap();
+        assert_eq!(resolved.as_deref(), Some("SPEAKER_00"));
+
+        // Enroll the resolved cluster
+        let enrolled = SpeakerRepository::enroll_cluster(&pool, "m1", &resolved.unwrap(), &bob.id)
+            .await
+            .unwrap();
+        assert!(enrolled > 0, "should enroll at least one prototype");
+
+        // Verify Bob now has prototypes
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[bob.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        assert!(!protos.is_empty(), "Bob should have enrolled prototypes");
+    }
+
+    #[tokio::test]
+    async fn assign_block_speaker_with_null_cluster_no_overlap_still_labels() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        // Insert transcript with NULL speaker and time range that doesn't overlap any exemplars
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, source_device) VALUES (?, ?, 'text', '2026-01-01T00:00:00Z', ?, ?, ?)",
+        )
+        .bind("t1")
+        .bind("m1")
+        .bind(100.0)
+        .bind(102.0)
+        .bind("Microphone")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create cluster cache with exemplars that don't overlap the transcript
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Set the override (label is applied)
+        let written = SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+            .await
+            .unwrap();
+        assert!(written, "override should be set");
+
+        // Try to resolve cluster - should return None
+        let time_info = SpeakerRepository::get_transcript_time_info(&pool, "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, Some(start), Some(end), Some(source_device)) = time_info else {
+            panic!("expected time info with all fields");
+        };
+        let channel = if source_device == "System" {
+            "system"
+        } else {
+            "mic"
+        };
+        let resolved =
+            SpeakerRepository::resolve_cluster_by_time_overlap(&pool, "m1", channel, start, end)
+                .await
+                .unwrap();
+        assert!(resolved.is_none(), "no overlap should return None");
+
+        // Verify the label is still applied (display name resolves to Bob)
+        let display = SpeakerRepository::get_transcript_display_name(&pool, "t1")
+            .await
+            .unwrap();
+        assert_eq!(
+            display.as_deref(),
+            Some("Bob"),
+            "label should be applied even without enrollment"
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_block_speaker_with_valid_cluster_uses_direct_path() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        // Insert transcript with valid speaker (cluster label)
+        insert_transcript(&pool, "t1", "m1", "SPEAKER_00").await;
+
+        // Create cluster cache
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 2.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[0.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Verify transcript has valid speaker
+        let cluster = SpeakerRepository::get_transcript_cluster(&pool, "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cluster.1.as_deref(),
+            Some("SPEAKER_00"),
+            "transcript should have cluster label"
+        );
+
+        // Set the override
+        SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+            .await
+            .unwrap();
+
+        // Enroll using the direct cluster label (existing behavior)
+        let enrolled = SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &bob.id)
+            .await
+            .unwrap();
+        assert!(enrolled > 0, "should enroll at least one prototype");
+
+        // Verify Bob now has prototypes
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[bob.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        assert!(!protos.is_empty(), "Bob should have enrolled prototypes");
     }
 }

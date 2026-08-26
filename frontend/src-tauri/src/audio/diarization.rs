@@ -165,7 +165,12 @@ pub async fn rematch_meeting_speakers<R: Runtime>(
         .collect();
     for c in &centroids {
         let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
-        if let Some(m) = crate::audio::speaker_recognition::best_match_with_threshold(&c.centroid, c.channel.as_deref(), &prototypes, threshold) {
+        if let Some(m) = crate::audio::speaker_recognition::best_match_with_threshold(
+            &c.centroid,
+            c.channel.as_deref(),
+            &prototypes,
+            threshold,
+        ) {
             // Skip user-bound clusters: their binding always wins.
             if let Some((_, by)) = existing.get(c.cluster_label.as_str()) {
                 if *by == Some("user") {
@@ -232,22 +237,15 @@ pub async fn start_diarization<R: Runtime>(
         .folder_path
         .ok_or_else(|| "Meeting has no folder path — cannot find audio file".to_string())?;
 
-    let models_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?
-        .join("models");
-
     let app_clone = app.clone();
     let meeting_id_clone = meeting_id.clone();
     let transcripts_for_block = transcripts.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_diarization_blocking(
+        run_diarization_blocking_with_app(
             &app_clone,
             &meeting_id_clone,
             &folder_path,
-            &models_dir,
             max_speakers,
             &config,
             &transcripts_for_block,
@@ -263,43 +261,109 @@ pub async fn start_diarization<R: Runtime>(
             // into N contiguous, gap-free blocks before persisting speakers.
             // This mirrors online_diarization.rs finalize logic but runs on the
             // post-clustering segments for offline re-analysis.
-            let mut expanded_inserts: Vec<(String, String, String, Option<String>, f64, f64, f64, String, String)> = Vec::new(); // (id, meeting_id, timestamp, source_device, start, end, duration, text, tokens_json)
+            let mut expanded_inserts: Vec<(
+                String,
+                String,
+                String,
+                Option<String>,
+                f64,
+                f64,
+                f64,
+                String,
+                String,
+            )> = Vec::new(); // (id, meeting_id, timestamp, source_device, start, end, duration, text, tokens_json)
             let mut original_row_updates: Vec<(String, f64, f64, f64, String, String)> = Vec::new(); // (id, start, end, duration, text, tokens_json) for first block
             let mut token_based_updates: Vec<(String, String)> = Vec::new();
             let mut saw_token_split = false;
             for t in &transcripts {
                 if let Some(tokens_json) = &t.tokens {
-                    if let Ok(tokens) = serde_json::from_str::<Vec<crate::audio::token_assignment::Token>>(tokens_json) {
+                    if let Ok(tokens) = serde_json::from_str::<
+                        Vec<crate::audio::token_assignment::Token>,
+                    >(tokens_json)
+                    {
                         if tokens.len() >= 2 {
-                            let segs_ref = if is_stereo && t.source_device.as_deref() == Some("System") {
-                                &sys_clusters.segments
-                            } else {
-                                &mic_clusters.segments
-                            };
+                            let segs_ref =
+                                if is_stereo && t.source_device.as_deref() == Some("System") {
+                                    &sys_clusters.segments
+                                } else {
+                                    &mic_clusters.segments
+                                };
                             if !segs_ref.is_empty() {
-                                let turns: Vec<TokenTurn> = segs_ref.iter().map(|s| TokenTurn { start: s.start, end: s.end, speaker: s.speaker }).collect();
+                                let turns: Vec<TokenTurn> = segs_ref
+                                    .iter()
+                                    .map(|s| TokenTurn {
+                                        start: s.start,
+                                        end: s.end,
+                                        speaker: s.speaker,
+                                    })
+                                    .collect();
                                 let assign = assign_tokens_to_speakers(&tokens, &turns);
                                 if assign.blocks.len() > 1 {
                                     saw_token_split = true;
                                     for (idx, block) in assign.blocks.iter().enumerate() {
                                         let slice = &tokens[block.start_idx..=block.end_idx];
-                                        let text_parts: Vec<String> = slice.iter().map(|tk| tk.text.clone()).collect();
+                                        let text_parts: Vec<String> =
+                                            slice.iter().map(|tk| tk.text.clone()).collect();
                                         let joined = text_parts.join("");
-                                        let text = if joined.trim().is_empty() { text_parts.join(" ") } else { joined };
+                                        let text = if joined.trim().is_empty() {
+                                            text_parts.join(" ")
+                                        } else {
+                                            joined
+                                        };
                                         let text = text.trim().to_string();
-                                        let block_tokens_json = serde_json::to_string(slice).unwrap_or_else(|_| "[]".to_string());
+                                        let block_tokens_json = serde_json::to_string(slice)
+                                            .unwrap_or_else(|_| "[]".to_string());
                                         let start = block.start as f64;
                                         let end = block.end as f64;
                                         let dur = (end - start).max(0.0);
                                         if idx == 0 {
-                                            original_row_updates.push((t.id.clone(), start, end, dur, text.clone(), block_tokens_json.clone()));
-                                            let prefix = if is_stereo && t.source_device.as_deref() == Some("System") { "SPEAKER" } else if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
-                                            token_based_updates.push((t.id.clone(), format!("{}_{:02}", prefix, block.speaker)));
+                                            original_row_updates.push((
+                                                t.id.clone(),
+                                                start,
+                                                end,
+                                                dur,
+                                                text.clone(),
+                                                block_tokens_json.clone(),
+                                            ));
+                                            let prefix = if is_stereo
+                                                && t.source_device.as_deref() == Some("System")
+                                            {
+                                                "SPEAKER"
+                                            } else if is_stereo {
+                                                "MIC_SPEAKER"
+                                            } else {
+                                                "SPEAKER"
+                                            };
+                                            token_based_updates.push((
+                                                t.id.clone(),
+                                                format!("{}_{:02}", prefix, block.speaker),
+                                            ));
                                         } else {
                                             let new_id = format!("{}_split{}", t.id, idx);
-                                            expanded_inserts.push((new_id.clone(), t.meeting_id.clone(), t.timestamp.clone(), t.source_device.clone(), start, end, dur, text.clone(), block_tokens_json.clone()));
-                                            let prefix = if is_stereo && t.source_device.as_deref() == Some("System") { "SPEAKER" } else if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
-                                            token_based_updates.push((new_id, format!("{}_{:02}", prefix, block.speaker)));
+                                            expanded_inserts.push((
+                                                new_id.clone(),
+                                                t.meeting_id.clone(),
+                                                t.timestamp.clone(),
+                                                t.source_device.clone(),
+                                                start,
+                                                end,
+                                                dur,
+                                                text.clone(),
+                                                block_tokens_json.clone(),
+                                            ));
+                                            let prefix = if is_stereo
+                                                && t.source_device.as_deref() == Some("System")
+                                            {
+                                                "SPEAKER"
+                                            } else if is_stereo {
+                                                "MIC_SPEAKER"
+                                            } else {
+                                                "SPEAKER"
+                                            };
+                                            token_based_updates.push((
+                                                new_id,
+                                                format!("{}_{:02}", prefix, block.speaker),
+                                            ));
                                         }
                                     }
                                     continue;
@@ -317,13 +381,18 @@ pub async fn start_diarization<R: Runtime>(
                         .execute(pool).await;
                 }
                 // Insert remaining blocks as new rows
-                for (new_id, meeting_id_ins, ts, src, start, end, dur, text, tokens_json) in &expanded_inserts {
+                for (new_id, meeting_id_ins, ts, src, start, end, dur, text, tokens_json) in
+                    &expanded_inserts
+                {
                     let _ = sqlx::query("INSERT OR IGNORE INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
                         .bind(new_id).bind(meeting_id_ins).bind(text).bind(ts).bind(*start).bind(*end).bind(*dur).bind(src).bind(tokens_json)
                         .execute(pool).await;
                 }
                 // Replace speaker_updates with token-derived ones plus non-split fallback entries
-                let split_ids: Vec<String> = original_row_updates.iter().map(|(oid,_,_,_,_,_)| oid.clone()).collect();
+                let split_ids: Vec<String> = original_row_updates
+                    .iter()
+                    .map(|(oid, _, _, _, _, _)| oid.clone())
+                    .collect();
                 let mut non_split_updates = Vec::new();
                 for (tid, spk) in &speaker_updates {
                     if !split_ids.contains(tid) {
@@ -438,15 +507,52 @@ struct StageTimings {
 
 impl StageTimings {}
 
+#[allow(dead_code)]
 fn run_diarization_blocking<R: Runtime>(
     app: &AppHandle<R>,
     meeting_id: &str,
     folder_path: &str,
-    models_dir: &PathBuf,
+    _models_dir: &PathBuf,
     max_speakers: Option<i32>,
     config: &DiarizationConfig,
     transcripts: &[crate::database::models::Transcript],
-) -> Result<(DiarizationResult, Vec<(String, String)>, ChannelClusters, ChannelClusters, bool), String> {
+) -> Result<
+    (
+        DiarizationResult,
+        Vec<(String, String)>,
+        ChannelClusters,
+        ChannelClusters,
+        bool,
+    ),
+    String,
+> {
+    run_diarization_blocking_with_app(
+        app,
+        meeting_id,
+        folder_path,
+        max_speakers,
+        config,
+        transcripts,
+    )
+}
+
+fn run_diarization_blocking_with_app<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    folder_path: &str,
+    max_speakers: Option<i32>,
+    config: &DiarizationConfig,
+    transcripts: &[crate::database::models::Transcript],
+) -> Result<
+    (
+        DiarizationResult,
+        Vec<(String, String)>,
+        ChannelClusters,
+        ChannelClusters,
+        bool,
+    ),
+    String,
+> {
     let overall_start = Instant::now();
     let mut timings = StageTimings::default();
     let memory_sampler = MemorySampler::start();
@@ -475,20 +581,40 @@ fn run_diarization_blocking<R: Runtime>(
     let is_stereo = channels == 2;
     timings.decode_secs = decode_start.elapsed().as_secs_f64();
 
-    emit_progress(app, meeting_id, "diarizing", 20, "Running speaker diarization...");
+    emit_progress(
+        app,
+        meeting_id,
+        "diarizing",
+        20,
+        "Running speaker diarization...",
+    );
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
         return Err("Diarization cancelled".to_string());
     }
 
-    // Load the diarizer once and reuse it for both channel runs.
-    let diarizer = create_polyvoice_diarizer(models_dir, max_speakers, config)
+    // Load the diarizer via the 3-location fallback (app_data → resource → manifest).
+    let diarizer = create_polyvoice_diarizer_for_app(app, max_speakers, config)
         .map_err(|e| format!("Diarization failed: {}", e))?;
 
     let channel_start = Instant::now();
     let (mic_result, sys_result): (
-        Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String>,
-        Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String>,
+        Result<
+            (
+                Vec<DiarizationSegment>,
+                Vec<ClusteredEmbedding>,
+                StageTimings,
+            ),
+            String,
+        >,
+        Result<
+            (
+                Vec<DiarizationSegment>,
+                Vec<ClusteredEmbedding>,
+                StageTimings,
+            ),
+            String,
+        >,
     ) = match find_ffmpeg_path() {
         Some(ffmpeg) => {
             if is_stereo {
@@ -513,11 +639,33 @@ fn run_diarization_blocking<R: Runtime>(
             let mic_stream = left.unwrap_or_default();
             if let Some(sys_stream) = right {
                 rayon::join(
-                    || run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic"),
-                    || run_channel_diarization(&diarizer, &sys_stream, decoded.sample_rate, config, "sys"),
+                    || {
+                        run_channel_diarization(
+                            &diarizer,
+                            &mic_stream,
+                            decoded.sample_rate,
+                            config,
+                            "mic",
+                        )
+                    },
+                    || {
+                        run_channel_diarization(
+                            &diarizer,
+                            &sys_stream,
+                            decoded.sample_rate,
+                            config,
+                            "sys",
+                        )
+                    },
                 )
             } else {
-                let mic = run_channel_diarization(&diarizer, &mic_stream, decoded.sample_rate, config, "mic");
+                let mic = run_channel_diarization(
+                    &diarizer,
+                    &mic_stream,
+                    decoded.sample_rate,
+                    config,
+                    "mic",
+                );
                 (mic, Ok((Vec::new(), Vec::new(), StageTimings::default())))
             }
         }
@@ -537,11 +685,25 @@ fn run_diarization_blocking<R: Runtime>(
     timings.clustering_secs = mic_timings.clustering_secs + sys_timings.clustering_secs;
     let channel_elapsed = channel_start.elapsed().as_secs_f64();
 
-    emit_progress(app, meeting_id, "matching", 70, "Matching speakers to transcripts...");
+    emit_progress(
+        app,
+        meeting_id,
+        "matching",
+        70,
+        "Matching speakers to transcripts...",
+    );
 
     let matching_start = Instant::now();
-    let speakers_found = count_unique_speakers(&mic_segments) + count_unique_speakers(&sys_segments);
-    let speaker_updates = compute_speaker_matches(&mic_segments, &sys_segments, is_stereo, transcripts, app, meeting_id)?;
+    let speakers_found =
+        count_unique_speakers(&mic_segments) + count_unique_speakers(&sys_segments);
+    let speaker_updates = compute_speaker_matches(
+        &mic_segments,
+        &sys_segments,
+        is_stereo,
+        transcripts,
+        app,
+        meeting_id,
+    )?;
     timings.matching_secs = matching_start.elapsed().as_secs_f64();
 
     let peak_mb = memory_sampler.stop();
@@ -596,7 +758,14 @@ fn run_channel_diarization(
     sample_rate: u32,
     config: &DiarizationConfig,
     channel_name: &str,
-) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
+) -> Result<
+    (
+        Vec<DiarizationSegment>,
+        Vec<ClusteredEmbedding>,
+        StageTimings,
+    ),
+    String,
+> {
     info!(
         "Running diarization on {} channel ({} samples, {}Hz)",
         channel_name,
@@ -651,22 +820,49 @@ fn create_polyvoice_diarizer(
     // Enhanced-only engine family: segmentation and embedding construction
     // error with clear messages when the bundled enhanced models are absent
     // (no fallback to a standard/legacy model set).
-    let segmenter = crate::audio::segmentation::create_segmenter(models_dir, config.segmenter_pool_size())?;
-    let embedder = crate::audio::embedder::create_speaker_embedder(models_dir, config.embedder_pool_size())
-        .map_err(|e| format!("Failed to create embedder: {}", e))?;
+    let segmenter =
+        crate::audio::segmentation::create_segmenter(models_dir, config.segmenter_pool_size())?;
+    let embedder =
+        crate::audio::embedder::create_speaker_embedder(models_dir, config.embedder_pool_size())
+            .map_err(|e| format!("Failed to create embedder: {}", e))?;
     let model_tag = embedder.model_tag();
     let family_threshold = embedder.family_threshold();
-    log::info!("Diarizer using enhanced family tag={} threshold={}", model_tag, family_threshold);
-
-    let max_clusters = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
-    let clusterer: Box<dyn polyvoice::clusterer::Clusterer> = Box::new(
-        polyvoice::clusterer::MinClusterSizeClusterer::new(
-            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(max_clusters, family_threshold)),
-            2,
-        ),
+    log::info!(
+        "Diarizer using enhanced family tag={} threshold={}",
+        model_tag,
+        family_threshold
     );
 
-    Ok(PolyvoiceDiarizer { segmenter, embedder, clusterer })
+    let max_clusters = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
+    let clusterer: Box<dyn polyvoice::clusterer::Clusterer> =
+        Box::new(polyvoice::clusterer::MinClusterSizeClusterer::new(
+            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
+                max_clusters,
+                family_threshold,
+            )),
+            2,
+        ));
+
+    Ok(PolyvoiceDiarizer {
+        segmenter,
+        embedder,
+        clusterer,
+    })
+}
+
+fn create_polyvoice_diarizer_for_app<R: Runtime>(
+    app: &AppHandle<R>,
+    max_speakers: Option<i32>,
+    config: &DiarizationConfig,
+) -> Result<PolyvoiceDiarizer, String> {
+    if let Some(dir) = crate::audio::embedder::resolve_enhanced_models_dir(app) {
+        return create_polyvoice_diarizer(&dir, max_speakers, config);
+    }
+    let locations = crate::audio::embedder::format_enhanced_search_locations(app);
+    Err(format!(
+        "Enhanced diarization models not found. Searched: {}. The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time near the executable; rebuild with network or install a build that includes them.",
+        locations
+    ))
 }
 
 const DIARIZATION_SAMPLE_RATE: u32 = 16000;
@@ -682,11 +878,16 @@ fn embed_segments(
 
     for seg in raw_segments {
         let start = (seg.start as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize;
-        let end = ((seg.end as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
+        let end =
+            ((seg.end as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
         if end <= start {
             continue;
         }
-        segments.push(DiarizationSegment { start: seg.start, end: seg.end, speaker: -1 });
+        segments.push(DiarizationSegment {
+            start: seg.start,
+            end: seg.end,
+            speaker: -1,
+        });
         slices.push(&diar_samples[start..end]);
     }
 
@@ -702,7 +903,10 @@ fn embed_segments(
                 .filter_map(|audio| match embedder.embed(audio) {
                     Ok(emb) => Some(emb),
                     Err(e) => {
-                        warn!("Embedding extraction failed for a segment ({}), skipping it", e);
+                        warn!(
+                            "Embedding extraction failed for a segment ({}), skipping it",
+                            e
+                        );
                         None
                     }
                 })
@@ -731,10 +935,22 @@ fn run_chunked_polyvoice_diarization(
     samples: &[f32],
     sample_rate: u32,
     config: &DiarizationConfig,
-) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
+) -> Result<
+    (
+        Vec<DiarizationSegment>,
+        Vec<ClusteredEmbedding>,
+        StageTimings,
+    ),
+    String,
+> {
     let mut timings = StageTimings::default();
     let chunk_duration = config.chunk_duration_secs();
-    let chunks = channel_chunks(samples, sample_rate, chunk_duration, config.chunk_overlap_secs);
+    let chunks = channel_chunks(
+        samples,
+        sample_rate,
+        chunk_duration,
+        config.chunk_overlap_secs,
+    );
 
     info!(
         "Chunked diarization: {} chunks ({}s duration, {}s overlap)",
@@ -745,6 +961,7 @@ fn run_chunked_polyvoice_diarization(
 
     let mut all_segments: Vec<DiarizationSegment> = Vec::new();
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+    let mut had_raw_segments = false;
 
     for (chunk_idx, (chunk_start_seconds, chunk_samples)) in chunks.iter().enumerate() {
         if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
@@ -767,7 +984,10 @@ fn run_chunked_polyvoice_diarization(
         let raw_segments = match diarizer.segmenter.segment(&diar_samples) {
             Ok(segments) => segments,
             Err(e) => {
-                warn!("Segmentation failed for chunk {} ({}), skipping chunk", chunk_idx, e);
+                warn!(
+                    "Segmentation failed for chunk {} ({}), skipping chunk",
+                    chunk_idx, e
+                );
                 continue;
             }
         };
@@ -776,10 +996,24 @@ fn run_chunked_polyvoice_diarization(
         if raw_segments.is_empty() {
             continue;
         }
+        had_raw_segments = true;
 
         let embed_start = Instant::now();
-        let (mut chunk_segments, chunk_embeddings) =
-            embed_segments(diarizer.embedder.as_ref(), &diar_samples, &raw_segments, config);
+        let (mut chunk_segments, chunk_embeddings) = embed_segments(
+            diarizer.embedder.as_ref(),
+            &diar_samples,
+            &raw_segments,
+            config,
+        );
+        // Distinguish layout/shape errors from transient failures in logs.
+        if chunk_segments.is_empty() && !raw_segments.is_empty() {
+            // `embed_segments` already warned per-batch/per-segment; surface layout hint.
+            warn!(
+                "Chunk {}: segmentation found {} raw segments but embedding produced 0 valid vectors (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large)",
+                chunk_idx,
+                raw_segments.len()
+            );
+        }
         timings.embedding_secs += embed_start.elapsed().as_secs_f64();
 
         // Adjust segment times so they are relative to the full channel.
@@ -793,6 +1027,11 @@ fn run_chunked_polyvoice_diarization(
     }
 
     if all_segments.is_empty() {
+        if had_raw_segments {
+            return Err(
+                "Embedding produced zero valid vectors (audio_signal layout mismatch — expected [B,80,T] for titanet_large, but no embeddings survived; check TitaNet layout)".to_string(),
+            );
+        }
         return Ok((Vec::new(), Vec::new(), timings));
     }
 
@@ -915,11 +1154,7 @@ impl Drop for PcmStream {
 
 /// Read up to `count` little-endian f32 samples from `reader`, appending them
 /// to `out`. Returns the number of samples appended (0 means EOF).
-fn read_f32_le(
-    reader: &mut impl Read,
-    out: &mut Vec<f32>,
-    count: usize,
-) -> Result<usize, String> {
+fn read_f32_le(reader: &mut impl Read, out: &mut Vec<f32>, count: usize) -> Result<usize, String> {
     let start = out.len();
     let mut byte_buf = [0u8; 16384];
     while out.len() - start < count {
@@ -1081,13 +1316,21 @@ fn run_channel_diarization_stream(
     diarizer: &PolyvoiceDiarizer,
     mut pcm: PcmStream,
     config: &DiarizationConfig,
-) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>, StageTimings), String> {
+) -> Result<
+    (
+        Vec<DiarizationSegment>,
+        Vec<ClusteredEmbedding>,
+        StageTimings,
+    ),
+    String,
+> {
     let mut timings = StageTimings::default();
     let chunk_samples = (config.chunk_duration_secs() * DIARIZATION_SAMPLE_RATE as f32) as usize;
     let overlap_samples = (config.chunk_overlap_secs * DIARIZATION_SAMPLE_RATE as f32) as usize;
 
     let mut all_segments: Vec<DiarizationSegment> = Vec::new();
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+    let mut had_raw_segments = false;
 
     let mut windows = StreamWindows::new(chunk_samples, overlap_samples);
 
@@ -1114,16 +1357,26 @@ fn run_channel_diarization_stream(
         let raw_segments = match diarizer.segmenter.segment(&window) {
             Ok(segments) => segments,
             Err(e) => {
-                warn!("Segmentation failed for a stream window ({}), skipping it", e);
+                warn!(
+                    "Segmentation failed for a stream window ({}), skipping it",
+                    e
+                );
                 continue;
             }
         };
         timings.segmentation_secs += seg_start.elapsed().as_secs_f64();
 
         if !raw_segments.is_empty() {
+            had_raw_segments = true;
             let embed_start = Instant::now();
             let (mut chunk_segments, chunk_embeddings) =
                 embed_segments(diarizer.embedder.as_ref(), &window, &raw_segments, config);
+            if chunk_segments.is_empty() {
+                warn!(
+                    "Stream window: segmentation found {} raw segments but embedding produced 0 valid vectors (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large)",
+                    raw_segments.len()
+                );
+            }
             timings.embedding_secs += embed_start.elapsed().as_secs_f64();
 
             for seg in &mut chunk_segments {
@@ -1144,6 +1397,11 @@ fn run_channel_diarization_stream(
     pcm.finish()?;
 
     if all_segments.is_empty() {
+        if had_raw_segments {
+            return Err(
+                "Embedding produced zero valid vectors (audio_signal layout mismatch — expected [B,80,T] for titanet_large, but no embeddings survived; check TitaNet layout)".to_string(),
+            );
+        }
         return Ok((Vec::new(), Vec::new(), timings));
     }
 
@@ -1266,7 +1524,12 @@ async fn persist_channel_clusters(
         .map_err(|e| format!("Failed to persist cluster cache: {}", e))?;
 
         let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
-        if let Some(m) = crate::audio::speaker_recognition::best_match_with_threshold(&centroid, Some(channel), prototypes, threshold) {
+        if let Some(m) = crate::audio::speaker_recognition::best_match_with_threshold(
+            &centroid,
+            Some(channel),
+            prototypes,
+            threshold,
+        ) {
             SpeakerRepository::set_auto_binding_if_unbound(
                 pool,
                 meeting_id,
@@ -1343,7 +1606,13 @@ fn compute_speaker_matches<R: Runtime>(
 
         let progress = 70 + ((idx as f32 / total as f32) * 25.0) as u32;
         if idx % 10 == 0 {
-            emit_progress(app, meeting_id, "matching", progress, &format!("Matching segment {}/{}", idx + 1, total));
+            emit_progress(
+                app,
+                meeting_id,
+                "matching",
+                progress,
+                &format!("Matching segment {}/{}", idx + 1, total),
+            );
         }
 
         let t_start = transcript.audio_start_time.unwrap_or(0.0) as f32;
@@ -1566,25 +1835,39 @@ pub async fn check_diarization_models<R: Runtime>(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?
         .join("models");
-    let resource_models = app.path().resource_dir().map(|p| p.join("models")).unwrap_or_else(|_| models_dir.clone());
-    let manifest_models = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
 
     cleanup_legacy_models(&models_dir);
 
-    // Enhanced-only readiness: verify the bundled segmentation-3.0 + TitaNet-Large
-    // files across app-data, bundled resources, and dev manifest locations.
-    let (enh_seg_ok_a, enh_emb_ok_a) = crate::audio::embedder::verify_enhanced_integrity(&models_dir);
-    let (enh_seg_ok_b, enh_emb_ok_b) = crate::audio::embedder::verify_enhanced_integrity(&resource_models);
-    let (enh_seg_ok_c, enh_emb_ok_c) = crate::audio::embedder::verify_enhanced_integrity(&manifest_models);
-    let segmentation_ready = enh_seg_ok_a || enh_seg_ok_b || enh_seg_ok_c;
-    let embedding_ready = enh_emb_ok_a || enh_emb_ok_b || enh_emb_ok_c;
-    let ready = crate::audio::embedder::is_enhanced_installed(&models_dir)
-        || crate::audio::embedder::is_enhanced_installed(&resource_models)
-        || crate::audio::embedder::is_enhanced_installed(&manifest_models);
+    // Delegate to the shared 3-location resolver so Settings and engine never disagree.
+    if let Some(resolved) = crate::audio::embedder::resolve_enhanced_models_dir(&app) {
+        let (seg_ok, emb_ok) = crate::audio::embedder::verify_enhanced_integrity(&resolved);
+        return Ok(DiarizationModelStatus {
+            segmentation_ready: seg_ok,
+            embedding_ready: emb_ok,
+            ready: true,
+        });
+    }
+    // No single location has both files — compute per-file OR across candidates for UI granularity,
+    // but `ready` remains false because engine requires both in the same directory.
+    let candidates = vec![
+        models_dir.clone(),
+        app.path()
+            .resource_dir()
+            .map(|p| p.join("models"))
+            .unwrap_or_else(|_| models_dir.clone()),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models"),
+    ];
+    let mut segmentation_ready = false;
+    let mut embedding_ready = false;
+    for dir in &candidates {
+        let (seg_ok, emb_ok) = crate::audio::embedder::verify_enhanced_integrity(dir);
+        segmentation_ready |= seg_ok;
+        embedding_ready |= emb_ok;
+    }
     Ok(DiarizationModelStatus {
         segmentation_ready,
         embedding_ready,
-        ready,
+        ready: false,
     })
 }
 
@@ -1608,22 +1891,58 @@ mod spike_tests {
     fn find_models_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("MEETILY_MODELS_DIR") {
             let p = PathBuf::from(dir);
+            if crate::audio::embedder::is_enhanced_installed(&p) {
+                return Some(p);
+            }
+            // MEETILY_MODELS_DIR override wins even if only raw existence; keep fallback for tests that create tiny dummies
             if p.join("segmentation-3.0.onnx").exists() && p.join("titanet_large.onnx").exists() {
                 return Some(p);
             }
         }
-        let candidates: Vec<PathBuf> = [
-            std::env::var("APPDATA").ok().map(|d| PathBuf::from(d).join("com.meetily.ai").join("models")),
-            std::env::var("HOME").ok().map(|d| PathBuf::from(d).join("Library").join("Application Support").join("com.meetily.ai").join("models")),
-            std::env::var("XDG_DATA_HOME").ok().map(|d| PathBuf::from(d).join("com.meetily.ai").join("models")),
-            std::env::var("HOME").ok().map(|d| PathBuf::from(d).join(".local").join("share").join("com.meetily.ai").join("models")),
+        let mut candidates: Vec<PathBuf> = [
+            std::env::var("APPDATA")
+                .ok()
+                .map(|d| PathBuf::from(d).join("com.meetily.ai").join("models")),
+            std::env::var("HOME").ok().map(|d| {
+                PathBuf::from(d)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("com.meetily.ai")
+                    .join("models")
+            }),
+            std::env::var("XDG_DATA_HOME")
+                .ok()
+                .map(|d| PathBuf::from(d).join("com.meetily.ai").join("models")),
+            std::env::var("HOME").ok().map(|d| {
+                PathBuf::from(d)
+                    .join(".local")
+                    .join("share")
+                    .join("com.meetily.ai")
+                    .join("models")
+            }),
         ]
         .into_iter()
         .flatten()
         .collect();
-        candidates
-            .into_iter()
-            .find(|p| p.join("segmentation-3.0.onnx").exists() && p.join("titanet_large.onnx").exists())
+        // Dev manifest fallback (cargo tauri dev) and resource dir fallback (bundled)
+        candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
+        // Resource dir near executable (best-effort for spike tests on installed builds)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                candidates.push(parent.join("resources").join("models"));
+                candidates.push(parent.join("models"));
+            }
+        }
+        // Use shared resolver helper (first verified location wins, size >1KB gate)
+        if let Some(dir) =
+            crate::audio::embedder::resolve_enhanced_models_dir_from_paths(&candidates)
+        {
+            return Some(dir);
+        }
+        // Fallback to raw existence check for spike tests with tiny dummies
+        candidates.into_iter().find(|p| {
+            p.join("segmentation-3.0.onnx").exists() && p.join("titanet_large.onnx").exists()
+        })
     }
 
     fn synthetic_speech_16k() -> Vec<f32> {
@@ -1656,7 +1975,10 @@ mod spike_tests {
             segments.len()
         );
         for pair in segments.windows(2) {
-            assert!(pair[0].start <= pair[1].start, "segments must be sorted by start time");
+            assert!(
+                pair[0].start <= pair[1].start,
+                "segments must be sorted by start time"
+            );
         }
     }
 
@@ -1692,7 +2014,10 @@ mod spike_tests {
             if let Ok(e) = emb {
                 assert_eq!(e.len(), 192);
                 let norm: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
-                assert!((norm - 1.0).abs() < 1e-2, "embedding must be L2-normalized (got {norm})");
+                assert!(
+                    (norm - 1.0).abs() < 1e-2,
+                    "embedding must be L2-normalized (got {norm})"
+                );
             }
         }
     }
@@ -1784,7 +2109,10 @@ mod spike_tests {
             .cluster(&embeddings.iter().map(|e| e.2.clone()).collect::<Vec<_>>())
             .expect("AhcClusterer should cluster buffered embeddings");
         assert_eq!(labels.len(), embeddings.len());
-        info!("spike: efficient-path clustering produced labels {:?}", labels);
+        info!(
+            "spike: efficient-path clustering produced labels {:?}",
+            labels
+        );
         assert!(
             labels.iter().all(|&l| l < 8),
             "labels must respect the max-speakers ceiling"
@@ -1799,8 +2127,17 @@ mod spike_tests {
 
         assert!(!chunks.is_empty());
         // Every chunk except the last should be a full 10-second window.
-        for (i, (_, chunk)) in chunks.iter().enumerate().take(chunks.len().saturating_sub(1)) {
-            assert_eq!(chunk.len(), sample_rate as usize * 10, "chunk {} has wrong size", i);
+        for (i, (_, chunk)) in chunks
+            .iter()
+            .enumerate()
+            .take(chunks.len().saturating_sub(1))
+        {
+            assert_eq!(
+                chunk.len(),
+                sample_rate as usize * 10,
+                "chunk {} has wrong size",
+                i
+            );
         }
 
         // Adjacent chunks should overlap by 5 seconds.
@@ -1808,7 +2145,11 @@ mod spike_tests {
             let start_a = window[0].0;
             let start_b = window[1].0;
             let diff = (start_b - start_a - 5.0).abs();
-            assert!(diff < 0.01, "expected 5s overlap, got diff {}s", start_b - start_a);
+            assert!(
+                diff < 0.01,
+                "expected 5s overlap, got diff {}s",
+                start_b - start_a
+            );
         }
 
         // Last chunk should reach the end of the input.
@@ -1859,7 +2200,12 @@ mod spike_tests {
         let batch = embedder.embed_batch(&refs).expect("batch should succeed");
         assert_eq!(batch.len(), inputs.len());
         for (i, emb) in batch.iter().enumerate() {
-            assert_eq!(emb[0], inputs[i].len() as f32, "embedding order mismatch at index {}", i);
+            assert_eq!(
+                emb[0],
+                inputs[i].len() as f32,
+                "embedding order mismatch at index {}",
+                i
+            );
         }
 
         // Empty batch should return an empty result, not an error.
@@ -1877,7 +2223,9 @@ mod spike_tests {
 
     #[test]
     fn fixed_pool_size_respects_floor_and_cap() {
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         let expected = (((cores as f64) * 0.75).ceil() as usize).min(8).max(1);
         assert_eq!(fixed_pool_size(), expected);
         assert!(fixed_pool_size() >= 1);
