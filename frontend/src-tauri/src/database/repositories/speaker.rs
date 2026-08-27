@@ -281,11 +281,18 @@ impl SpeakerRepository {
         .await?;
 
         // Drop prior cache rows for this cluster before writing fresh ones.
-        sqlx::query("DELETE FROM speaker_embeddings WHERE meeting_id = ? AND cluster_label = ?")
-            .bind(meeting_id)
-            .bind(cluster_label)
-            .execute(&mut *tx)
-            .await?;
+        // Only delete unassigned cache rows (speaker_id IS NULL); enrolled prototypes
+        // (speaker_id IS NOT NULL) are owned by speakers and must survive cache refreshes.
+        // The DELETE is channel-scoped to preserve cross-channel cache independence:
+        // re-persisting one channel's cache does not affect the other channel's rows.
+        sqlx::query(
+            "DELETE FROM speaker_embeddings WHERE meeting_id = ? AND cluster_label = ? AND channel = ? AND speaker_id IS NULL",
+        )
+        .bind(meeting_id)
+        .bind(cluster_label)
+        .bind(channel)
+        .execute(&mut *tx)
+        .await?;
 
         let now = Utc::now();
         for exemplar in exemplars {
@@ -3133,5 +3140,103 @@ mod tests {
         .await
         .unwrap();
         assert!(!protos.is_empty(), "Bob should have enrolled prototypes");
+    }
+
+    /// Regression test: write_cluster_cache must not delete enrolled prototypes.
+    /// This test verifies the fix for the bug where offline diarization re-runs
+    /// would wipe out voiceprints enrolled during the recording session.
+    #[tokio::test]
+    async fn write_cluster_cache_preserves_enrolled_prototypes() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        // Step 1: Write initial cache with 5 exemplars
+        let initial_exemplars: Vec<Exemplar> = (0..5)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: (i + 1) as f64,
+                start_secs: Some(i as f32 * 10.0),
+                end_secs: Some(i as f32 * 10.0 + (i + 1) as f32),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[99.0; 4]),
+            &initial_exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Step 2: Enroll the cluster's exemplars as Alice's prototypes
+        let enrolled = SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+        assert_eq!(enrolled, 5, "all 5 exemplars should be enrolled");
+
+        // Verify Alice has prototypes
+        let protos_before = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(protos_before.len(), 5, "Alice should have 5 prototypes before cache refresh");
+
+        // Step 3: Simulate offline diarization re-run: write new cache for the same cluster
+        // This is what happens when offline diarization runs after online enrollment
+        let new_exemplars: Vec<Exemplar> = (10..15)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: (i - 9) as f64,
+                start_secs: Some((i - 10) as f32 * 100.0),
+                end_secs: Some((i - 10) as f32 * 100.0 + (i - 9) as f32),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[88.0; 4]), // new centroid
+            &new_exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Step 4: Verify Alice's prototypes survived the cache refresh
+        let protos_after = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(&[alice.id.clone()]),
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            protos_after.len(),
+            5,
+            "Alice's prototypes must survive cache refresh (bug regression)"
+        );
+
+        // Verify the prototypes are the ORIGINAL ones (values 0..5), not the new cache (10..15)
+        for p in &protos_after {
+            assert!(
+                p.embedding[0] < 5.0,
+                "prototypes should be the original enrolled ones, not the new cache"
+            );
+        }
+
+        // Step 5: Verify the new cache rows exist separately (unassigned)
+        let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(stats.prototype_count, 5, "Alice's 5 prototypes");
+        assert_eq!(stats.cache_count, 5, "new cache has 5 unassigned exemplars");
     }
 }
