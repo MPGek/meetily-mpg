@@ -487,6 +487,18 @@ impl ParakeetEngine {
 
     /// Transcribe audio samples using the loaded Parakeet model
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
+        let (text, _tokens) = self.transcribe_audio_with_tokens(audio_data).await?;
+        Ok(text)
+    }
+
+    /// Transcribe audio samples and return per-word tokens derived from the
+    /// model's native token-frame alignment (word-level-diarization-alignment D1).
+    /// Token timestamps are chunk-relative seconds quantized to the encoder
+    /// frame granularity; empty text yields an empty token list.
+    pub async fn transcribe_audio_with_tokens(
+        &self,
+        audio_data: Vec<f32>,
+    ) -> Result<(String, Vec<crate::audio::token_assignment::Token>)> {
         let mut model_guard = self.current_model.write().await;
         let model = model_guard
             .as_mut()
@@ -537,7 +549,13 @@ impl ParakeetEngine {
 
         log::info!("Parakeet transcription result: '{}'", result.text);
 
-        Ok(result.text)
+        let tokens = if result.text.trim().is_empty() {
+            Vec::new()
+        } else {
+            crate::parakeet_engine::model::build_word_tokens(&result.tokens, &result.timestamps)
+        };
+
+        Ok((result.text, tokens))
     }
 
     /// Get the models directory path

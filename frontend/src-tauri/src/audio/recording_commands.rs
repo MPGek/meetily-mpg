@@ -121,6 +121,52 @@ pub struct TranscriptionStatus {
     pub last_activity_ms: u64,
 }
 
+/// Map a `TranscriptUpdate` event payload onto the shared buffered segment.
+/// Used by both transcript-update listeners so word-level tokens always
+/// propagate into `SHARED_SEGMENTS` / `transcripts.json` (word-level-diarization-alignment D6).
+fn transcript_segment_from_update(
+    update: &TranscriptUpdate,
+) -> super::recording_saver::TranscriptSegment {
+    super::recording_saver::TranscriptSegment {
+        id: format!("seg_{}", update.sequence_id),
+        text: update.text.clone(),
+        audio_start_time: update.audio_start_time,
+        audio_end_time: update.audio_end_time,
+        duration: update.duration,
+        display_time: update.timestamp.clone(),
+        confidence: update.confidence,
+        sequence_id: update.sequence_id,
+        source_device: update.source_device.clone(),
+        tokens: update.tokens.clone(),
+    }
+}
+
+/// Resolve a repair-path span source over a meeting's saved audio file
+/// (word-level-diarization-alignment 5.6). The mic/system channel mapping is
+/// baked into the returned source. `None` when the file/ffmpeg is unavailable.
+fn meeting_span_source(
+    folder: &std::path::Path,
+) -> Option<Box<dyn crate::audio::word_alignment::refine::AudioSpanSource>> {
+    use crate::audio::word_alignment::refine::FileSpanSource;
+    let audio_path = match crate::audio::audio_file::find_audio_file(folder) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Alignment repair: no audio file in meeting folder: {}", e);
+            return None;
+        }
+    };
+    let stereo = crate::audio::decoder::probe_audio_metadata(&audio_path)
+        .map(|(_, ch)| ch >= 2)
+        .unwrap_or(false);
+    match FileSpanSource::new(audio_path, stereo) {
+        Ok(s) => Some(Box::new(s)),
+        Err(e) => {
+            warn!("Alignment repair: span source init failed: {}", e);
+            None
+        }
+    }
+}
+
 // ============================================================================
 // RECORDING COMMANDS
 // ============================================================================
@@ -349,18 +395,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         use tauri::Listener;
         let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
             if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
-                    text: update.text.clone(),
-                    audio_start_time: update.audio_start_time,
-                    audio_end_time: update.audio_end_time,
-                    duration: update.duration,
-                    display_time: update.timestamp.clone(),
-                    confidence: update.confidence,
-                    sequence_id: update.sequence_id,
-                    source_device: update.source_device.clone(),
-                    tokens: update.tokens.clone(),
-                };
+                let segment = transcript_segment_from_update(&update);
 
                 // Write to shared transcript segments (no RecordingManager access)
                 if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
@@ -688,18 +723,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         use tauri::Listener;
         let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
             if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
-                    text: update.text.clone(),
-                    audio_start_time: update.audio_start_time,
-                    audio_end_time: update.audio_end_time,
-                    duration: update.duration,
-                    display_time: update.timestamp.clone(),
-                    confidence: update.confidence,
-                    sequence_id: update.sequence_id,
-                    source_device: update.source_device.clone(),
-                    tokens: None,
-                };
+                let segment = transcript_segment_from_update(&update);
 
                 // Write to shared transcript segments (no RecordingManager access)
                 if let Ok(segments_guard) = SHARED_SEGMENTS.lock() {
@@ -997,9 +1021,38 @@ pub async fn stop_recording<R: Runtime>(
         let transcripts = manager_for_cleanup
             .as_ref()
             .map(|manager| manager.get_transcript_segments());
+        let meeting_folder = manager_for_cleanup
+            .as_ref()
+            .and_then(|m| m.get_meeting_folder());
 
-        if let (Some(mut processor), Some(transcripts)) = (processor, transcripts) {
-            match tokio::task::spawn_blocking(move || processor.finalize(&transcripts)).await {
+        if let (Some(mut processor), Some(mut transcripts)) = (processor, transcripts) {
+            // Stop-time repair (word-level-diarization-alignment 5.6): before
+            // the N-way split, refine any segment still lacking refined tokens
+            // (alignment off/missing during recording, or a block dropped by
+            // queue overflow) against the saved post-flush meeting file.
+            let align_settings = crate::audio::word_alignment::settings::current();
+            match tokio::task::spawn_blocking(move || {
+                if align_settings.enabled {
+                    if let Some(folder) = &meeting_folder {
+                        if let Some(source) = meeting_span_source(folder) {
+                            let n = crate::audio::word_alignment::refine::refine_segment_tokens(
+                                &mut transcripts,
+                                source.as_ref(),
+                                &align_settings,
+                            );
+                            if n > 0 {
+                                info!(
+                                    "Stop-time alignment repair: refined {} segment(s) before split",
+                                    n
+                                );
+                            }
+                        }
+                    }
+                }
+                processor.finalize(&transcripts)
+            })
+            .await
+            {
                 Ok(Ok((assignments, cluster_embeddings, live_bindings))) => {
                     info!(
                         "✅ Online diarization finalized: {} speaker assignments, {} live bindings",
@@ -1945,4 +1998,64 @@ pub async fn assign_live_speaker(
         speaker_id: speaker.id,
         name: speaker.name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::token_assignment::Token;
+
+    fn sample_update() -> TranscriptUpdate {
+        TranscriptUpdate {
+            text: "hello world".to_string(),
+            timestamp: "[00:01]".to_string(),
+            source: "Audio".to_string(),
+            sequence_id: 7,
+            chunk_start_time: 1.0,
+            is_partial: false,
+            confidence: 0.9,
+            audio_start_time: 1.0,
+            audio_end_time: 3.5,
+            duration: 2.5,
+            source_device: "Microphone".to_string(),
+            speaker: None,
+            tokens: Some(vec![
+                Token {
+                    text: "hello".to_string(),
+                    start: 1.0,
+                    end: 1.8,
+                    refined: false,
+                },
+                Token {
+                    text: "world".to_string(),
+                    start: 1.8,
+                    end: 2.4,
+                    refined: false,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn transcript_update_tokens_survive_event_payload_roundtrip() {
+        // Mirrors the listener path: serialize the emitted update, parse it back
+        // from the event payload, and map it onto a buffered segment.
+        let update = sample_update();
+        let payload = serde_json::to_string(&update).unwrap();
+        let parsed: TranscriptUpdate = serde_json::from_str(&payload).unwrap();
+        let segment = transcript_segment_from_update(&parsed);
+        let tokens = segment.tokens.expect("tokens must be forwarded");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[1].end, 2.4);
+        assert_eq!(segment.sequence_id, 7);
+    }
+
+    #[test]
+    fn transcript_segment_from_update_without_tokens_stays_none() {
+        let mut update = sample_update();
+        update.tokens = None;
+        let segment = transcript_segment_from_update(&update);
+        assert!(segment.tokens.is_none());
+    }
 }

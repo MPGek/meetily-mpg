@@ -186,6 +186,57 @@ graph LR
 - New Tauri commands: `list_speakers`, `assign_speaker`, `rename_speaker`, `set_expected_speakers`, `get_expected_speakers`, `assign_live_speaker`, `rematch_meeting_speakers`, `finalize_online_session`, `speaker_storage_stats`.
 - Live Fast mode: `PrototypeStore` (shared `Arc<RwLock>` beside `ONLINE_DIARIZATION_TASK`) matches each chunk embedding and relabels turns via `SpeakerTurn.display_name`; `assign_live_speaker` binds mid-recording renames that take effect immediately.
 
+### Word-Level CTC Alignment (`word_alignment/`) (NEW — `word-level-diarization-alignment` change)
+
+Post-ASR forced alignment that refines per-word timestamps so the token N-way
+speaker split (`token_assignment.rs`) operates on word-true boundaries. Reuses
+the existing `ort` runtime (no new heavy deps; `half` added for f16 tensor
+extraction). All failure modes degrade silently to the ASR-provided tokens.
+
+- **`catalog.rs`** — model catalog + readiness resolver. Default model
+  `wav2vec2-xlsr-56` = `NewComer00/wav2vec2-xlsr-multilingual-56-ONNX`
+  (56-language wav2vec2-large CTC), files under `app_data_dir/models/alignment/<id>/`
+  (existence + min-size validation → `Available`/`Missing`/`Downloading`/`Corrupted`).
+- **`download.rs`** — HF multi-file download with weighted progress, Range
+  resume, cancel (partial cleanup), delete — cloned from the Parakeet pattern.
+- **`engine.rs`** — `AlignmentEngine`: lazily-pooled ONNX sessions
+  (`min(8, ceil(0.75×cores))`), per-span zero-mean/unit-variance normalize →
+  `input_values` f32 → `logits` (f32 despite the fp16 file) → row log-softmax
+  `[frames×9913]`, blank id from `config.pad_token_id`, 20 ms frame hop.
+  `align_tokens` refines a segment's tokens in place; `align_tokens_with_timeout`
+  bounds each segment on a helper thread.
+- **`viterbi.rs`** — character-sequence builder (word-boundary + repeat blank
+  markers; out-of-alphabet char → per-segment fallback, never an error) and a
+  CTC blank-aware constrained interval-Viterbi recovering per-word frame ranges.
+- **`refine.rs`** — `refine_segment_tokens(segments, source, settings)` (the
+  single repair entry point) + `refine_tokens_with_source` core + `AudioSpanSource`
+  (`FileSpanSource` ffmpeg `-ss/-t` bounded windows with per-channel batching,
+  mic=left/system=right; `MemorySpanSource`). Skips already-`refined` segments.
+- **`queue.rs`** — bounded live queue (128 MB, drop-oldest) + consumer.
+- **`settings.rs`** — process globals for `wordAlignmentEnabled` (default on) +
+  `alignmentModelId`, set by the `set_word_alignment_settings` command.
+
+**Three call sites (single engine + one `refined` flag):**
+1. **Live** (`transcription/worker.rs`): a final result with tokens moves its
+   in-memory 16 kHz block into the queue; the consumer refines and **re-emits**
+   `transcript-update` for the same `sequence_id` (the recording_commands
+   listener upserts it into `SHARED_SEGMENTS`/`transcripts.json`). Partials are
+   never queued. The task drains the queue (bounded wait) before returning so
+   stop-time finalize sees refined-or-baseline data.
+2. **Stop-time repair** (`recording_commands.rs` finalize path): refines
+   segments still lacking refined tokens from the saved post-flush meeting file
+   before `OnlineDiarizationProcessor::finalize`'s N-way expansion.
+3. **Offline repair** (`diarization.rs`): `refine_offline_rows` refines stored
+   rows' tokens per-channel from the meeting audio immediately before
+   `assign_tokens_to_speakers`.
+
+**Token plumbing fix (D6):** both `transcript-update` listeners now forward
+`update.tokens` (was hardcoded `None`); `Token` gained a `refined` flag; the
+Parakeet engine exposes native frame-aligned word timestamps via
+`transcribe_audio_with_tokens` (worker populates `TranscriptUpdate.tokens` for
+Parakeet exactly like Whisper). Frontend `Transcript`/`TranscriptUpdate` types +
+save payload carry `tokens` (DB `transcripts.tokens` column already bound).
+
 ### Streaming Meeting Audio Player (`audio_file.rs`)
 
 `find_audio_file` locates a meeting's recording (candidate name list → extension scan); `prepare_audio_for_playback` FFmpeg-transcodes to 44.1 kHz WAV in `%TEMP%/meetily-playback` (cached by `(path, mtime)` hash, atomic `.part`→rename). The webview streams via `convertFileSrc`; on native decode failure `useAudioPlayer` falls back to `prepare_audio_for_playback`.

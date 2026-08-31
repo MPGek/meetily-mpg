@@ -639,3 +639,112 @@ impl ParakeetModel {
         Ok(timestamped_result)
     }
 }
+
+/// Encoder frame duration in seconds (10 ms feature window × 8× subsampling = 80 ms hop).
+pub const FRAME_DURATION_SECS: f32 = WINDOW_SIZE * SUBSAMPLING_FACTOR as f32;
+
+/// Merge Parakeet vocab pieces into word-level tokens with frame-aligned
+/// timestamps (word-level-diarization-alignment D1).
+///
+/// `pieces` are `TimestampedResult.tokens` (vocab entries with `▁` already
+/// replaced by a leading space) and `timestamps` their per-piece start times in
+/// seconds, chunk-relative. A piece starting with a space begins a new word;
+/// other pieces continue the current word. A word's end is the next word's
+/// start (words in the same frame share a start); the last word ends one frame
+/// after its start. Timestamps are non-decreasing by construction.
+pub fn build_word_tokens(
+    pieces: &[String],
+    timestamps: &[f32],
+) -> Vec<crate::audio::token_assignment::Token> {
+    let mut words: Vec<(String, f32)> = Vec::new();
+    for (piece, &ts) in pieces.iter().zip(timestamps.iter()) {
+        if let Some(stripped) = piece.strip_prefix(' ') {
+            words.push((stripped.to_string(), ts));
+        } else if let Some((text, _)) = words.last_mut() {
+            text.push_str(piece);
+        } else {
+            words.push((piece.clone(), ts));
+        }
+    }
+    words.retain(|(text, _)| !text.is_empty());
+
+    let count = words.len();
+    let mut tokens = Vec::with_capacity(count);
+    for i in 0..count {
+        let (text, start) = words[i].clone();
+        let end = if i + 1 < count {
+            words[i + 1].1.max(start)
+        } else {
+            start + FRAME_DURATION_SECS
+        };
+        tokens.push(crate::audio::token_assignment::Token {
+            text,
+            start,
+            end,
+            refined: false,
+        });
+    }
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pieces(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn word_tokens_merge_subwords_and_chain_boundaries() {
+        // Vocab pieces carry a leading space where `▁` was: a space-prefixed
+        // piece starts a new word, a bare piece continues the current one.
+        let tokens = build_word_tokens(
+            &pieces(&[" hello", " wor", "ld", " there"]),
+            &[0.0, 0.08, 0.16, 0.24],
+        );
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[0].start, 0.0);
+        assert_eq!(tokens[0].end, 0.08); // next word's start
+        assert_eq!(tokens[1].text, "world");
+        assert_eq!(tokens[1].start, 0.08);
+        assert_eq!(tokens[1].end, 0.24); // subword "ld" does not split the word
+        assert_eq!(tokens[2].text, "there");
+        assert_eq!(tokens[2].start, 0.24);
+        assert_eq!(tokens[2].end, 0.24 + FRAME_DURATION_SECS); // last word: +1 frame
+    }
+
+    #[test]
+    fn same_frame_words_share_start_and_last_word_ends_one_frame_later() {
+        let tokens = build_word_tokens(&pieces(&[" one", " two"]), &[0.16, 0.16]);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].start, 0.16);
+        assert_eq!(tokens[0].end, 0.16); // same-frame: end == next start
+        assert_eq!(tokens[1].start, 0.16);
+        assert_eq!(tokens[1].end, 0.16 + FRAME_DURATION_SECS);
+    }
+
+    #[test]
+    fn single_word_and_empty_inputs() {
+        let tokens = build_word_tokens(&pieces(&["hello"]), &[0.0]);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].end, FRAME_DURATION_SECS);
+        assert!(build_word_tokens(&[], &[]).is_empty());
+        // Pure-space piece yields no word.
+        assert!(build_word_tokens(&pieces(&[" "]), &[0.0]).is_empty());
+    }
+
+    #[test]
+    fn timestamps_are_never_decreasing() {
+        let tokens = build_word_tokens(
+            &pieces(&[" a", "b", " c", " d"]),
+            &[0.0, 0.08, 0.08, 0.32],
+        );
+        assert_eq!(tokens.len(), 3);
+        for w in tokens.windows(2) {
+            assert!(w[1].start >= w[0].start);
+            assert!(w[1].end >= w[0].end);
+        }
+    }
+}

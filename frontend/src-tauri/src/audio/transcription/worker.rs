@@ -78,6 +78,24 @@ pub fn start_transcription_task<R: Runtime>(
         let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
         let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
 
+        // Live word-alignment queue (word-level-diarization-alignment D4):
+        // final blocks with tokens are handed off here and refined off the
+        // worker's emit path. Absent when the feature is disabled.
+        let (alignment_queue, alignment_consumer): (
+            Option<Arc<crate::audio::word_alignment::queue::AlignmentQueue>>,
+            Option<tokio::task::JoinHandle<()>>,
+        ) = if crate::audio::word_alignment::settings::is_enabled() {
+            let q = Arc::new(crate::audio::word_alignment::queue::AlignmentQueue::new(
+                crate::audio::word_alignment::queue::QUEUE_CAPACITY_BYTES,
+            ));
+            let consumer =
+                crate::audio::word_alignment::queue::spawn_consumer(app.clone(), q.clone());
+            info!("🧩 Live word-alignment consumer started");
+            (Some(q), Some(consumer))
+        } else {
+            (None, None)
+        };
+
         // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
         let chunks_queued = Arc::new(AtomicU64::new(0));
         let chunks_completed = Arc::new(AtomicU64::new(0));
@@ -102,6 +120,7 @@ pub fn start_transcription_task<R: Runtime>(
             let chunks_completed_clone = chunks_completed.clone();
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
+            let align_queue_clone = alignment_queue.clone();
 
             let worker_handle = tokio::spawn(async move {
                 info!("👷 Worker {} started", worker_id);
@@ -182,6 +201,24 @@ pub fn start_transcription_task<R: Runtime>(
                                     }
                                 }
                             };
+
+                            // Live-alignment samples: the 16 kHz mono block the
+                            // ASR will transcribe, captured before `chunk` is
+                            // moved (only when a queue is active).
+                            let align_samples: Option<Arc<[f32]>> = align_queue_clone.as_ref().map(
+                                |_| {
+                                    let s = if chunk.sample_rate != 16000 {
+                                        crate::audio::audio_processing::resample_audio(
+                                            &chunk.data,
+                                            chunk.sample_rate,
+                                            16000,
+                                        )
+                                    } else {
+                                        chunk.data.clone()
+                                    };
+                                    Arc::from(s)
+                                },
+                            );
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -307,6 +344,25 @@ pub fn start_transcription_task<R: Runtime>(
                                                 "Worker {}: Failed to emit transcript update: {}",
                                                 worker_id, e
                                             );
+                                        }
+
+                                        // Hand the completed block to the
+                                        // live-alignment queue (finals only,
+                                        // never partials) for off-path
+                                        // refinement + re-emit (D4).
+                                        if !is_partial {
+                                            if let (Some(q), Some(samples)) =
+                                                (align_queue_clone.as_ref(), align_samples.clone())
+                                            {
+                                                if update.tokens.is_some() {
+                                                    q.push(
+                                                        crate::audio::word_alignment::queue::AlignmentJob {
+                                                            update: update.clone(),
+                                                            samples,
+                                                        },
+                                                    );
+                                                }
+                                            }
                                         }
                                         // PERFORMANCE: Removed verbose logging of every emission
                                     } else if !transcript.trim().is_empty() && should_log_this_chunk
@@ -488,6 +544,18 @@ pub fn start_transcription_task<R: Runtime>(
             }
         }
 
+        // Drain the live-alignment queue before this task returns (stop-time
+        // bounded wait, D4/5.4). Runs while finalize has not started yet; the
+        // finalize repair hook handles anything left unrefined afterwards.
+        if let (Some(q), Some(consumer)) = (alignment_queue.clone(), alignment_consumer) {
+            crate::audio::word_alignment::queue::drain_on_stop(
+                &q,
+                consumer,
+                std::time::Duration::from_secs(120),
+            )
+            .await;
+        }
+
         info!("✅ Parallel transcription task completed - all workers finished, ready for model unload");
     })
 }
@@ -589,20 +657,31 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             }
         }
         TranscriptionEngine::Parakeet(parakeet_engine) => {
-            match parakeet_engine.transcribe_audio(speech_samples).await {
-                Ok(text) => {
+            match parakeet_engine
+                .transcribe_audio_with_tokens(speech_samples)
+                .await
+            {
+                Ok((text, tokens)) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
                         return Ok((String::new(), None, None, false));
                     }
 
                     info!(
-                        "Parakeet transcription complete for chunk {}: '{}'",
-                        chunk.chunk_id, cleaned_text
+                        "Parakeet transcription complete for chunk {}: '{}' ({} tokens)",
+                        chunk.chunk_id,
+                        cleaned_text,
+                        tokens.len()
                     );
 
-                    // Parakeet doesn't provide confidence, partial, or token timestamps
-                    Ok((cleaned_text, None, None, false))
+                    // Parakeet doesn't provide confidence or partial state;
+                    // tokens carry native frame-aligned timestamps (chunk-relative).
+                    let tokens_opt = if tokens.is_empty() {
+                        None
+                    } else {
+                        Some(tokens)
+                    };
+                    Ok((cleaned_text, tokens_opt, None, false))
                 }
                 Err(e) => {
                     error!(

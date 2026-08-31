@@ -240,6 +240,7 @@ pub async fn start_diarization<R: Runtime>(
     let app_clone = app.clone();
     let meeting_id_clone = meeting_id.clone();
     let transcripts_for_block = transcripts.clone();
+    let folder_path_for_repair = folder_path.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         run_diarization_blocking_with_app(
@@ -275,13 +276,60 @@ pub async fn start_diarization<R: Runtime>(
             let mut original_row_updates: Vec<(String, f64, f64, f64, String, String)> = Vec::new(); // (id, start, end, duration, text, tokens_json) for first block
             let mut token_based_updates: Vec<(String, String)> = Vec::new();
             let mut saw_token_split = false;
+
+            // Repair hook (word-level-diarization-alignment 5.5): refine the
+            // word tokens of rows that lack refined timestamps, per-channel
+            // from the meeting audio, immediately before the N-way split.
+            // Rows already carrying refined tokens (live alignment during
+            // recording) are skipped by the engine. Disabled/missing model ->
+            // empty map -> split uses stored (baseline) tokens.
+            let refined_tokens: HashMap<String, Vec<crate::audio::token_assignment::Token>> = {
+                let align_settings = crate::audio::word_alignment::settings::current();
+                if align_settings.enabled {
+                    let folder = folder_path_for_repair.clone();
+                    let stereo = is_stereo;
+                    let rows: Vec<(String, String, Option<String>, Option<f64>, Option<f64>)> =
+                        transcripts
+                            .iter()
+                            .filter_map(|t| {
+                                t.tokens.clone().map(|j| {
+                                    (
+                                        t.id.clone(),
+                                        j,
+                                        t.source_device.clone(),
+                                        t.audio_start_time,
+                                        t.audio_end_time,
+                                    )
+                                })
+                            })
+                            .collect();
+                    if rows.is_empty() {
+                        HashMap::new()
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            refine_offline_rows(&folder, stereo, rows, &align_settings)
+                        })
+                        .await
+                        .unwrap_or_default()
+                    }
+                } else {
+                    HashMap::new()
+                }
+            };
+
             for t in &transcripts {
                 if let Some(tokens_json) = &t.tokens {
-                    if let Ok(tokens) = serde_json::from_str::<
-                        Vec<crate::audio::token_assignment::Token>,
-                    >(tokens_json)
-                    {
-                        if tokens.len() >= 2 {
+                    let tokens: Vec<crate::audio::token_assignment::Token> = refined_tokens
+                        .get(&t.id)
+                        .cloned()
+                        .or_else(|| {
+                            serde_json::from_str::<Vec<crate::audio::token_assignment::Token>>(
+                                tokens_json,
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default();
+                    if tokens.len() >= 2 {
                             let segs_ref =
                                 if is_stereo && t.source_device.as_deref() == Some("System") {
                                     &sys_clusters.segments
@@ -369,7 +417,6 @@ pub async fn start_diarization<R: Runtime>(
                                     continue;
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -453,6 +500,59 @@ pub async fn start_diarization<R: Runtime>(
 /// Fixed chunk duration for offline diarization (seconds). Diarization always
 /// processes recordings in chunks to keep peak memory bounded.
 const DIARIZATION_CHUNK_DURATION_SECS: f32 = 600.0;
+
+/// Offline repair (word-level-diarization-alignment 5.5): refine the word
+/// tokens of stored transcript rows that lack refined timestamps, per-channel
+/// from the meeting audio file. Returns `row_id -> refined tokens` for rows
+/// that were successfully refined; the caller overlays these before the N-way
+/// split. Blocking (ffmpeg seek extraction) — call from `spawn_blocking`.
+fn refine_offline_rows(
+    folder: &str,
+    stereo: bool,
+    rows: Vec<(String, String, Option<String>, Option<f64>, Option<f64>)>,
+    settings: &crate::audio::word_alignment::refine::AlignmentSettings,
+) -> HashMap<String, Vec<crate::audio::token_assignment::Token>> {
+    use crate::audio::word_alignment::refine::{
+        refine_tokens_with_source, FileSpanSource,
+    };
+    let Some(engine) = settings.engine() else {
+        return HashMap::new();
+    };
+    let audio_path = match find_audio_file(Path::new(folder)) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Alignment repair: no audio file in {}: {}", folder, e);
+            return HashMap::new();
+        }
+    };
+    let source = match FileSpanSource::new(audio_path, stereo) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Alignment repair: span source init failed: {}", e);
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    let mut refined_count = 0;
+    for (id, tokens_json, channel, start, end) in rows {
+        let Ok(mut tokens) =
+            serde_json::from_str::<Vec<crate::audio::token_assignment::Token>>(&tokens_json)
+        else {
+            continue;
+        };
+        let ch = channel.as_deref().unwrap_or("Microphone");
+        let s = start.unwrap_or(0.0);
+        let e = end.unwrap_or(0.0);
+        if refine_tokens_with_source(&mut tokens, &source, ch, s, e, &engine) {
+            refined_count += 1;
+            out.insert(id, tokens);
+        }
+    }
+    if refined_count > 0 {
+        info!("Alignment repair: refined {} offline transcript row(s)", refined_count);
+    }
+    out
+}
 
 /// Fixed concurrency profile: the ONNX session pool size is the smaller of 8
 /// or 75% of the logical CPU core count (rounded up, minimum 1). There is no

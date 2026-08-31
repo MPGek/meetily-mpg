@@ -7,6 +7,7 @@ import { configService, ModelConfig } from '@/services/configService';
 import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
+import { syncAlignmentSettingsToBackend } from '@/lib/alignment';
 
 export interface OllamaModel {
   name: string;
@@ -223,6 +224,15 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
         });
     }
   }, []); 
+
+  // Sync word-alignment settings to Rust on mount so the live worker and
+  // repair paths read the persisted values before the first recording
+  // (word-level-diarization-alignment 6.1).
+  useEffect(() => {
+    syncAlignmentSettingsToBackend().catch(err =>
+      console.error('[ConfigContext] Failed to sync alignment settings:', err)
+    );
+  }, []);
 
   // Load model configuration on mount
   useEffect(() => {

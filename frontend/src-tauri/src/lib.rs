@@ -479,6 +479,9 @@ pub fn run() {
             // Set Parakeet models directory
             parakeet_engine::commands::set_models_directory(&_app.handle());
 
+            // Set alignment models directory (word-level-diarization-alignment)
+            audio::word_alignment::commands::set_models_directory(&_app.handle());
+
             // Initialize Parakeet engine on startup
             tauri::async_runtime::spawn(async {
                 if let Err(e) = parakeet_engine::commands::parakeet_init().await {
@@ -664,6 +667,12 @@ pub fn run() {
             parakeet_engine::commands::parakeet_cancel_download,
             parakeet_engine::commands::parakeet_delete_corrupted_model,
             parakeet_engine::commands::open_parakeet_models_folder,
+            audio::word_alignment::commands::list_alignment_models,
+            audio::word_alignment::commands::check_alignment_models,
+            audio::word_alignment::commands::download_alignment_model,
+            audio::word_alignment::commands::cancel_alignment_download,
+            audio::word_alignment::commands::delete_alignment_model,
+            audio::word_alignment::commands::set_word_alignment_settings,
             // Parallel processing commands
             whisper_engine::parallel_commands::initialize_parallel_processor,
             whisper_engine::parallel_commands::start_parallel_processing,

@@ -21,6 +21,15 @@ export interface Transcript {
   speaker_label?: string;    // User-assigned speaker name
   speaker_matched_by?: string; // 'user' | 'auto' | 'fallback'
   speaker_match_score?: number; // cosine similarity 0..1 for auto-matched
+  tokens?: TranscriptToken[]; // Word-level timestamps for token diarization
+}
+
+// One word token with recording-relative start/end times (seconds).
+export interface TranscriptToken {
+  text: string;
+  start: number;
+  end: number;
+  refined?: boolean; // true when timestamps came from CTC forced alignment
 }
 
 export interface TranscriptUpdate {
@@ -37,6 +46,7 @@ export interface TranscriptUpdate {
   duration: number;          // Segment duration in seconds
   source_device: string;    // "Microphone" or "System"
   speaker?: string;         // Speaker ID from diarization
+  tokens?: TranscriptToken[]; // Word-level timestamps from the transcription engine
 }
 
 export interface Block {

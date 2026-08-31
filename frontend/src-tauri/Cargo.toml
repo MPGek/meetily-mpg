@@ -107,7 +107,8 @@ polyvoice = { version = "=0.17.0", default-features = false, features = ["onnx",
 
 # Parakeet (ONNX-based fast transcription) dependencies
 # ort pinned to exactly 2.0.0-rc.12 (polyvoice's tested version; rc.13+ breaks the rc.10 API usage)
-ort = { version = "=2.0.0-rc.12" }  # ONNX Runtime for Parakeet models
+ort = { version = "=2.0.0-rc.12", features = ["half"] }  # ONNX Runtime for Parakeet models
+half = "2"                          # f16 tensor extraction (word alignment posteriors)
 thiserror = "2.0.16"                # Error handling for Parakeet
 
 # Async

@@ -11,13 +11,18 @@
 use serde::{Deserialize, Serialize};
 
 /// One Whisper token with start/end timestamps (seconds, recording-relative).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Token {
     pub text: String,
     /// Start time in seconds from recording start.
     pub start: f32,
     /// End time in seconds from recording start.
     pub end: f32,
+    /// True when `start`/`end` came from CTC forced alignment rather than the
+    /// transcription engine's own timestamps (word-level-diarization-alignment
+    /// D4). Refinement call sites skip tokens already flagged refined.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refined: bool,
 }
 
 /// A diarization turn (speaker-active interval) used for assignment.
@@ -289,6 +294,7 @@ mod tests {
             text: text.to_string(),
             start: s,
             end: e,
+            refined: false,
         }
     }
     fn turn(s: f32, e: f32, spk: i32) -> SpeakerTurn {

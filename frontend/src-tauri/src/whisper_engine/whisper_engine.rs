@@ -677,6 +677,7 @@ impl WhisperEngine {
                             },
                             start: t_start as f32,
                             end: t_end as f32,
+                            refined: false,
                         });
                     }
                     if !result.is_empty() {
@@ -711,6 +712,7 @@ impl WhisperEngine {
                     },
                     start: (base + per * idx as f64) as f32,
                     end: (base + per * (idx as f64 + 1.0)) as f32,
+                    refined: false,
                 })
                 .collect();
         }
@@ -817,6 +819,7 @@ impl WhisperEngine {
                             },
                             start: (s + per * wi as f64) as f32,
                             end: (s + per * (wi as f64 + 1.0)) as f32,
+                            refined: false,
                         });
                     }
                     if !result.is_empty() {
@@ -847,6 +850,7 @@ impl WhisperEngine {
                     },
                     start: (base + per * idx as f64) as f32,
                     end: (base + per * (idx as f64 + 1.0)) as f32,
+                    refined: false,
                 })
                 .collect();
         }

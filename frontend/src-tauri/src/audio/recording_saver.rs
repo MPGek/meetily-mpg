@@ -825,4 +825,59 @@ mod tests {
         let warning = build_audio_warning(Some(120.0), Some(120.0), 2).unwrap();
         assert_eq!(warning.failed_checkpoints, 2);
     }
+
+    #[test]
+    fn test_tokens_roundtrip_through_transcripts_json() {
+        // word-level-diarization-alignment 1.2: tokens must survive the
+        // incremental transcripts.json write/read cycle so stop-time finalize
+        // and repair paths see them.
+        let dir = std::env::temp_dir().join(format!(
+            "meetily_transcript_tokens_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let segments = Arc::new(Mutex::new(vec![TranscriptSegment {
+            id: "seg_1".to_string(),
+            text: "hello world".to_string(),
+            audio_start_time: 1.0,
+            audio_end_time: 3.5,
+            duration: 2.5,
+            display_time: "[00:01]".to_string(),
+            confidence: 0.9,
+            sequence_id: 1,
+            source_device: "Microphone".to_string(),
+            tokens: Some(vec![
+                crate::audio::token_assignment::Token {
+                    text: "hello".to_string(),
+                    start: 1.0,
+                    end: 1.8,
+                    refined: false,
+                },
+                crate::audio::token_assignment::Token {
+                    text: "world".to_string(),
+                    start: 1.8,
+                    end: 2.4,
+                    refined: false,
+                },
+            ]),
+        }]));
+
+        write_transcripts_to_disk(&dir, &segments).unwrap();
+        let raw = std::fs::read_to_string(dir.join("transcripts.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let loaded: Vec<TranscriptSegment> =
+            serde_json::from_value(parsed["segments"].clone()).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        let tokens = loaded[0]
+            .tokens
+            .as_ref()
+            .expect("tokens must survive transcripts.json round-trip");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[1].end, 2.4);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

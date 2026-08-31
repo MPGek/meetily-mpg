@@ -32,7 +32,7 @@ Meetily is a **privacy-first AI meeting assistant** desktop application built wi
 
 ### Core Capabilities
 - **Audio Capture**: Microphone + system audio (stereo left=mic/right=sys) with per-channel Silero v6 VAD, RNNoise, HPF, adaptive resampling
-- **Diarization**: Enhanced-only Polyvoice (segmentation-3.0 + TitaNet-Large 192-d + AHC MinClusterSize=2), ffmpeg streaming decode, fixed ONNX pool `min(8, 75% cores)`, offline + online (Efficient/Fast) with `PrototypeStore`
+- **Diarization**: Enhanced-only Polyvoice (segmentation-3.0 + TitaNet-Large 192-d + AHC MinClusterSize=2), ffmpeg streaming decode, fixed ONNX pool `min(8, 75% cores)`, offline + online (Efficient/Fast) with `PrototypeStore`; **word-level CTC alignment** (`word_alignment/`, wav2vec2 XLS-R 56 + constrained Viterbi) refines per-token timestamps live at block finalization + as offline/stop-time repair, feeding the token N-way split
 - **Transcription**: Whisper.cpp (local) / Parakeet ONNX streaming / provider abstraction, provider-aware readiness gate, Enhance re-transcription, import pipeline
 - **Speaker Registry**: Global `speakers` + `speaker_embeddings` (voiceprints with provenance, two-owner CHECK, 64-cap), `meeting_speakers` (centroids + exemplars ≤32) + `meeting_expected_speakers` allowlists, cosine matcher τ=0.7, live `assign_live_speaker`/`rematch_meeting_speakers`
 - **Summarization**: Multi-provider AI (Ollama, Claude, Groq, OpenAI, OpenRouter + built-in llama-helper) with chunked processing, template system, English-cache, debug logging
@@ -87,6 +87,7 @@ Meetily is a **privacy-first AI meeting assistant** desktop application built wi
 | **Transcription** | `audio/transcription/` | Provider abstraction for STT engines | `engine.rs`, `worker.rs`, `provider.rs` |
 | **Whisper Engine** | `whisper_engine/` | Whisper.cpp Rust bindings, model loading, parallel batch | `whisper_engine.rs`, `commands.rs`, `parallel_processor.rs` |
 | **Parakeet Engine** | `parakeet_engine/` | ONNX runtime for Parakeet streaming | `parakeet_engine.rs`, `model.rs` |
+| **Word Alignment** | `audio/word_alignment/` | Post-ASR CTC forced alignment (wav2vec2 XLS-R + Viterbi), model catalog/download, live queue + repair hooks | `engine.rs`, `viterbi.rs`, `refine.rs`, `queue.rs`, `catalog.rs`, `download.rs` |
 | **Summary Service** | `summary/` | AI summarization orchestration, templates, debug log | `service.rs`, `processor.rs`, `summary_engine/` |
 | **AI Providers** | `ollama/`, `openai/`, `anthropic/`, `groq/`, `openrouter/` | Provider-specific LLM adapters | provider clients |
 | **API** | `api/` | IPC commands + shared DTOs + legacy HTTP shim | `api.rs` |
@@ -152,6 +153,7 @@ Meetily is a **desktop application** built with:
 | **Audio save durability** | Fix incremental audio save loss, transcript timestamp drift (`audio_start_time` anchoring), VBR AAC encoding (`optimize-audio-encoding`) | `2ec1abc`, `766a066` |
 | **Mic / ducking** | Fix mic noise pumping (speech-driven ducking), `mic-gain-and-ducking` spec, RNNoise gating | `aa0263d` |
 | **Playback** | `clip-playback-indicator` per-segment active highlight, `isAudioPlaying` + `activeSegmentId` propagation | `clip-playback-indicator` |
+| **Word alignment** | `word-level-diarization-alignment`: token plumbing fix (listeners forward `tokens`, Parakeet native frame tokens, frontend save carries tokens), new `audio/word_alignment/` CTC aligner (wav2vec2 XLS-R 56 ONNX + constrained Viterbi) run live at block finalization + offline/stop-time repair, `refined` flag, settings + model download UI | `word-level-diarization-alignment` |
 | **Frontend fixes** | Voiceprint review UI, Rc corruption crash fix (transcript event listener), live label revert guard | `8ad2ed7`, `9797178` |
 
 > See `openspec/changes/` and `openspec/specs/` for full specs: `speaker-identity-registry`, `speaker-diarization`, `voiceprint-provenance`, `recording-save-durability`, `mic-gain-and-ducking`, `audio-encoding`, `meeting-audio-player`.

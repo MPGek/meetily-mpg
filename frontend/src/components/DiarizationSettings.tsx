@@ -5,6 +5,7 @@ import { Switch } from "./ui/switch";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { recordingService } from "@/services/recordingService";
+import { WordAlignmentSettings } from "./WordAlignmentSettings";
 import { CheckCircle, AlertCircle } from "lucide-react";
 import type { DiarizationMode } from "@/lib/diarization";
 
@@ -242,11 +243,13 @@ export function DiarizationSettings() {
         </p>
       </div>
 
+      {/* Word-level CTC alignment (live refinement + repair) */}
+      <WordAlignmentSettings />
+
       {/* Voiceprint storage stats */}
       <div className="p-4 border rounded-lg bg-gray-50">
         <div className="flex items-center justify-between mb-2">
-          <div className="font-medium">Voiceprint Storage</div>
-          {speakerStats && (
+          <div className="font-medium">Voiceprint Storage</div>          {speakerStats && (
             <span className="text-xs text-gray-500">{formatBytes(speakerStats.total_bytes)}</span>
           )}
         </div>
