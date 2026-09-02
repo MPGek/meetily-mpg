@@ -1,0 +1,14 @@
+# leshinsky/ru-youtube-diarization (Hugging Face, Apache-2.0). Real Russian
+# YouTube clips with Label Studio JSON annotations (channel/start/end/labels).
+name: ru-youtube
+license: Apache-2.0
+parser: label_studio_json
+channel_policy: mono
+baseline_der: null
+sources:
+  - kind: hf
+    url: https://huggingface.co/datasets/leshinsky/ru-youtube-diarization
+    dataset_id: leshinsky/ru-youtube-diarization
+    patterns:
+      - "*.json"
+      - clips/*

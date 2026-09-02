@@ -1,0 +1,14 @@
+# diarization eval harness (eval/)
+.venv/
+cache/
+raw/*
+!raw/ami/
+!raw/dihard3/
+raw/ami/*
+!raw/ami/*.dvc
+raw/dihard3/*
+!raw/dihard3/*.dvc
+out/
+reports/
+.dvc/tmp/
+*.pyc

@@ -1,0 +1,6 @@
+outs:
+- md5: 09f5fc76188bd6987c711fcf5bc153fb.dir
+  size: 3031408997
+  nfiles: 2002
+  hash: md5
+  path: ru-synthetic

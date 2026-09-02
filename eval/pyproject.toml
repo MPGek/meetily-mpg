@@ -1,0 +1,40 @@
+[project]
+name = "diareval"
+version = "0.1.0"
+description = "Meetily diarization evaluation harness: datasets, runner, DER scoring"
+readme = "README.md"
+authors = [
+    { name = "vasiliy.kotov", email = "vasiliy.kotov@ventionteams.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "dvc",
+    "pyannote-metrics",
+    "pyannote-core",
+    "datasets",
+    "gdown",
+    "huggingface-hub",
+    "pyyaml",
+    "pyarrow",
+    "soundfile",
+    "tqdm",
+]
+
+[project.scripts]
+diareval = "diareval.cli:main"
+download = "diareval.cli:download_cli"
+ingest = "diareval.cli:ingest_cli"
+normalize = "diareval.cli:normalize_cli"
+run = "diareval.cli:run_cli"
+score = "diareval.cli:score_cli"
+report = "diareval.cli:report_cli"
+subset = "diareval.cli:subset_cli"
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"

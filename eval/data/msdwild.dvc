@@ -1,0 +1,6 @@
+outs:
+- md5: cf6b99a4acbac2d2f85ae1626be166a6.dir
+  size: 9228238457
+  nfiles: 3145
+  hash: md5
+  path: msdwild

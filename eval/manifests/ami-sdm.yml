@@ -1,0 +1,20 @@
+# AMI meeting corpus, SDM variant (single distant microphone = Array1 ch1).
+# Audio is license-gated: download per the hint and drop archives into
+# eval/raw/ami-sdm/. Reference RTTM/UEM from BUTSpeechFIT/AMI-diarization-setup.
+name: ami-sdm
+license: "CC BY 4.0 (AMI corpus, requires signed EULA)"
+parser: ami_but_speechfit
+gated: true
+channel_policy: array1:1
+baseline_der: 22.4
+split: test
+raw_files:
+  - ami-sdm-audio.zip
+raw_hint: >
+  Obtain the AMI corpus SDM audio (amicorpus ES/IB/EN/ST/IC meetings, *.Array1-01.flac)
+  from https://groups.inf.ed.ac.uk/ami/corpus/ after agreeing to the EULA, and place
+  the archive here as ami-sdm-audio.zip (zip or tar.gz).
+sources:
+  - kind: http
+    url: https://github.com/BUTSpeechFIT/AMI-diarization-setup/archive/refs/heads/master.zip
+    filename: AMI-diarization-setup.zip

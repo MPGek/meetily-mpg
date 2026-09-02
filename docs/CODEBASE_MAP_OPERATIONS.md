@@ -109,3 +109,10 @@ Workspace members: `frontend/src-tauri`, `llama-helper`; **target dir at repo ro
 - **`llama-cpp-2` sidecar release profile** is size-optimized (`opt-level="s"`) for faster load.
 - GPU feature choice materially affects whisper.cpp speed; `auto-detect-gpu.js` chooses based on detected hardware.
 - The app relies on **local** transcription/summarization (no cloud dependency) — CPU fallback exists when no GPU backend is detected.
+
+## Diarization Evaluation Harness
+
+- Quantitative DER evaluation lives in [`eval/`](../eval/README.md) (uv project, `uv run --project eval <cmd>`).
+- Headless harness binary: `cargo build --release --bin diarize-eval -p meetily` — reuses the production offline diarization path from `audio/diarization.rs` (`diarize_wav_samples` + standalone 3-location model fallback).
+- Datasets materialized to canonical `wav/ + rttm/ + uem/` under `eval/data/`, DVC-tracked with a local blob remote; gated corpora (AMI, DIHARD-3) are manual drops into `eval/raw/`.
+- Fast regression gate: `uv run --project eval subset` (≤10 recordings, ru-synthetic + VoxConverse).

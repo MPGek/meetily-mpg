@@ -1,0 +1,27 @@
+# VoxConverse test set (Oxford VGG). Audio zip + reference RTTMs from the
+# joonson/voxconverse repo (test/*.rttm). License: research use only.
+name: voxconverse
+license: "Research use only (VoxConverse, Oxford VGG)"
+parser: rttm_passthrough
+channel_policy: mono
+baseline_der: 11.3
+subset: true
+subset_files:
+  - fuzfh
+  - msbyq
+  - euqef
+  - dohag
+  - neiye
+normalize:
+  audio_archive: voxconverse_test_wav.zip
+  audio_glob: voxconverse_test_wav/*.wav
+  rttm_archive: voxconverse-repo.zip
+  rttm_glob: voxconverse-master/test/*.rttm
+sources:
+  - kind: http
+    url: https://www.robots.ox.ac.uk/~vgg/data/voxconverse/data/voxconverse_test_wav.zip
+    md5: 834558bbd9b1ffd2d4893181556ceddd
+    filename: voxconverse_test_wav.zip
+  - kind: http
+    url: https://github.com/joonson/voxconverse/archive/refs/heads/master.zip
+    filename: voxconverse-repo.zip

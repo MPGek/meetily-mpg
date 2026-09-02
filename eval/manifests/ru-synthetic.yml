@@ -1,0 +1,21 @@
+# niobures/synthetic-speech-diarization-ru (Hugging Face, MIT). Synthetic TTS
+# Russian conversations with speakers[] segment annotations in parquet.
+# TTS voices -> optimistic absolute DER; use as a relative regression gate.
+name: ru-synthetic
+license: MIT
+parser: ru_synthetic_parquet
+channel_policy: mono
+baseline_der: null
+subset: true
+subset_files:
+  - train-00006-of-00030_0052
+  - train-00008-of-00030_0030
+  - train-00008-of-00030_0031
+  - train-00008-of-00030_0035
+  - train-00012-of-00030_0024
+sources:
+  - kind: hf
+    url: https://huggingface.co/datasets/niobures/synthetic-speech-diarization-ru
+    dataset_id: niobures/synthetic-speech-diarization-ru
+    patterns:
+      - train-*.parquet
