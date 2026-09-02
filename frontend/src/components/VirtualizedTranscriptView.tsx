@@ -568,7 +568,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                         </TooltipContent>
                     </Tooltip>
                     {playButton}
-                    <div className="flex-1 max-w-[80%]">
+                    <div className="flex-1 max-w-[90%]">
                         {hasSpeaker && (
                             <div className="flex items-center gap-1.5 mb-1 ml-1">
                                 <span
@@ -605,7 +605,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     return (
         <div id={`segment-${id}`} className="mb-3">
             <div className="flex items-start gap-2 justify-end">
-                <div className="flex-1 max-w-[80%]">
+                <div className="flex-1 max-w-[90%]">
                     {hasSpeaker && (
                         <div className="flex items-center gap-1.5 mb-1 mr-1 justify-end">
                                 <SpeakerLabel

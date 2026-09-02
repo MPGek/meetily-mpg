@@ -17,6 +17,8 @@ interface TranscriptContextType {
   copyTranscript: () => void;
   flushBuffer: () => void;
   transcriptContainerRef: React.RefObject<HTMLDivElement>;
+  isFollowingBottom: boolean;
+  scrollToBottom: () => void;
   meetingTitle: string;
   setMeetingTitle: (title: string) => void;
   clearTranscripts: () => void;
@@ -31,6 +33,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
   const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
+  // Mirror of isUserAtBottomRef exposed as state so the scroll-to-bottom
+  // button can render; suppressed while a programmatic smooth scroll runs.
+  const [isFollowingBottom, setIsFollowingBottom] = useState<boolean>(true);
 
   // Recording state context - provides backend-synced state
   const recordingState = useRecordingState();
@@ -38,6 +43,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // Refs for transcript management
   const transcriptsRef = useRef<Transcript[]>(transcripts);
   const isUserAtBottomRef = useRef<boolean>(true);
+  const isProgrammaticScrollRef = useRef<boolean>(false);
+  const programmaticScrollResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const finalFlushRef = useRef<(() => void) | null>(null);
   const turnsRef = useRef<SpeakerTurn[]>([]);
@@ -68,22 +75,119 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   }, [transcripts]);
 
   // Smart auto-scroll: Track user scroll position
-  useEffect(() => {
-    const handleScroll = () => {
-      const container = transcriptContainerRef.current;
-      if (!container) return;
+  const isContainerAtBottom = useCallback(() => {
+    const container = transcriptContainerRef.current;
+    if (!container) return true;
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    return scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
+  }, []);
 
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const isAtBottom = scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
-      isUserAtBottomRef.current = isAtBottom;
+  useEffect(() => {
+    const container = transcriptContainerRef.current;
+    if (!container) return;
+
+    const handleScroll = () => {
+      const atBottom = isContainerAtBottom();
+      isUserAtBottomRef.current = atBottom;
+      if (atBottom && isProgrammaticScrollRef.current) {
+        // Programmatic smooth scroll reached its target
+        isProgrammaticScrollRef.current = false;
+        if (programmaticScrollResetRef.current) {
+          clearTimeout(programmaticScrollResetRef.current);
+          programmaticScrollResetRef.current = null;
+        }
+      }
+      // Ignore intermediate "not at bottom" events of our own smooth scroll
+      // so the button does not flicker while auto-follow/button click animates.
+      if (!isProgrammaticScrollRef.current) {
+        setIsFollowingBottom(atBottom);
+      }
     };
 
+    // Abandon our in-flight smooth scroll: an instant scrollTo at the
+    // current position cancels a running smooth animation.
+    const releaseProgrammaticScroll = () => {
+      if (!isProgrammaticScrollRef.current) return;
+      container.scrollTo({ top: container.scrollTop, behavior: 'instant' });
+      isProgrammaticScrollRef.current = false;
+      if (programmaticScrollResetRef.current) {
+        clearTimeout(programmaticScrollResetRef.current);
+        programmaticScrollResetRef.current = null;
+      }
+    };
+
+    const syncFollowingFromPosition = () => {
+      const atBottom = isContainerAtBottom();
+      isUserAtBottomRef.current = atBottom;
+      setIsFollowingBottom(atBottom);
+    };
+
+    const SCROLL_KEYS = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '];
+    const handleUserInterrupt = (e: Event) => {
+      if (e.type === 'keydown' && !SCROLL_KEYS.includes((e as KeyboardEvent).key)) {
+        return;
+      }
+      // User input during our animation is interrupt intent (D8): release the
+      // suppression flag and re-sync state from the current position so the
+      // button reacts immediately instead of waiting for the fallback timer.
+      releaseProgrammaticScroll();
+      syncFollowingFromPosition();
+    };
+
+    const handleScrollEnd = () => {
+      if (!isProgrammaticScrollRef.current) return;
+      releaseProgrammaticScroll();
+      syncFollowingFromPosition();
+    };
+
+    container.addEventListener('scroll', handleScroll);
+    container.addEventListener('wheel', handleUserInterrupt, { passive: true });
+    container.addEventListener('touchstart', handleUserInterrupt, { passive: true });
+    container.addEventListener('keydown', handleUserInterrupt);
+    container.addEventListener('scrollend', handleScrollEnd);
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      container.removeEventListener('wheel', handleUserInterrupt);
+      container.removeEventListener('touchstart', handleUserInterrupt);
+      container.removeEventListener('keydown', handleUserInterrupt);
+      container.removeEventListener('scrollend', handleScrollEnd);
+      if (programmaticScrollResetRef.current) {
+        clearTimeout(programmaticScrollResetRef.current);
+        programmaticScrollResetRef.current = null;
+      }
+    };
+  }, [isContainerAtBottom]);
+
+  // Scroll to the bottom and re-enable auto-follow (used by the button and
+  // by the auto-scroll effect below).
+  const scrollToBottom = useCallback(() => {
     const container = transcriptContainerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll);
-      return () => container.removeEventListener('scroll', handleScroll);
+    if (!container) return;
+    isUserAtBottomRef.current = true;
+    setIsFollowingBottom(true);
+    if (isContainerAtBottom()) {
+      // Already at bottom: nothing will move, no events will fire -- arming
+      // the flag here would only suppress genuine user scrolls (D8).
+      return;
     }
-  }, []);
+    isProgrammaticScrollRef.current = true;
+    if (programmaticScrollResetRef.current) {
+      clearTimeout(programmaticScrollResetRef.current);
+    }
+    // Last-resort fallback in case neither a bottom-reaching scroll event nor
+    // `scrollend` fires (e.g. the animation is interrupted without events).
+    programmaticScrollResetRef.current = setTimeout(() => {
+      programmaticScrollResetRef.current = null;
+      isProgrammaticScrollRef.current = false;
+      const atBottom = isContainerAtBottom();
+      isUserAtBottomRef.current = atBottom;
+      setIsFollowingBottom(atBottom);
+    }, 500);
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: 'smooth'
+    });
+  }, [isContainerAtBottom]);
 
   // Auto-scroll when transcripts change (only if user is at bottom)
   useEffect(() => {
@@ -92,18 +196,15 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       // Wait for Framer Motion animation to complete (150ms) before scrolling
       // This ensures scrollHeight includes the full rendered height of the new transcript
       const scrollTimeout = setTimeout(() => {
-        const container = transcriptContainerRef.current;
-        if (container) {
-          container.scrollTo({
-            top: container.scrollHeight,
-            behavior: 'smooth'
-          });
+        // Re-check at-bottom: the user may have scrolled up during the delay
+        if (isUserAtBottomRef.current) {
+          scrollToBottom();
         }
       }, 150); // Match Framer Motion transition duration
 
       return () => clearTimeout(scrollTimeout);
     }
-  }, [transcripts]);
+  }, [transcripts, scrollToBottom]);
 
   // Listen for live speaker turns (Fast-mode online diarization) and
   // retroactively assign `speaker` to transcript segments by time overlap.
@@ -659,6 +760,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     copyTranscript,
     flushBuffer,
     transcriptContainerRef,
+    isFollowingBottom,
+    scrollToBottom,
     meetingTitle,
     setMeetingTitle,
     clearTranscripts,
