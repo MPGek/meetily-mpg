@@ -7,12 +7,19 @@ license = "MIT"
 repository = "https://github.com/Zackriya-Solutions/meeting-minutes"
 edition = "2021"
 rust-version = "1.77"
+default-run = "meetily"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "app_lib"
 crate-type = ["cdylib", "rlib"]
+
+# Developer-only headless diarization harness for the eval pipeline
+# (openspec: add-diarization-eval-harness). Not shipped in the app bundle.
+[[bin]]
+name = "diarize-eval"
+path = "src/bin/diarize_eval.rs"
 
 
 # Hardware acceleration features for whisper-rs

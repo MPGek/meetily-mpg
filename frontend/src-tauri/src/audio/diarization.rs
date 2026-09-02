@@ -877,10 +877,10 @@ fn run_channel_diarization(
 }
 
 #[derive(Debug, Clone)]
-struct DiarizationSegment {
-    start: f32,
-    end: f32,
-    speaker: i32,
+pub struct DiarizationSegment {
+    pub start: f32,
+    pub end: f32,
+    pub speaker: i32,
 }
 
 /// An embedding tagged with its cluster id and source-segment duration,
@@ -899,14 +899,14 @@ pub struct ClusteredEmbedding {
 /// Per-channel diarization output: labeled segments plus the clustered
 /// embeddings aligned to them (captured before the start-time sort).
 #[derive(Debug, Clone, Default)]
-struct ChannelClusters {
-    segments: Vec<DiarizationSegment>,
-    embeddings: Vec<ClusteredEmbedding>,
+pub struct ChannelClusters {
+    pub segments: Vec<DiarizationSegment>,
+    pub embeddings: Vec<ClusteredEmbedding>,
 }
 
 /// Polyvoice diarization engine: enhanced segmentation-3.0 + TitaNet-Large
 /// embedding + AHC clustering, loaded once per run.
-struct PolyvoiceDiarizer {
+pub struct PolyvoiceDiarizer {
     segmenter: Box<dyn crate::audio::segmentation::Segmenter>,
     embedder: Box<dyn crate::audio::embedder::SpeakerEmbedder>,
     clusterer: Box<dyn polyvoice::clusterer::Clusterer>,
@@ -963,6 +963,108 @@ fn create_polyvoice_diarizer_for_app<R: Runtime>(
         "Enhanced diarization models not found. Searched: {}. The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time near the executable; rebuild with network or install a build that includes them.",
         locations
     ))
+}
+
+// ===== Tauri/DB-free diarization core (shared with the `diarize-eval` bin) =====
+
+/// Candidate model directories without an `AppHandle`, mirroring the app's
+/// 3-location fallback: app data dir → resource dir near the executable →
+/// dev manifest dir. An explicit override (CLI flag / env) is prepended.
+fn standalone_model_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = explicit {
+        // Explicit override is strict: no fallback locations are searched.
+        dirs.push(dir.to_path_buf());
+        return dirs;
+    }
+    if let Ok(dir) = std::env::var("MEETILY_MODELS_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    // 1. app_data_dir/models (same identifier the Tauri resolver uses)
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        dirs.push(PathBuf::from(appdata).join("com.meetily.ai").join("models"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("com.meetily.ai")
+                .join("models"),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            dirs.push(PathBuf::from(xdg).join("com.meetily.ai").join("models"));
+        } else if let Ok(home) = std::env::var("HOME") {
+            dirs.push(
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("com.meetily.ai")
+                    .join("models"),
+            );
+        }
+    }
+    // 2. resource dir near the executable (bundled install layout)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("resources").join("models"));
+            dirs.push(parent.join("models"));
+        }
+    }
+    // 3. dev manifest fallback (`cargo run`/`cargo build` from src-tauri)
+    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"));
+    dirs
+}
+
+/// Resolve the enhanced models directory without an `AppHandle`. When
+/// `explicit` is given it must verify on its own (no fallback); otherwise the
+/// standalone 3-location fallback applies. Errors name the missing model
+/// files and every searched location.
+pub fn resolve_models_dir_standalone(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    let candidates = standalone_model_candidates(explicit);
+    if let Some(dir) = crate::audio::embedder::resolve_enhanced_models_dir_from_paths(&candidates) {
+        return Ok(dir);
+    }
+    Err(format!(
+        "Enhanced diarization models not found ({} and {}). Searched: {}",
+        crate::audio::embedder::ENHANCED_SEGMENTATION_FILE,
+        crate::audio::embedder::ENHANCED_EMBEDDING_FILE,
+        crate::audio::embedder::format_search_locations_from_paths(&candidates),
+    ))
+}
+
+/// Create the production diarizer without an `AppHandle`, using an explicit
+/// models directory or the standalone 3-location fallback.
+pub fn create_diarizer_standalone(
+    models_dir: Option<&Path>,
+    max_speakers: Option<i32>,
+    config: &DiarizationConfig,
+) -> Result<PolyvoiceDiarizer, String> {
+    let dir = resolve_models_dir_standalone(models_dir)?;
+    create_polyvoice_diarizer(&dir, max_speakers, config)
+}
+
+/// Tauri/DB-free entry point: diarize one channel of in-memory samples with
+/// the same chunked pipeline the app uses for offline diarization.
+pub fn diarize_wav_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    max_speakers: Option<i32>,
+    config: &DiarizationConfig,
+    models_dir: Option<&Path>,
+) -> Result<ChannelClusters, String> {
+    let diarizer = create_diarizer_standalone(models_dir, max_speakers, config)?;
+    let (segments, embeddings, _) =
+        run_channel_diarization(&diarizer, samples, sample_rate, config, "mono")?;
+    Ok(ChannelClusters {
+        segments,
+        embeddings,
+    })
 }
 
 const DIARIZATION_SAMPLE_RATE: u32 = 16000;
@@ -2313,9 +2415,85 @@ mod spike_tests {
         assert!(embedder.embed_batch(&empty).unwrap().is_empty());
     }
 
+    /// Parity check (add-diarization-eval-harness 2.3): the app's offline
+    /// ffmpeg-streaming path and the harness's in-memory chunked core must
+    /// produce identical speaker turns for the same audio. Requires
+    /// `MEETILY_TEST_AUDIO` pointing at a real recording plus the enhanced
+    /// models and ffmpeg on this machine.
     #[test]
-    fn diarization_config_uses_fixed_profile() {
-        let cfg = DiarizationConfig::default();
+    #[ignore = "parity: requires MEETILY_TEST_AUDIO, models, and ffmpeg"]
+    fn parity_stream_vs_in_memory_core() {
+        let Ok(path) = std::env::var("MEETILY_TEST_AUDIO") else {
+            eprintln!("SKIP: MEETILY_TEST_AUDIO not set");
+            return;
+        };
+        let source = PathBuf::from(&path);
+        let config = DiarizationConfig::default();
+        let (_, channels) = probe_audio_metadata(&source).expect("probe audio");
+        let is_stereo = channels == 2;
+        let ffmpeg = find_ffmpeg_path().expect("ffmpeg required for parity check");
+
+        // App path: streaming windows over the ffmpeg PCM pipe.
+        let diarizer_app = create_polyvoice_diarizer(
+            &resolve_models_dir_standalone(None).expect("models"),
+            None,
+            &config,
+        )
+        .expect("app-path diarizer");
+        let mut app_turns: Vec<(f32, f32, i32)> = Vec::new();
+        let chans: Vec<Option<u32>> = if is_stereo {
+            vec![Some(0), Some(1)]
+        } else {
+            vec![None]
+        };
+        for ch in chans {
+            let pcm = spawn_ffmpeg_pcm(&ffmpeg, &source, ch).expect("spawn ffmpeg");
+            let (segments, _, _) =
+                run_channel_diarization_stream(&diarizer_app, pcm, &config).expect("stream run");
+            app_turns.extend(segments.iter().map(|s| (s.start, s.end, s.speaker)));
+        }
+
+        // Harness path: symphonia decode + in-memory chunked core.
+        let decoded = decode_audio_file(&source).expect("decode audio");
+        let (left, right) = decoded.extract_channels();
+        let mut eval_turns: Vec<(f32, f32, i32)> = Vec::new();
+        for samples in [left, right].into_iter().flatten() {
+            let clusters = diarize_wav_samples(&samples, decoded.sample_rate, None, &config, None)
+                .expect("harness run");
+            eval_turns.extend(
+                clusters
+                    .segments
+                    .iter()
+                    .map(|s| (s.start, s.end, s.speaker)),
+            );
+        }
+
+        assert!(
+            !app_turns.is_empty(),
+            "app path produced no segments (audio too quiet?)"
+        );
+        assert_eq!(
+            app_turns.len(),
+            eval_turns.len(),
+            "turn count mismatch: app={} eval={}",
+            app_turns.len(),
+            eval_turns.len()
+        );
+        let mut max_dt = 0.0f32;
+        for (a, e) in app_turns.iter().zip(eval_turns.iter()) {
+            assert_eq!(a.2, e.2, "speaker label mismatch at app turn {:?}", a);
+            max_dt = max_dt.max((a.0 - e.0).abs()).max((a.1 - e.1).abs());
+        }
+        assert!(
+            max_dt < 0.01,
+            "turn boundary drift {}s exceeds deterministic-identical tolerance",
+            max_dt
+        );
+        info!("parity: {} turns identical (max drift {:.4}s)", app_turns.len(), max_dt);
+    }
+
+    #[test]
+    fn diarization_config_uses_fixed_profile() {        let cfg = DiarizationConfig::default();
         assert!(cfg.max_sessions >= 1 && cfg.max_sessions <= 8);
         assert_eq!(cfg.chunk_overlap_secs, 5.0);
         assert_eq!(cfg.chunk_duration_secs(), 600.0);
