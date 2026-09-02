@@ -1,6 +1,14 @@
 # niobures/synthetic-speech-diarization-ru (Hugging Face, MIT). Synthetic TTS
 # Russian conversations with speakers[] segment annotations in parquet.
 # TTS voices -> optimistic absolute DER; use as a relative regression gate.
+#
+# KNOWN DATASET ARTIFACT (measured 2026-09-02): the speakers[] annotation
+# timeline is broken — segments tile the file contiguously while the mixed
+# audio contains inter-clip silence, so 73.6% of reference-"speech" frames
+# measure < -35 dBFS (Silero v6 and segmentation-3.0 agree within 2pp on
+# coverage). The resulting ~43pp Miss is a dataset artifact, not a model
+# failure: read ru-synthetic as a Conf-only relative gate; absolute numbers
+# come from real-data sets (voxconverse, msdwild, ru-youtube).
 name: ru-synthetic
 license: MIT
 parser: ru_synthetic_parquet

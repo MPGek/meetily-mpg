@@ -9,7 +9,7 @@ from pathlib import Path
 
 def extract_archive(archive: Path, dest: Path) -> Path:
     """Extract zip/tar.gz/tgz/tar into dest/<stem>/ (idempotent)."""
-    marker = dest / ".extracted"
+    marker = dest / f".extracted.{archive.name}"
     target = dest / archive.stem
     if marker.is_file() and target.is_dir():
         return target

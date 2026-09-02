@@ -12,9 +12,16 @@ from .normalize import ffmpeg_normalize, wav_duration, _write_outputs
 from .paths import CACHE_DIR, RAW_DIR
 
 
+ARCHIVE_SUFFIXES = (".zip", ".tar.gz", ".tgz", ".tar")
+
+
 def _require_raw(manifest: DatasetManifest) -> list[Path]:
     raw_dir = RAW_DIR / manifest.name
-    found = [p for p in raw_dir.glob("*") if p.is_file() and not p.name.startswith(".")]
+    found = [
+        p for p in sorted(raw_dir.glob("*"))
+        if p.is_file() and not p.name.startswith(".")
+        and p.name.lower().endswith(ARCHIVE_SUFFIXES)
+    ]
     if not found:
         expected = ", ".join(manifest.raw_files) or "the archive"
         raise SystemExit(
@@ -25,8 +32,15 @@ def _require_raw(manifest: DatasetManifest) -> list[Path]:
 
 
 def _meeting_id(path: Path) -> str | None:
-    m = re.match(r"^(ES\d{4}|IBI\d{4}|EN\d{4}|ST\d{4}|IC\w+|IS\d{4})", path.name)
-    return m.group(1) if m else None
+    m = re.match(
+        r"^(es\d{4}|ibi?\d{4}|en\d{4}|st\d{4})([a-f])(?=[._])|^(ic\d{3}|is\d{4})(?=[._])",
+        path.name.lower(),
+    )
+    if not m:
+        return None
+    if m.group(3):
+        return m.group(3).upper()
+    return m.group(1).upper() + (m.group(2) or "")
 
 
 def ingest_ami(manifest: DatasetManifest) -> None:

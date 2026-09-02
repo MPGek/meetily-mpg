@@ -45,7 +45,7 @@ ffmpeg is the single decoder/normalizer for all sources (already the app's decod
 
 - [Refactor of `diarization.rs` changes app behavior] → Parity check: diarize one stored meeting via app and via harness, diff RTTMs; refactor is pure extraction, no logic edits.
 - [Gated data (AMI/DIHARD) can't be scripted] → `ingest` accepts manual drops; VoxConverse + MSDWild + ru-sets already cover the ladder's week-1/3 needs, so gated sets are additive, not blocking.
-- [ru-synthetic uses TTS voices → optimistic DER] → Treat it as a *relative* regression gate only; absolute numbers come from real-data sets.
+- [ru-synthetic annotation timeline is broken (measured 2026-09-02): `speakers[]` segments tile the file contiguously while the mixed audio has inter-clip silence — 73.6% of ref-annotated "speech" frames measure < -35 dBFS; Silero v6 and segmentation-3.0 agree to within 2pp on coverage] → its ~43pp Miss is a dataset artifact, not a model failure; treat ru-synthetic as a *Conf-only relative gate*; absolute numbers come from real-data sets (voxconverse, msdwild, ru-youtube).
 - [pyannote.metrics collar/overlap convention mismatch inflates/deflates vs baselines] → Baselines recorded in manifests are explicitly the "Full" setup; scoring config hardcodes collar=0, skip_overlap=False; document in report footer.
 - [DVC local remote is single-machine; disk grows to tens of GB] → Remote path is config, swappable to a network share/S3 later; `dvc gc` documented.
 - [Windows file:// URL quirks in DVC config] → Use forward slashes, drive-letter form `file://C:/...`; verified at init time in tasks.
@@ -61,5 +61,6 @@ ffmpeg is the single decoder/normalizer for all sources (already the app's decod
 ## Open Questions
 
 - Online-streaming evaluation harness (chunked feeding of `online_diarization`, label-stability metrics) — second change once offline DER is trustworthy.
+- Closing the measured Conf gap (over-clustering: voxconverse mean 23.0 hypothesis vs 6.5 reference speakers; AHC threshold 0.52 is stricter than polyvoice's 0.45 default with no cluster-count ceiling): tunable threshold + sweep first, then polyvoice `pipeline_v2` (resegmentation, dense embed windows, VBx/NME-SC auto speaker count) — next change.
 - Whether to add long-form sets (REPERE, SUMMARY) to stress clustering on >1 h files — decide after first full runs.
 - Cross-meeting voiceprint evaluation protocol (enroll on meeting A, test on B using AMI/ICSI database-scope labels) — separate capability.

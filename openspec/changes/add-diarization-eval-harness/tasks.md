@@ -31,5 +31,6 @@
 
 ## 6. Wrap-up
 
-- [ ] 6.1 Write `eval/README.md` quickstart (one-time setup, per-dataset commands, gated-data drop locations, disk expectations, remote relocation note) and add a pointer from `docs/CODEBASE_MAP_OPERATIONS.md`; verify a fresh clone + README steps reproduces the week-1 ladder (voxconverse + ru-synthetic scored) without asking anyone
+- [x] 6.1 Write `eval/README.md` quickstart (one-time setup, per-dataset commands, gated-data drop locations, disk expectations, remote relocation note) and add a pointer from `docs/CODEBASE_MAP_OPERATIONS.md`; verify a fresh clone + README steps reproduces the week-1 ladder (voxconverse + ru-synthetic scored) without asking anyone
 - [x] 6.2 Run `openspec validate add-diarization-eval-harness --strict` and address findings; verify validation passes
+- [x] 6.3 Record the ru-synthetic annotation-timeline artifact (measured: 73.6% of ref-"speech" frames are silence) in `eval/README.md`, `eval/LICENSES.md` usage notes, and a comment in `eval/manifests/ru-synthetic.yml`; keep the subset gate composition spec-mandated (ru-synthetic + voxconverse, ≤10 files) and document that ru-synthetic is read Conf-only

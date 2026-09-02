@@ -10,7 +10,7 @@ forbid training outright), and results are reported only as aggregate metrics.
 | AMI (SDM + headset mix) | AMI corpus via EDAP/LDC (manual, gated) | CC BY 4.0 after signed EULA | Meetings audio + BUTSpeechFIT pyannote-fork reference RTTM/UEM lists. |
 | MSDWild | Oxford VGG (manual/registration) | Research use, non-commercial | Music-show "in the wild" audio, YouTube-sourced. |
 | DIHARD-3 | LDC (LDC2022S03, manual, gated) | LDC User Agreement | Evaluation-only clause; no redistribution. |
-| niobures/synthetic-speech-diarization-ru | Hugging Face | MIT | Synthetic Russian TTS speech, 2000 tracks, 16 kHz. |
+| niobures/synthetic-speech-diarization-ru | Hugging Face | MIT | Synthetic Russian TTS speech, 2000 tracks, 16 kHz. Usage note: annotation timeline is broken (73.6% of ref-"speech" frames are silence, measured 2026-09-02) — read Conf-only as a relative gate, ignore its absolute DER/Miss. |
 | leshinsky/ru-youtube-diarization | Hugging Face | Apache-2.0 | Real Russian YouTube clips with Label Studio annotations. |
 
 ## Eval-only usage statement

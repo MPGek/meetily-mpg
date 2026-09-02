@@ -88,5 +88,13 @@ old folder's `files/` tree across.
 - Baseline DERs (pyannote 3.1 "Full") are declared per dataset in
   `eval/manifests/*.yml`; the report compares against them.
 - ru-synthetic uses TTS voices: treat it as a *relative* regression gate only.
+- **ru-synthetic annotation-timeline artifact** (measured 2026-09-02): its
+  `speakers[]` segments tile the file contiguously while the mixed audio has
+  inter-clip silence — 73.6% of reference-"speech" frames measure < -35 dBFS
+  (Silero v6 and segmentation-3.0 agree within 2pp on coverage). The resulting
+  ~43pp Miss is a dataset artifact, not a model failure: **read ru-synthetic
+  Conf-only** as a relative gate; absolute DER numbers come from real-data sets
+  (voxconverse, msdwild, ru-youtube). The subset gate composition stays
+  spec-mandated (ru-synthetic + voxconverse, ≤10 files).
 - Licenses and eval-only usage terms: see `LICENSES.md`.
 - The harness binary is dev-only and never shipped in the app bundle.
