@@ -8,6 +8,7 @@ import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
 import { syncAlignmentSettingsToBackend } from '@/lib/alignment';
+import { syncClusteringSettingsToBackend } from '@/lib/diarization';
 
 export interface OllamaModel {
   name: string;
@@ -231,6 +232,14 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     syncAlignmentSettingsToBackend().catch(err =>
       console.error('[ConfigContext] Failed to sync alignment settings:', err)
+    );
+  }, []);
+
+  // Sync offline clustering parameter overrides to Rust on mount
+  // (diarization-param-tuning D2). Unset keys clear back to built-in defaults.
+  useEffect(() => {
+    syncClusteringSettingsToBackend().catch(err =>
+      console.error('[ConfigContext] Failed to sync clustering settings:', err)
     );
   }, []);
 

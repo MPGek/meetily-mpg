@@ -27,6 +27,15 @@ struct Args {
     /// Maximum number of speakers (omit for automatic)
     #[arg(long)]
     max_speakers: Option<i32>,
+    /// AHC merge threshold override (default: built-in 0.60)
+    #[arg(long)]
+    cluster_threshold: Option<f32>,
+    /// Speaker-count ceiling override (default: built-in 128)
+    #[arg(long)]
+    max_clusters: Option<usize>,
+    /// Same-speaker gap-merge window in seconds (default: built-in 0.3)
+    #[arg(long)]
+    gap_merge: Option<f32>,
     /// Recording URI field in RTTM lines (default: input file stem)
     #[arg(long)]
     uri: Option<String>,
@@ -56,7 +65,16 @@ fn run(args: Args) -> Result<(), String> {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let config = DiarizationConfig::default();
+    let mut config = DiarizationConfig::default();
+    if let Some(t) = args.cluster_threshold {
+        config.cluster_threshold = t;
+    }
+    if let Some(c) = args.max_clusters {
+        config.cluster_ceiling = c;
+    }
+    if let Some(g) = args.gap_merge {
+        config.gap_merge_secs = g;
+    }
     let (left, right) = decoded.extract_channels();
     let mut channels: Vec<(u32, Vec<f32>)> = Vec::new();
     if let Some(mic) = left {

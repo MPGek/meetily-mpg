@@ -48,7 +48,13 @@ def normalize(args: argparse.Namespace) -> int:
 def run(args: argparse.Namespace) -> int:
     from ..runner import run_dataset
 
-    run_dataset(args.dataset, args.run_id, args.workers, args.force)
+    run_dataset(
+        args.dataset,
+        args.run_id,
+        args.workers,
+        args.force,
+        harness_args=args.harness_arg,
+    )
     return 0
 
 
@@ -69,5 +75,11 @@ def report(args: argparse.Namespace) -> int:
 def subset(args: argparse.Namespace) -> int:
     from ..subset import run_subset
 
-    run_subset(force=args.force)
+    run_subset(force=args.force, harness_args=getattr(args, "harness_arg", None))
     return 0
+
+
+def sweep(args: argparse.Namespace) -> int:
+    from ..sweep import sweep as _sweep
+
+    return _sweep(args)

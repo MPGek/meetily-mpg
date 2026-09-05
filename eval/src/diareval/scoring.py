@@ -23,7 +23,12 @@ def _load_uem(path: Path) -> dict[str, Timeline]:
     return uem
 
 
-def score_dataset(dataset: str, run_id: str = "latest", files: list[str] | None = None) -> dict:
+def score_dataset(
+    dataset: str,
+    run_id: str = "latest",
+    files: list[str] | None = None,
+    exclude: set[str] | None = None,
+) -> dict:
     data = DATA_DIR / dataset
     ref_path = data / "rttm" / "ref.rttm"
     uem_path = data / "uem" / "ref.uem"
@@ -40,6 +45,11 @@ def score_dataset(dataset: str, run_id: str = "latest", files: list[str] | None 
         if missing_refs:
             raise SystemExit(f"{dataset}: references missing for {sorted(missing_refs)[:5]}")
         refs = {uri: ann for uri, ann in refs.items() if uri in wanted}
+    excluded = 0
+    if exclude:
+        before = len(refs)
+        refs = {uri: ann for uri, ann in refs.items() if uri not in exclude}
+        excluded = before - len(refs)
     uem = _load_uem(uem_path)
 
     hyps: dict[str, object] = {}
@@ -89,6 +99,7 @@ def score_dataset(dataset: str, run_id: str = "latest", files: list[str] | None 
         "dataset": dataset,
         "run_id": run_id,
         "files": len(refs),
+        "excluded": excluded,
         "scored_hours": total_ref / 3600.0,
         "der": der * 100.0,
         "fa": comp["false_alarm"] / total_ref * 100.0,

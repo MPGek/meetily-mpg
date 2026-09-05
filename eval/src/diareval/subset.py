@@ -28,7 +28,11 @@ def prepare_once(manifest) -> None:
     normalize_dataset(manifest)
 
 
-def run_subset(force: bool = False, run_id: str = "subset") -> dict:
+def run_subset(
+    force: bool = False,
+    run_id: str = "subset",
+    harness_args: list[str] | None = None,
+) -> dict:
     manifests = subset_datasets()
     if not manifests:
         raise SystemExit(
@@ -48,7 +52,10 @@ def run_subset(force: bool = False, run_id: str = "subset") -> dict:
     results = {}
     for m in manifests:
         prepare_once(m)
-        run_dataset(m.name, run_id=run_id, force=force, files=list(m.subset_files))
+        run_dataset(
+            m.name, run_id=run_id, force=force, files=list(m.subset_files),
+            harness_args=harness_args,
+        )
         results[m.name] = score_dataset(m.name, run_id=run_id, files=list(m.subset_files))
 
     print("\nsubset results:")
@@ -57,4 +64,23 @@ def run_subset(force: bool = False, run_id: str = "subset") -> dict:
             f"  {name}: DER {r['der']:.2f}% "
             f"(FA {r['fa']:.2f} / Miss {r['miss']:.2f} / Conf {r['conf']:.2f})"
         )
+
+    gate_failures: list[str] = []
+    for m in manifests:
+        if not m.subset_gate:
+            continue
+        r = results[m.name]
+        for metric, bound in sorted(m.subset_gate.items()):
+            if r[metric] > bound:
+                gate_failures.append(
+                    f"{m.name}: {metric} {r[metric]:.2f}% exceeds recorded gate max "
+                    f"{bound:.2f}% — regression source: {m.name} {metric.upper()}"
+                )
+    if gate_failures:
+        print("\nsubset gate FAILED:")
+        for line in gate_failures:
+            print(f"  {line}")
+        raise SystemExit(1)
+    if any(m.subset_gate for m in manifests):
+        print("subset gate PASSED: all recorded metric ranges met")
     return results

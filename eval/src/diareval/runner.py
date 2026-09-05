@@ -61,8 +61,17 @@ def run_dataset(
     workers: int | None = None,
     force: bool = False,
     files: list[str] | None = None,
+    harness_args: list[str] | None = None,
+    skip_failures: bool = False,
 ) -> Path:
-    """Diarize every WAV of a materialized dataset; resumable per file."""
+    """Diarize every WAV of a materialized dataset; resumable per file.
+
+    `harness_args` are appended verbatim to each `diarize-eval` invocation
+    (sweep per-candidate overrides, e.g. `["--cluster-threshold=0.35"]`).
+    With `skip_failures`, files whose harness run fails are recorded in
+    `failed.txt` inside the run dir and processing continues (the sweep uses
+    this so one bad recording cannot abort a multi-hour grid).
+    """
     wav_dir = DATA_DIR / dataset / "wav"
     if not wav_dir.is_dir():
         raise SystemExit(
@@ -81,10 +90,20 @@ def run_dataset(
     exe = harness_binary()
     out_dir = OUT_DIR / dataset / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    failed_file = out_dir / "failed.txt"
+    already_failed: set[str] = set()
+    if force:
+        failed_file.unlink(missing_ok=True)
+    elif failed_file.is_file():
+        already_failed = {
+            ln for ln in failed_file.read_text(encoding="utf-8").splitlines() if ln
+        }
 
     todo: list[Path] = []
     skipped = 0
     for wav in wavs:
+        if wav.stem in already_failed:
+            continue
         rttm = out_dir / f"{wav.stem}.rttm"
         if not force and _valid_hypothesis(rttm):
             skipped += 1
@@ -105,11 +124,10 @@ def run_dataset(
     def one(wav: Path) -> None:
         rttm = out_dir / f"{wav.stem}.rttm"
         tmp = rttm.with_name(rttm.name + ".part")
-        proc = subprocess.run(
-            [str(exe), str(wav), "--out", str(tmp), "--uri", wav.stem],
-            capture_output=True,
-            text=True,
-        )
+        cmd = [str(exe), str(wav), "--out", str(tmp), "--uri", wav.stem]
+        if harness_args:
+            cmd.extend(harness_args)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode == 0 and _valid_hypothesis(tmp):
             tmp.replace(rttm)
         else:
@@ -126,7 +144,13 @@ def run_dataset(
         print(f"{len(failures)} file(s) failed:")
         for name, err in failures[:10]:
             print(f"  {name}: {err}")
-        raise SystemExit(1)
+        if skip_failures:
+            with failed_file.open("a", encoding="utf-8") as f:
+                for name, _ in failures:
+                    f.write(f"{Path(name).stem}\n")
+            print(f"{dataset}: recorded {len(failures)} failure(s) in {failed_file.name}, continuing")
+        else:
+            raise SystemExit(1)
     return out_dir
 
 

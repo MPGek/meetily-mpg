@@ -12,6 +12,7 @@ Measured 2026-09-02 via the eval harness: offline clustering over-produces speak
 ### D1. Parameter surface = extend `DiarizationConfig`
 Add `cluster_threshold: f32`, `cluster_ceiling: usize`, `gap_merge_secs: f32` to the existing `DiarizationConfig` (it already carries the other knobs and reaches both app and harness). Resolution order: explicit override (harness CLI) → persisted app setting (app only) → built-in default. Alternative considered: separate `ClusteringParams` struct — rejected, fragments the existing config flow.
 **Initial built-in defaults:** threshold 0.45 (polyvoice's own `DEFAULT_AHC_THRESHOLD`, first sweep center — current 0.52 is the suspected culprit), ceiling 20 (polyvoice `PipelineConfig` default for `max_speakers`; 184-speaker pathology becomes ≤20 immediately), gap_merge 0.0 (off until swept). These are starting values; final values come from D5.
+**D1 amendment (2026-09-04, user-approved, from grid-1 sweep data):** the grid-1 winner (thr 0.55 / ceil 20) failed the held-out gate — voxconverse-test Conf 41.5 vs 25.3 baseline, msdwild Conf 31.0 vs 28.27 — because a tight ceiling *forces* below-threshold merges once active clusters exceed it, converting harmless over-clustering into confusion. A ceiling probe showed the optimum is at ceil ≈ 64 (dev Conf 23.8 at thr 0.55, plateauing 64→128) and the threshold optimum is at or above the grid-1 edge (0.55). Extended grid: threshold {0.55, 0.60} × ceiling {64, 128} × gap-merge {0.0, 0.3}; final defaults selected from the combined evidence under the D5 rule. The always-enforced-ceiling requirement (spec) is unchanged — 64 still caps the 184-speaker pathology.
 
 ### D2. Settings persistence = existing settings-store mechanism, no new UI
 The three params become keys in the same persisted settings store the app already uses for diarization-adjacent settings, read where `DiarizationConfig` is constructed. A frontend Advanced-settings widget is deliberately deferred — power users can set keys via the existing settings commands; UI is a separate decision after defaults are tuned. Alternative: ship UI now — rejected as scope creep (UI copy churns once defaults change anyway).
@@ -45,5 +46,5 @@ Land code (defaults: 0.45/20/0.0) → run sweep → set tuned defaults + re-base
 
 ## Open Questions
 
-- Final ceiling default if the sweep prefers 12 vs 20 (decide with data; both are spec-compliant).
+- ~~Final ceiling default if the sweep prefers 12 vs 20~~ — resolved by grid-1 + probe data: both are too tight; extended grid tests 64/128 (see D1 amendment).
 - Whether `voxconverse-dev` should also feed the subset gate (currently gate composition stays spec-mandated: ru-synthetic + voxconverse-test files).

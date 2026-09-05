@@ -209,7 +209,7 @@ pub async fn start_diarization<R: Runtime>(
     let _guard = DiarizationGuard::acquire()?;
     DIARIZATION_CANCELLED.store(false, Ordering::SeqCst);
 
-    let config = DiarizationConfig::default();
+    let config = DiarizationConfig::resolved();
 
     let pool = state.db_manager.pool();
 
@@ -565,10 +565,26 @@ fn fixed_pool_size() -> usize {
     seventy_five_percent.min(8).max(1)
 }
 
+/// Built-in default speaker-count ceiling: sweep-selected (extended grid,
+/// 2026-09-04) — tight ceilings force below-threshold merges and inflate
+/// confusion, so the ceiling sits well above real meeting speaker counts while
+/// still guaranteeing AHC never runs with `AscStop::Off`.
+pub const DEFAULT_CLUSTER_CEILING: usize = 128;
+
+/// Built-in default same-speaker gap-merge window (sweep-selected, 2026-09-04).
+pub const DEFAULT_GAP_MERGE_SECS: f32 = 0.3;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DiarizationConfig {
     pub max_sessions: usize,
     pub chunk_overlap_secs: f32,
+    /// AHC merge criterion: minimum cosine similarity to merge two clusters.
+    pub cluster_threshold: f32,
+    /// Hard ceiling on distinct speaker labels per channel per pass.
+    pub cluster_ceiling: usize,
+    /// Merge consecutive same-speaker segments when the gap between them is
+    /// within this window (0 disables gap-merging).
+    pub gap_merge_secs: f32,
 }
 
 impl Default for DiarizationConfig {
@@ -576,6 +592,9 @@ impl Default for DiarizationConfig {
         Self {
             max_sessions: fixed_pool_size(),
             chunk_overlap_secs: 5.0,
+            cluster_threshold: crate::audio::embedder::TITANET_CLUSTER_THRESHOLD,
+            cluster_ceiling: DEFAULT_CLUSTER_CEILING,
+            gap_merge_secs: DEFAULT_GAP_MERGE_SECS,
         }
     }
 }
@@ -592,6 +611,93 @@ impl DiarizationConfig {
     fn segmenter_pool_size(&self) -> usize {
         self.max_sessions.clamp(1, 16)
     }
+
+    /// App-path config: built-in defaults overlaid with persisted clustering
+    /// settings (diarization-param-tuning D2). A stored override wins per key;
+    /// unset keys fall back to the built-in defaults.
+    pub fn resolved() -> Self {
+        Self {
+            cluster_threshold: stored_cluster_threshold()
+                .unwrap_or(crate::audio::embedder::TITANET_CLUSTER_THRESHOLD),
+            cluster_ceiling: stored_cluster_ceiling().unwrap_or(DEFAULT_CLUSTER_CEILING),
+            gap_merge_secs: stored_gap_merge_secs().unwrap_or(DEFAULT_GAP_MERGE_SECS),
+            ..Self::default()
+        }
+    }
+}
+
+// ===== Persisted clustering-settings holder (diarization-param-tuning D2) ====
+//
+// Mirrors `word_alignment::settings`: the frontend persists the keys in its
+// settings store and mirrors them to the backend via
+// `set_diarization_clustering_settings`; offline diarization reads them when
+// building `DiarizationConfig`. The `diarize-eval` harness never consults
+// these globals (D4: it measures defaults + explicit CLI flags).
+
+static CLUSTER_THRESHOLD_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else f32 bits + 1
+static CLUSTER_CEILING_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else value
+static GAP_MERGE_SECS_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else f32 bits + 1
+
+fn store_f32_option(cell: &AtomicU64, value: Option<f32>) {
+    match value {
+        Some(v) => cell.store((v.to_bits() as u64) + 1, Ordering::SeqCst),
+        None => cell.store(0, Ordering::SeqCst),
+    }
+}
+
+fn load_f32_option(cell: &AtomicU64) -> Option<f32> {
+    let raw = cell.load(Ordering::SeqCst);
+    if raw == 0 {
+        None
+    } else {
+        Some(f32::from_bits((raw - 1) as u32))
+    }
+}
+
+fn stored_cluster_threshold() -> Option<f32> {
+    load_f32_option(&CLUSTER_THRESHOLD_OVERRIDE)
+}
+
+fn stored_cluster_ceiling() -> Option<usize> {
+    match CLUSTER_CEILING_OVERRIDE.load(Ordering::SeqCst) {
+        0 => None,
+        v => Some(v as usize),
+    }
+}
+
+fn stored_gap_merge_secs() -> Option<f32> {
+    load_f32_option(&GAP_MERGE_SECS_OVERRIDE)
+}
+
+/// Update the persisted clustering overrides (None clears a key back to the
+/// built-in default).
+pub fn set_clustering_overrides(
+    cluster_threshold: Option<f32>,
+    cluster_ceiling: Option<usize>,
+    gap_merge_secs: Option<f32>,
+) {
+    store_f32_option(&CLUSTER_THRESHOLD_OVERRIDE, cluster_threshold);
+    CLUSTER_CEILING_OVERRIDE.store(
+        cluster_ceiling.map(|v| v as u64).unwrap_or(0),
+        Ordering::SeqCst,
+    );
+    store_f32_option(&GAP_MERGE_SECS_OVERRIDE, gap_merge_secs);
+    log::info!(
+        "Diarization clustering settings updated: threshold={:?}, ceiling={:?}, gap_merge={:?}",
+        stored_cluster_threshold(),
+        stored_cluster_ceiling(),
+        stored_gap_merge_secs()
+    );
+}
+
+#[tauri::command]
+pub async fn set_diarization_clustering_settings(
+    cluster_threshold: Option<f32>,
+    cluster_ceiling: Option<usize>,
+    gap_merge_secs: Option<f32>,
+) -> Result<(), String> {
+    set_clustering_overrides(cluster_threshold, cluster_ceiling, gap_merge_secs);
+    Ok(())
 }
 
 // ===== Blocking diarization orchestration =====
@@ -927,18 +1033,28 @@ fn create_polyvoice_diarizer(
             .map_err(|e| format!("Failed to create embedder: {}", e))?;
     let model_tag = embedder.model_tag();
     let family_threshold = embedder.family_threshold();
+    // Runtime-resolved merge threshold wins over the family default; the
+    // config default equals the family threshold, so the log distinguishes
+    // overrides from the built-in.
+    let cluster_threshold = config.cluster_threshold;
     log::info!(
-        "Diarizer using enhanced family tag={} threshold={}",
+        "Diarizer using enhanced family tag={} threshold={} (resolved={})",
         model_tag,
-        family_threshold
+        family_threshold,
+        cluster_threshold
     );
 
-    let max_clusters = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
+    // Always-on ceiling: user max_speakers when smaller, else the configured
+    // default ceiling. `AhcClusterer::with_threshold` treats 0 as no ceiling,
+    // so the effective value is clamped to >= 1 to keep `AscStop::Off`
+    // unreachable on every code path.
+    let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
+    let max_clusters = user_max.min(config.cluster_ceiling).max(1);
     let clusterer: Box<dyn polyvoice::clusterer::Clusterer> =
         Box::new(polyvoice::clusterer::MinClusterSizeClusterer::new(
             Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
                 max_clusters,
-                family_threshold,
+                cluster_threshold,
             )),
             2,
         ));
@@ -1267,6 +1383,7 @@ fn run_chunked_polyvoice_diarization(
         .collect();
 
     all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let all_segments = merge_same_speaker_gaps(all_segments, config.gap_merge_secs);
 
     info!(
         "Chunked diarization found {} segments with {} unique speakers",
@@ -1633,6 +1750,7 @@ fn run_channel_diarization_stream(
         .collect();
 
     all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let all_segments = merge_same_speaker_gaps(all_segments, config.gap_merge_secs);
 
     info!(
         "Streamed diarization found {} segments with {} unique speakers",
@@ -1648,6 +1766,32 @@ fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
     speakers.sort();
     speakers.dedup();
     speakers.len()
+}
+
+/// Merge consecutive same-speaker segments whose silence gap fits within
+/// `window_secs` (diarization-param-tuning D3). Input must be sorted by start
+/// time. A different-speaker segment between two same-speaker segments always
+/// blocks the merge, and overlapping pairs (no silence gap) are left
+/// untouched. `window_secs <= 0` is a no-op. Clustered embeddings are captured
+/// before this pass, so downstream caches stay aligned to the pre-merge list.
+fn merge_same_speaker_gaps(segments: Vec<DiarizationSegment>, window_secs: f32) -> Vec<DiarizationSegment> {
+    if window_secs <= 0.0 || segments.len() < 2 {
+        return segments;
+    }
+    let mut out: Vec<DiarizationSegment> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        match out.last_mut() {
+            Some(cur)
+                if cur.speaker == seg.speaker
+                    && seg.start >= cur.end
+                    && seg.start - cur.end <= window_secs =>
+            {
+                cur.end = cur.end.max(seg.end);
+            }
+            _ => out.push(seg),
+        }
+    }
+    out
 }
 
 /// Group a channel's clustered embeddings by cluster id, computing the
@@ -2428,7 +2572,23 @@ mod spike_tests {
             return;
         };
         let source = PathBuf::from(&path);
+        // Flag-free harness config == DiarizationConfig::default(): the bin
+        // starts from default() and only overlays explicit CLI flags
+        // (diarize_eval.rs), so a no-flag run must equal this config exactly.
         let config = DiarizationConfig::default();
+        assert_eq!(
+            (
+                config.cluster_threshold,
+                config.cluster_ceiling,
+                config.gap_merge_secs
+            ),
+            (
+                crate::audio::embedder::TITANET_CLUSTER_THRESHOLD,
+                DEFAULT_CLUSTER_CEILING,
+                DEFAULT_GAP_MERGE_SECS
+            ),
+            "flag-free harness parity requires default() to equal the built-in constants"
+        );
         let (_, channels) = probe_audio_metadata(&source).expect("probe audio");
         let is_stereo = channels == 2;
         let ffmpeg = find_ffmpeg_path().expect("ffmpeg required for parity check");
@@ -2497,6 +2657,118 @@ mod spike_tests {
         assert!(cfg.max_sessions >= 1 && cfg.max_sessions <= 8);
         assert_eq!(cfg.chunk_overlap_secs, 5.0);
         assert_eq!(cfg.chunk_duration_secs(), 600.0);
+    }
+
+    #[test]
+    fn diarization_config_clustering_defaults() {
+        let cfg = DiarizationConfig::default();
+        assert_eq!(cfg.cluster_threshold, 0.60);
+        assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
+        assert_eq!(cfg.cluster_ceiling, 128);
+        assert_eq!(cfg.gap_merge_secs, 0.3);
+        // Built-in threshold equals the family default (single source of truth).
+        assert_eq!(
+            cfg.cluster_threshold,
+            crate::audio::embedder::TITANET_CLUSTER_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_is_user_max_when_smaller_and_always_positive() {        // Mirrors the ceiling computation in create_polyvoice_diarizer.
+        let ceiling = |max_speakers: Option<i32>, config: &DiarizationConfig| -> usize {
+            let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
+            user_max.min(config.cluster_ceiling).max(1)
+        };
+        let cfg = DiarizationConfig::default();
+        // No user max -> default ceiling.
+        assert_eq!(ceiling(None, &cfg), 128);
+        assert_eq!(ceiling(Some(0), &cfg), 128);
+        assert_eq!(ceiling(Some(-1), &cfg), 128);
+        // User max below the ceiling wins.
+        assert_eq!(ceiling(Some(5), &cfg), 5);
+        // User max above the ceiling is capped by the configured ceiling.
+        assert_eq!(ceiling(Some(200), &cfg), 128);
+        // Never zero (AscStop::Off unreachable).
+        assert_eq!(ceiling(Some(1), &cfg), 1);
+    }
+
+    fn seg(start: f32, end: f32, speaker: i32) -> DiarizationSegment {
+        DiarizationSegment { start, end, speaker }
+    }
+
+    #[test]
+    fn gap_merge_bridges_short_same_speaker_gap() {
+        let input = vec![seg(0.0, 1.0, 0), seg(1.2, 2.5, 0), seg(5.0, 6.0, 0)];
+        let out = merge_same_speaker_gaps(input, 0.3);
+        assert_eq!(out.len(), 2, "gap 0.2s bridged, gap 2.5s kept");
+        assert_eq!((out[0].start, out[0].end, out[0].speaker), (0.0, 2.5, 0));
+        assert_eq!((out[1].start, out[1].end, out[1].speaker), (5.0, 6.0, 0));
+    }
+
+    #[test]
+    fn gap_merge_at_window_boundary_is_bridged() {
+        let input = vec![seg(0.0, 1.0, 0), seg(1.3, 2.0, 0)];
+        let out = merge_same_speaker_gaps(input, 0.3);
+        assert_eq!(out.len(), 1, "gap equal to the window merges (<=)");
+    }
+
+    #[test]
+    fn gap_merge_preserves_cross_speaker_boundaries() {
+        // A different-speaker segment between two same-speaker segments must
+        // block bridging even when both gaps fit the window.
+        let input = vec![seg(0.0, 1.0, 0), seg(1.1, 2.0, 1), seg(2.1, 3.0, 0)];
+        let out = merge_same_speaker_gaps(input, 0.3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.iter().map(|s| s.speaker).collect::<Vec<_>>(), vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn gap_merge_leaves_overlaps_untouched() {
+        // Overlapping same-speaker segments have no silence gap: untouched.
+        let input = vec![seg(0.0, 2.0, 0), seg(1.5, 3.0, 0)];
+        let out = merge_same_speaker_gaps(input, 0.3);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn gap_merge_zero_window_is_noop() {
+        let input = vec![seg(0.0, 1.0, 0), seg(1.05, 2.0, 0), seg(2.02, 3.0, 0)];
+        let expected = input.clone();
+        let out = merge_same_speaker_gaps(input, 0.0);
+        assert_eq!(out.len(), expected.len());
+        assert!(out.iter().zip(expected.iter()).all(|(a, b)| a.start == b.start
+            && a.end == b.end
+            && a.speaker == b.speaker));
+    }
+
+    #[test]
+    fn resolved_config_prefers_stored_overrides_and_falls_back_to_defaults() {
+        // Save/restore the process globals so the test is parallel-safe:
+        // no other test reads the clustering overrides.
+        let saved = (
+            stored_cluster_threshold(),
+            stored_cluster_ceiling(),
+            stored_gap_merge_secs(),
+        );
+        // Unset -> built-in defaults.
+        set_clustering_overrides(None, None, None);
+        let cfg = DiarizationConfig::resolved();
+        assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
+        assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
+        assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
+        // Stored override wins per key.
+        set_clustering_overrides(Some(0.35), Some(12), Some(0.3));
+        let cfg = DiarizationConfig::resolved();
+        assert_eq!(cfg.cluster_threshold, 0.35);
+        assert_eq!(cfg.cluster_ceiling, 12);
+        assert_eq!(cfg.gap_merge_secs, 0.3);
+        // Partial override: only the ceiling is stored, others fall back.
+        set_clustering_overrides(None, Some(7), None);
+        let cfg = DiarizationConfig::resolved();
+        assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
+        assert_eq!(cfg.cluster_ceiling, 7);
+        assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
+        set_clustering_overrides(saved.0, saved.1, saved.2);
     }
 
     #[test]

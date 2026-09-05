@@ -5,6 +5,7 @@ license: Apache-2.0
 parser: label_studio_json
 channel_policy: mono
 baseline_der: null
+tuning: true
 sources:
   - kind: hf
     url: https://huggingface.co/datasets/leshinsky/ru-youtube-diarization

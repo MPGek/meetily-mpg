@@ -99,6 +99,7 @@ module: audio
 | `get_diarization_status` | `(app, meeting_id, state) -> Result<Value, String>` | `{ diarization_status, speaker_names }` for a meeting |
 | `update_speaker_label_command` | `(app, meeting_id, speaker, label, state) -> Result<bool, String>` | Rename a speaker id to a user label |
 | `check_diarization_models` / `download_diarization_models` | `(app) -> Result<DiarizationModelStatus, String>` / `(app) -> Result<(), String>` | Verify / download polyvoice ONNX models (segmentation + embedding) |
+| `set_diarization_clustering_settings` | `(cluster_threshold: Option<f32>, cluster_ceiling: Option<usize>, gap_merge_secs: Option<f32>) -> Result<(), String>` | Mirror persisted offline-clustering overrides to the backend (None clears a key; `DiarizationConfig::resolved()` reads them) |
 | `check_active_transcription_model_ready` | `(app) -> Result<TranscriptionModelStatus, String>` | **Provider-aware gate**: report `{ ready, provider, downloading }` for the active transcript provider |
 
 ### Key Types
@@ -128,7 +129,29 @@ enum DiarizationMode { Off, Efficient, Fast }     // online_diarization.rs; pars
 struct SpeakerAssignment { sequence_id: u64, speaker: String }
 struct DiarizationSegment { start: f32, end: f32, speaker: i32 }   // internal, seconds
 // Label scheme (shared offline+online): mic → "MIC_SPEAKER_NN", system/mono → "SPEAKER_NN"
+
+struct DiarizationConfig {                          // diarization.rs; default()/resolved()
+    max_sessions: usize, chunk_overlap_secs: f32,
+    cluster_threshold: f32,   // AHC min cosine merge; default 0.60 (TITANET_CLUSTER_THRESHOLD)
+    cluster_ceiling: usize,   // hard speaker-count cap per channel; default 128 (DEFAULT_CLUSTER_CEILING)
+    gap_merge_secs: f32,      // same-speaker gap-merge window; default 0.3 (DEFAULT_GAP_MERGE_SECS)
+}
 ```
+
+### Offline Clustering Settings Keys (persisted, optional)
+
+Power-user overrides live in the browser settings store (localStorage,
+`frontend/src/lib/diarization.ts`), are mirrored to the backend via
+`set_diarization_clustering_settings` on startup, and are read by
+`DiarizationConfig::resolved()`; unset keys fall back to the built-in
+sweep-tuned defaults. Harness equivalents: `diarize-eval --cluster-threshold /
+--max-clusters / --gap-merge` (see `eval/README.md`).
+
+| localStorage key | Type | Built-in default | Effect |
+| --- | --- | --- | --- |
+| `diarizationClusterThreshold` | float | 0.60 | AHC merge criterion: minimum cosine similarity to merge two clusters. Lower → more merging, fewer speakers. |
+| `diarizationClusterCeiling` | int | 128 | Hard cap on distinct speaker labels per channel per pass (always enforced; user `max_speakers` wins when smaller). |
+| `diarizationGapMergeSecs` | float | 0.3 | Merge consecutive same-speaker output segments whose silence gap ≤ this window (0 = off; cross-speaker boundaries and overlaps untouched). |
 
 ## Internal Architecture
 

@@ -1253,7 +1253,7 @@ mod tests {
         let expected_dim = 192;
         assert_eq!(expected_dim, 192);
         // Thresholds unchanged for both Efficient and Fast modes.
-        assert_eq!(crate::audio::embedder::TITANET_CLUSTER_THRESHOLD, 0.52);
+        assert_eq!(crate::audio::embedder::TITANET_CLUSTER_THRESHOLD, 0.60);
         assert_eq!(crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD, 0.68);
     }
 }

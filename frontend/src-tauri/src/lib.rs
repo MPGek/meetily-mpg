@@ -844,6 +844,7 @@ pub fn run() {
             audio::import::is_import_in_progress_command,
             // Diarization commands
             audio::diarization::start_diarization,
+            audio::diarization::set_diarization_clustering_settings,
             audio::diarization::get_diarization_status,
             audio::diarization::update_speaker_label_command,
             audio::diarization::rematch_meeting_speakers,

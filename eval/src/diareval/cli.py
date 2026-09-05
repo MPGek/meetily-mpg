@@ -34,6 +34,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", default="latest", help="Output run directory name under eval/out")
     run.add_argument("--workers", type=int, default=None, help="Parallel workers (default 4)")
     run.add_argument("--force", action="store_true", help="Reprocess files that already have outputs")
+    run.add_argument(
+        "--harness-arg",
+        action="append",
+        default=None,
+        metavar="ARG",
+        help="Extra argument appended to each diarize-eval invocation (repeatable), "
+        "e.g. --harness-arg --cluster-threshold=0.35",
+    )
     run.set_defaults(func=_dispatch("run"))
 
     score = sub.add_parser("score", help="Score hypothesis RTTMs against references (DER)")
@@ -48,7 +56,61 @@ def build_parser() -> argparse.ArgumentParser:
 
     subset = sub.add_parser("subset", help="Run the fast regression subset end-to-end")
     subset.add_argument("--force", action="store_true", help="Reprocess subset files with existing outputs")
+    subset.add_argument(
+        "--harness-arg",
+        action="append",
+        default=None,
+        metavar="ARG",
+        help="Extra argument appended to each diarize-eval invocation (repeatable), "
+        "e.g. --harness-arg --cluster-threshold=0.9 (gate testing)",
+    )
     subset.set_defaults(func=_dispatch("subset"))
+
+    sweep = sub.add_parser(
+        "sweep",
+        help="Grid-sweep clustering parameters over tuning datasets (diarization-param-tuning D5)",
+    )
+    sweep.add_argument(
+        "--dataset",
+        action="append",
+        default=None,
+        help="Tuning dataset (repeatable; default: all manifests marked `tuning: true`)",
+    )
+    sweep.add_argument(
+        "--grid",
+        action="append",
+        required=True,
+        metavar="PARAM=V1,V2,...",
+        help="Grid axis; PARAM in {cluster_threshold, cluster_ceiling, gap_merge_secs} (repeatable)",
+    )
+    sweep.add_argument("--run-prefix", default="sweep", help="Run-id prefix for per-candidate runs")
+    sweep.add_argument("--workers", type=int, default=None, help="Parallel workers per run (default 4)")
+    sweep.add_argument(
+        "--files",
+        action="append",
+        default=None,
+        metavar="DATASET=f1,f2",
+        help="Restrict a dataset to specific recordings (repeatable)",
+    )
+    sweep.add_argument(
+        "--validation",
+        action="append",
+        default=None,
+        help="Held-out validation dataset (repeatable; default: voxconverse, msdwild)",
+    )
+    sweep.add_argument(
+        "--validate-top",
+        type=int,
+        default=2,
+        help="Evaluate the top-N tuning candidates on held-out validation sets (default 2)",
+    )
+    sweep.add_argument(
+        "--report",
+        default=None,
+        metavar="PATH",
+        help="Report output path (default: eval/reports/sweep-<date>-<gitrev>.md)",
+    )
+    sweep.set_defaults(func=_dispatch("sweep"))
 
     return parser
 

@@ -143,8 +143,9 @@ pub use audio_file::{find_audio_file, prepare_audio_for_playback};
 // Export diarization
 pub use diarization::{
     cancel_diarization, check_diarization_models, get_diarization_status,
-    is_diarization_in_progress, rematch_meeting_speakers, start_diarization,
-    update_speaker_label_command, DiarizationModelStatus, DiarizationProgress, DiarizationResult,
+    is_diarization_in_progress, rematch_meeting_speakers, set_clustering_overrides,
+    start_diarization, update_speaker_label_command, DiarizationModelStatus, DiarizationProgress,
+    DiarizationResult,
 };
 
 // Export online diarization

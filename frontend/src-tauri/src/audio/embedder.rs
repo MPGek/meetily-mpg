@@ -23,10 +23,11 @@ use tauri::{AppHandle, Manager, Runtime};
 /// Enhanced TitaNet-Large model tag.
 pub const ENHANCED_MODEL_TAG: &str = "titanet_large";
 
-/// Enhanced TitaNet clustering threshold – experimental (calibrated offline).
-/// Until the held-out calibration pass completes this is a conservative
-/// placeholder slightly above legacy. Do not treat as final.
-pub const TITANET_CLUSTER_THRESHOLD: f32 = 0.52; // experimental threshold
+/// Enhanced TitaNet clustering threshold – built-in default for the
+/// runtime-tunable merge threshold (diarization-param-tuning D1/D5).
+/// Overridable via app settings (`clusterThreshold`) / harness CLI; 0.60 is
+/// the sweep-selected value (extended grid + held-out validation, 2026-09-04).
+pub const TITANET_CLUSTER_THRESHOLD: f32 = 0.60; // tuned default (swept)
 
 /// Enhanced TitaNet recognition threshold – experimental.
 pub const TITANET_RECOGNITION_THRESHOLD: f32 = 0.68; // experimental threshold
@@ -676,7 +677,7 @@ mod tests {
     #[test]
     fn enhanced_constants() {
         assert_eq!(ENHANCED_MODEL_TAG, "titanet_large");
-        assert_eq!(TITANET_CLUSTER_THRESHOLD, 0.52);
+        assert_eq!(TITANET_CLUSTER_THRESHOLD, 0.60);
         assert_eq!(TITANET_RECOGNITION_THRESHOLD, 0.68);
     }
 
@@ -788,7 +789,7 @@ mod tests {
         // Even without real ONNX, the selection helper would attempt Titanet load and fallback,
         // but the tag/dim contract is that enhanced family is 192-d and titanet_large
         assert_eq!(ENHANCED_MODEL_TAG, "titanet_large");
-        assert_eq!(TITANET_CLUSTER_THRESHOLD, 0.52);
+        assert_eq!(TITANET_CLUSTER_THRESHOLD, 0.60);
         // Simulate what offline diarization would tag centroids with
         let simulated_centroid_dim = 192;
         assert_eq!(simulated_centroid_dim, 192);

@@ -14,6 +14,7 @@ license: MIT
 parser: ru_synthetic_parquet
 channel_policy: mono
 baseline_der: null
+tuning: true
 subset: true
 subset_files:
   - train-00006-of-00030_0052
@@ -21,6 +22,11 @@ subset_files:
   - train-00008-of-00030_0031
   - train-00008-of-00030_0035
   - train-00012-of-00030_0024
+# Subset regression gate (Conf-only — DER is inflated by the annotation-timeline
+# artifact above). Re-baselined 2026-09-05 on tuned clustering defaults
+# threshold=0.60 / ceiling=128 / gap-merge=0.3: measured subset Conf 4.00.
+subset_gate:
+  conf: 6.0
 sources:
   - kind: hf
     url: https://huggingface.co/datasets/niobures/synthetic-speech-diarization-ru

@@ -61,7 +61,7 @@ The system SHALL resolve the enhanced diarization model directory by searching `
 - **THEN** diarization SHALL succeed via the manifest fallback location without requiring files in AppData or resources
 
 ### Requirement: Speaker diarization pipeline
-The system SHALL provide a speaker diarization pipeline using the enhanced polyvoice ONNX model set (pyannote `segmentation-3.0` segmentation, TitaNet-Large speaker embedding, and agglomerative clustering) that processes recorded audio and assigns speaker labels to transcript segments. The pipeline SHALL resolve its segmentation and embedding models through the 3-location fallback chain and SHALL utilize multiple CPU cores during embedding extraction, process stereo channels concurrently, and cap memory growth for long recordings.
+The system SHALL provide a speaker diarization pipeline using the enhanced polyvoice ONNX model set (pyannote `segmentation-3.0` segmentation, TitaNet-Large speaker embedding, and agglomerative clustering) that processes recorded audio and assigns speaker labels to transcript segments. The pipeline SHALL resolve its segmentation and embedding models through the 3-location fallback chain and SHALL utilize multiple CPU cores during embedding extraction, process stereo channels concurrently, and cap memory growth for long recordings. Clustering SHALL honor runtime-configurable merge parameters and an always-enforced speaker-count ceiling as specified by the diarization-param-tuning capability, with built-in defaults chosen by the measured sweep protocol.
 
 #### Scenario: Successful diarization of a meeting
 - **WHEN** diarization is triggered for a saved meeting with valid audio and the enhanced models are present in any fallback location
@@ -86,6 +86,10 @@ The system SHALL provide a speaker diarization pipeline using the enhanced polyv
 #### Scenario: Long recordings process without unbounded memory growth
 - **WHEN** offline diarization runs on a recording of any length
 - **THEN** the system SHALL process each channel in overlapping chunks, accumulating only embeddings and segment metadata between chunks, so peak memory does not grow linearly with recording duration
+
+#### Scenario: Offline clustering respects the speaker-count ceiling
+- **WHEN** offline diarization clusters a channel's embeddings
+- **THEN** the number of distinct speaker labels in the result does not exceed the effective ceiling (user max-speakers when set, otherwise the configured default ceiling), and the clustering merge threshold and gap-merge window come from the resolved runtime parameters
 
 ### Requirement: Diarization trigger modes
 The system SHALL support automatic diarization after recording stops (when enabled) and manual diarization on any past meeting.
@@ -274,17 +278,17 @@ The system SHALL cluster speaker embeddings with a fixed cosine-similarity thres
 
 ### Requirement: Max speakers setting caps cluster count
 
-The system SHALL apply the user-configured `maxSpeakers` setting as a hard ceiling on the number of clusters produced during offline diarization, and SHALL use no ceiling when the setting is unset or zero.
+The system SHALL apply the user-configured `maxSpeakers` setting as a hard ceiling on the number of clusters produced during offline diarization when set, and SHALL apply the configured default speaker-count ceiling when the setting is unset or zero — the ceiling is always enforced (diarization-param-tuning).
 
 #### Scenario: Max speakers set
 
 - **WHEN** offline diarization runs and the `maxSpeakers` setting is a positive value N
-- **THEN** the clustering SHALL produce at most N distinct speaker labels
+- **THEN** the clustering SHALL produce at most min(N, configured default ceiling) distinct speaker labels
 
 #### Scenario: Max speakers unset
 
 - **WHEN** offline diarization runs and the `maxSpeakers` setting is unset or zero
-- **THEN** the clustering SHALL run without a ceiling and infer the speaker count automatically
+- **THEN** the clustering SHALL apply the configured default speaker-count ceiling and infer the speaker count automatically within it
 
 ### Requirement: Singleton cluster pruning
 
@@ -438,7 +442,7 @@ When embedding extraction produces zero valid embeddings (all batch and per-segm
 
 ### Requirement: Offline TitaNet recognition stays model-tagged
 
-Offline diarization's post-clustering recognition and cache persistence SHALL remain tagged `titanet_large` (192-d) and thresholds `0.52` (clustering) / `0.68` (recognition) as already specified for the enhanced-only family. This delta does not change thresholds, only enforces that embeddings reaching clustering were produced with the correct layout.
+Offline diarization's post-clustering recognition and cache persistence SHALL remain tagged `titanet_large` (192-d) with the runtime-resolved clustering merge threshold (built-in default 0.60 per diarization-param-tuning) and recognition threshold `0.68` as specified for the enhanced-only family. This requirement does not change thresholds, only enforces that embeddings reaching clustering were produced with the correct layout.
 
 #### Scenario: Centroids are 192-d TitaNet vectors
 

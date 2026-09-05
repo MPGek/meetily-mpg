@@ -46,6 +46,69 @@ Fast regression gate (≤10 recordings, ru-synthetic + voxconverse, end-to-end):
 uv run --project eval subset
 ```
 
+## Clustering parameter sweep (diarization-param-tuning)
+
+The offline clustering parameters are runtime values shared by app and harness.
+Built-in defaults (sweep-selected 2026-09-04, extended grid + held-out
+validation): merge threshold **0.60**, speaker-count ceiling **128**,
+same-speaker gap-merge **0.3 s**. Harness overrides need no rebuild:
+
+```powershell
+uv run --project eval run --dataset ru-youtube --run-id cand1 `
+  --harness-arg=--cluster-threshold=0.35   # also: --max-clusters=N, --gap-merge=SECS
+```
+
+Sweep a grid over the tuning pools (voxconverse-dev, ru-youtube, ru-synthetic —
+the latter read Conf-only; see Notes) and score the top-2 on held-out
+validation (voxconverse test, msdwild):
+
+```powershell
+uv run --project eval sweep --grid cluster_threshold=0.55,0.60 `
+  --grid cluster_ceiling=64,128 --grid gap_merge_secs=0.0,0.3 --run-prefix sweepext
+```
+
+Per-candidate hypotheses land under `eval/out/<dataset>/sweep-NNN-.../`; the
+report is `eval/reports/sweep-<date>-<gitrev>.md` with tuning and validation
+columns kept separate. Selection rule: minimize held-out DER among candidates
+whose tuning components never regress >2 pp from their best.
+
+The grid history lives in `eval/reports/`: grid-1 (thr 0.35–0.55 × ceil 12/20)
+winner failed held-out validation — tight ceilings force below-threshold merges
+once active clusters exceed the cap — so the extended grid (thr 0.55/0.60 ×
+ceil 64/128 × gap 0.0/0.3) selected the shipped defaults
+(thr 0.60 / ceil 128 / gap 0.3).
+
+**Behavior change note:** meetings diarized before this tuning will produce
+different speaker labels when re-diarized (higher merge threshold, always-on
+ceiling, gap-merge on). Rollback without a code revert: store overrides
+`diarizationClusterThreshold=0.52`, `diarizationGapMergeSecs=0.0` (the ceiling
+can also be raised via `diarizationClusterCeiling`).
+
+### App settings keys (persisted, optional)
+
+Power users can override the defaults without a rebuild; unset keys fall back
+to the built-in defaults. Keys live in the browser settings store (localStorage)
+and are mirrored to the backend via `set_diarization_clustering_settings` on
+startup:
+
+| Key | Type | Built-in default | Effect |
+| --- | --- | --- | --- |
+| `diarizationClusterThreshold` | float | 0.60 | AHC merge criterion: minimum cosine similarity to merge two clusters. Lower → more merging, fewer speakers. |
+| `diarizationClusterCeiling` | int | 128 | Hard cap on distinct speaker labels per channel per pass. User `max_speakers` wins when smaller; the ceiling is always enforced. |
+| `diarizationGapMergeSecs` | float | 0.3 | Merge consecutive same-speaker output segments whose silence gap ≤ this window (0 = off; cross-speaker boundaries and overlaps untouched). |
+
+### Subset regression gate ranges (re-baselined 2026-09-05, tuned defaults)
+
+`uv run --project eval subset` enforces the recorded ranges (declared as
+`subset_gate:` in the manifests) and exits non-zero with a regressed-source
+message when a metric exceeds its bound:
+
+| Dataset | Gated metric | Measured | Gate max |
+| --- | --- | ---: | ---: |
+| voxconverse (5 files) | DER | 15.32 | 18.0 |
+| voxconverse (5 files) | Conf | 11.21 | 14.0 |
+| ru-synthetic (5 files) | Conf (DER is artifact-inflated, see Notes) | 4.00 | 6.0 |
+
 ## Gated datasets (manual data drop)
 
 AMI and DIHARD-3 audio cannot be scripted. Place the archives, then ingest:

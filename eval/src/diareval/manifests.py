@@ -54,6 +54,12 @@ class DatasetManifest:
     baseline_der: float | None = None
     subset: bool = False
     subset_files: tuple[str, ...] = ()
+    # Designated tuning data (diarization-param-tuning D5): usable for
+    # parameter sweeps, never for selecting published results.
+    tuning: bool = False
+    # Subset regression gate (diarization-param-tuning): metric -> max allowed
+    # value on the subset run; `subset` fails when a metric exceeds its bound.
+    subset_gate: dict[str, float] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -103,6 +109,17 @@ def parse_manifest(data: Any, name: str) -> DatasetManifest:
             baseline = float(baseline)
         except (TypeError, ValueError) as exc:
             raise ManifestError(f"{name}: baseline_der must be a number") from exc
+    subset_gate_raw = data.get("subset_gate", {}) or {}
+    if not isinstance(subset_gate_raw, dict):
+        raise ManifestError(f"{name}: subset_gate must be a mapping of metric -> max")
+    subset_gate: dict[str, float] = {}
+    for metric, bound in subset_gate_raw.items():
+        if metric not in {"der", "fa", "miss", "conf"}:
+            raise ManifestError(f"{name}: subset_gate unknown metric '{metric}'")
+        try:
+            subset_gate[metric] = float(bound)
+        except (TypeError, ValueError) as exc:
+            raise ManifestError(f"{name}: subset_gate.{metric} must be a number") from exc
     return DatasetManifest(
         name=data["name"],
         license=str(data["license"]),
@@ -115,9 +132,12 @@ def parse_manifest(data: Any, name: str) -> DatasetManifest:
         baseline_der=baseline,
         subset=bool(data.get("subset", False)),
         subset_files=tuple(data.get("subset_files", ())),
+        tuning=bool(data.get("tuning", False)),
+        subset_gate=subset_gate,
         extra={k: v for k, v in data.items() if k not in {
             "name", "license", "parser", "gated", "raw_files", "raw_hint",
             "sources", "channel_policy", "baseline_der", "subset", "subset_files",
+            "tuning", "subset_gate",
         }},
     )
 
