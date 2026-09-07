@@ -12,12 +12,13 @@ subset_files:
   - euqef
   - dohag
   - neiye
-# Subset regression gate ranges (re-baselined 2026-09-05 on tuned clustering
-# defaults threshold=0.60 / ceiling=128 / gap-merge=0.3): measured subset DER
-# 15.32, Conf 11.21 -> gate maxes leave ~3pp margin. `subset` fails outside them.
+# Subset regression gate ranges (re-baselined 2026-09-07 on the pipeline-v2
+# core, AHC default kind, threshold=0.60 / ceiling=128 / gap-merge=0.3):
+# measured subset DER 8.40, Conf 3.89 -> gate maxes leave ~3-4pp margin.
+# `subset` fails outside them.
 subset_gate:
-  der: 18.0
-  conf: 14.0
+  der: 12.0
+  conf: 7.0
 normalize:
   audio_archive: voxconverse_test_wav.zip
   audio_glob: voxconverse_test_wav/*.wav

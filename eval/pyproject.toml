@@ -29,6 +29,7 @@ run = "diareval.cli:run_cli"
 score = "diareval.cli:score_cli"
 report = "diareval.cli:report_cli"
 subset = "diareval.cli:subset_cli"
+sweep = "diareval.cli:sweep_cli"
 
 [dependency-groups]
 dev = [

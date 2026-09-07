@@ -40,19 +40,23 @@ after all chunks (global stage):
 
 Alternatives considered: (b) buffer the whole channel and call `run()` — rejected, breaks the memory spec; (c) run full v2 per chunk then merge labels — rejected, resegmentation and clustering are global stages and per-chunk global passes break cross-chunk label consistency.
 
+**Correction — primary turns are per source segment, not per dense window (spike 2026-09-07):** dense windows are embedding units only. Emitting one turn per window tiles long segments with overlapping duplicates that only gap-fill can re-glue (breaks `gap_merge_secs=0` and double-covers time when adjacent-window labels alternate — measured FA 63.02 on voxconverse-dev with the AHC kind). The global stage therefore builds one primary turn per source segment labeled by the duration-weighted majority of its windows, splits region-primary turns at mapped overlap spans (the resegmenter re-emits the primary+secondary pair there; other speakers' coverage is never destroyed), then resegments, min-speech-filters, and gap-fills as above.
+
 **Escape hatch (spike-gated):** if posterior stitching or resegmentation composition proves impractical against the vendored API, degrade to adopting only the clustering + overlap-assignment stages over the current per-segment embeddings (still replaces AHC with VBx/NME-SC and adds overlap output), and record the reduced scope in the specs before implementation continues. Task 1 decides this.
 
 ### D2. Clusterer: `NmeSc` default (revised — spike finding 2026-09-07), kind is a setting, `Ahc` is the rollback
 
 **Original decision** was `ClustererKind::Vbx` (VBx HMM + PLDA, automatic count) as default. The spike invalidated it: the vendored PLDA parameter set is dimension-locked to 256-d WeSpeaker ResNet34 embeddings (`plda_mean1.npy` shape `(256,)`, `plda_lda.npy` `(256,128)` — verified from the manifest-pinned fixtures), and polyvoice's own v2 profile path pairs VBx with `ResNet34Adapter`. The app's enhanced TitaNet-Large is 192-d; `PldaModel::transform` would panic on the broadcast mismatch (no dim check in `VbxClusterer`). The change's non-goal "no model replacements (segmentation-3.0 + TitaNet stay)" forbids the 256-d swap, and training 192-d PLDA params is new-algorithm work the proposal explicitly rejected.
 
-**Revised decision**: `ClustererKind::NmeSc` (spectral normalized-maximum-eigengap, automatic count, cosine-affinity → dimension-agnostic, no asset) is the built-in default. New persisted setting `diarizationClusterer` ∈ `vbx|nmesc|ahc`, default `nmesc`. `vbx` remains parseable (forward-compatible if a PLDA-compatible 256-d family ever ships) but the clusterer factory SHALL return a clear actionable error for the enhanced family — no panic, no silent kind switch (consistent with "no silent fallback model set"). **No PLDA files are bundled**; the model-management requirement and the asset tasks are amended accordingly. `Ahc` remains the no-rebuild rollback. The acceptance gates (msdwild Conf < 28.27, no voxconverse/ru-youtube regression) are measured with the `nmesc` default; if `nmesc` misses them, the 6.2 sweep falls back to `ahc` re-tune, not to VBx.
+**Revised decision (superseded by the 6.2 sweep — see below)**: `ClustererKind::NmeSc` (spectral normalized-maximum-eigengap, automatic count, cosine-affinity → dimension-agnostic, no asset) was initially the built-in default. New persisted setting `diarizationClusterer` ∈ `vbx|nmesc|ahc`. `vbx` remains parseable (forward-compatible if a PLDA-compatible 256-d family ever ships) but the clusterer factory SHALL return a clear actionable error for the enhanced family — no panic, no silent kind switch (consistent with "no silent fallback model set"). **No PLDA files are bundled**; the model-management requirement and the asset tasks are amended accordingly.
+
+**6.2 outcome — default kind switched to `ahc`**: NME-SC under-clusters dense TitaNet windows (dev Conf 37.27, mean 1.33 speakers/file; voxconverse-test Conf 41.88 vs AHC-report 21.45), failing the no-regression gate, while the msdwild gate passed (26.78 < 28.27). The AHC re-tune sweep on the dev pool (thr {0.52, 0.60} × gap {0.0, 0.3}, ceil 128) selected thr 0.60 / gap 0.3 (dev Conf 14.80, DER 21.23) — identical to the already-shipped tuned numbers. Built-in default is therefore `ahc` with unchanged numeric defaults (threshold 0.60, ceiling 128, gap-merge 0.3 s); `nmesc` stays selectable. Held-out validation (voxconverse test + msdwild + ru sets, `v2-ahc` runs) confirms before re-baseline.
 
 ### D3. Parameter mapping onto the existing tuning surface
 
 | setting | v2 mapping | notes |
 | --- | --- | --- |
-| `diarizationClusterer` (new) | `ClustererKind` | default `nmesc` (revised D2); `vbx` gated to an actionable error |
+| `diarizationClusterer` (new) | `ClustererKind` | default `ahc` (6.2 sweep; was `nmesc`); `vbx` gated to an actionable error |
 | `diarizationClusterThreshold` | `Ahc { threshold }` only | ignored (no-op) for vbx/nmesc; UI text updated |
 | `diarizationClusterCeiling` | `PipelineConfig::max_speakers` | u8: clamp stored values >255 to 255, log; default 128 fits |
 | `diarizationGapMergeSecs` | `max_gap_secs` (pipeline gap-fill) | replaces the app's post-clustering merge pass; 0 disables |
@@ -81,13 +85,13 @@ The post-clustering gap-merge pass in `diarization.rs` is deleted once `max_gap_
 - [VBx unstable on very short / single-speaker channels (few embeddings)] → spike includes a single-speaker meeting; rollback kind `nmesc`/`ahc` via setting; built-in default is re-decided at re-baseline.
 - [Russian-domain quality unknown — PLDA/VBx priors are English-tuned] → gates on ru-youtube/ru-synthetic (Conf-only) decide whether `vbx` or `nmesc` ships as default; kind is already a value, not a code change.
 - [Component stitching (posteriors across chunk overlaps) produces boundary artifacts] → 5 s chunk overlap already guarantees turn coverage; parity test on a stored long meeting; escape hatch D1.
-- [VBx PLDA params are 256-d-locked (WeSpeaker ResNet34), incompatible with the 192-d enhanced TitaNet-Large family] → **materialized in the spike**; resolved by shipping `nmesc` as the default kind and gating `vbx` to a clear actionable error (revised D2); no PLDA asset is bundled.
+- [VBx PLDA params are 256-d-locked (WeSpeaker ResNet34), incompatible with the 192-d enhanced TitaNet-Large family] → **materialized in the spike**; resolved by gating `vbx` to a clear actionable error (revised D2) and shipping `ahc` as the default kind per the 6.2 sweep; no PLDA asset is bundled.
 - [Users' stored ceiling >255 or threshold silently ignored under vbx] → clamp + log at resolve time; settings UI labels threshold "(AHC only)".
 - [Re-diarized meetings get different labels/turn boundaries] → already the accepted pattern from the tuning change; release note + settings rollback.
 
 ## Migration Plan
 
-1. Land v2 core behind default `diarizationClusterer=nmesc`; no DB migrations; caches are rewritten by the next diarization run.
+1. Land v2 core behind default `diarizationClusterer=ahc` (6.2 sweep; was `nmesc`); no DB migrations; caches are rewritten by the next diarization run.
 2. Rollback without revert: set `diarizationClusterer=ahc` (plus stored threshold 0.52 / gap 0.0 to recover exact pre-adoption behavior, mirroring the tuning-change rollback documented in eval/README).
 3. eval/README: new sweep section for kind + window params; re-baselined gate table.
 

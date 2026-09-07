@@ -440,4 +440,20 @@ mod tests {
         assert_eq!(spans[1].0, 2.0);
         assert_eq!(spans[1].1, 4.0);
     }
+
+    #[test]
+    fn overlapping_turns_larger_covered_duration_wins() {
+        // Pipeline-v2 overlap output: two turns share [1.0, 2.0]. A token fully
+        // inside the overlap picks the turn covering more of the token.
+        let tokens = vec![tok("x", 1.2, 1.8), tok("y", 2.5, 3.0)];
+        let turns = vec![turn(0.0, 2.0, 0), turn(1.0, 4.0, 1)];
+        let a = assign_tokens_to_speakers(&tokens, &turns);
+        // Token x: overlap 0.6 with both -> first max wins (tie keeps first);
+        // token y: only turn 1 covers it.
+        assert_eq!(a.per_token[1], Some(1));
+        // Shifted token covered more by turn 1 than turn 0.
+        let tokens = vec![tok("z", 1.8, 2.5)];
+        let a = assign_tokens_to_speakers(&tokens, &turns);
+        assert_eq!(a.per_token[0], Some(1));
+    }
 }

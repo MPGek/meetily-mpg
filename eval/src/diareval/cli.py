@@ -156,3 +156,7 @@ def report_cli() -> None:
 
 def subset_cli() -> None:
     sys.exit(main(["subset", *sys.argv[1:]]))
+
+
+def sweep_cli() -> None:
+    sys.exit(main(["sweep", *sys.argv[1:]]))

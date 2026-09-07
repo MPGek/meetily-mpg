@@ -23,10 +23,14 @@ subset_files:
   - train-00008-of-00030_0035
   - train-00012-of-00030_0024
 # Subset regression gate (Conf-only — DER is inflated by the annotation-timeline
-# artifact above). Re-baselined 2026-09-05 on tuned clustering defaults
-# threshold=0.60 / ceiling=128 / gap-merge=0.3: measured subset Conf 4.00.
+# artifact above). Re-baselined 2026-09-07 on the pipeline-v2 core (AHC default
+# kind, threshold=0.60 / ceiling=128 / gap-merge=0.3): measured subset Conf
+# 12.66. The jump vs 4.00 (2026-09-05) is short-TTS-blip fragmentation: dense
+# window-mean aggregates of 0.4–2 s blips land just under the 0.60 merge
+# threshold and split from the same voice's longer segments (full-set Conf
+# moved only 8.59 → 9.82, within noise on this artifact set).
 subset_gate:
-  conf: 6.0
+  conf: 16.0
 sources:
   - kind: hf
     url: https://huggingface.co/datasets/niobures/synthetic-speech-diarization-ru

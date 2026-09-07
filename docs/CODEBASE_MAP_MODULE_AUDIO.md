@@ -72,7 +72,7 @@ module: audio
 | `transcription/whisper_provider.rs` | Whisper provider impl | `WhisperProvider` | <1k |
 | `transcription/parakeet_provider.rs` | Parakeet provider impl | `ParakeetProvider` | <1k |
 | `transcription/commands.rs` | **NEW** model-readiness command (provider-aware gate) | `check_active_transcription_model_ready`, `TranscriptionModelStatus` | <1k |
-| `diarization.rs` | **NEW** offline speaker diarization (polyvoice: powerset segmentation + ResNet34 embeddings + AHC clustering, per-channel) | `start_diarization`, `DiarizationResult`, `DiarizationProgress`, model check/download commands | ~7.6k |
+| `diarization.rs` | Offline speaker diarization (polyvoice pipeline-v2: calibrated powerset segmentation + dense TitaNet-Large windows + resegmentation + NME-SC/AHC clustering + overlap-aware output, per-channel chunked core) | `start_diarization`, `DiarizationResult`, `DiarizationProgress`, `DiarizationConfig`, `ClustererKindSetting`, model check commands | ~7.6k+ |
 | `online_diarization.rs` | **NEW** online (during-recording) diarization — Efficient (buffer+cluster) / Fast (polyvoice StreamingPipeline) modes | `OnlineDiarizationProcessor`, `DiarizationMode`, `SpeakerAssignment` | ~3.9k |
 | `audio_file.rs` | **NEW** audio file discovery + FFmpeg transcode-to-WAV for webview playback (temp cache) | `find_audio_file`, `prepare_audio_for_playback` | <1k |
 
@@ -131,10 +131,14 @@ struct DiarizationSegment { start: f32, end: f32, speaker: i32 }   // internal, 
 // Label scheme (shared offline+online): mic → "MIC_SPEAKER_NN", system/mono → "SPEAKER_NN"
 
 struct DiarizationConfig {                          // diarization.rs; default()/resolved()
-    max_sessions: usize, chunk_overlap_secs: f32,
-    cluster_threshold: f32,   // AHC min cosine merge; default 0.60 (TITANET_CLUSTER_THRESHOLD)
-    cluster_ceiling: usize,   // hard speaker-count cap per channel; default 128 (DEFAULT_CLUSTER_CEILING)
-    gap_merge_secs: f32,      // same-speaker gap-merge window; default 0.3 (DEFAULT_GAP_MERGE_SECS)
+    max_sessions: usize, chunk_overlap_secs: f32,  // 5 s chunk overlap
+    clusterer: ClustererKindSetting, // ahc (default, 6.2 sweep) | nmesc (selectable) | vbx (gated)
+    cluster_threshold: f32,   // AHC-only min cosine merge; default 0.60 (TITANET_CLUSTER_THRESHOLD)
+    cluster_ceiling: usize,   // hard speaker-count cap per channel; default 128 (DEFAULT_CLUSTER_CEILING, clamped to 255)
+    gap_merge_secs: f32,      // pipeline gap-fill window; default 0.3 (DEFAULT_GAP_MERGE_SECS, 0 disables)
+    embed_window_secs: f32,   // dense embedding window; default 5.0 (compiled-in, harness-sweepable)
+    binarization: Option<BinarizationConfig>, // hysteresis onset=0.5/offset=0.4/min 0.2/0.2 (compiled-in)
+    min_speech_secs: f32,     // min turn duration; default 0.25
 }
 ```
 
@@ -144,14 +148,16 @@ Power-user overrides live in the browser settings store (localStorage,
 `frontend/src/lib/diarization.ts`), are mirrored to the backend via
 `set_diarization_clustering_settings` on startup, and are read by
 `DiarizationConfig::resolved()`; unset keys fall back to the built-in
-sweep-tuned defaults. Harness equivalents: `diarize-eval --cluster-threshold /
---max-clusters / --gap-merge` (see `eval/README.md`).
+sweep-tuned defaults. Harness equivalents: `diarize-eval --clusterer /
+--cluster-threshold / --max-clusters / --gap-merge / --embed-window /
+--binarization` (see `eval/README.md`).
 
 | localStorage key | Type | Built-in default | Effect |
 | --- | --- | --- | --- |
-| `diarizationClusterThreshold` | float | 0.60 | AHC merge criterion: minimum cosine similarity to merge two clusters. Lower → more merging, fewer speakers. |
-| `diarizationClusterCeiling` | int | 128 | Hard cap on distinct speaker labels per channel per pass (always enforced; user `max_speakers` wins when smaller). |
-| `diarizationGapMergeSecs` | float | 0.3 | Merge consecutive same-speaker output segments whose silence gap ≤ this window (0 = off; cross-speaker boundaries and overlaps untouched). |
+| `diarizationClusterer` | vbx\|nmesc\|ahc | ahc | Clusterer kind (AHC default per 6.2 sweep; `nmesc` selectable; `vbx` gated to an actionable 256-d/192-d error). |
+| `diarizationClusterThreshold` | float | 0.60 | AHC-only merge criterion: minimum cosine similarity to merge two clusters. Lower → more merging, fewer speakers. |
+| `diarizationClusterCeiling` | int | 128 | Hard cap on distinct speaker labels per channel per pass (always enforced; user `max_speakers` wins when smaller; clamped to 255). |
+| `diarizationGapMergeSecs` | float | 0.3 | Pipeline gap-fill window (0 = off; cross-speaker boundaries and overlaps untouched). |
 
 ## Internal Architecture
 
@@ -186,13 +192,13 @@ graph LR
 
 ### Speaker Diarization (NEW)
 
-**Offline (`diarization.rs`)** — `start_diarization` runs in `spawn_blocking`:
-1. Load transcripts (`get_transcripts_for_diarization`), locate + decode the meeting audio.
-2. `extract_channels()` splits stereo into mic (left) / system (right); mono is treated as remote-only.
-3. `create_polyvoice_diarizer` loads `PowersetSegmenter` + `ResNet34Adapter` (256-dim, CPU) + `MinClusterSizeClusterer(AhcClusterer, 2)`; geometry overridden from the manifest to fix a polyvoice `window_size`→`window_secs` unit mismatch.
-4. Per-channel: segment → embed → cluster → `DiarizationSegment[]`.
-5. `compute_speaker_matches` routes each transcript by `source_device`, picks the segment with max temporal overlap (with 30s nearest-speaker **gap-fill** fallback), formats `MIC_SPEAKER_NN`/`SPEAKER_NN`.
-6. Persists via `update_transcript_speaker` + `update_diarization_status`; streams `diarization-progress` events.
+**Offline (`diarization.rs`, pipeline-v2)** — `start_diarization` runs in `spawn_blocking`:
+1. Load transcripts (`get_transcripts_for_diarization`), locate + decode the meeting audio (ffmpeg 16 kHz f32le streaming per channel, or Symphonia fallback).
+2. Stereo channels diarize concurrently (mic left / system right); mono is treated as remote-only.
+3. `create_polyvoice_diarizer` loads the enhanced set (segmentation-3.0 calibrated `BinarizationConfig` + TitaNet-Large 192-d) plus the kind-selected clusterer (`NmeSc` default, `Ahc` rollback, `Vbx` gated) and the overlap resegmenter; ceiling is always enforced (clamped to 255).
+4. Per-channel chunked v2 core (`V2Core`, 5 s chunk overlap, bounded memory): binarized segmentation → dense `embed_window_secs` windows through the batched multi-core embed path (overlap-masked) → global clustering → per-chunk Hungarian local→global mapping → overlap-aware two-speaker resegmentation → min-speech filter → pipeline gap-fill (`max_gap_secs`, 0 disables). No singleton-cluster pruning; per-segment aggregates (L2-normalized window mean) feed `ClusteredEmbedding` caches/enrollment.
+5. `compute_speaker_matches` routes each transcript by `source_device`, picks the segment with max temporal overlap (token-level: larger covered duration wins; 30s nearest-speaker **gap-fill** fallback), formats `MIC_SPEAKER_NN`/`SPEAKER_NN` (overlapping turns preserved end-to-end).
+6. Persists via `update_transcript_speaker` + `update_diarization_status`; streams `diarization-progress` events with stage timings + peak-RSS regression warnings.
 
 **Online (`online_diarization.rs`)** — during recording, driven by `recording_commands.rs`:
 - The pipeline fans VAD-merged speech segments to an `embedding_sender` channel; a `spawn_blocking` consumer feeds `OnlineDiarizationProcessor::process_chunk`.

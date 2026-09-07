@@ -51,7 +51,9 @@ impl AudioCaptureBackend {
         }
     }
 
-    /// Convert to string (lowercase)
+    /// Convert to string (lowercase wire format, intentionally distinct from
+    /// the `Display` human-readable name — `from_string` round-trips this).
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         match self {
             AudioCaptureBackend::ScreenCaptureKit => "screencapturekit".to_string(),
