@@ -568,23 +568,98 @@ fn fixed_pool_size() -> usize {
 /// Built-in default speaker-count ceiling: sweep-selected (extended grid,
 /// 2026-09-04) — tight ceilings force below-threshold merges and inflate
 /// confusion, so the ceiling sits well above real meeting speaker counts while
-/// still guaranteeing AHC never runs with `AscStop::Off`.
+/// still guaranteeing the clusterer never runs unbounded.
 pub const DEFAULT_CLUSTER_CEILING: usize = 128;
 
 /// Built-in default same-speaker gap-merge window (sweep-selected, 2026-09-04).
 pub const DEFAULT_GAP_MERGE_SECS: f32 = 0.3;
+
+/// Pipeline's clustering-backend maximum speaker count (`u8` local labels).
+const MAX_CLUSTERERS: usize = 255;
+
+/// Dense embedding window length (seconds, w/2 hop) — compiled-in constant
+/// (pipeline-v2 D4), harness-sweepable via `--embed-window`, not a persisted
+/// setting.
+pub const DEFAULT_EMBED_WINDOW_SECS: f32 = 5.0;
+
+/// Minimum segment length (seconds) accepted for embedding: sub-0.2 s windows
+/// collapse the pooling std toward NaN on the TitaNet time-downsample path
+/// (mirrors the vendored `MIN_EMBED_SECS`).
+const MIN_EMBED_SECS: f64 = 0.20;
+
+/// Calibrated binarization constants (pipeline-v2 D4): the vendored
+/// `BinarizationConfig` default is plain thresholding (0.5/0.5/0/0), so the
+/// spike selects hysteresis + min-duration smoothing constants; harness-
+/// sweepable via `--binarization`, not a persisted setting.
+pub const DEFAULT_BINARIZATION: polyvoice::segmentation::BinarizationConfig =
+    polyvoice::segmentation::BinarizationConfig {
+        onset: 0.5,
+        offset: 0.4,
+        min_duration_on: 0.2,
+        min_duration_off: 0.2,
+    };
+
+/// Built-in minimum turn duration (seconds) after resegmentation (mirrors
+/// `PipelineConfig::min_speech_secs`).
+pub const DEFAULT_MIN_SPEECH_SECS: f32 = 0.25;
+
+/// Offline clusterer kind (diarization-param-tuning, pipeline-v2 D2).
+/// `ahc` is the built-in default (fixed cosine threshold, selected by the 6.2
+/// sweep: NME-SC under-clusters dense TitaNet windows into ~1 speaker/file).
+/// `nmesc` remains selectable (automatic count over cosine-affinity spectral
+/// clustering, dimension-agnostic). `vbx` stays parseable but the clusterer
+/// factory rejects it for the enhanced 192-d family (the vendored PLDA params
+/// require 256-d embeddings) — no silent kind switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClustererKindSetting {
+    Nmesc,
+    Vbx,
+    Ahc,
+}
+
+impl ClustererKindSetting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nmesc => "nmesc",
+            Self::Vbx => "vbx",
+            Self::Ahc => "ahc",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "nmesc" => Some(Self::Nmesc),
+            "vbx" => Some(Self::Vbx),
+            "ahc" => Some(Self::Ahc),
+            _ => None,
+        }
+    }
+
+    pub fn is_automatic_count(self) -> bool {
+        matches!(self, Self::Nmesc | Self::Vbx)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DiarizationConfig {
     pub max_sessions: usize,
     pub chunk_overlap_secs: f32,
     /// AHC merge criterion: minimum cosine similarity to merge two clusters.
+    /// Applies to the `ahc` kind only (ignored under automatic count).
     pub cluster_threshold: f32,
     /// Hard ceiling on distinct speaker labels per channel per pass.
     pub cluster_ceiling: usize,
     /// Merge consecutive same-speaker segments when the gap between them is
     /// within this window (0 disables gap-merging).
     pub gap_merge_secs: f32,
+    /// Clusterer kind (nmesc|vbx|ahc); default `ahc` (6.2 sweep).
+    pub clusterer: ClustererKindSetting,
+    /// Dense embedding window (0 = sparse one-embedding-per-segment).
+    pub embed_window_secs: f32,
+    /// Calibrated binarization of segmentation posteriors (None = argmax).
+    pub binarization: Option<polyvoice::segmentation::BinarizationConfig>,
+    /// Minimum output turn duration.
+    pub min_speech_secs: f32,
 }
 
 impl Default for DiarizationConfig {
@@ -595,6 +670,10 @@ impl Default for DiarizationConfig {
             cluster_threshold: crate::audio::embedder::TITANET_CLUSTER_THRESHOLD,
             cluster_ceiling: DEFAULT_CLUSTER_CEILING,
             gap_merge_secs: DEFAULT_GAP_MERGE_SECS,
+            clusterer: ClustererKindSetting::Ahc,
+            embed_window_secs: DEFAULT_EMBED_WINDOW_SECS,
+            binarization: Some(DEFAULT_BINARIZATION),
+            min_speech_secs: DEFAULT_MIN_SPEECH_SECS,
         }
     }
 }
@@ -621,6 +700,7 @@ impl DiarizationConfig {
                 .unwrap_or(crate::audio::embedder::TITANET_CLUSTER_THRESHOLD),
             cluster_ceiling: stored_cluster_ceiling().unwrap_or(DEFAULT_CLUSTER_CEILING),
             gap_merge_secs: stored_gap_merge_secs().unwrap_or(DEFAULT_GAP_MERGE_SECS),
+            clusterer: stored_clusterer_kind().unwrap_or(ClustererKindSetting::Ahc),
             ..Self::default()
         }
     }
@@ -637,6 +717,7 @@ impl DiarizationConfig {
 static CLUSTER_THRESHOLD_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else f32 bits + 1
 static CLUSTER_CEILING_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else value
 static GAP_MERGE_SECS_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else f32 bits + 1
+static CLUSTERER_KIND_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 = unset
 
 fn store_f32_option(cell: &AtomicU64, value: Option<f32>) {
     match value {
@@ -669,12 +750,31 @@ fn stored_gap_merge_secs() -> Option<f32> {
     load_f32_option(&GAP_MERGE_SECS_OVERRIDE)
 }
 
+fn kind_code(kind: ClustererKindSetting) -> u8 {
+    match kind {
+        ClustererKindSetting::Nmesc => 1,
+        ClustererKindSetting::Vbx => 2,
+        ClustererKindSetting::Ahc => 3,
+    }
+}
+
+fn stored_clusterer_kind() -> Option<ClustererKindSetting> {
+    match CLUSTERER_KIND_OVERRIDE.load(Ordering::SeqCst) {
+        0 => None,
+        1 => Some(ClustererKindSetting::Nmesc),
+        2 => Some(ClustererKindSetting::Vbx),
+        3 => Some(ClustererKindSetting::Ahc),
+        _ => None,
+    }
+}
+
 /// Update the persisted clustering overrides (None clears a key back to the
 /// built-in default).
 pub fn set_clustering_overrides(
     cluster_threshold: Option<f32>,
     cluster_ceiling: Option<usize>,
     gap_merge_secs: Option<f32>,
+    clusterer: Option<ClustererKindSetting>,
 ) {
     store_f32_option(&CLUSTER_THRESHOLD_OVERRIDE, cluster_threshold);
     CLUSTER_CEILING_OVERRIDE.store(
@@ -682,11 +782,14 @@ pub fn set_clustering_overrides(
         Ordering::SeqCst,
     );
     store_f32_option(&GAP_MERGE_SECS_OVERRIDE, gap_merge_secs);
+    CLUSTERER_KIND_OVERRIDE
+        .store(clusterer.map(kind_code).unwrap_or(0), Ordering::SeqCst);
     log::info!(
-        "Diarization clustering settings updated: threshold={:?}, ceiling={:?}, gap_merge={:?}",
+        "Diarization clustering settings updated: threshold={:?}, ceiling={:?}, gap_merge={:?}, clusterer={:?}",
         stored_cluster_threshold(),
         stored_cluster_ceiling(),
-        stored_gap_merge_secs()
+        stored_gap_merge_secs(),
+        stored_clusterer_kind(),
     );
 }
 
@@ -695,8 +798,17 @@ pub async fn set_diarization_clustering_settings(
     cluster_threshold: Option<f32>,
     cluster_ceiling: Option<usize>,
     gap_merge_secs: Option<f32>,
+    clusterer: Option<String>,
 ) -> Result<(), String> {
-    set_clustering_overrides(cluster_threshold, cluster_ceiling, gap_merge_secs);
+    let kind = match clusterer.as_deref() {
+        None => None,
+        Some(raw) => Some(ClustererKindSetting::parse(raw).ok_or_else(|| {
+            format!(
+                "Unknown diarizationClusterer '{raw}' (expected vbx|nmesc|ahc)"
+            )
+        })?),
+    };
+    set_clustering_overrides(cluster_threshold, cluster_ceiling, gap_merge_secs, kind);
     Ok(())
 }
 
@@ -708,6 +820,7 @@ struct StageTimings {
     segmentation_secs: f64,
     embedding_secs: f64,
     clustering_secs: f64,
+    resegmentation_secs: f64,
     matching_secs: f64,
 }
 
@@ -889,6 +1002,8 @@ fn run_diarization_blocking_with_app<R: Runtime>(
     timings.segmentation_secs = mic_timings.segmentation_secs + sys_timings.segmentation_secs;
     timings.embedding_secs = mic_timings.embedding_secs + sys_timings.embedding_secs;
     timings.clustering_secs = mic_timings.clustering_secs + sys_timings.clustering_secs;
+    timings.resegmentation_secs =
+        mic_timings.resegmentation_secs + sys_timings.resegmentation_secs;
     let channel_elapsed = channel_start.elapsed().as_secs_f64();
 
     emit_progress(
@@ -916,12 +1031,13 @@ fn run_diarization_blocking_with_app<R: Runtime>(
     let overall_secs = overall_start.elapsed().as_secs_f64();
 
     info!(
-        "Diarization timing for {}: decode={:.2}s, segmentation={:.2}s, embedding={:.2}s, clustering={:.2}s, matching={:.2}s, channel_total={:.2}s, overall={:.2}s, peak_rss={}MB, segments={}, speakers={}",
+        "Diarization timing for {}: decode={:.2}s, segmentation={:.2}s, embedding={:.2}s, clustering={:.2}s, resegmentation={:.2}s, matching={:.2}s, channel_total={:.2}s, overall={:.2}s, peak_rss={}MB, segments={}, speakers={}",
         meeting_id,
         timings.decode_secs,
         timings.segmentation_secs,
         timings.embedding_secs,
         timings.clustering_secs,
+        timings.resegmentation_secs,
         timings.matching_secs,
         channel_elapsed,
         overall_secs,
@@ -1010,12 +1126,57 @@ pub struct ChannelClusters {
     pub embeddings: Vec<ClusteredEmbedding>,
 }
 
-/// Polyvoice diarization engine: enhanced segmentation-3.0 + TitaNet-Large
-/// embedding + AHC clustering, loaded once per run.
+/// Polyvoice diarization engine (pipeline_v2 architecture): enhanced
+/// segmentation-3.0 with calibrated binarization + TitaNet-Large embedding +
+/// kind-selected clusterer + overlap resegmenter, loaded once per run.
 pub struct PolyvoiceDiarizer {
-    segmenter: Box<dyn crate::audio::segmentation::Segmenter>,
+    segmenter: Box<dyn polyvoice::segmentation::Segmenter>,
     embedder: Box<dyn crate::audio::embedder::SpeakerEmbedder>,
     clusterer: Box<dyn polyvoice::clusterer::Clusterer>,
+    resegmenter: polyvoice::resegmentation::OverlapResegmenter,
+}
+
+/// Build the offline clusterer for the resolved kind. The effective ceiling is
+/// clamped to the pipeline's 255 maximum (logged). `vbx` is gated: the vendored
+/// PLDA parameters require 256-d embeddings while the enhanced TitaNet-Large
+/// family is 192-d, so selecting it errors actionably — no silent kind switch.
+fn build_clusterer(
+    config: &DiarizationConfig,
+    max_clusters: usize,
+) -> Result<Box<dyn polyvoice::clusterer::Clusterer>, String> {
+    let ceiling = max_clusters.min(MAX_CLUSTERERS);
+    if ceiling < max_clusters {
+        warn!(
+            "Speaker-count ceiling {} exceeds the clustering backend maximum; clamped to {}",
+            max_clusters, ceiling
+        );
+    }
+    match config.clusterer {
+        ClustererKindSetting::Ahc => {
+            log::info!(
+                "Diarization clusterer: ahc (threshold={:.3}, ceiling={})",
+                config.cluster_threshold,
+                ceiling
+            );
+            Ok(Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
+                ceiling,
+                config.cluster_threshold,
+            )))
+        }
+        ClustererKindSetting::Nmesc => {
+            log::info!(
+                "Diarization clusterer: nmesc (automatic count, ceiling={}; merge threshold inert)",
+                ceiling
+            );
+            Ok(Box::new(polyvoice::clusterer::NmeScClusterer::new(ceiling)))
+        }
+        ClustererKindSetting::Vbx => Err(format!(
+            "The 'vbx' clusterer is unavailable for the enhanced diarization model set: \
+             VBx requires 256-dimensional embeddings (the vendored PLDA parameters are \
+              dimension-locked), while the bundled TitaNet-Large family embeds 192-d. \
+              Select 'ahc' (default) or 'nmesc' instead."
+        )),
+    }
 }
 
 fn create_polyvoice_diarizer(
@@ -1026,43 +1187,34 @@ fn create_polyvoice_diarizer(
     // Enhanced-only engine family: segmentation and embedding construction
     // error with clear messages when the bundled enhanced models are absent
     // (no fallback to a standard/legacy model set).
-    let segmenter =
-        crate::audio::segmentation::create_segmenter(models_dir, config.segmenter_pool_size())?;
+    let segmenter = crate::audio::segmentation::create_v2_segmenter(
+        models_dir,
+        config.segmenter_pool_size(),
+        config.binarization,
+    )?;
     let embedder =
         crate::audio::embedder::create_speaker_embedder(models_dir, config.embedder_pool_size())
             .map_err(|e| format!("Failed to create embedder: {}", e))?;
     let model_tag = embedder.model_tag();
-    let family_threshold = embedder.family_threshold();
-    // Runtime-resolved merge threshold wins over the family default; the
-    // config default equals the family threshold, so the log distinguishes
-    // overrides from the built-in.
-    let cluster_threshold = config.cluster_threshold;
-    log::info!(
-        "Diarizer using enhanced family tag={} threshold={} (resolved={})",
-        model_tag,
-        family_threshold,
-        cluster_threshold
-    );
 
     // Always-on ceiling: user max_speakers when smaller, else the configured
-    // default ceiling. `AhcClusterer::with_threshold` treats 0 as no ceiling,
-    // so the effective value is clamped to >= 1 to keep `AscStop::Off`
-    // unreachable on every code path.
+    // default ceiling. Clamped to >= 1 so the clusterer never runs unbounded,
+    // and to the backend's 255 maximum inside `build_clusterer`.
     let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
     let max_clusters = user_max.min(config.cluster_ceiling).max(1);
-    let clusterer: Box<dyn polyvoice::clusterer::Clusterer> =
-        Box::new(polyvoice::clusterer::MinClusterSizeClusterer::new(
-            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
-                max_clusters,
-                cluster_threshold,
-            )),
-            2,
-        ));
+    let clusterer = build_clusterer(config, max_clusters)?;
+    log::info!(
+        "Diarizer using enhanced family tag={} embed_window={:.1}s kind={}",
+        model_tag,
+        config.embed_window_secs,
+        config.clusterer.as_str(),
+    );
 
     Ok(PolyvoiceDiarizer {
         segmenter,
         embedder,
         clusterer,
+        resegmenter: polyvoice::resegmentation::OverlapResegmenter::default(),
     })
 }
 
@@ -1185,67 +1337,616 @@ pub fn diarize_wav_samples(
 
 const DIARIZATION_SAMPLE_RATE: u32 = 16000;
 
-fn embed_segments(
-    embedder: &dyn crate::audio::embedder::SpeakerEmbedder,
-    diar_samples: &[f32],
-    raw_segments: &[crate::audio::segmentation::Segment],
-    _config: &DiarizationConfig,
-) -> (Vec<DiarizationSegment>, Vec<Vec<f32>>) {
-    let mut segments: Vec<DiarizationSegment> = Vec::with_capacity(raw_segments.len());
-    let mut slices: Vec<&[f32]> = Vec::with_capacity(raw_segments.len());
+type TimeRange = polyvoice::types::TimeRange;
+type RawSegment = polyvoice::segmentation::RawSegment;
+type SpeakerTurn = polyvoice::types::SpeakerTurn;
 
-    for seg in raw_segments {
-        let start = (seg.start as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize;
-        let end =
-            ((seg.end as f64 * DIARIZATION_SAMPLE_RATE as f64) as usize).min(diar_samples.len());
-        if end <= start {
+/// One dense embedding unit: a window slice of a primary segment, tagged with
+/// its chunk-local time span, the segment's local speaker index, and the index
+/// of its parent segment in the chunk's primary list.
+#[derive(Debug, Clone)]
+struct DenseUnit {
+    time: TimeRange,
+    local_idx: u8,
+    segment_idx: usize,
+    embedding: Vec<f32>,
+}
+
+/// Per-chunk accumulation between chunks (bounded): segment metadata with
+/// chunk-local times plus the embedded units. `start_secs` offsets to global
+/// channel time.
+#[derive(Debug, Default)]
+struct ChunkRecord {
+    start_secs: f32,
+    primary: Vec<RawSegment>,
+    overlaps: Vec<(TimeRange, u8, u8)>,
+    units: Vec<DenseUnit>,
+    /// Mixed-voice embeddings (L2-normalized) precomputed during the chunk
+    /// pass for overlap regions where at least one local speaker never
+    /// appeared as a primary segment — the resegmentation fallback needs them
+    /// after global clustering, when the chunk audio buffer is gone.
+    mixed_overlaps: Vec<(TimeRange, Vec<f32>)>,
+}
+
+/// Expand primary segments into embedding units. Segments longer than `window`
+/// are split into `window`-second sub-windows hopped by `window/2` (dense,
+/// v2-style); sub-window segments stay whole. Mirrors the vendored
+/// `pipeline_v2::expand_embed_units` (private). `window <= 0` keeps one unit
+/// per segment (sparse).
+fn expand_embed_units(segs: &[RawSegment], window: f32) -> Vec<(TimeRange, u8, usize)> {
+    let w = if window > 0.0 { window as f64 } else { 0.0 };
+    let mut out = Vec::new();
+    for (idx, seg) in segs.iter().enumerate() {
+        if w <= 0.0 || seg.time.end - seg.time.start <= w {
+            out.push((seg.time, seg.local_speaker_idx, idx));
             continue;
         }
-        segments.push(DiarizationSegment {
-            start: seg.start,
-            end: seg.end,
-            speaker: -1,
-        });
-        slices.push(&diar_samples[start..end]);
+        let hop = (w / 2.0).max(0.05);
+        let mut t = seg.time.start;
+        loop {
+            let end = (t + w).min(seg.time.end);
+            out.push((
+                TimeRange {
+                    start: t,
+                    end,
+                },
+                seg.local_speaker_idx,
+                idx,
+            ));
+            if end >= seg.time.end {
+                break;
+            }
+            t += hop;
+        }
     }
+    out
+}
 
-    let embeddings = match embedder.embed_batch(&slices) {
-        Ok(batch) => batch,
+/// Embed masked unit slices through the batched multi-core path, falling back
+/// to per-item embedding when the batch call fails. Returns embeddings aligned
+/// 1:1 with `masked` (`None` marks dropped units: fallback failures,
+/// non-finite, or dimension-mismatched vectors).
+fn embed_unit_slices(
+    embedder: &dyn crate::audio::embedder::SpeakerEmbedder,
+    masked: &[Vec<f32>],
+) -> Vec<Option<Vec<f32>>> {
+    let valid = |emb: Vec<f32>| {
+        let ok = emb.len() == embedder.input_dim() && emb.iter().all(|v| v.is_finite());
+        if !ok {
+            warn!("Skipping invalid embedding (dimension or non-finite values)");
+        }
+        ok.then_some(emb)
+    };
+    let refs: Vec<&[f32]> = masked.iter().map(Vec::as_slice).collect();
+    match embedder.embed_batch(&refs) {
+        Ok(batch) => batch.into_iter().map(valid).collect(),
         Err(e) => {
             warn!(
                 "Batch embedding failed ({}), falling back to per-segment embedding",
                 e
             );
-            slices
+            masked
                 .iter()
-                .filter_map(|audio| match embedder.embed(audio) {
-                    Ok(emb) => Some(emb),
-                    Err(e) => {
-                        warn!(
-                            "Embedding extraction failed for a segment ({}), skipping it",
+                .map(|audio| {
+                    embedder
+                        .embed(audio)
+                        .map_err(|e| {
+                            warn!(
+                                "Embedding extraction failed for a segment ({}), skipping it",
+                                e
+                            );
                             e
-                        );
-                        None
-                    }
+                        })
+                        .ok()
+                        .and_then(valid)
                 })
                 .collect()
         }
+    }
+}
+
+/// The pipeline_v2 chunked core: per-chunk binarized segmentation + dense
+/// embedding accumulation, then global clustering, per-chunk Hungarian
+/// local→global mapping, overlap-aware two-speaker resegmentation, minimum-
+/// speech filtering, and gap-fill. Bounded memory: only embeddings, segment
+/// metadata, and small overlap embeddings accumulate across chunks.
+struct V2Core<'a> {
+    diarizer: &'a PolyvoiceDiarizer,
+    config: &'a DiarizationConfig,
+    chunks: Vec<ChunkRecord>,
+    had_raw_segments: bool,
+    timings: StageTimings,
+}
+
+impl<'a> V2Core<'a> {
+    fn new(diarizer: &'a PolyvoiceDiarizer, config: &'a DiarizationConfig) -> Self {
+        Self {
+            diarizer,
+            config,
+            chunks: Vec::new(),
+            had_raw_segments: false,
+            timings: StageTimings::default(),
+        }
+    }
+
+    /// Segment one 16 kHz chunk and embed its dense units (chunk-local times).
+    fn process_chunk(&mut self, chunk_start_secs: f32, samples: &[f32]) -> Result<(), String> {
+        if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Diarization cancelled".to_string());
+        }
+
+        let seg_start = Instant::now();
+        let raw_segments = match self.diarizer.segmenter.segment(samples) {
+            Ok(segments) => segments,
+            Err(e) => {
+                warn!("Segmentation failed for a chunk ({}), skipping chunk", e);
+                return Ok(());
+            }
+        };
+        self.timings.segmentation_secs += seg_start.elapsed().as_secs_f64();
+        if raw_segments.is_empty() {
+            return Ok(());
+        }
+        self.had_raw_segments = true;
+
+        let overlaps = polyvoice::resegmentation::extract_overlap_time_ranges(&raw_segments);
+        let primary: Vec<RawSegment> = raw_segments
+            .iter()
+            .filter(|s| !s.is_overlap)
+            .cloned()
+            .collect();
+
+        let embed_start = Instant::now();
+        let mut units: Vec<DenseUnit> = Vec::new();
+        if !primary.is_empty() {
+            let specs = expand_embed_units(&primary, self.config.embed_window_secs);
+            let sample_rate = DIARIZATION_SAMPLE_RATE as f64;
+            let mut masked: Vec<Vec<f32>> = Vec::with_capacity(specs.len());
+            let mut kept: Vec<(TimeRange, u8, usize)> = Vec::with_capacity(specs.len());
+            for (time, local_idx, segment_idx) in specs {
+                let start_idx = (time.start * sample_rate) as usize;
+                let end_idx = ((time.end * sample_rate) as usize).min(samples.len());
+                if end_idx <= start_idx {
+                    continue;
+                }
+                if (end_idx - start_idx) as f64 / sample_rate < MIN_EMBED_SECS {
+                    continue;
+                }
+                // Zero-fill overlap regions inside the unit so two-speaker
+                // audio cannot bias the embedding (v2 masking contract).
+                let local_overlaps: Vec<(f32, f32)> = overlaps
+                    .iter()
+                    .filter_map(|(ot, _, _)| {
+                        let lo = ot.start.max(time.start);
+                        let hi = ot.end.min(time.end);
+                        if hi > lo {
+                            Some(((lo - time.start) as f32, (hi - time.start) as f32))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let chunk = polyvoice::embedder::apply_overlap_mask(
+                    &samples[start_idx..end_idx],
+                    &local_overlaps,
+                    DIARIZATION_SAMPLE_RATE,
+                );
+                masked.push(chunk);
+                kept.push((time, local_idx, segment_idx));
+            }
+            let embeddings = embed_unit_slices(self.diarizer.embedder.as_ref(), &masked);
+            for ((time, local_idx, segment_idx), embedding) in kept.into_iter().zip(embeddings) {
+                if let Some(embedding) = embedding {
+                    units.push(DenseUnit {
+                        time,
+                        local_idx,
+                        segment_idx,
+                        embedding,
+                    });
+                }
+            }
+        }
+
+        // Pre-embed mixed-voice overlap regions whose local speakers never
+        // appear solo in this chunk (resegmentation fallback after clustering).
+        let primary_locals: std::collections::HashSet<u8> =
+            primary.iter().map(|s| s.local_speaker_idx).collect();
+        let mut mixed_overlaps: Vec<(TimeRange, Vec<f32>)> = Vec::new();
+        let unresolved: Vec<(TimeRange, u8, u8)> = overlaps
+            .iter()
+            .filter(|(_, lo, hi)| !primary_locals.contains(lo) || !primary_locals.contains(hi))
+            .cloned()
+            .collect();
+        let sample_rate = DIARIZATION_SAMPLE_RATE as f64;
+        let embeddable: Vec<(TimeRange, Vec<f32>)> = unresolved
+            .into_iter()
+            .filter_map(|(time, _, _)| {
+                let start_idx = (time.start * sample_rate) as usize;
+                let end_idx = ((time.end * sample_rate) as usize).min(samples.len());
+                if end_idx > start_idx
+                    && (end_idx - start_idx) as f64 / sample_rate >= MIN_EMBED_SECS
+                {
+                    Some((time, samples[start_idx..end_idx].to_vec()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !embeddable.is_empty() {
+            let embeddings = embed_unit_slices(
+                self.diarizer.embedder.as_ref(),
+                &embeddable.iter().map(|(_, a)| a.clone()).collect::<Vec<_>>(),
+            );
+            for ((time, _), emb) in embeddable.into_iter().zip(embeddings) {
+                if let Some(mut emb) = emb {
+                    polyvoice::utils::l2_normalize(&mut emb);
+                    mixed_overlaps.push((time, emb));
+                }
+            }
+        }
+
+        self.timings.embedding_secs += embed_start.elapsed().as_secs_f64();
+        if units.is_empty() && !primary.is_empty() {
+            warn!(
+                "Chunk at {:.0}s: segmentation found {} primary segments but embedding produced 0 valid vectors (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large)",
+                chunk_start_secs,
+                primary.len()
+            );
+        }
+
+        self.chunks.push(ChunkRecord {
+            start_secs: chunk_start_secs,
+            primary,
+            overlaps,
+            units,
+            mixed_overlaps,
+        });
+        Ok(())
+    }
+
+    /// Global stage: cluster all accumulated units, map per-chunk local
+    /// speakers onto global clusters, resegment overlaps, filter, gap-fill.
+    fn finish(self) -> Result<
+        (
+            Vec<DiarizationSegment>,
+            Vec<ClusteredEmbedding>,
+            StageTimings,
+        ),
+        String,
+    > {
+        let mut timings = self.timings;
+        let all_units: Vec<&DenseUnit> = self.chunks.iter().flat_map(|c| c.units.iter()).collect();
+        if all_units.is_empty() {
+            if self.had_raw_segments {
+                return Err(
+                    "Embedding produced zero valid vectors (audio_signal layout mismatch — expected [B,80,T] for titanet_large, but no embeddings survived; check TitaNet layout)".to_string(),
+                );
+            }
+            return Ok((Vec::new(), Vec::new(), timings));
+        }
+        if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+            return Err("Diarization cancelled".to_string());
+        }
+
+        let raw_embeddings = self.diarizer.clusterer.wants_raw_embeddings();
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(all_units.len());
+        let mut durations: Vec<f64> = Vec::with_capacity(all_units.len());
+        for unit in &all_units {
+            let mut emb = unit.embedding.clone();
+            if !raw_embeddings {
+                polyvoice::utils::l2_normalize(&mut emb);
+            }
+            durations.push(unit.time.end - unit.time.start);
+            embeddings.push(emb);
+        }
+
+        let cluster_start = Instant::now();
+        let labels = self
+            .diarizer
+            .clusterer
+            .cluster_with_durations(&embeddings, &durations)
+            .map_err(|e| format!("Speaker clustering failed: {}", e))?;
+        timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
+
+        let reseg_start = Instant::now();
+        let (segments, clustered) = assemble_channel_turns(
+            &self.chunks,
+            &embeddings,
+            &labels,
+            &self.diarizer.resegmenter,
+            self.config,
+        )?;
+        timings.resegmentation_secs = reseg_start.elapsed().as_secs_f64();
+
+        info!(
+            "Chunked v2 diarization found {} segments with {} unique speakers ({} embedding units)",
+            segments.len(),
+            count_unique_speakers(&segments),
+            all_units.len()
+        );
+        Ok((segments, clustered, timings))
+    }
+}
+
+/// Pure global stage (unit-testable): per-chunk Hungarian local→global mapping
+/// over the clustered unit labels, per-segment primary turns (majority label
+/// of the segment's dense windows) with splitting at mapped overlap spans,
+/// overlap-aware two-speaker resegmentation, min-speech filter, and gap-fill.
+fn assemble_channel_turns(
+    chunks: &[ChunkRecord],
+    unit_embeddings: &[Vec<f32>],
+    unit_labels: &[usize],
+    resegmenter: &polyvoice::resegmentation::OverlapResegmenter,
+    config: &DiarizationConfig,
+) -> Result<(Vec<DiarizationSegment>, Vec<ClusteredEmbedding>), String> {
+    use polyvoice::clusterer::{build_cooccurrence, hungarian_local_to_global};
+    use polyvoice::resegmentation::{
+        compute_centroids, OverlapRegionInput, ResegmentInputs, Resegmenter as _,
     };
 
-    let valid_count = segments.len().min(embeddings.len());
-    segments.truncate(valid_count);
-    segments
-        .into_iter()
-        .zip(embeddings.into_iter().take(valid_count))
-        .filter_map(|(seg, emb)| {
-            if emb.len() == embedder.input_dim() {
-                Some((seg, emb))
-            } else {
-                warn!("Skipping embedding with mismatched dimension");
-                None
+    let mut global_unit = 0usize;
+    let mut primary_turns: Vec<SpeakerTurn> = Vec::new();
+    let mut clustered: Vec<ClusteredEmbedding> = Vec::new();
+    let mut overlap_inputs: Vec<OverlapRegionInput> = Vec::new();
+
+    // Overlap spans whose both local speakers mapped to global clusters
+    // (global coords + region primary). Primary turns of the region-primary
+    // speaker are split at these spans below: the resegmenter re-emits the
+    // primary+secondary pair over the span (vendored aggregator semantics),
+    // so leaving the primary covering it would double-cover the span.
+    let mut mapped_spans: Vec<(TimeRange, polyvoice::types::SpeakerId)> = Vec::new();
+
+    for chunk in chunks {
+        let n = chunk.units.len();
+        let chunk_labels = &unit_labels[global_unit..global_unit + n];
+        global_unit += n;
+        if n == 0 {
+            continue;
+        }
+
+        let local_idx: Vec<u8> = chunk.units.iter().map(|u| u.local_idx).collect();
+        let durations: Vec<f64> = chunk
+            .units
+            .iter()
+            .map(|u| u.time.end - u.time.start)
+            .collect();
+        let cooc = build_cooccurrence(&local_idx, chunk_labels, &durations);
+        let cannot_link: Vec<(u8, u8)> =
+            chunk.overlaps.iter().map(|(_, lo, hi)| (*lo, *hi)).collect();
+        let local_to_global = hungarian_local_to_global(&cooc, &cannot_link);
+
+        // Per source segment (D5 contract: per-segment semantics for turns,
+        // caches, and enrollment are preserved): label = duration-weighted
+        // majority of the segment's unit cluster labels; vector =
+        // L2-normalized mean of its unit embeddings. Raw dense windows are
+        // embedding units only — emitting one turn per window would tile long
+        // segments with overlapping duplicates that only gap-fill can re-glue
+        // (breaks gap=0 and double-covers time when labels alternate).
+        // Powerset local indices are concurrent-speaker slots reused across
+        // time, so segment identity is resolved through the segment's own
+        // unit majority, not the per-chunk local→global map (the map serves
+        // the overlap regions only).
+        let mut by_segment: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (ui, unit) in chunk.units.iter().enumerate() {
+            by_segment.entry(unit.segment_idx).or_default().push(ui);
+        }
+        for (segment_idx, unit_ids) in by_segment {
+            let seg = &chunk.primary[segment_idx];
+            let mut label_secs: std::collections::BTreeMap<usize, f64> =
+                std::collections::BTreeMap::new();
+            for &ui in &unit_ids {
+                *label_secs.entry(chunk_labels[ui]).or_insert(0.0) +=
+                    chunk.units[ui].time.end - chunk.units[ui].time.start;
             }
+            let Some((&majority, _)) = label_secs
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            else {
+                continue;
+            };
+            primary_turns.push(SpeakerTurn {
+                speaker: polyvoice::types::SpeakerId(majority as u32),
+                time: TimeRange {
+                    start: seg.time.start + chunk.start_secs as f64,
+                    end: seg.time.end + chunk.start_secs as f64,
+                },
+                text: None,
+                stable: true,
+            });
+            let mut mean = vec![0.0f32; unit_embeddings[unit_ids[0]].len()];
+            for &ui in &unit_ids {
+                for (i, x) in unit_embeddings[ui].iter().enumerate() {
+                    mean[i] += x;
+                }
+            }
+            let n = unit_ids.len().max(1) as f32;
+            for m in mean.iter_mut() {
+                *m /= n;
+            }
+            polyvoice::utils::l2_normalize(&mut mean);
+            clustered.push(ClusteredEmbedding {
+                speaker: majority as i32,
+                embedding: mean,
+                duration_secs: (seg.time.end - seg.time.start).max(0.0) as f32,
+                start_secs: Some((seg.time.start + chunk.start_secs as f64) as f32),
+                end_secs: Some((seg.time.end + chunk.start_secs as f64) as f32),
+            });
+        }
+
+        // Overlap regions → two-speaker assignment.
+        for (time, lo, hi) in &chunk.overlaps {
+            let g_lo = local_to_global.get(lo).copied();
+            let g_hi = local_to_global.get(hi).copied();
+            let global_time = TimeRange {
+                start: time.start + chunk.start_secs as f64,
+                end: time.end + chunk.start_secs as f64,
+            };
+            if let (Some(a), Some(b)) = (g_lo, g_hi) {
+                overlap_inputs.push(OverlapRegionInput {
+                    time: global_time,
+                    primary_speaker: a,
+                    secondary_speaker: Some(b),
+                    embedding: Vec::new(),
+                });
+                mapped_spans.push((global_time, a));
+                continue;
+            }
+            let mixed = chunk
+                .mixed_overlaps
+                .iter()
+                .find(|(t, _)| (t.start - time.start).abs() < 1e-6 && (t.end - time.end).abs() < 1e-6)
+                .map(|(_, e)| e.clone());
+            let Some(mixed) = mixed else { continue };
+            let primary = g_lo.or(g_hi).unwrap_or_else(|| {
+                let mid = (global_time.start + global_time.end) / 2.0;
+                let tmid = |t: &SpeakerTurn| (t.time.start + t.time.end) / 2.0;
+                primary_turns
+                    .iter()
+                    .min_by(|a, b| (tmid(a) - mid).abs().total_cmp(&(tmid(b) - mid).abs()))
+                    .map(|t| t.speaker)
+                    .unwrap_or(polyvoice::types::SpeakerId(0))
+            });
+            overlap_inputs.push(OverlapRegionInput {
+                time: global_time,
+                primary_speaker: primary,
+                secondary_speaker: None,
+                embedding: mixed,
+            });
+        }
+    }
+
+    // Split region-primary turns at mapped overlap spans (vendored
+    // aggregator semantics: primaries must not cover overlap spans because
+    // the resegmenter re-emits the primary+secondary pair there). Only the
+    // region-primary speaker's turns are split — other speakers' coverage is
+    // never destroyed. Sub-min-speech slivers are dropped by the filter below.
+    let mut split_turns: Vec<SpeakerTurn> = Vec::with_capacity(
+        primary_turns.len() + 2 * mapped_spans.len(),
+    );
+    for turn in &primary_turns {
+        let mut pieces = vec![turn.clone()];
+        for (span, primary_spk) in &mapped_spans {
+            if turn.speaker != *primary_spk {
+                continue;
+            }
+            let mut next: Vec<SpeakerTurn> = Vec::with_capacity(pieces.len() + 1);
+            for piece in pieces {
+                next.extend(subtract_span(&piece, span));
+            }
+            pieces = next;
+        }
+        split_turns.extend(pieces);
+    }
+    let primary_turns = split_turns;
+
+    let centroids = compute_centroids(unit_embeddings, unit_labels);
+
+    let mut all_turns = if centroids.len() >= 2 && !overlap_inputs.is_empty() {
+        resegmenter
+            .resegment(ResegmentInputs {
+                primary_turns: &primary_turns,
+                speaker_centroids: &centroids,
+                overlap_regions: &overlap_inputs,
+            })
+            .map_err(|e| format!("Overlap resegmentation failed: {}", e))?
+    } else {
+        let mut base = primary_turns.clone();
+        // No resegmentation (single cluster or no overlap spans): overlap
+        // spans have no primary coverage (primaries exclude overlap-flagged
+        // segments), so emit them with their resolved primary speaker instead
+        // of leaving holes (which score as Miss).
+        for region in &overlap_inputs {
+            base.push(SpeakerTurn {
+                speaker: region.primary_speaker,
+                time: region.time,
+                text: None,
+                stable: true,
+            });
+        }
+        base
+    };
+    all_turns.sort_by(|a, b| a.time.start.total_cmp(&b.time.start));
+
+    let min_secs = config.min_speech_secs as f64;
+    all_turns.retain(|t| t.time.duration() >= min_secs);
+
+    let all_turns = if config.gap_merge_secs > 0.0 {
+        gap_fill_turns(all_turns, config.gap_merge_secs)
+    } else {
+        all_turns
+    };
+
+    let segments = all_turns
+        .into_iter()
+        .map(|t| DiarizationSegment {
+            start: t.time.start as f32,
+            end: t.time.end as f32,
+            speaker: t.speaker.0 as i32,
         })
-        .unzip()
+        .collect();
+    Ok((segments, clustered))
+}
+
+/// Subtract an overlap span from a primary turn, returning the surviving
+/// piece(s). Zero-length pieces are dropped; disjoint inputs return the turn
+/// unchanged. Used to keep primaries off mapped overlap spans that the
+/// resegmenter re-emits as primary+secondary pairs.
+fn subtract_span(turn: &SpeakerTurn, span: &TimeRange) -> Vec<SpeakerTurn> {
+    if span.end <= turn.time.start || span.start >= turn.time.end {
+        return vec![turn.clone()];
+    }
+    let mut out = Vec::with_capacity(2);
+    if span.start > turn.time.start {
+        out.push(SpeakerTurn {
+            speaker: turn.speaker,
+            time: TimeRange {
+                start: turn.time.start,
+                end: span.start,
+            },
+            text: None,
+            stable: true,
+        });
+    }
+    if span.end < turn.time.end {
+        out.push(SpeakerTurn {
+            speaker: turn.speaker,
+            time: TimeRange {
+                start: span.end,
+                end: turn.time.end,
+            },
+            text: None,
+            stable: true,
+        });
+    }
+    out
+}
+
+/// Pipeline gap-fill: bridge consecutive same-speaker turns separated by at
+/// most `max_gap_secs` (v2 `merge_segments` semantics; replaces the old
+/// app-side post-clustering merge pass). Overlapping same-speaker pairs merge
+/// (negative gap); cross-speaker boundaries and different-speaker overlaps are
+/// left untouched.
+fn gap_fill_turns(turns: Vec<SpeakerTurn>, max_gap_secs: f32) -> Vec<SpeakerTurn> {
+    let segments: Vec<polyvoice::types::Segment> = turns
+        .into_iter()
+        .map(|t| polyvoice::types::Segment {
+            time: t.time,
+            speaker: Some(t.speaker),
+            confidence: None,
+        })
+        .collect();
+    polyvoice::utils::merge_segments(segments, max_gap_secs as f64)
+        .into_iter()
+        .filter_map(|s| {
+            s.speaker.map(|spk| SpeakerTurn {
+                speaker: spk,
+                time: s.time,
+                text: None,
+                stable: true,
+            })
+        })
+        .collect()
 }
 
 fn run_chunked_polyvoice_diarization(
@@ -1261,7 +1962,6 @@ fn run_chunked_polyvoice_diarization(
     ),
     String,
 > {
-    let mut timings = StageTimings::default();
     let chunk_duration = config.chunk_duration_secs();
     let chunks = channel_chunks(
         samples,
@@ -1271,21 +1971,14 @@ fn run_chunked_polyvoice_diarization(
     );
 
     info!(
-        "Chunked diarization: {} chunks ({}s duration, {}s overlap)",
+        "Chunked v2 diarization: {} chunks ({}s duration, {}s overlap)",
         chunks.len(),
         chunk_duration,
         config.chunk_overlap_secs
     );
 
-    let mut all_segments: Vec<DiarizationSegment> = Vec::new();
-    let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
-    let mut had_raw_segments = false;
-
+    let mut core = V2Core::new(diarizer, config);
     for (chunk_idx, (chunk_start_seconds, chunk_samples)) in chunks.iter().enumerate() {
-        if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-            return Err("Diarization cancelled".to_string());
-        }
-
         let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
             crate::audio::audio_processing::resample(
                 chunk_samples,
@@ -1297,101 +1990,9 @@ fn run_chunked_polyvoice_diarization(
         } else {
             std::borrow::Cow::Borrowed(chunk_samples)
         };
-
-        let seg_start = Instant::now();
-        let raw_segments = match diarizer.segmenter.segment(&diar_samples) {
-            Ok(segments) => segments,
-            Err(e) => {
-                warn!(
-                    "Segmentation failed for chunk {} ({}), skipping chunk",
-                    chunk_idx, e
-                );
-                continue;
-            }
-        };
-        timings.segmentation_secs += seg_start.elapsed().as_secs_f64();
-
-        if raw_segments.is_empty() {
-            continue;
-        }
-        had_raw_segments = true;
-
-        let embed_start = Instant::now();
-        let (mut chunk_segments, chunk_embeddings) = embed_segments(
-            diarizer.embedder.as_ref(),
-            &diar_samples,
-            &raw_segments,
-            config,
-        );
-        // Distinguish layout/shape errors from transient failures in logs.
-        if chunk_segments.is_empty() && !raw_segments.is_empty() {
-            // `embed_segments` already warned per-batch/per-segment; surface layout hint.
-            warn!(
-                "Chunk {}: segmentation found {} raw segments but embedding produced 0 valid vectors (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large)",
-                chunk_idx,
-                raw_segments.len()
-            );
-        }
-        timings.embedding_secs += embed_start.elapsed().as_secs_f64();
-
-        // Adjust segment times so they are relative to the full channel.
-        for seg in &mut chunk_segments {
-            seg.start += *chunk_start_seconds;
-            seg.end += *chunk_start_seconds;
-        }
-
-        all_segments.extend(chunk_segments);
-        all_embeddings.extend(chunk_embeddings);
+        core.process_chunk(*chunk_start_seconds, &diar_samples)?;
     }
-
-    if all_segments.is_empty() {
-        if had_raw_segments {
-            return Err(
-                "Embedding produced zero valid vectors (audio_signal layout mismatch — expected [B,80,T] for titanet_large, but no embeddings survived; check TitaNet layout)".to_string(),
-            );
-        }
-        return Ok((Vec::new(), Vec::new(), timings));
-    }
-
-    if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-        return Err("Diarization cancelled".to_string());
-    }
-
-    let cluster_start = Instant::now();
-    let labels = diarizer
-        .clusterer
-        .cluster(&all_embeddings)
-        .map_err(|e| format!("Speaker clustering failed: {}", e))?;
-    timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
-
-    for (segment, label) in all_segments.iter_mut().zip(labels) {
-        segment.speaker = label as i32;
-    }
-
-    // Capture clustered embeddings while segments and embeddings are still
-    // aligned (the sort below reshuffles segments only).
-    let clustered: Vec<ClusteredEmbedding> = all_segments
-        .iter()
-        .zip(all_embeddings.iter())
-        .map(|(s, e)| ClusteredEmbedding {
-            speaker: s.speaker,
-            embedding: e.clone(),
-            duration_secs: (s.end - s.start).max(0.0),
-            start_secs: Some(s.start),
-            end_secs: Some(s.end),
-        })
-        .collect();
-
-    all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-    let all_segments = merge_same_speaker_gaps(all_segments, config.gap_merge_secs);
-
-    info!(
-        "Chunked diarization found {} segments with {} unique speakers",
-        all_segments.len(),
-        count_unique_speakers(&all_segments)
-    );
-
-    Ok((all_segments, clustered, timings))
+    core.finish()
 }
 
 fn channel_chunks(
@@ -1630,7 +2231,8 @@ impl StreamWindows {
 }
 
 /// Diarize a channel streamed from ffmpeg (already 16 kHz), reading overlapping
-/// in-memory windows and clustering all accumulated embeddings globally.
+/// in-memory windows through the v2 core and clustering all accumulated
+/// embeddings globally.
 fn run_channel_diarization_stream(
     diarizer: &PolyvoiceDiarizer,
     mut pcm: PcmStream,
@@ -1643,14 +2245,10 @@ fn run_channel_diarization_stream(
     ),
     String,
 > {
-    let mut timings = StageTimings::default();
     let chunk_samples = (config.chunk_duration_secs() * DIARIZATION_SAMPLE_RATE as f32) as usize;
     let overlap_samples = (config.chunk_overlap_secs * DIARIZATION_SAMPLE_RATE as f32) as usize;
 
-    let mut all_segments: Vec<DiarizationSegment> = Vec::new();
-    let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
-    let mut had_raw_segments = false;
-
+    let mut core = V2Core::new(diarizer, config);
     let mut windows = StreamWindows::new(chunk_samples, overlap_samples);
 
     loop {
@@ -1671,40 +2269,9 @@ fn run_channel_diarization_stream(
         if window.is_empty() {
             continue;
         }
-
-        let seg_start = Instant::now();
-        let raw_segments = match diarizer.segmenter.segment(&window) {
-            Ok(segments) => segments,
-            Err(e) => {
-                warn!(
-                    "Segmentation failed for a stream window ({}), skipping it",
-                    e
-                );
-                continue;
-            }
-        };
-        timings.segmentation_secs += seg_start.elapsed().as_secs_f64();
-
-        if !raw_segments.is_empty() {
-            had_raw_segments = true;
-            let embed_start = Instant::now();
-            let (mut chunk_segments, chunk_embeddings) =
-                embed_segments(diarizer.embedder.as_ref(), &window, &raw_segments, config);
-            if chunk_segments.is_empty() {
-                warn!(
-                    "Stream window: segmentation found {} raw segments but embedding produced 0 valid vectors (possible audio_signal layout mismatch — expected [B,80,T] for titanet_large)",
-                    raw_segments.len()
-                );
-            }
-            timings.embedding_secs += embed_start.elapsed().as_secs_f64();
-
-            for seg in &mut chunk_segments {
-                seg.start += window_start_seconds;
-                seg.end += window_start_seconds;
-            }
-
-            all_segments.extend(chunk_segments);
-            all_embeddings.extend(chunk_embeddings);
+        if let Err(e) = core.process_chunk(window_start_seconds, &window) {
+            pcm.kill();
+            return Err(e);
         }
     }
 
@@ -1714,51 +2281,7 @@ fn run_channel_diarization_stream(
     }
 
     pcm.finish()?;
-
-    if all_segments.is_empty() {
-        if had_raw_segments {
-            return Err(
-                "Embedding produced zero valid vectors (audio_signal layout mismatch — expected [B,80,T] for titanet_large, but no embeddings survived; check TitaNet layout)".to_string(),
-            );
-        }
-        return Ok((Vec::new(), Vec::new(), timings));
-    }
-
-    let cluster_start = Instant::now();
-    let labels = diarizer
-        .clusterer
-        .cluster(&all_embeddings)
-        .map_err(|e| format!("Speaker clustering failed: {}", e))?;
-    timings.clustering_secs = cluster_start.elapsed().as_secs_f64();
-
-    for (segment, label) in all_segments.iter_mut().zip(labels) {
-        segment.speaker = label as i32;
-    }
-
-    // Capture clustered embeddings while segments and embeddings are still
-    // aligned (the sort below reshuffles segments only).
-    let clustered: Vec<ClusteredEmbedding> = all_segments
-        .iter()
-        .zip(all_embeddings.iter())
-        .map(|(s, e)| ClusteredEmbedding {
-            speaker: s.speaker,
-            embedding: e.clone(),
-            duration_secs: (s.end - s.start).max(0.0),
-            start_secs: Some(s.start),
-            end_secs: Some(s.end),
-        })
-        .collect();
-
-    all_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-    let all_segments = merge_same_speaker_gaps(all_segments, config.gap_merge_secs);
-
-    info!(
-        "Streamed diarization found {} segments with {} unique speakers",
-        all_segments.len(),
-        count_unique_speakers(&all_segments)
-    );
-
-    Ok((all_segments, clustered, timings))
+    core.finish()
 }
 
 fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
@@ -1766,32 +2289,6 @@ fn count_unique_speakers(segments: &[DiarizationSegment]) -> usize {
     speakers.sort();
     speakers.dedup();
     speakers.len()
-}
-
-/// Merge consecutive same-speaker segments whose silence gap fits within
-/// `window_secs` (diarization-param-tuning D3). Input must be sorted by start
-/// time. A different-speaker segment between two same-speaker segments always
-/// blocks the merge, and overlapping pairs (no silence gap) are left
-/// untouched. `window_secs <= 0` is a no-op. Clustered embeddings are captured
-/// before this pass, so downstream caches stay aligned to the pre-merge list.
-fn merge_same_speaker_gaps(segments: Vec<DiarizationSegment>, window_secs: f32) -> Vec<DiarizationSegment> {
-    if window_secs <= 0.0 || segments.len() < 2 {
-        return segments;
-    }
-    let mut out: Vec<DiarizationSegment> = Vec::with_capacity(segments.len());
-    for seg in segments {
-        match out.last_mut() {
-            Some(cur)
-                if cur.speaker == seg.speaker
-                    && seg.start >= cur.end
-                    && seg.start - cur.end <= window_secs =>
-            {
-                cur.end = cur.end.max(seg.end);
-            }
-            _ => out.push(seg),
-        }
-    }
-    out
 }
 
 /// Group a channel's clustered embeddings by cluster id, computing the
@@ -2559,6 +3056,85 @@ mod spike_tests {
         assert!(embedder.embed_batch(&empty).unwrap().is_empty());
     }
 
+    /// SpeakerEmbedder double for the v2 embed path: echoes input length in
+    /// every dim, batch failure is injectable to exercise the fallback.
+    struct EchoEmbedder {
+        dim: usize,
+        fail_batch: bool,
+    }
+
+    impl crate::audio::embedder::SpeakerEmbedder for EchoEmbedder {
+        fn embed_batch(
+            &self,
+            audios: &[&[f32]],
+        ) -> Result<Vec<Vec<f32>>, polyvoice::embedder::EmbedderError> {
+            if self.fail_batch {
+                return Err(polyvoice::embedder::EmbedderError::Legacy(
+                    "injected batch failure".to_string(),
+                ));
+            }
+            Ok(audios
+                .iter()
+                .map(|a| vec![a.len() as f32; self.dim])
+                .collect())
+        }
+        fn embed(&self, audio: &[f32]) -> Result<Vec<f32>, polyvoice::embedder::EmbedderError> {
+            Ok(vec![audio.len() as f32; self.dim])
+        }
+        fn input_dim(&self) -> usize {
+            self.dim
+        }
+        fn model_tag(&self) -> &'static str {
+            crate::audio::embedder::ENHANCED_MODEL_TAG
+        }
+        fn family_threshold(&self) -> f32 {
+            crate::audio::embedder::TITANET_CLUSTER_THRESHOLD
+        }
+    }
+
+    #[test]
+    fn embed_unit_slices_batch_and_fallback_are_position_aligned() {
+        let inputs: Vec<Vec<f32>> = vec![vec![0.0; 10], vec![0.0; 20], vec![0.0; 30]];
+        let batch = embed_unit_slices(&EchoEmbedder { dim: 4, fail_batch: false }, &inputs);
+        let fallback = embed_unit_slices(&EchoEmbedder { dim: 4, fail_batch: true }, &inputs);
+        assert_eq!(batch.len(), inputs.len());
+        assert_eq!(fallback.len(), inputs.len(), "fallback keeps alignment");
+        for (b, f) in batch.iter().zip(fallback.iter()) {
+            assert_eq!(
+                b.as_ref().map(|v| v[0]),
+                f.as_ref().map(|v| v[0]),
+                "batch and fallback results must agree"
+            );
+        }
+        assert_eq!(
+            batch.iter().map(|o| o.as_ref().map(|v| v[0]).unwrap()).collect::<Vec<_>>(),
+            vec![10.0, 20.0, 30.0],
+            "input order preserved"
+        );
+        // Wrong-dimension batch output is dropped in place (None), not shifted.
+        struct BadDim;
+        impl crate::audio::embedder::SpeakerEmbedder for BadDim {
+            fn embed_batch(
+                &self,
+                _audios: &[&[f32]],
+            ) -> Result<Vec<Vec<f32>>, polyvoice::embedder::EmbedderError> {
+                Ok(vec![vec![1.0; 2]; 3])
+            }
+            fn input_dim(&self) -> usize {
+                4
+            }
+            fn model_tag(&self) -> &'static str {
+                crate::audio::embedder::ENHANCED_MODEL_TAG
+            }
+            fn family_threshold(&self) -> f32 {
+                crate::audio::embedder::TITANET_CLUSTER_THRESHOLD
+            }
+        }
+        let out = embed_unit_slices(&BadDim, &inputs);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(Option::is_none), "dimension mismatches drop in place");
+    }
+
     /// Parity check (add-diarization-eval-harness 2.3): the app's offline
     /// ffmpeg-streaming path and the harness's in-memory chunked core must
     /// produce identical speaker turns for the same audio. Requires
@@ -2666,6 +3242,14 @@ mod spike_tests {
         assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
         assert_eq!(cfg.cluster_ceiling, 128);
         assert_eq!(cfg.gap_merge_secs, 0.3);
+        // Built-in default kind is ahc (6.2 sweep: nmesc under-clusters).
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        assert_eq!(cfg.embed_window_secs, DEFAULT_EMBED_WINDOW_SECS);
+        assert_eq!(cfg.embed_window_secs, 5.0);
+        assert_eq!(cfg.min_speech_secs, 0.25);
+        let bin = cfg.binarization.expect("v2 default enables calibrated binarization");
+        assert!(bin.offset < bin.onset, "hysteresis: offset below onset");
+        assert!(bin.min_duration_on > 0.0 && bin.min_duration_off > 0.0);
         // Built-in threshold equals the family default (single source of truth).
         assert_eq!(
             cfg.cluster_threshold,
@@ -2674,10 +3258,12 @@ mod spike_tests {
     }
 
     #[test]
-    fn effective_ceiling_is_user_max_when_smaller_and_always_positive() {        // Mirrors the ceiling computation in create_polyvoice_diarizer.
+    fn effective_ceiling_is_user_max_when_smaller_and_always_positive() {
+        // Mirrors the ceiling computation in create_polyvoice_diarizer +
+        // build_clusterer (clamp to the backend's 255 maximum).
         let ceiling = |max_speakers: Option<i32>, config: &DiarizationConfig| -> usize {
             let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
-            user_max.min(config.cluster_ceiling).max(1)
+            user_max.min(config.cluster_ceiling).max(1).min(MAX_CLUSTERERS)
         };
         let cfg = DiarizationConfig::default();
         // No user max -> default ceiling.
@@ -2688,57 +3274,609 @@ mod spike_tests {
         assert_eq!(ceiling(Some(5), &cfg), 5);
         // User max above the ceiling is capped by the configured ceiling.
         assert_eq!(ceiling(Some(200), &cfg), 128);
-        // Never zero (AscStop::Off unreachable).
+        // Oversized stored ceiling is clamped to the backend maximum.
+        let stored = DiarizationConfig {
+            cluster_ceiling: 300,
+            ..DiarizationConfig::default()
+        };
+        assert_eq!(ceiling(None, &stored), 255);
+        assert_eq!(ceiling(Some(999), &stored), 255);
+        // Never zero (unbounded stop unreachable).
         assert_eq!(ceiling(Some(1), &cfg), 1);
     }
 
-    fn seg(start: f32, end: f32, speaker: i32) -> DiarizationSegment {
-        DiarizationSegment { start, end, speaker }
+    #[test]
+    fn clusterer_kind_parses_and_resolves_without_rebuild() {
+        assert_eq!(ClustererKindSetting::parse("vbx"), Some(ClustererKindSetting::Vbx));
+        assert_eq!(ClustererKindSetting::parse("NMEsc"), Some(ClustererKindSetting::Nmesc));
+        assert_eq!(ClustererKindSetting::parse(" ahc "), Some(ClustererKindSetting::Ahc));
+        assert_eq!(ClustererKindSetting::parse("kmeans"), None);
+        assert_eq!(ClustererKindSetting::Nmesc.as_str(), "nmesc");
+        assert!(ClustererKindSetting::Nmesc.is_automatic_count());
+        assert!(ClustererKindSetting::Vbx.is_automatic_count());
+        assert!(!ClustererKindSetting::Ahc.is_automatic_count());
     }
 
     #[test]
-    fn gap_merge_bridges_short_same_speaker_gap() {
-        let input = vec![seg(0.0, 1.0, 0), seg(1.2, 2.5, 0), seg(5.0, 6.0, 0)];
-        let out = merge_same_speaker_gaps(input, 0.3);
+    fn vbx_kind_fails_actionably_on_the_192d_enhanced_family() {
+        // Gate (revised D2): the vendored PLDA params require 256-d
+        // embeddings; selecting vbx must error with a clear message and never
+        // silently switch kinds.
+        let config = DiarizationConfig {
+            clusterer: ClustererKindSetting::Vbx,
+            ..DiarizationConfig::default()
+        };
+        let err = match build_clusterer(&config, 128) {
+            Ok(_) => panic!("vbx must not build for the 192-d enhanced family"),
+            Err(e) => e,
+        };
+        assert!(err.contains("256-dimensional"), "error names the dim requirement: {err}");
+        assert!(err.contains("192-d"), "error names the active family: {err}");
+        assert!(err.contains("ahc"), "error suggests the default kind: {err}");
+    }
+
+    #[test]
+    fn clusterer_factory_enforces_clamped_ceiling() {
+        let cfg = DiarizationConfig {
+            clusterer: ClustererKindSetting::Ahc,
+            ..DiarizationConfig::default()
+        };
+        let c = build_clusterer(&cfg, 300).expect("ahc builds");
+        assert_eq!(c.max_clusters(), 255, "clamped to the backend maximum");
+        let c = build_clusterer(&cfg, 12).expect("ahc builds");
+        assert_eq!(c.max_clusters(), 12);
+        let cfg = DiarizationConfig {
+            clusterer: ClustererKindSetting::Nmesc,
+            ..DiarizationConfig::default()
+        };
+        let c = build_clusterer(&cfg, 300).expect("nmesc builds");
+        assert_eq!(c.max_clusters(), 255);
+    }
+
+    #[test]
+    fn merge_threshold_is_inert_under_automatic_count() {
+        // Same embeddings, two stored thresholds, kind nmesc: identical labels
+        // (the threshold only decorates the ahc kind).
+        use polyvoice::clusterer::Clusterer as _;
+        let embeddings: Vec<Vec<f32>> = (0..8)
+            .map(|i| {
+                let mut v = vec![0.0f32; 6];
+                v[i % 2] = 1.0;
+                v[(i % 2) + 2] = 0.3;
+                v
+            })
+            .collect();
+        let mut labels_by_threshold = Vec::new();
+        for threshold in [0.1f32, 0.9] {
+            let cfg = DiarizationConfig {
+            clusterer: ClustererKindSetting::Ahc,
+                cluster_threshold: threshold,
+                ..DiarizationConfig::default()
+            };
+            let clusterer = build_clusterer(&cfg, 128).expect("nmesc builds");
+            labels_by_threshold.push(clusterer.cluster(&embeddings).expect("cluster"));
+        }
+        assert_eq!(
+            labels_by_threshold[0], labels_by_threshold[1],
+            "stored merge threshold must not change nmesc results"
+        );
+    }
+
+    #[test]
+    fn expand_embed_units_dense_windowing() {
+        // 12 s segment, 5 s window, 2.5 s hop -> windows [0,5],[2.5,7.5],[5,10],[7.5,12].
+        let segs = vec![raw_seg(0.0, 12.0, 0), raw_seg(20.0, 23.0, 1)];
+        let units = expand_embed_units(&segs, 5.0);
+        assert_eq!(units.len(), 5, "4 dense windows + 1 short whole segment");
+        assert_eq!((units[0].0.start, units[0].0.end), (0.0, 5.0));
+        assert_eq!((units[1].0.start, units[1].0.end), (2.5, 7.5));
+        assert_eq!((units[2].0.start, units[2].0.end), (5.0, 10.0));
+        assert_eq!((units[3].0.start, units[3].0.end), (7.5, 12.0));
+        assert_eq!((units[4].0.start, units[4].0.end), (20.0, 23.0));
+        // Ordering + parent linkage.
+        for w in units.windows(2) {
+            assert!(w[0].0.start <= w[1].0.start, "units sorted by start");
+        }
+        assert_eq!(
+            (units[0].2, units[3].2, units[4].2),
+            (0, 0, 1),
+            "segment_idx ties units to their parent"
+        );
+        assert_eq!(units[4].1, 1, "local speaker inherited");
+        // Sparse mode: one unit per segment.
+        let sparse = expand_embed_units(&segs, 0.0);
+        assert_eq!(sparse.len(), 2);
+    }
+
+    #[test]
+    fn per_segment_embedding_is_l2_normalized_window_mean() {
+        use polyvoice::clusterer::Clusterer as _;
+        // One 12 s primary segment split into 4 dense windows by the clusterer
+        // path; the segment's ClusteredEmbedding must be the L2-normalized
+        // mean of its window embeddings.
+        let chunk = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![raw_seg(0.0, 12.0, 0)],
+            overlaps: Vec::new(),
+            units: (0..4)
+                .map(|i| DenseUnit {
+                    time: polyvoice::types::TimeRange {
+                        start: i as f64 * 2.5,
+                        end: i as f64 * 2.5 + 5.0,
+                    },
+                    local_idx: 0,
+                    segment_idx: 0,
+                    embedding: vec![1.0, (i as f32) * 0.5],
+                })
+                .collect(),
+            mixed_overlaps: Vec::new(),
+        };
+        let embeddings: Vec<Vec<f32>> = chunk.units.iter().map(|u| u.embedding.clone()).collect();
+        let config = DiarizationConfig::default();
+        let clusterer = build_clusterer(&config, 128).expect("default kind builds");
+        let durations: Vec<f64> = vec![5.0; 4];
+        let labels = clusterer
+            .cluster_with_durations(&embeddings, &durations)
+            .expect("cluster");
+        let (segments, clustered) = assemble_channel_turns(
+            &[chunk],
+            &embeddings,
+            &labels,
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        assert_eq!(clustered.len(), 1, "one per-segment aggregate");
+        assert_eq!(segments.len(), 1);
+        let emb = &clustered[0].embedding;
+        let expected_mean = vec![1.0f32, 0.75]; // mean of [0, .5, 1, 1.5]
+        let norm = expected_mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for (got, want) in emb.iter().zip(&expected_mean) {
+            assert!(
+                (got - want / norm).abs() < 1e-5,
+                "aggregate must be the L2-normalized window mean"
+            );
+        }
+        let unit_norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((unit_norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dense_windows_emit_single_segment_turn_without_gap_fill() {
+        // One 12 s primary segment split into 4 dense windows (all one
+        // cluster): the output must be a single [0,12] turn even with
+        // gap-merge disabled — windows are embedding units, not turns.
+        let chunk = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![raw_seg(0.0, 12.0, 0)],
+            overlaps: Vec::new(),
+            units: (0..4)
+                .map(|i| DenseUnit {
+                    time: polyvoice::types::TimeRange {
+                        start: i as f64 * 2.5,
+                        end: i as f64 * 2.5 + 5.0,
+                    },
+                    local_idx: 0,
+                    segment_idx: 0,
+                    embedding: vec![1.0, 0.0],
+                })
+                .collect(),
+            mixed_overlaps: Vec::new(),
+        };
+        let embeddings: Vec<Vec<f32>> = chunk.units.iter().map(|u| u.embedding.clone()).collect();
+        let config = DiarizationConfig {
+            gap_merge_secs: 0.0,
+            ..DiarizationConfig::default()
+        };
+        let (segments, _) = assemble_channel_turns(
+            &[chunk],
+            &embeddings,
+            &[0, 0, 0, 0],
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        assert_eq!(segments.len(), 1, "dense windows must not tile the output");
+        assert_eq!((segments[0].start, segments[0].end), (0.0, 12.0));
+    }
+
+    #[test]
+    fn single_cluster_overlap_span_stays_covered_without_resegmentation() {
+        // One cluster (centroids < 2 → resegmenter fast path): the overlap
+        // span must still be emitted with its primary speaker — otherwise it
+        // scores as Miss.
+        let chunk = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![raw_seg(0.0, 10.0, 0)],
+            overlaps: vec![(
+                polyvoice::types::TimeRange { start: 4.0, end: 6.0 },
+                0,
+                1,
+            )],
+            units: vec![DenseUnit {
+                time: polyvoice::types::TimeRange { start: 0.0, end: 10.0 },
+                local_idx: 0,
+                segment_idx: 0,
+                embedding: vec![1.0, 0.0],
+            }],
+            mixed_overlaps: vec![(
+                polyvoice::types::TimeRange { start: 4.0, end: 6.0 },
+                vec![0.9, 0.1],
+            )],
+        };
+        let embeddings: Vec<Vec<f32>> = chunk.units.iter().map(|u| u.embedding.clone()).collect();
+        let config = DiarizationConfig {
+            gap_merge_secs: 0.0,
+            ..DiarizationConfig::default()
+        };
+        let (segments, _) = assemble_channel_turns(
+            &[chunk],
+            &embeddings,
+            &[0],
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        for t in [2.0f32, 5.0, 8.0] {
+            assert!(
+                segments.iter().any(|s| s.start <= t && t <= s.end),
+                "t={t} must stay covered, got {segments:?}"
+            );
+        }
+        assert!(
+            segments.iter().all(|s| s.speaker == 0),
+            "single cluster keeps one label, got {segments:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_overlap_splits_region_primary_without_losing_coverage() {
+        // Primary [0,10] (label 0) fully mapped with overlap [4,6] (locals
+        // 0,1 → globals 0,1): the primary is split into [0,4]+[6,10] and the
+        // resegmenter re-emits [4,6] for both speakers — no triple coverage,
+        // no lost coverage.
+        let c0 = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![raw_seg(0.0, 10.0, 0)],
+            overlaps: vec![(
+                polyvoice::types::TimeRange { start: 4.0, end: 6.0 },
+                0,
+                1,
+            )],
+            units: vec![
+                DenseUnit {
+                    time: polyvoice::types::TimeRange { start: 0.0, end: 5.0 },
+                    local_idx: 0,
+                    segment_idx: 0,
+                    embedding: vec![1.0, 0.0, 0.0],
+                },
+                DenseUnit {
+                    time: polyvoice::types::TimeRange { start: 5.0, end: 10.0 },
+                    local_idx: 0,
+                    segment_idx: 0,
+                    embedding: vec![1.0, 0.0, 0.0],
+                },
+                DenseUnit {
+                    time: polyvoice::types::TimeRange { start: 0.0, end: 2.0 },
+                    local_idx: 1,
+                    segment_idx: 0,
+                    embedding: vec![0.0, 1.0, 0.0],
+                },
+            ],
+            mixed_overlaps: Vec::new(),
+        };
+        let embeddings: Vec<Vec<f32>> = c0.units.iter().map(|u| u.embedding.clone()).collect();
+        let config = DiarizationConfig {
+            gap_merge_secs: 0.0,
+            ..DiarizationConfig::default()
+        };
+        let (segments, _) = assemble_channel_turns(
+            &[c0],
+            &embeddings,
+            &[0, 0, 1],
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        // [0,4]→0, [4,6]→0, [4,6]→1, [6,10]→0: overlap span carries exactly
+        // two distinct speakers, and every instant stays covered.
+        let at_overlap: Vec<&DiarizationSegment> = segments
+            .iter()
+            .filter(|s| s.start < 6.0 && s.end > 4.0)
+            .collect();
+        assert_eq!(at_overlap.len(), 2, "overlap span has exactly the pair, got {segments:?}");
+        assert_ne!(at_overlap[0].speaker, at_overlap[1].speaker);
+        for t in [2.0f32, 5.0, 8.0] {
+            assert!(
+                segments.iter().any(|s| s.start <= t && t <= s.end),
+                "t={t} must stay covered, got {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_pair_yields_two_speaker_turns() {
+        // Chunk 0: speaker A solo [0,10] with an overlap pair [4,6] whose
+        // second local never appears solo in this chunk (mixed-embedding
+        // fallback). Chunk 1 (starts 9.5 s): speaker B solo [11,13] global.
+        // (The overlap pair members are excluded from `primary`, matching the
+        // core's `!is_overlap` filter.)
+        let c0 = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![raw_seg(0.0, 10.0, 0)],
+            overlaps: vec![(
+                polyvoice::types::TimeRange { start: 4.0, end: 6.0 },
+                0,
+                1,
+            )],
+            units: vec![DenseUnit {
+                time: polyvoice::types::TimeRange { start: 0.0, end: 10.0 },
+                local_idx: 0,
+                segment_idx: 0,
+                embedding: vec![1.0, 0.0, 0.0],
+            }],
+            mixed_overlaps: vec![(
+                polyvoice::types::TimeRange { start: 4.0, end: 6.0 },
+                vec![0.0, 1.0, 0.0],
+            )],
+        };
+        let c1 = ChunkRecord {
+            start_secs: 9.5,
+            primary: vec![raw_seg(1.5, 3.5, 1)],
+            overlaps: Vec::new(),
+            units: vec![DenseUnit {
+                time: polyvoice::types::TimeRange { start: 1.5, end: 3.5 },
+                local_idx: 1,
+                segment_idx: 0,
+                embedding: vec![0.05, 0.95, 0.0],
+            }],
+            mixed_overlaps: Vec::new(),
+        };
+        let embeddings: Vec<Vec<f32>> =
+            c0.units.iter().chain(c1.units.iter()).map(|u| u.embedding.clone()).collect();
+        // Global clusters: 0 = speaker A (unit 0), 1 = speaker B (unit 1).
+        let labels = vec![0usize, 1];
+        let config = DiarizationConfig {
+            gap_merge_secs: 0.5,
+            ..DiarizationConfig::default()
+        };
+        let (segments, clustered) = assemble_channel_turns(
+            &[c0, c1],
+            &embeddings,
+            &labels,
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        assert_eq!(clustered.len(), 2);
+        let spk_a = clustered[0].speaker;
+        let spk_b = clustered[1].speaker;
+        assert_ne!(spk_a, spk_b, "distinct clusters get distinct labels");
+        // Overlap [4,6] carries two distinct speakers: A's solo turn plus a
+        // secondary B turn recovered from the mixed embedding.
+        let at_overlap: Vec<&DiarizationSegment> = segments
+            .iter()
+            .filter(|s| s.start < 6.0 && s.end > 4.0)
+            .collect();
+        assert_eq!(at_overlap.len(), 2, "overlap region has two speaker turns");
+        assert_ne!(at_overlap[0].speaker, at_overlap[1].speaker);
+        assert!(
+            at_overlap.iter().any(|s| s.speaker == spk_b && s.start >= 3.9 && s.end <= 6.1),
+            "secondary B turn covers the overlap region, got {:?}",
+            at_overlap
+        );
+        // Non-overlap instants stay single-labeled: no same-speaker overlap.
+        for i in 0..segments.len() {
+            for j in i + 1..segments.len() {
+                let (a, b) = (&segments[i], &segments[j]);
+                let ov = a.end.min(b.end) - a.start.max(b.start);
+                if ov > 0.01 {
+                    assert_ne!(a.speaker, b.speaker, "same-speaker overlap must not survive");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_boundary_split_is_bridged_by_gap_fill() {
+        // Speaker A's [0,10] + [9.5,14] across the 0.5 s chunk overlap, and
+        // speaker B [11,13] in between: A's pieces bridge (negative gap ≤
+        // max_gap), B's boundary with A survives.
+        let c0 = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![raw_seg(0.0, 10.0, 0)],
+            overlaps: Vec::new(),
+            units: vec![DenseUnit {
+                time: polyvoice::types::TimeRange { start: 0.0, end: 10.0 },
+                local_idx: 0,
+                segment_idx: 0,
+                embedding: vec![1.0, 0.0],
+            }],
+            mixed_overlaps: Vec::new(),
+        };
+        let c1 = ChunkRecord {
+            start_secs: 9.5,
+            primary: vec![raw_seg(0.0, 4.5, 0), raw_seg(1.5, 3.5, 1)],
+            overlaps: Vec::new(),
+            units: vec![
+                DenseUnit {
+                    time: polyvoice::types::TimeRange { start: 0.0, end: 4.5 },
+                    local_idx: 0,
+                    segment_idx: 0,
+                    embedding: vec![0.99, 0.05],
+                },
+                DenseUnit {
+                    time: polyvoice::types::TimeRange { start: 1.5, end: 3.5 },
+                    local_idx: 1,
+                    segment_idx: 1,
+                    embedding: vec![0.0, 1.0],
+                },
+            ],
+            mixed_overlaps: Vec::new(),
+        };
+        let embeddings: Vec<Vec<f32>> =
+            c0.units.iter().chain(c1.units.iter()).map(|u| u.embedding.clone()).collect();
+        // Units: (A c0), (A c1), (B c1) -> clusters 0,0,1.
+        let labels = vec![0usize, 0, 1];
+        let config = DiarizationConfig {
+            gap_merge_secs: 0.5,
+            ..DiarizationConfig::default()
+        };
+        let (segments, _) = assemble_channel_turns(
+            &[c0, c1],
+            &embeddings,
+            &labels,
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        let a_turns: Vec<&DiarizationSegment> =
+            segments.iter().filter(|s| s.speaker == 0).collect();
+        assert_eq!(a_turns.len(), 1, "boundary split bridged into one turn");
+        assert!(a_turns[0].start <= 0.0 && a_turns[0].end >= 13.9, "{:?}", a_turns[0]);
+        let b_turns: Vec<&DiarizationSegment> =
+            segments.iter().filter(|s| s.speaker == 1).collect();
+        assert_eq!(b_turns.len(), 1);
+        assert!((b_turns[0].start - 11.0).abs() < 0.01 && (b_turns[0].end - 13.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fragmented_long_recording_is_capped_by_the_ceiling() {
+        // Singleton pruning is gone (3.6); the always-enforced ceiling still
+        // bounds the label count on a fragmented embedding set.
+        use polyvoice::clusterer::Clusterer as _;
+        let embeddings: Vec<Vec<f32>> = (0..40)
+            .map(|i| {
+                let mut v = vec![0.0f32; 16];
+                v[i % 16] = 1.0;
+                v[(i / 16) + 8] = 0.2;
+                polyvoice::utils::l2_normalize(&mut v);
+                v
+            })
+            .collect();
+        let cfg = DiarizationConfig {
+            clusterer: ClustererKindSetting::Nmesc,
+            ..DiarizationConfig::default()
+        };
+        let clusterer = build_clusterer(&cfg, 4).expect("nmesc builds");
+        let labels = clusterer.cluster(&embeddings).expect("cluster");
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert!(
+            distinct.len() <= 4,
+            "ceiling must bound distinct labels, got {}",
+            distinct.len()
+        );
+    }
+
+    fn turn(start: f64, end: f64, speaker: u32) -> polyvoice::types::SpeakerTurn {
+        polyvoice::types::SpeakerTurn {
+            speaker: polyvoice::types::SpeakerId(speaker),
+            time: polyvoice::types::TimeRange { start, end },
+            text: None,
+            stable: true,
+        }
+    }
+
+    fn turn_span(t: &polyvoice::types::SpeakerTurn) -> (f32, f32, i32) {
+        (t.time.start as f32, t.time.end as f32, t.speaker.0 as i32)
+    }
+
+    #[test]
+    fn gap_fill_bridges_short_same_speaker_gap() {
+        let input = vec![turn(0.0, 1.0, 0), turn(1.2, 2.5, 0), turn(5.0, 6.0, 0)];
+        let out = gap_fill_turns(input, 0.3);
         assert_eq!(out.len(), 2, "gap 0.2s bridged, gap 2.5s kept");
-        assert_eq!((out[0].start, out[0].end, out[0].speaker), (0.0, 2.5, 0));
-        assert_eq!((out[1].start, out[1].end, out[1].speaker), (5.0, 6.0, 0));
+        assert_eq!(turn_span(&out[0]), (0.0, 2.5, 0));
+        assert_eq!(turn_span(&out[1]), (5.0, 6.0, 0));
     }
 
     #[test]
-    fn gap_merge_at_window_boundary_is_bridged() {
-        let input = vec![seg(0.0, 1.0, 0), seg(1.3, 2.0, 0)];
-        let out = merge_same_speaker_gaps(input, 0.3);
+    fn gap_fill_at_window_boundary_is_bridged() {
+        let input = vec![turn(0.0, 1.0, 0), turn(1.3, 2.0, 0)];
+        let out = gap_fill_turns(input, 0.3);
         assert_eq!(out.len(), 1, "gap equal to the window merges (<=)");
     }
 
     #[test]
-    fn gap_merge_preserves_cross_speaker_boundaries() {
+    fn gap_fill_preserves_cross_speaker_boundaries() {
         // A different-speaker segment between two same-speaker segments must
         // block bridging even when both gaps fit the window.
-        let input = vec![seg(0.0, 1.0, 0), seg(1.1, 2.0, 1), seg(2.1, 3.0, 0)];
-        let out = merge_same_speaker_gaps(input, 0.3);
+        let input = vec![turn(0.0, 1.0, 0), turn(1.1, 2.0, 1), turn(2.1, 3.0, 0)];
+        let out = gap_fill_turns(input, 0.3);
         assert_eq!(out.len(), 3);
-        assert_eq!(out.iter().map(|s| s.speaker).collect::<Vec<_>>(), vec![0, 1, 0]);
+        assert_eq!(
+            out.iter().map(|s| s.speaker.0).collect::<Vec<_>>(),
+            vec![0, 1, 0]
+        );
     }
 
     #[test]
-    fn gap_merge_leaves_overlaps_untouched() {
-        // Overlapping same-speaker segments have no silence gap: untouched.
-        let input = vec![seg(0.0, 2.0, 0), seg(1.5, 3.0, 0)];
-        let out = merge_same_speaker_gaps(input, 0.3);
-        assert_eq!(out.len(), 2);
+    fn gap_fill_merges_same_speaker_overlap_and_keeps_cross_speaker_overlap() {
+        // Pipeline gap-fill (v2 merge_segments): negative gaps (overlaps)
+        // merge only within the same speaker; distinct speakers sharing time
+        // are preserved (the overlap-aware output contract).
+        let same = vec![turn(0.0, 2.0, 0), turn(1.5, 3.0, 0)];
+        let out = gap_fill_turns(same, 0.3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(turn_span(&out[0]), (0.0, 3.0, 0));
+        let diff = vec![turn(0.0, 2.0, 0), turn(1.5, 3.0, 1)];
+        let out = gap_fill_turns(diff, 0.3);
+        assert_eq!(out.len(), 2, "cross-speaker overlap untouched");
     }
 
     #[test]
-    fn gap_merge_zero_window_is_noop() {
-        let input = vec![seg(0.0, 1.0, 0), seg(1.05, 2.0, 0), seg(2.02, 3.0, 0)];
-        let expected = input.clone();
-        let out = merge_same_speaker_gaps(input, 0.0);
-        assert_eq!(out.len(), expected.len());
-        assert!(out.iter().zip(expected.iter()).all(|(a, b)| a.start == b.start
-            && a.end == b.end
-            && a.speaker == b.speaker));
+    fn gap_fill_zero_window_is_noop() {
+        // 0 disables: assemble_channel_turns skips gap_fill_turns entirely.
+        let input = vec![turn(0.0, 1.0, 0), turn(1.05, 2.0, 0), turn(2.02, 3.0, 0)];
+        let expected: Vec<(f32, f32, i32)> =
+            input.iter().map(turn_span).collect();
+        let config = DiarizationConfig {
+            gap_merge_secs: 0.0,
+            ..DiarizationConfig::default()
+        };
+        let chunk = ChunkRecord {
+            start_secs: 0.0,
+            primary: vec![
+                raw_seg(0.0, 1.0, 0),
+                raw_seg(1.05, 2.0, 0),
+                raw_seg(2.02, 3.0, 0),
+            ],
+            overlaps: Vec::new(),
+            units: vec![
+                test_unit(0.0, 1.0, 0, 0),
+                test_unit(1.05, 2.0, 0, 1),
+                test_unit(2.02, 3.0, 0, 2),
+            ],
+            mixed_overlaps: Vec::new(),
+        };
+        let (segments, _) = assemble_channel_turns(
+            &[chunk],
+            &[vec![1.0, 0.0], vec![1.0, 0.0], vec![1.0, 0.0]],
+            &[0, 0, 0],
+            &polyvoice::resegmentation::OverlapResegmenter::default(),
+            &config,
+        )
+        .expect("assemble");
+        let got: Vec<(f32, f32, i32)> = segments.iter().map(|s| (s.start, s.end, s.speaker)).collect();
+        assert_eq!(got, expected, "gap 0 must not merge anything");
+    }
+
+    fn raw_seg(start: f64, end: f64, local: u8) -> RawSegment {
+        RawSegment {
+            time: polyvoice::types::TimeRange { start, end },
+            local_speaker_idx: local,
+            is_overlap: false,
+            confidence: polyvoice::types::Confidence::new(0.9).unwrap_or_default(),
+        }
+    }
+
+    fn test_unit(start: f64, end: f64, local: u8, segment_idx: usize) -> DenseUnit {
+        DenseUnit {
+            time: polyvoice::types::TimeRange { start, end },
+            local_idx: local,
+            segment_idx,
+            embedding: vec![1.0, 0.0],
+        }
     }
 
     #[test]
@@ -2749,26 +3887,30 @@ mod spike_tests {
             stored_cluster_threshold(),
             stored_cluster_ceiling(),
             stored_gap_merge_secs(),
+            stored_clusterer_kind(),
         );
         // Unset -> built-in defaults.
-        set_clustering_overrides(None, None, None);
+        set_clustering_overrides(None, None, None, None);
         let cfg = DiarizationConfig::resolved();
         assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
         assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
         assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
         // Stored override wins per key.
-        set_clustering_overrides(Some(0.35), Some(12), Some(0.3));
+        set_clustering_overrides(Some(0.35), Some(12), Some(0.3), Some(ClustererKindSetting::Ahc));
         let cfg = DiarizationConfig::resolved();
         assert_eq!(cfg.cluster_threshold, 0.35);
         assert_eq!(cfg.cluster_ceiling, 12);
         assert_eq!(cfg.gap_merge_secs, 0.3);
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
         // Partial override: only the ceiling is stored, others fall back.
-        set_clustering_overrides(None, Some(7), None);
+        set_clustering_overrides(None, Some(7), None, None);
         let cfg = DiarizationConfig::resolved();
         assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
         assert_eq!(cfg.cluster_ceiling, 7);
         assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
-        set_clustering_overrides(saved.0, saved.1, saved.2);
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        set_clustering_overrides(saved.0, saved.1, saved.2, saved.3);
     }
 
     #[test]

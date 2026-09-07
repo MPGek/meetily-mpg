@@ -108,9 +108,12 @@ futures-util = "0.3"
 # silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", package = "silero" }
 
 # Speaker diarization via polyvoice (Rust-native, MIT): powerset segmentation,
-# ONNX embedding, and AHC clustering for both offline and online paths.
+# ONNX embedding, and clustering for both offline and online paths.
 # The `onnx` feature pins ort to >= 2.0.0-rc.12 (see ort below).
-polyvoice = { version = "=0.17.0", default-features = false, features = ["onnx", "download", "segmentation", "embedder", "clusterer"] }
+# pipeline-v2 adoption adds: `vbx` (VBx HMM+PLDA auto-count clusterer),
+# `resegmentation` (overlap-aware resegmentation stage), and `spectral`
+# (NME-SC auto-count clusterer, faer-backed).
+polyvoice = { version = "=0.17.0", default-features = false, features = ["onnx", "download", "segmentation", "embedder", "clusterer", "resegmentation", "vbx", "spectral"] }
 
 # Parakeet (ONNX-based fast transcription) dependencies
 # ort pinned to exactly 2.0.0-rc.12 (polyvoice's tested version; rc.13+ breaks the rc.10 API usage)

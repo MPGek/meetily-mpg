@@ -8,6 +8,12 @@ import { recordingService } from "@/services/recordingService";
 import { WordAlignmentSettings } from "./WordAlignmentSettings";
 import { CheckCircle, AlertCircle } from "lucide-react";
 import type { DiarizationMode } from "@/lib/diarization";
+import {
+  loadClusteringSettings,
+  saveClusteringSettings,
+  syncClusteringSettingsToBackend,
+  type DiarizationClusterer,
+} from "@/lib/diarization";
 
 const STORAGE_KEYS = {
   enabled: "diarizationEnabled",
@@ -15,6 +21,12 @@ const STORAGE_KEYS = {
   maxSpeakers: "diarizationMaxSpeakers",
   mode: "diarizationMode",
 };
+
+const CLUSTERER_OPTIONS: { value: DiarizationClusterer; label: string }[] = [
+  { value: "ahc", label: "AHC (fixed threshold, recommended)" },
+  { value: "nmesc", label: "NME-SC (automatic count)" },
+  { value: "vbx", label: "VBx (automatic count; unavailable for the bundled 192-d models)" },
+];
 
 export interface DiarizationSettingsState {
   enabled: boolean;
@@ -79,6 +91,12 @@ export function DiarizationSettings() {
   );
   const [modelsReady, setModelsReady] = useState<DiarizationModelStatus | null>(null);
   const [speakerStats, setSpeakerStats] = useState<SpeakerStorageStats | null>(null);
+  const [clusterer, setClusterer] = useState<DiarizationClusterer>(() =>
+    loadClusteringSettings().clusterer ?? "ahc"
+  );
+  const [clusterThreshold, setClusterThreshold] = useState<number>(() =>
+    loadClusteringSettings().clusterThreshold ?? 0.6
+  );
 
   const mountedRef = useRef(false);
 
@@ -201,6 +219,61 @@ export function DiarizationSettings() {
           }}
           className="w-32"
         />
+      </div>
+
+      {/* Offline clustering (pipeline-v2): clusterer kind + AHC threshold */}
+      <div className="p-4 border rounded-lg bg-gray-50 space-y-4">
+        <div>
+          <div className="font-medium mb-1">Offline clustering</div>
+          <p className="text-xs text-gray-500">
+            Applies to speaker analysis on saved meetings. Takes effect without a rebuild.
+          </p>
+        </div>
+        <div>
+          <Label className="text-sm font-medium text-gray-900 mb-1 block">Clusterer</Label>
+          <select
+            value={clusterer}
+            onChange={(e) => {
+              const kind = e.target.value as DiarizationClusterer;
+              setClusterer(kind);
+              saveClusteringSettings({ clusterer: kind });
+              syncClusteringSettingsToBackend();
+            }}
+            className="w-full sm:w-64 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            {CLUSTERER_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <Label className="text-sm font-medium text-gray-900 mb-1 block">
+            Merge threshold (AHC only)
+          </Label>
+          <p className="text-xs text-gray-500 mb-2">
+            Minimum cosine similarity to merge two clusters. Only used by the AHC clusterer;
+            ignored under automatic-count kinds.
+          </p>
+          <Input
+            type="number"
+            step={0.01}
+            min={0}
+            max={1}
+            disabled={clusterer !== "ahc"}
+            value={clusterThreshold}
+            onChange={(e) => {
+              const value = parseFloat(e.target.value);
+              if (Number.isNaN(value)) return;
+              const normalized = Math.max(0, Math.min(1, value));
+              setClusterThreshold(normalized);
+              saveClusteringSettings({ clusterThreshold: normalized });
+              syncClusteringSettingsToBackend();
+            }}
+            className="w-32"
+          />
+        </div>
       </div>
 
       {/* Enhanced model set - read-only, bundled at build time */}

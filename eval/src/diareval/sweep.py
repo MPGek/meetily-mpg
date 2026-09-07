@@ -25,10 +25,20 @@ PARAM_FLAGS: dict[str, tuple[str, type]] = {
     "cluster_threshold": ("--cluster-threshold", float),
     "cluster_ceiling": ("--max-clusters", int),
     "gap_merge_secs": ("--gap-merge", float),
+    "clusterer": ("--clusterer", str),
+    "embed_window": ("--embed-window", float),
+    "binarization": ("--binarization", str),
 }
 
 # Unique short prefixes for run-ids (first-word slugs of cluster_* collide).
-PARAM_SLUGS = {"cluster_threshold": "thr", "cluster_ceiling": "ceil", "gap_merge_secs": "gap"}
+PARAM_SLUGS = {
+    "cluster_threshold": "thr",
+    "cluster_ceiling": "ceil",
+    "gap_merge_secs": "gap",
+    "clusterer": "kind",
+    "embed_window": "win",
+    "binarization": "bin",
+}
 
 VALIDATION_DATASETS = ("voxconverse", "msdwild")
 

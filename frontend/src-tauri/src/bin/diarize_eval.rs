@@ -36,6 +36,17 @@ struct Args {
     /// Same-speaker gap-merge window in seconds (default: built-in 0.3)
     #[arg(long)]
     gap_merge: Option<f32>,
+    /// Clusterer kind: vbx|nmesc|ahc (default: built-in ahc, 6.2 sweep)
+    #[arg(long)]
+    clusterer: Option<String>,
+    /// Dense embedding window in seconds; 0 = sparse one-embedding-per-segment
+    /// (default: built-in 5.0)
+    #[arg(long)]
+    embed_window: Option<f32>,
+    /// Calibrated binarization as onset,offset,min_on,min_off; 'off' disables
+    /// (default: built-in hysteresis constants)
+    #[arg(long)]
+    binarization: Option<String>,
     /// Recording URI field in RTTM lines (default: input file stem)
     #[arg(long)]
     uri: Option<String>,
@@ -50,6 +61,32 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse a `--binarization` value: `off` disables calibrated binarization
+/// (plain argmax), otherwise `onset,offset,min_on,min_off` floats.
+fn parse_binarization(
+    raw: &str,
+) -> Result<Option<polyvoice::segmentation::BinarizationConfig>, String> {
+    if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "invalid --binarization '{raw}' (expected off, or onset,offset,min_on,min_off)"
+        ));
+    }
+    let nums: Vec<f32> = parts
+        .iter()
+        .map(|p| p.parse::<f32>().map_err(|_| format!("invalid --binarization float '{p}'")))
+        .collect::<Result<_, _>>()?;
+    Ok(Some(polyvoice::segmentation::BinarizationConfig {
+        onset: nums[0],
+        offset: nums[1],
+        min_duration_on: nums[2],
+        min_duration_off: nums[3],
+    }))
 }
 
 fn run(args: Args) -> Result<(), String> {
@@ -74,6 +111,16 @@ fn run(args: Args) -> Result<(), String> {
     }
     if let Some(g) = args.gap_merge {
         config.gap_merge_secs = g;
+    }
+    if let Some(k) = &args.clusterer {
+        config.clusterer = app_lib::audio::diarization::ClustererKindSetting::parse(k)
+            .ok_or_else(|| format!("invalid --clusterer '{k}' (expected vbx|nmesc|ahc)"))?;
+    }
+    if let Some(w) = args.embed_window {
+        config.embed_window_secs = w;
+    }
+    if let Some(b) = &args.binarization {
+        config.binarization = parse_binarization(b)?;
     }
     let (left, right) = decoded.extract_channels();
     let mut channels: Vec<(u32, Vec<f32>)> = Vec::new();
