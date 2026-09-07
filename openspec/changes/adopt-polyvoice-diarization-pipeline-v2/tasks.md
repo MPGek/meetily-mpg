@@ -45,4 +45,4 @@
 
 - [x] 7.1 Run `cargo test -p meetily` (or the crate's test invocation) and clippy; verify all diarization, cache-persistence, and attribution tests pass
 - [ ] 7.2 End-to-end on a stored stereo meeting (auto + manual re-diarize, cancel mid-run, re-diarize after voiceprint enrollment): verify progress events, provenance/`matched_by='user'` guards, and that enrolled prototypes survive re-diarization on the new architecture
-- [ ] 7.3 Run `graphify update .` and commit; verify the map reflects the reworked module boundaries
+- [x] 7.3 Run `graphify update .` and commit; verify the map reflects the reworked module boundaries
