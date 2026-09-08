@@ -45,9 +45,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Audio files
-*.wav
-
 # Large media files
 docs/demo.mov
 docs/demo.gif

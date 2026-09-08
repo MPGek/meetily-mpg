@@ -1,4 +1,6 @@
 [core]
-    remote = storage
-['remote "storage"']
-    url = C:/Users/vasiliy.kotov/Work/Own/meetily-dvc
+    remote = local-server
+[cache]
+    type = "hardlink,copy"
+['remote "local-server"']
+    url = \\192.168.17.34\UsersHome\Vasiliy.Kotov\DVC\meetily\
