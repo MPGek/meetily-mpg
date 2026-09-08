@@ -9,6 +9,7 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
+import { getShortLanguageLabel } from '@/constants/languages';
 import { useMemo } from 'react';
 
 /**
@@ -32,10 +33,12 @@ export function TranscriptPanel({
 }: TranscriptPanelProps) {
   // Contexts
   const { transcripts, transcriptContainerRef, isFollowingBottom, scrollToBottom, copyTranscript, applyLiveSpeakerLabel } = useTranscripts();
-  const { transcriptModelConfig } = useConfig();
+  const { transcriptModelConfig, selectedLanguage } = useConfig();
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
+
+  const languageCode = getShortLanguageLabel(selectedLanguage);
 
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>
@@ -81,11 +84,14 @@ export function TranscriptPanel({
                       variant="outline"
                       size="sm"
                       onClick={() => showModal('languageSettings')}
-                      title="Language"
+                      title={`Transcription language: ${languageCode} (click to change)`}
                     >
                       <GlobeIcon />
                       <span className='hidden md:inline'>
-                        Language
+                        Language&nbsp;({languageCode})
+                      </span>
+                      <span className='md:hidden'>
+                        ({languageCode})
                       </span>
                     </Button>
                   }

@@ -38,3 +38,20 @@ export const LANGUAGES = [
   { code: 'bg', name: 'Bulgarian' },
   { code: 'lt', name: 'Lithuanian' },
 ];
+
+/**
+ * Short code for the home-page Language button (transcription-language-indicator).
+ * - 'auto' -> 'auto'
+ * - 'auto-translate' -> 'auto-en' (distinct from plain auto)
+ * - explicit code -> itself
+ * - missing/unknown/blank -> 'auto' fallback so the button is never empty
+ */
+export function getShortLanguageLabel(code: string | null | undefined): string {
+  if (!code || !code.trim()) {
+    return 'auto';
+  }
+  if (code === 'auto-translate') {
+    return 'auto-en';
+  }
+  return code;
+}
