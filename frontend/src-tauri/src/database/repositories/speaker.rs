@@ -31,6 +31,10 @@ pub struct SpeakerStorageStats {
     pub prototype_count: i64,
     pub cache_count: i64,
     pub total_bytes: i64,
+    /// Total bytes of stored voice-clip blobs (separate from embeddings).
+    pub audio_bytes: i64,
+    /// Number of rows carrying a stored voice clip.
+    pub clip_count: i64,
 }
 
 /// A single candidate prototype loaded for recognition: which speaker it
@@ -73,6 +77,11 @@ pub struct VoiceprintRow {
     pub audio_start_time: Option<f64>,
     pub audio_end_time: Option<f64>,
     pub meeting_title: Option<String>,
+    /// Whether the row carries a self-contained voice clip (blob playback).
+    pub has_audio: bool,
+    /// 0 = unverified, 1 = user-confirmed the voice is correct.
+    #[sqlx(default)]
+    pub is_verified: i64,
     pub created_at: crate::database::models::DateTimeUtc,
 }
 
@@ -82,6 +91,7 @@ pub struct SpeakerVoiceprints {
     pub speaker_name: String,
     pub is_me: bool,
     pub prototype_count: usize,
+    pub unverified_count: usize,
     pub prototypes: Vec<VoiceprintRow>,
 }
 
@@ -89,6 +99,7 @@ pub struct SpeakerVoiceprints {
 pub struct MeetingVoiceprints {
     pub meeting_id: String,
     pub meeting_title: String,
+    pub unverified_count: usize,
     pub caches: Vec<VoiceprintRow>,
 }
 
@@ -260,6 +271,26 @@ impl SpeakerRepository {
         exemplars: &[Exemplar],
         model: &str,
     ) -> Result<(), SqlxError> {
+        // Best-effort voice clips, cut BEFORE opening the transaction so slow
+        // ffmpeg encodes never hold the write lock. One Opus mono clip per
+        // exemplar window from the meeting's saved audio (same channel as the
+        // embedding). Any failure yields legacy clip-less rows; persistence
+        // never fails because of clips.
+        let windows: Vec<(f64, f64)> = exemplars
+            .iter()
+            .map(|e| match (e.start_secs, e.end_secs) {
+                (Some(s), Some(en)) => (s as f64, en as f64),
+                _ => (f64::NAN, f64::NAN),
+            })
+            .collect();
+        let clips = crate::audio::voiceprint_clips::cut_clips_for_meeting(
+            pool,
+            meeting_id,
+            channel,
+            &windows,
+        )
+        .await;
+
         let mut tx = pool.begin().await?;
 
         // Upsert the meeting_speakers row with centroid + channel. An existing
@@ -295,7 +326,7 @@ impl SpeakerRepository {
         .await?;
 
         let now = Utc::now();
-        for exemplar in exemplars {
+        for (exemplar, clip) in exemplars.iter().zip(clips.iter()) {
             let id = format!("emb-{}", Uuid::new_v4());
             let emb_bytes = embedding_to_bytes(&exemplar.embedding);
             // Verify start_secs present implies end_secs
@@ -309,7 +340,7 @@ impl SpeakerRepository {
                 }
             };
             sqlx::query(
-                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
             )
             .bind(&id)
             .bind(&emb_bytes)
@@ -320,6 +351,9 @@ impl SpeakerRepository {
             .bind(cluster_label)
             .bind(start)
             .bind(end)
+            .bind(clip.as_deref())
+            .bind(clip.as_ref().map(|_| crate::audio::voiceprint_clips::VOICEPRINT_CLIP_CODEC))
+            .bind(clip.as_ref().map(|_| crate::audio::voiceprint_clips::VOICEPRINT_CLIP_SAMPLE_RATE as i64))
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -553,10 +587,24 @@ impl SpeakerRepository {
             return Ok(0);
         }
 
+        // Best-effort voice clips for the enrolled candidates, cut before the
+        // transaction so ffmpeg never holds the write lock.
+        let windows: Vec<(f64, f64)> = candidates
+            .iter()
+            .map(|(_, _, s, e)| (*s as f64, *e as f64))
+            .collect();
+        let clips = crate::audio::voiceprint_clips::cut_clips_for_meeting(
+            pool,
+            meeting_id,
+            channel,
+            &windows,
+        )
+        .await;
+
         let mut tx = pool.begin().await?;
         let now = Utc::now();
         let mut inserted = 0usize;
-        for (dur, emb, start, end) in candidates {
+        for ((dur, emb, start, end), clip) in candidates.into_iter().zip(clips.iter()) {
             let id = format!("emb-{}", Uuid::new_v4());
             let emb_bytes = embedding_to_bytes(&emb);
             // Model-aware: infer family from embedding dimension (192 = TitaNet, 256 = legacy).
@@ -566,8 +614,8 @@ impl SpeakerRepository {
                 SPEAKER_EMBEDDING_MODEL
             };
             sqlx::query(
-                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
             )
             .bind(&id)
             .bind(&emb_bytes)
@@ -579,6 +627,9 @@ impl SpeakerRepository {
             .bind(cluster_label)
             .bind(start as f64)
             .bind(end as f64)
+            .bind(clip.as_deref())
+            .bind(clip.as_ref().map(|_| crate::audio::voiceprint_clips::VOICEPRINT_CLIP_CODEC))
+            .bind(clip.as_ref().map(|_| crate::audio::voiceprint_clips::VOICEPRINT_CLIP_SAMPLE_RATE as i64))
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -739,11 +790,21 @@ impl SpeakerRepository {
             sqlx::query_as("SELECT COALESCE(SUM(LENGTH(embedding)), 0) FROM speaker_embeddings")
                 .fetch_one(pool)
                 .await?;
+        let audio_bytes: (i64,) =
+            sqlx::query_as("SELECT COALESCE(SUM(LENGTH(audio_blob)), 0) FROM speaker_embeddings")
+                .fetch_one(pool)
+                .await?;
+        let clip_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE audio_blob IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
         Ok(SpeakerStorageStats {
             registry_count: registry_count.0,
             prototype_count: prototype_count.0,
             cache_count: cache_count.0,
             total_bytes: total_bytes.0,
+            audio_bytes: audio_bytes.0,
+            clip_count: clip_count.0,
         })
     }
 
@@ -801,7 +862,7 @@ impl SpeakerRepository {
 
             for sp in speakers {
                 let rows: Vec<VoiceprintRow> = sqlx::query_as::<_, VoiceprintRow>(
-                    "SELECT se.id, se.model, se.channel, se.duration_secs, se.speaker_id, se.meeting_id, se.cluster_label, se.audio_start_time, se.audio_end_time, COALESCE(m.title, CASE WHEN se.meeting_id IS NOT NULL THEN 'deleted meeting' ELSE NULL END) as meeting_title, se.created_at
+                    "SELECT se.id, se.model, se.channel, se.duration_secs, se.speaker_id, se.meeting_id, se.cluster_label, se.audio_start_time, se.audio_end_time, COALESCE(m.title, CASE WHEN se.meeting_id IS NOT NULL THEN 'deleted meeting' ELSE NULL END) as meeting_title, (se.audio_blob IS NOT NULL) as has_audio, se.is_verified, se.created_at
                      FROM speaker_embeddings se LEFT JOIN meetings m ON m.id = se.meeting_id
                      WHERE se.speaker_id = ?
                      ORDER BY se.created_at DESC",
@@ -810,11 +871,13 @@ impl SpeakerRepository {
                 .fetch_all(pool)
                 .await?;
                 let count = rows.len();
+                let unverified = rows.iter().filter(|r| r.is_verified == 0).count();
                 speakers_out.push(SpeakerVoiceprints {
                     speaker_id: sp.id,
                     speaker_name: sp.name,
                     is_me: sp.is_me,
                     prototype_count: count,
+                    unverified_count: unverified,
                     prototypes: rows,
                 });
             }
@@ -823,7 +886,7 @@ impl SpeakerRepository {
         // Unconfirmed caches grouped by meeting, unless filtered to a single speaker
         if speaker_id_filter.is_none() {
             let cache_rows: Vec<VoiceprintRow> = sqlx::query_as::<_, VoiceprintRow>(
-                "SELECT se.id, se.model, se.channel, se.duration_secs, se.speaker_id, se.meeting_id, se.cluster_label, se.audio_start_time, se.audio_end_time, COALESCE(m.title, 'deleted meeting') as meeting_title, se.created_at
+                "SELECT se.id, se.model, se.channel, se.duration_secs, se.speaker_id, se.meeting_id, se.cluster_label, se.audio_start_time, se.audio_end_time, COALESCE(m.title, 'deleted meeting') as meeting_title, (se.audio_blob IS NOT NULL) as has_audio, se.is_verified, se.created_at
                  FROM speaker_embeddings se LEFT JOIN meetings m ON m.id = se.meeting_id
                  WHERE se.speaker_id IS NULL AND se.meeting_id IS NOT NULL
                  ORDER BY se.meeting_id ASC, se.created_at DESC",
@@ -853,9 +916,11 @@ impl SpeakerRepository {
                 }
             }
             for (mid, (title, caches)) in grouped {
+                let unverified = caches.iter().filter(|r| r.is_verified == 0).count();
                 unconfirmed_out.push(MeetingVoiceprints {
                     meeting_id: mid,
                     meeting_title: title,
+                    unverified_count: unverified,
                     caches,
                 });
             }
@@ -951,17 +1016,19 @@ impl SpeakerRepository {
 
     /// Reconfirm a cache (or demoted) voiceprint as a speaker's prototype.
     /// Enforces per-person cap (reuse enforce_prototype_cap), no provenance change.
+    /// The row becomes unverified for its new owner until explicitly verified.
     pub async fn reconfirm_voiceprint(
         pool: &SqlitePool,
         id: &str,
         speaker_id: &str,
     ) -> Result<(), SqlxError> {
         let mut tx = pool.begin().await?;
-        let rows = sqlx::query("UPDATE speaker_embeddings SET speaker_id = ? WHERE id = ?")
-            .bind(speaker_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let rows =
+            sqlx::query("UPDATE speaker_embeddings SET speaker_id = ?, is_verified = 0, verified_at = NULL WHERE id = ?")
+                .bind(speaker_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         if rows.rows_affected() == 0 {
             tx.rollback().await?;
             return Err(SqlxError::RowNotFound);
@@ -969,6 +1036,73 @@ impl SpeakerRepository {
         Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Mark a single voiceprint as user-verified (voice is correct).
+    /// Display-only flag: touches nothing but `is_verified`/`verified_at`.
+    /// Returns true when the row existed.
+    pub async fn verify_voiceprint(pool: &SqlitePool, id: &str) -> Result<bool, SqlxError> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            "UPDATE speaker_embeddings SET is_verified = 1, verified_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
+    /// Mark every voiceprint of a speaker (or every cache of a meeting when
+    /// `speaker_id` is None and `meeting_id` is Some) as verified.
+    /// Returns the number of rows updated.
+    pub async fn verify_speaker(
+        pool: &SqlitePool,
+        speaker_id: &str,
+    ) -> Result<u64, SqlxError> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            "UPDATE speaker_embeddings SET is_verified = 1, verified_at = ? WHERE speaker_id = ? AND is_verified = 0",
+        )
+        .bind(now)
+        .bind(speaker_id)
+        .execute(pool)
+        .await?;
+        Ok(rows.rows_affected())
+    }
+
+    /// Mark every unconfirmed cache of a meeting as verified.
+    /// Returns the number of rows updated.
+    pub async fn verify_meeting_caches(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<u64, SqlxError> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            "UPDATE speaker_embeddings SET is_verified = 1, verified_at = ? WHERE meeting_id = ? AND speaker_id IS NULL AND is_verified = 0",
+        )
+        .bind(now)
+        .bind(meeting_id)
+        .execute(pool)
+        .await?;
+        Ok(rows.rows_affected())
+    }
+
+    /// Load a voiceprint's stored audio clip. Returns the raw bytes plus the
+    /// codec tag, or `None` when the row has no clip (legacy row).
+    pub async fn get_voiceprint_audio(
+        pool: &SqlitePool,
+        id: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, SqlxError> {
+        let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(
+            "SELECT audio_blob, audio_codec FROM speaker_embeddings WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.and_then(|(blob, codec)| {
+            blob.map(|b| (b, codec.unwrap_or_else(|| "opus".to_string())))
+        }))
     }
 
     /// Replace a speaker across the whole corpus: re-bind auto-matched clusters
@@ -3238,5 +3372,174 @@ mod tests {
         let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
         assert_eq!(stats.prototype_count, 5, "Alice's 5 prototypes");
         assert_eq!(stats.cache_count, 5, "new cache has 5 unassigned exemplars");
+    }
+
+    async fn insert_prototype_with_clip(
+        pool: &SqlitePool,
+        id: &str,
+        speaker_id: &str,
+        meeting_id: &str,
+        clip: Option<&[u8]>,
+    ) {
+        sqlx::query(
+            "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at)
+             VALUES (?, ?, 'titanet_large', 'mic', 3.0, ?, ?, 'SPEAKER_00', 10.0, 13.0, ?, ?, ?, 0, NULL, '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(embedding_to_bytes(&[0.5f32; 192]))
+        .bind(speaker_id)
+        .bind(meeting_id)
+        .bind(clip)
+        .bind(clip.map(|_| "opus"))
+        .bind(clip.map(|_| 16000i64))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn voiceprint_clip_columns_default_to_legacy_without_audio_file() {
+        let pool = setup_pool().await;
+        // Meeting without folder_path: no audio file resolvable, so clips
+        // must be absent and rows must read as legacy (unverified, no clip).
+        insert_meeting(&pool, "m1").await;
+        let exemplars: Vec<Exemplar> = vec![Exemplar {
+            embedding: emb(&[1.0, 2.0, 3.0, 4.0]),
+            duration_secs: 3.0,
+            start_secs: Some(10.0),
+            end_secs: Some(13.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[1.0, 2.0, 3.0, 4.0]),
+            &exemplars,
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+
+        let row: SpeakerEmbedding = sqlx::query_as::<_, SpeakerEmbedding>(
+            "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at FROM speaker_embeddings WHERE meeting_id = 'm1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.audio_blob.is_none(), "no clip without an audio file");
+        assert_eq!(row.is_verified, 0, "new rows start unverified");
+
+        let browser = SpeakerRepository::list_voiceprints(&pool, None, false, None, None)
+            .await
+            .unwrap();
+        assert!(!browser.unconfirmed[0].caches[0].has_audio);
+        assert_eq!(browser.unconfirmed[0].caches[0].is_verified, 0);
+        assert_eq!(browser.unconfirmed[0].unverified_count, 1);
+    }
+
+    #[tokio::test]
+    async fn voiceprint_verify_flag_transitions() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let clip = vec![0x4Fu8, 0x67, 0x67, 0x53];
+        insert_prototype_with_clip(&pool, "emb-1", &alice.id, "m1", Some(&clip)).await;
+        insert_prototype_with_clip(&pool, "emb-2", &alice.id, "m1", None).await;
+
+        // Verify sets only the flag + timestamp.
+        assert!(SpeakerRepository::verify_voiceprint(&pool, "emb-1").await.unwrap());
+        assert!(!SpeakerRepository::verify_voiceprint(&pool, "emb-missing").await.unwrap());
+        let row: SpeakerEmbedding = sqlx::query_as::<_, SpeakerEmbedding>(
+            "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at FROM speaker_embeddings WHERE id = 'emb-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.is_verified, 1);
+        assert!(row.verified_at.is_some());
+        assert_eq!(row.audio_blob, Some(clip), "clip untouched by verify");
+        assert_eq!(row.speaker_id.as_deref(), Some(alice.id.as_str()));
+
+        // Bulk verify covers the rest; already-verified rows are skipped.
+        assert_eq!(SpeakerRepository::verify_speaker(&pool, &alice.id).await.unwrap(), 1);
+        assert_eq!(SpeakerRepository::verify_speaker(&pool, &alice.id).await.unwrap(), 0);
+
+        // Reconfirm resets verification for the new owner.
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+        SpeakerRepository::reconfirm_voiceprint(&pool, "emb-1", &bob.id).await.unwrap();
+        let row: SpeakerEmbedding = sqlx::query_as::<_, SpeakerEmbedding>(
+            "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at FROM speaker_embeddings WHERE id = 'emb-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.is_verified, 0, "reconfirm resets verification");
+        assert!(row.verified_at.is_none());
+        assert_eq!(row.speaker_id.as_deref(), Some(bob.id.as_str()));
+
+        // Browser surfaces per-group unverified counts.
+        let browser = SpeakerRepository::list_voiceprints(&pool, None, false, None, None)
+            .await
+            .unwrap();
+        let bob_group = browser.speakers.iter().find(|s| s.speaker_id == bob.id).unwrap();
+        assert_eq!(bob_group.unverified_count, 1);
+    }
+
+    #[tokio::test]
+    async fn voiceprint_storage_stats_separates_audio_bytes() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let clip = vec![7u8; 100];
+        insert_prototype_with_clip(&pool, "emb-1", &alice.id, "m1", Some(&clip)).await;
+        insert_prototype_with_clip(&pool, "emb-2", &alice.id, "m1", None).await;
+
+        let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(stats.prototype_count, 2);
+        assert_eq!(stats.clip_count, 1, "only one row carries a clip");
+        assert_eq!(stats.audio_bytes, 100, "audio bytes counted separately");
+        // Embedding bytes unchanged: 2 rows x 192 f32 x 4 bytes.
+        assert_eq!(stats.total_bytes, 2 * 192 * 4);
+
+        // Blob round-trips through the audio accessor.
+        let loaded = SpeakerRepository::get_voiceprint_audio(&pool, "emb-1")
+            .await
+            .unwrap()
+            .expect("clip present");
+        assert_eq!(loaded.0, clip);
+        assert_eq!(loaded.1, "opus");
+        assert!(
+            SpeakerRepository::get_voiceprint_audio(&pool, "emb-2")
+                .await
+                .unwrap()
+                .is_none(),
+            "legacy row has no clip"
+        );
+
+        // Meeting-cache bulk verify.
+        insert_meeting(&pool, "m2").await;
+        let exemplars: Vec<Exemplar> = vec![Exemplar {
+            embedding: emb(&[9.0; 4]),
+            duration_secs: 2.0,
+            start_secs: Some(1.0),
+            end_secs: Some(3.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool, "m2", "SPEAKER_01", "system", &emb(&[9.0; 4]), &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            SpeakerRepository::verify_meeting_caches(&pool, "m2").await.unwrap(),
+            1
+        );
     }
 }

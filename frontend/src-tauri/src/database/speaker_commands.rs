@@ -4,6 +4,7 @@ use crate::database::repositories::speaker::{
 };
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 /// Response for `assign_speaker`: the registry speaker now bound to the cluster.
 #[derive(Debug, Serialize)]
@@ -369,6 +370,86 @@ pub async fn reconfirm_voiceprint(
     SpeakerRepository::reconfirm_voiceprint(pool, &id, &speaker_id)
         .await
         .map_err(|e| format!("Failed to reconfirm voiceprint: {}", e))
+}
+
+/// Mark a single voiceprint as user-verified. Display-only flag.
+#[tauri::command]
+pub async fn verify_voiceprint(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::verify_voiceprint(pool, &id)
+        .await
+        .map_err(|e| format!("Failed to verify voiceprint: {}", e))
+}
+
+/// Mark every prototype of a speaker as verified. Returns rows updated.
+#[tauri::command]
+pub async fn verify_speaker(
+    speaker_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<u64, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::verify_speaker(pool, &speaker_id)
+        .await
+        .map_err(|e| format!("Failed to verify speaker voiceprints: {}", e))
+}
+
+/// Mark every unconfirmed cache of a meeting as verified. Returns rows updated.
+#[tauri::command]
+pub async fn verify_meeting_caches(
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<u64, String> {
+    let pool = state.db_manager.pool();
+    SpeakerRepository::verify_meeting_caches(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to verify meeting caches: {}", e))
+}
+
+/// Resolve a voiceprint's stored audio clip to a playable temp file path.
+/// Writes the blob to the temp dir (cached by voiceprint id — blobs are
+/// immutable after insert) and registers it in the asset protocol scope.
+/// Returns `None` when the row has no stored clip (legacy row).
+#[tauri::command]
+pub async fn get_voiceprint_audio<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let pool = state.db_manager.pool();
+    let clip = SpeakerRepository::get_voiceprint_audio(pool, &id)
+        .await
+        .map_err(|e| format!("Failed to load voiceprint audio: {}", e))?;
+    let Some((bytes, codec)) = clip else {
+        return Ok(None);
+    };
+    let ext = match codec.as_str() {
+        "opus" => "ogg",
+        other => other,
+    };
+    let cache_dir = std::env::temp_dir().join("meetily-voiceprint-clips");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Cannot create temp dir: {}", e))?;
+    // Voiceprint ids are `emb-<uuid>`; sanitize defensively for file use.
+    let safe_id: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let out_path = cache_dir.join(format!("{}.{}", safe_id, ext));
+    if !out_path.is_file() {
+        std::fs::write(&out_path, &bytes).map_err(|e| format!("Cannot write clip file: {}", e))?;
+    }
+    if let Err(e) = app.asset_protocol_scope().allow_file(&out_path) {
+        log::warn!("Failed to allow voiceprint clip in asset scope: {}", e);
+    }
+    Ok(Some(out_path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]

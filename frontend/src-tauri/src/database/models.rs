@@ -180,6 +180,18 @@ pub struct SpeakerEmbedding {
     pub audio_start_time: Option<f64>,
     #[sqlx(default)]
     pub audio_end_time: Option<f64>,
+    /// Self-contained Opus mono clip of the source segment (NULL = legacy row).
+    #[sqlx(default)]
+    pub audio_blob: Option<Vec<u8>>,
+    #[sqlx(default)]
+    pub audio_codec: Option<String>,
+    #[sqlx(default)]
+    pub audio_sample_rate: Option<i64>,
+    /// 0 = unverified, 1 = user-confirmed the voice is correct.
+    #[sqlx(default)]
+    pub is_verified: i64,
+    #[sqlx(default)]
+    pub verified_at: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
 }
 

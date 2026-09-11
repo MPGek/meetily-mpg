@@ -16,6 +16,8 @@ type VoiceprintRow = {
   audio_start_time: number | null;
   audio_end_time: number | null;
   meeting_title: string | null;
+  has_audio: boolean;
+  is_verified: number;
   created_at: string;
 };
 
@@ -24,12 +26,14 @@ type SpeakerVoiceprints = {
   speaker_name: string;
   is_me: boolean;
   prototype_count: number;
+  unverified_count: number;
   prototypes: VoiceprintRow[];
 };
 
 type MeetingVoiceprints = {
   meeting_id: string;
   meeting_title: string;
+  unverified_count: number;
   caches: VoiceprintRow[];
 };
 
@@ -43,6 +47,8 @@ type StorageStats = {
   prototype_count: number;
   cache_count: number;
   total_bytes: number;
+  audio_bytes: number;
+  clip_count: number;
 };
 
 type SpeakerLite = { id: string; name: string; is_me?: boolean };
@@ -285,6 +291,7 @@ export default function VoiceprintBrowser() {
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [audioPath, setAudioPath] = useState<string | null>(null);
   const [pendingRange, setPendingRange] = useState<{ start: number; end: number } | null>(null);
+  const [pendingBlobPlay, setPendingBlobPlay] = useState(false);
   const [playingRowId, setPlayingRowId] = useState<string | null>(null);
   const [failedRowId, setFailedRowId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -322,6 +329,14 @@ export default function VoiceprintBrowser() {
     }
   }, [audioPath, pendingRange, player]);
 
+  // Stored-clip playback: the temp file IS the clip, play it directly.
+  useEffect(() => {
+    if (audioPath && pendingBlobPlay && player.duration > 0) {
+      player.play();
+      setPendingBlobPlay(false);
+    }
+  }, [audioPath, pendingBlobPlay, player]);
+
   useEffect(() => {
     if (player.endedCount > 0) {
       setPlayingRowId(null);
@@ -357,7 +372,6 @@ export default function VoiceprintBrowser() {
   }, []);
 
   const handlePlay = async (row: VoiceprintRow) => {
-    if (row.audio_start_time == null || row.audio_end_time == null || !row.meeting_id) return;
     if (playingRowId === row.id && player.isPlaying) {
       player.pause();
       setPlayingRowId(null);
@@ -365,6 +379,26 @@ export default function VoiceprintBrowser() {
       return;
     }
     if (failedRowId) setFailedRowId(null);
+    // Blob-first: stored clips play without the meeting file or timecodes.
+    if (row.has_audio) {
+      try {
+        const clipPath = await invoke<string | null>('get_voiceprint_audio', { id: row.id });
+        if (clipPath) {
+          setPlayingRowId(row.id);
+          setPendingBlobPlay(true);
+          setPendingRange(null);
+          setAudioPath(clipPath);
+          return;
+        }
+        // Blob missing despite the flag (e.g. temp write failed) — fall
+        // through to the legacy meeting-file path below.
+      } catch (e) {
+        setError(String(e));
+        setFailedRowId(row.id);
+        return;
+      }
+    }
+    if (row.audio_start_time == null || row.audio_end_time == null || !row.meeting_id) return;
     try {
       const path = await invoke<string>('get_meeting_audio_path', { meetingId: row.meeting_id });
       if (!path) {
@@ -373,6 +407,7 @@ export default function VoiceprintBrowser() {
         return;
       }
       setPlayingRowId(row.id);
+      setPendingBlobPlay(false);
       setPendingRange({ start: row.audio_start_time, end: row.audio_end_time });
       setAudioPath(path);
     } catch (e) {
@@ -394,6 +429,41 @@ export default function VoiceprintBrowser() {
       setError(String(e));
     }
   };
+
+  // ——— Verification (voiceprint-verification) ———
+  const [hideVerified, setHideVerified] = useState(false);
+
+  const handleVerifyRow = async (row: VoiceprintRow) => {
+    try {
+      await invoke('verify_voiceprint', { id: row.id });
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handleVerifySpeaker = async (speakerId: string) => {
+    try {
+      await invoke('verify_speaker', { speakerId });
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handleVerifyMeeting = async (meetingId: string) => {
+    try {
+      await invoke('verify_meeting_caches', { meetingId });
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const visiblePrototypes = (sp: SpeakerVoiceprints) =>
+    hideVerified ? sp.prototypes.filter((r) => r.is_verified === 0) : sp.prototypes;
+  const visibleCaches = (mg: MeetingVoiceprints) =>
+    hideVerified ? mg.caches.filter((r) => r.is_verified === 0) : mg.caches;
 
   // ——— Shared picker state for reconfirm & replace (reuse same dialog) ———
   const [picker, setPicker] = useState<
@@ -529,7 +599,8 @@ export default function VoiceprintBrowser() {
             <span>Speakers: {stats.registry_count}</span>
             <span>Prototypes: {stats.prototype_count}</span>
             <span>Unconfirmed caches: {stats.cache_count}</span>
-            <span>Storage size: {formatBytes(stats.total_bytes)}</span>
+            <span>Embeddings: {formatBytes(stats.total_bytes)}</span>
+            <span>Voice clips: {formatBytes(stats.audio_bytes)} ({stats.clip_count} clips)</span>
           </div>
         </div>
       )}
@@ -538,6 +609,15 @@ export default function VoiceprintBrowser() {
         <div className="flex items-center justify-between mb-2">
           <h3 className="font-semibold">Confirmed speakers</h3>
           <div className="flex items-center gap-1">
+            <label className="text-xs px-2 py-1 bg-gray-100 rounded flex items-center gap-1 cursor-pointer" title="Show only unverified voiceprints">
+              <input
+                type="checkbox"
+                checked={hideVerified}
+                onChange={(e) => setHideVerified(e.target.checked)}
+                aria-label="Hide verified voiceprints"
+              />
+              Hide verified
+            </label>
             <button
               onClick={expandAll}
               disabled={isAllExpanded || allIds.length === 0}
@@ -564,6 +644,7 @@ export default function VoiceprintBrowser() {
           data.speakers.map((sp) => {
             const key = `speaker:${sp.speaker_id}`;
             const isExpanded = expanded.has(key);
+            const rows = visiblePrototypes(sp);
             return (
               <div key={sp.speaker_id} className="mb-4 border-b pb-2">
                 <div className="flex items-center justify-between">
@@ -583,11 +664,26 @@ export default function VoiceprintBrowser() {
                     <span>
                       {sp.speaker_name} {sp.is_me ? '(you)' : ''} — {sp.prototype_count} prototypes
                     </span>
+                    {sp.unverified_count > 0 && (
+                      <span className="text-xs px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded" title="Unverified voiceprints">
+                        {sp.unverified_count} new
+                      </span>
+                    )}
                     {!isExpanded && <span className="text-xs text-gray-400">(collapsed)</span>}
                   </button>
-                  <button onClick={() => setPicker({ mode: 'replace', sourceId: sp.speaker_id, sourceName: sp.speaker_name })} className="text-xs px-2 py-1 bg-amber-100 rounded">
-                    Replace speaker across meetings
-                  </button>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => handleVerifySpeaker(sp.speaker_id)}
+                      disabled={sp.unverified_count === 0}
+                      className="text-xs px-2 py-1 bg-green-100 rounded disabled:opacity-40"
+                      title="Mark all prototypes of this speaker as verified"
+                    >
+                      Verify all
+                    </button>
+                    <button onClick={() => setPicker({ mode: 'replace', sourceId: sp.speaker_id, sourceName: sp.speaker_name })} className="text-xs px-2 py-1 bg-amber-100 rounded">
+                      Replace speaker across meetings
+                    </button>
+                  </div>
                 </div>
                 {isExpanded ? (
                   <table id={`section-${key}`} className="w-full text-xs mt-2">
@@ -601,24 +697,33 @@ export default function VoiceprintBrowser() {
                       </tr>
                     </thead>
                     <tbody>
-                      {sp.prototypes.map((row) => {
+                      {rows.map((row) => {
                         const hasProvenance = row.meeting_id != null && row.audio_start_time != null;
-                        const disabledPlay = row.audio_start_time == null || row.audio_end_time == null;
+                        const disabledPlay = !row.has_audio && (row.audio_start_time == null || row.audio_end_time == null);
                         const isPlayingRow = playingRowId === row.id && player.isPlaying;
                         const isFailedRow = failedRowId === row.id;
+                        const verified = row.is_verified !== 0;
                         return (
                           <tr key={row.id} className="border-t">
                             <td>{row.channel}</td>
                             <td>{row.duration_secs.toFixed(2)}s</td>
                             <td>
                               {hasProvenance ? `${row.meeting_title ?? 'deleted meeting'} / ${row.cluster_label ?? ''}` : <span className="italic text-gray-400">source unavailable</span>}
+                              {!row.has_audio && <span className="italic text-gray-400"> · no clip</span>}
                             </td>
                             <td>{row.audio_start_time != null && row.audio_end_time != null ? `${row.audio_start_time.toFixed(1)}–${row.audio_end_time.toFixed(1)}s` : '—'}</td>
-                            <td className="flex gap-1 py-1">
+                            <td className="flex gap-1 py-1 flex-wrap items-center">
                               <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs flex items-center gap-1 ${disabledPlay ? 'bg-gray-100 text-gray-400' : isFailedRow ? 'bg-red-600 text-white' : isPlayingRow ? 'bg-blue-700 text-white' : 'bg-blue-500 text-white'}`}>
                                 {isFailedRow ? <AlertCircle className="h-3 w-3" /> : isPlayingRow ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                                 Play clip
                               </button>
+                              {verified ? (
+                                <span className="px-2 py-0.5 text-xs text-green-700" title="Voice confirmed correct">✓ verified</span>
+                              ) : (
+                                <button onClick={() => handleVerifyRow(row)} className="px-2 py-0.5 bg-green-100 rounded text-xs" title="Confirm this voice is correct">
+                                  Verify
+                                </button>
+                              )}
                               <button onClick={() => handleReject(row, false)} className="px-2 py-0.5 bg-gray-200 rounded text-xs">
                                 Reject
                               </button>
@@ -629,10 +734,10 @@ export default function VoiceprintBrowser() {
                           </tr>
                         );
                       })}
-                      {sp.prototypes.length === 0 && (
+                      {rows.length === 0 && (
                         <tr>
                           <td colSpan={5} className="text-center text-gray-400 py-2">
-                            No voiceprints — reconfirm from unconfirmed below
+                            {hideVerified ? 'All voiceprints verified — nothing new to review' : 'No voiceprints — reconfirm from unconfirmed below'}
                           </td>
                         </tr>
                       )}
@@ -673,26 +778,42 @@ export default function VoiceprintBrowser() {
           data.unconfirmed.map((mg) => {
             const key = `meeting:${mg.meeting_id}`;
             const isExpanded = expanded.has(key);
+            const rows = visibleCaches(mg);
             return (
               <div key={mg.meeting_id} className="mb-4 border-b pb-2">
-                <button
-                  onClick={() => toggleGroup(key)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      toggleGroup(key);
-                    }
-                  }}
-                  aria-expanded={isExpanded}
-                  aria-controls={`section-${key}`}
-                  className="flex items-center gap-2 font-medium text-left hover:bg-gray-50 px-1 py-0.5 rounded w-full"
-                >
-                  {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                  <span>
-                    {mg.meeting_title} — {mg.caches.length} caches
-                  </span>
-                  {!isExpanded && <span className="text-xs text-gray-400">(collapsed)</span>}
-                </button>
+                <div className="flex items-center justify-between">
+                  <button
+                    onClick={() => toggleGroup(key)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        toggleGroup(key);
+                      }
+                    }}
+                    aria-expanded={isExpanded}
+                    aria-controls={`section-${key}`}
+                    className="flex items-center gap-2 font-medium text-left hover:bg-gray-50 px-1 py-0.5 rounded"
+                  >
+                    {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                    <span>
+                      {mg.meeting_title} — {mg.caches.length} caches
+                    </span>
+                    {mg.unverified_count > 0 && (
+                      <span className="text-xs px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded" title="Unverified caches">
+                        {mg.unverified_count} new
+                      </span>
+                    )}
+                    {!isExpanded && <span className="text-xs text-gray-400">(collapsed)</span>}
+                  </button>
+                  <button
+                    onClick={() => handleVerifyMeeting(mg.meeting_id)}
+                    disabled={mg.unverified_count === 0}
+                    className="text-xs px-2 py-1 bg-green-100 rounded disabled:opacity-40"
+                    title="Mark all caches of this meeting as verified"
+                  >
+                    Verify all
+                  </button>
+                </div>
                 {isExpanded ? (
                   <table id={`section-${key}`} className="w-full text-xs mt-2">
                     <thead>
@@ -705,21 +826,29 @@ export default function VoiceprintBrowser() {
                       </tr>
                     </thead>
                     <tbody>
-                      {mg.caches.map((row) => {
-                        const disabledPlay = row.audio_start_time == null || row.audio_end_time == null;
+                      {rows.map((row) => {
+                        const disabledPlay = !row.has_audio && (row.audio_start_time == null || row.audio_end_time == null);
                         const isPlayingRow = playingRowId === row.id && player.isPlaying;
                         const isFailedRow = failedRowId === row.id;
+                        const verified = row.is_verified !== 0;
                         return (
                           <tr key={row.id} className="border-t">
                             <td>{row.channel}</td>
                             <td>{row.duration_secs.toFixed(2)}s</td>
-                            <td>{row.cluster_label}</td>
+                            <td>{row.cluster_label}{!row.has_audio && <span className="italic text-gray-400"> · no clip</span>}</td>
                             <td>{row.audio_start_time != null && row.audio_end_time != null ? `${row.audio_start_time.toFixed(1)}–${row.audio_end_time.toFixed(1)}s` : '—'}</td>
-                            <td className="flex gap-1 py-1">
+                            <td className="flex gap-1 py-1 flex-wrap items-center">
                               <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs flex items-center gap-1 ${disabledPlay ? 'bg-gray-100 text-gray-400' : isFailedRow ? 'bg-red-600 text-white' : isPlayingRow ? 'bg-blue-700 text-white' : 'bg-blue-500 text-white'}`}>
                                 {isFailedRow ? <AlertCircle className="h-3 w-3" /> : isPlayingRow ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                                 Play clip
                               </button>
+                              {verified ? (
+                                <span className="px-2 py-0.5 text-xs text-green-700" title="Voice confirmed correct">✓ verified</span>
+                              ) : (
+                                <button onClick={() => handleVerifyRow(row)} className="px-2 py-0.5 bg-green-100 rounded text-xs" title="Confirm this voice is correct">
+                                  Verify
+                                </button>
+                              )}
                               <button onClick={() => setPicker({ mode: 'reconfirm', rowId: row.id })} className="px-2 py-0.5 bg-green-100 rounded text-xs">
                                 Reconfirm
                               </button>
@@ -730,6 +859,13 @@ export default function VoiceprintBrowser() {
                           </tr>
                         );
                       })}
+                      {rows.length === 0 && (
+                        <tr>
+                          <td colSpan={5} className="text-center text-gray-400 py-2">
+                            {hideVerified ? 'All caches verified — nothing new to review' : 'No caches'}
+                          </td>
+                        </tr>
+                      )}
                     </tbody>
                   </table>
                 ) : null}

@@ -169,6 +169,17 @@ The system SHALL provide voiceprint storage statistics (registry speaker count, 
 - **WHEN** user opens the speaker/diarization section of Settings
 - **THEN** the UI SHALL show the current voiceprint storage usage (counts and human-readable size)
 
+### Requirement: Audio clip bytes reported separately
+The storage statistics command SHALL additionally report total stored audio-clip bytes and the count of rows carrying a clip, separately from embedding bytes. The Settings display SHALL show audio storage alongside embedding storage using the same human-readable size formatting.
+
+#### Scenario: Audio bytes shown separately
+- **WHEN** the browser loads with embedding bytes and audio-clip bytes present
+- **THEN** the summary SHALL show both sizes distinctly rather than merging them into one number
+
+#### Scenario: Zero audio shows zero
+- **WHEN** no voiceprint row carries an audio clip
+- **THEN** the audio portion of the summary SHALL show zero without error
+
 ### Requirement: Confirm an auto-assigned binding as correct
 The system SHALL let the user confirm that an automatically recognized speaker binding is correct without changing the name. Confirming SHALL flip the binding to user provenance: for a cluster-binding share, `meeting_speakers.matched_by` SHALL become `'user'` and `match_score` SHALL be cleared; for a single-block override, the block SHALL be marked overridden so it reads as user provenance. Confirming SHALL NOT re-enroll or duplicate the already-present voiceprint.
 
