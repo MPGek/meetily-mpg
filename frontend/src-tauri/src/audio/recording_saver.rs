@@ -313,6 +313,17 @@ impl RecordingSaver {
         // Write initial metadata.json
         self.write_metadata(&meeting_folder, &metadata)?;
 
+        // Init the pending-tag set for this recording (change:
+        // tags-before-during-recording). Fresh starts — including tray and
+        // auto starts — begin with an empty set; best-effort so a tags
+        // failure can never break recording setup.
+        if let Err(e) = crate::summary::metadata::write_pending_tag_ids_to_metadata(
+            &meeting_folder,
+            &[],
+        ) {
+            warn!("Failed to init pending tags: {}", e);
+        }
+
         self.meeting_folder = Some(meeting_folder);
         self.metadata = Some(metadata);
 

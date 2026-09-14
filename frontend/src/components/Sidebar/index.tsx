@@ -31,11 +31,16 @@ import Info from '../Info';
 import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group';
+import { detectTitleLang, formatMeetingDate, TagPills, TagEditorPopover } from '@/components/MeetingTags';
+import type { MeetingTag } from '@/lib/meeting-tags';
 
 interface SidebarItem {
   id: string;
   title: string;
   type: 'folder' | 'file';
+  created_at?: string;
+  started_at?: string | null;
+  tags?: MeetingTag[];
   children?: SidebarItem[];
 }
 
@@ -54,7 +59,8 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
-    serverAddress
+    serverAddress,
+    refetchMeetings
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
@@ -258,6 +264,9 @@ const Sidebar: React.FC = () => {
   // Combine search results with sidebar items
   const filteredSidebarItems = useMemo(() => {
     if (!searchQuery.trim()) return sidebarItems;
+    const q = searchQuery.toLowerCase();
+    const matchesTags = (item: SidebarItem) =>
+      (item.tags ?? []).some((t) => t.name.toLowerCase().includes(q));
 
     // If we have search results, highlight matching meetings
     if (searchResults.length > 0) {
@@ -270,13 +279,16 @@ const Sidebar: React.FC = () => {
           if (folder.type === 'folder') {
             if (!folder.children) return folder;
 
-            // Filter children based on search results or title match
+            // Filter children based on search results or title/tag match
             const filteredChildren = folder.children.filter(item => {
               // Include if the meeting ID is in our search results
               if (matchedMeetingIds.has(item.id)) return true;
 
               // Or if the title matches the search query
-              return item.title.toLowerCase().includes(searchQuery.toLowerCase());
+              if (item.title.toLowerCase().includes(q)) return true;
+
+              // Or if any tag matches
+              return matchesTags(item);
             });
 
             return {
@@ -287,12 +299,13 @@ const Sidebar: React.FC = () => {
 
           // For non-folder items, check if they match the search
           return (matchedMeetingIds.has(folder.id) ||
-            folder.title.toLowerCase().includes(searchQuery.toLowerCase()))
+            folder.title.toLowerCase().includes(q) ||
+            matchesTags(folder))
             ? folder : undefined;
         })
         .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
     } else {
-      // Fall back to title-only filtering if no transcript results
+      // Fall back to title/tag filtering if no transcript results
       return sidebarItems
         .map(folder => {
           // Always include folders in the results
@@ -301,7 +314,7 @@ const Sidebar: React.FC = () => {
 
             // Filter children based on search query
             const filteredChildren = folder.children.filter(item =>
-              item.title.toLowerCase().includes(searchQuery.toLowerCase())
+              item.title.toLowerCase().includes(q) || matchesTags(item)
             );
 
             return {
@@ -311,7 +324,7 @@ const Sidebar: React.FC = () => {
           }
 
           // For non-folder items, check if they match the search
-          return folder.title.toLowerCase().includes(searchQuery.toLowerCase()) ? folder : undefined;
+          return (folder.title.toLowerCase().includes(q) || matchesTags(folder)) ? folder : undefined;
         })
         .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
     }
@@ -397,7 +410,7 @@ const Sidebar: React.FC = () => {
 
       // Update current meeting if it's the one being edited
       if (currentMeeting?.id === meetingId) {
-        setCurrentMeeting({ id: meetingId, title: newTitle });
+        setCurrentMeeting({ ...currentMeeting, id: meetingId, title: newTitle });
       }
 
       // Track the edit
@@ -553,7 +566,11 @@ const Sidebar: React.FC = () => {
 
   const renderItem = (item: SidebarItem, depth = 0) => {
     const isExpanded = expandedFolders.has(item.id);
-    const paddingLeft = `${depth * 12 + 12}px`;
+    // Meeting file rows use a tighter left gutter so the icon sits closer
+    // to the edge and the title gets maximum width.
+    const paddingLeft = item.type === 'file'
+      ? `${depth * 12 + 4}px`
+      : `${depth * 12 + 12}px`;
     const isActive = item.type === 'file' && currentMeeting?.id === item.id;
     const isMeetingItem = item.id.includes('-') && !item.id.startsWith('intro-call');
 
@@ -577,7 +594,7 @@ const Sidebar: React.FC = () => {
             if (item.type === 'folder') {
               toggleFolder(item.id);
             } else {
-              setCurrentMeeting({ id: item.id, title: item.title });
+              setCurrentMeeting({ id: item.id, title: item.title, created_at: item.created_at, started_at: item.started_at ?? null, tags: item.tags ?? [] });
               const basePath = item.id.startsWith('intro-call') ? '/' :
                 item.id.includes('-') ? `/meeting-details?id=${item.id}` : `/notes/${item.id}`;
               router.push(basePath);
@@ -604,20 +621,35 @@ const Sidebar: React.FC = () => {
               )}
             </>
           ) : (
-            <div className="flex flex-col w-full">
-              <div className="flex items-center w-full">
+            <div className="flex min-w-0 flex-col w-full">
+              {/* Title line: icon + full-width wrapping title, no buttons */}
+              <div className="flex w-full items-start gap-1">
                 {isMeetingItem ? (
-                  <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-gray-100">
-                    <File className="w-3.5 h-3.5 text-gray-600" />
+                  <div className="mt-px flex-shrink-0 flex items-center justify-center w-5 h-5 rounded-full mr-1 bg-gray-100">
+                    <File className="w-3 h-3 text-gray-600" />
                   </div>
                 ) : (
-                  <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-100">
-                    <Plus className="w-3.5 h-3.5 text-blue-600" />
+                  <div className="mt-px flex-shrink-0 flex items-center justify-center w-5 h-5 rounded-full mr-1 bg-blue-100">
+                    <Plus className="w-3 h-3 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">{item.title}</span>
-                {isMeetingItem && (
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                <span className="flex-1 min-w-0 break-words hyphens-auto text-xs font-medium line-clamp-3" title={item.title} lang={detectTitleLang(item.title)}>{item.title}</span>
+              </div>
+
+              {isMeetingItem && (
+                <div className="ml-6 flex items-center gap-1">
+                  <div
+                    className="min-w-0 flex-1 truncate text-[11px] leading-4 text-gray-500 tabular-nums"
+                    title={item.started_at ?? item.created_at ?? ''}
+                  >
+                    {formatMeetingDate(item.started_at ?? item.created_at)}
+                  </div>
+                  <div className="flex flex-shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity duration-150">
+                    <TagEditorPopover
+                      meetingId={item.id}
+                      assigned={item.tags ?? []}
+                      onChanged={() => refetchMeetings()}
+                    />
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -626,7 +658,7 @@ const Sidebar: React.FC = () => {
                       className="hover:text-blue-600 p-1 rounded-md hover:bg-blue-50 flex-shrink-0"
                       aria-label="Edit meeting title"
                     >
-                      <Pencil className="w-4 h-4" />
+                      <Pencil className="w-3.5 h-3.5" />
                     </button>
                     <button
                       onClick={(e) => {
@@ -636,15 +668,21 @@ const Sidebar: React.FC = () => {
                       className="hover:text-red-600 p-1 rounded-md hover:bg-red-50 flex-shrink-0"
                       aria-label="Delete meeting"
                     >
-                      <Trash2 className="w-4 h-4" />
+                      <Trash2 className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                )}
-              </div>
+                </div>
+              )}
+
+              {isMeetingItem && (item.tags?.length ?? 0) > 0 && (
+                <div className="ml-6 min-w-0">
+                  <TagPills tags={item.tags ?? []} />
+                </div>
+              )}
 
               {/* Show transcript match snippet if available */}
               {hasTranscriptMatch && (
-                <div className="mt-1 ml-8 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
+                <div className="mt-1 ml-6 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
                   <span className="font-medium text-yellow-600">Match:</span> {matchingResult.matchContext}
                 </div>
               )}

@@ -871,6 +871,17 @@ pub fn run() {
             database::speaker_commands::find_or_create_speaker,
             database::speaker_commands::preview_replace_speaker,
             database::speaker_commands::clear_all_voiceprints,
+            // Meeting tag dictionary + links (meeting-notes-list-display-tags)
+            database::tag_commands::list_tags,
+            database::tag_commands::create_tag,
+            database::tag_commands::rename_tag,
+            database::tag_commands::set_tag_color,
+            database::tag_commands::delete_tag,
+            database::tag_commands::assign_tag,
+            database::tag_commands::unassign_tag,
+            database::tag_commands::create_and_assign_tag,
+            database::tag_commands::get_recording_pending_tags,
+            database::tag_commands::set_recording_pending_tags,
             // Online session finalization and live speaker assignment
             audio::recording_commands::finalize_online_session,
             audio::recording_commands::assign_live_speaker,

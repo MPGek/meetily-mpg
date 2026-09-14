@@ -16,6 +16,8 @@ import { useModalState } from '@/hooks/useModalState';
 import { useRecordingStateSync } from '@/hooks/useRecordingStateSync';
 import { useRecordingStart } from '@/hooks/useRecordingStart';
 import { useRecordingStop } from '@/hooks/useRecordingStop';
+import { usePendingRecordingTags } from '@/hooks/usePendingRecordingTags';
+import { PendingTagsPicker } from '@/components/MeetingTags';
 import { useTranscriptRecovery } from '@/hooks/useTranscriptRecovery';
 import { TranscriptRecovery } from '@/components/TranscriptRecovery';
 import { indexedDBService } from '@/services/indexedDBService';
@@ -48,6 +50,10 @@ export default function Home() {
     setIsRecordingState,
     setIsRecordingDisabled
   );
+
+  // Pending tag set for the upcoming / in-progress recording (shared by the
+  // pre-start picker and the in-recording editor below).
+  const pendingTags = usePendingRecordingTags(isRecording);
 
   // Recovery hook
   const {
@@ -225,11 +231,18 @@ export default function Home() {
           status !== RecordingStatus.SAVING && (
             <div className="fixed bottom-12 left-0 right-0 z-10">
               <div
-                className="flex justify-center pl-8 transition-[margin] duration-300"
+                className="flex flex-col items-center gap-2 pl-8 transition-[margin] duration-300"
                 style={{
                   marginLeft: sidebarCollapsed ? '4rem' : '16rem'
                 }}
               >
+                <PendingTagsPicker
+                  pending={pendingTags.pending}
+                  onToggle={pendingTags.toggle}
+                  onCreate={pendingTags.create}
+                  onRemove={pendingTags.remove}
+                  label={isRecording ? 'Tags for this recording' : 'Tag this recording'}
+                />
                 <div className="w-2/3 max-w-[750px] flex justify-center">
                   <div className="bg-white rounded-full shadow-lg flex items-center">
                     <RecordingControls

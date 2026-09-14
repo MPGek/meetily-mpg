@@ -6,10 +6,10 @@ use tauri_plugin_store::StoreExt;
 
 use crate::{
     database::{
-        models::MeetingModel,
+        models::{MeetingModel, MeetingTag},
         repositories::{
             meeting::MeetingsRepository, setting::SettingsRepository,
-            transcript::TranscriptsRepository,
+            tags::TagsRepository, transcript::TranscriptsRepository,
         },
     },
     state::AppState,
@@ -30,6 +30,14 @@ pub struct ApiResponse<T> {
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub created_at: String,
+    /// When the recording began (change: recording-start-time). Optional for
+    /// backward compatibility; readers fall back to `created_at`.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<MeetingTag>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -357,11 +365,22 @@ pub async fn api_get_meetings<R: Runtime>(
         Ok(meeting_models) => {
             log_info!("Successfully got {} meetings", meeting_models.len());
 
+            let ids: Vec<String> = meeting_models.iter().map(|m| m.id.clone()).collect();
+            let tags_by_meeting = TagsRepository::tags_for_meetings(pool, &ids)
+                .await
+                .unwrap_or_default();
+
             let result: Vec<Meeting> = meeting_models
                 .into_iter()
-                .map(|m| Meeting {
-                    id: m.id,
-                    title: m.title,
+                .map(|m| {
+                    let tags = tags_by_meeting.get(&m.id).cloned().unwrap_or_default();
+                    Meeting {
+                        id: m.id.clone(),
+                        title: m.title.clone(),
+                        created_at: m.created_at.0.to_rfc3339(),
+                        started_at: m.started_at.map(|s| s.0.to_rfc3339()),
+                        tags,
+                    }
                 })
                 .collect();
             Ok(result)
@@ -1022,9 +1041,58 @@ pub async fn api_save_meeting_title<R: Runtime>(
     }
 }
 
+/// Link the recording's pending tag ids (from the meeting folder's
+/// `metadata.json`) to a newly saved meeting. Best-effort per tag: returns
+/// human-readable warnings for skipped/failed ids, never errors — the meeting
+/// save must not fail because of tags (change: tags-before-during-recording).
+async fn link_recording_pending_tags(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    folder_path: Option<&str>,
+) -> Vec<String> {
+    let Some(folder) = folder_path else {
+        return Vec::new();
+    };
+    let pending = match crate::summary::metadata::read_pending_tag_ids_from_metadata(
+        std::path::Path::new(folder),
+    ) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log_warn!("Failed to read pending tags for {}: {}", meeting_id, e);
+            return vec!["Could not read pending tags for this recording.".to_string()];
+        }
+    };
+    let mut warnings = Vec::new();
+    for tag_id in pending {
+        match TagsRepository::assign_tag(pool, meeting_id, &tag_id).await {
+            Ok(_) => {}
+            Err(sqlx::Error::RowNotFound) => {
+                log_warn!(
+                    "Pending tag {} no longer exists, skipping for meeting {}",
+                    tag_id,
+                    meeting_id
+                );
+                warnings.push(format!(
+                    "Tag no longer exists and was skipped: {}",
+                    tag_id
+                ));
+            }
+            Err(e) => {
+                log_warn!(
+                    "Failed to link pending tag {} to meeting {}: {}",
+                    tag_id,
+                    meeting_id,
+                    e
+                );
+                warnings.push(format!("Could not assign tag: {}", tag_id));
+            }
+        }
+    }
+    warnings
+}
+
 #[tauri::command]
-pub async fn api_save_transcript<R: Runtime>(
-    _app: AppHandle<R>,
+pub async fn api_save_transcript<R: Runtime>(    _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
@@ -1071,6 +1139,10 @@ pub async fn api_save_transcript<R: Runtime>(
 
     let pool = state.db_manager.pool();
 
+    // Cloned before the save call below moves `folder_path`; needed for
+    // pending-tag linking after the meeting row exists.
+    let pending_tags_folder = folder_path.clone();
+
     // Now, call the repository with the correctly typed data.
     match TranscriptsRepository::save_transcript(
         pool,
@@ -1085,10 +1157,18 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            // Link pending recording tags (change:
+            // tags-before-during-recording). Best-effort per tag: stale ids
+            // (tag deleted mid-recording) are skipped with a warning, and a
+            // tag failure never fails the meeting save.
+            let tag_warnings =
+                link_recording_pending_tags(pool, &meeting_id, pending_tags_folder.as_deref())
+                    .await;
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",
-                "meeting_id": meeting_id
+                "meeting_id": meeting_id,
+                "tag_warnings": tag_warnings,
             }))
         }
         Err(e) => {
@@ -1500,5 +1580,100 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                 Err(format!("Connection failed: {}", e))
             }
         }
+    }
+}
+#[cfg(test)]
+mod pending_tags_tests {
+    use super::*;
+    use crate::database::repositories::tags::TagsRepository;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn setup_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn pending_tags_link_to_new_meeting() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("meeting-1")
+            .bind("M")
+            .bind("2026-09-11T15:30:00Z")
+            .bind("2026-09-11T15:30:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let work = TagsRepository::create_tag(&pool, "Work", None).await.unwrap();
+        let q3 = TagsRepository::create_tag(&pool, "Q3", None).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::json!({ "pending_tag_ids": [&work.id, &q3.id] }).to_string(),
+        )
+        .unwrap();
+
+        let warnings =
+            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path().to_str().unwrap()))
+                .await;
+        assert!(warnings.is_empty(), "unexpected warnings");
+
+        let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
+            .await
+            .unwrap();
+        let ids: Vec<&str> = linked["meeting-1"].iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&work.id.as_str()));
+        assert!(ids.contains(&q3.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn stale_pending_id_warns_without_failing() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("meeting-1")
+            .bind("M")
+            .bind("2026-09-11T15:30:00Z")
+            .bind("2026-09-11T15:30:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let work = TagsRepository::create_tag(&pool, "Work", None).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::json!({ "pending_tag_ids": [&work.id, "tag-deleted-mid-recording"] })
+                .to_string(),
+        )
+        .unwrap();
+
+        let warnings =
+            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path().to_str().unwrap()))
+                .await;
+        assert_eq!(warnings.len(), 1);
+
+        let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(linked["meeting-1"].len(), 1);
+        assert_eq!(linked["meeting-1"][0].id, work.id);
+    }
+
+    #[tokio::test]
+    async fn no_folder_means_no_warnings() {
+        let pool = setup_pool().await;
+        let warnings = link_recording_pending_tags(&pool, "meeting-1", None).await;
+        assert!(warnings.is_empty());
     }
 }

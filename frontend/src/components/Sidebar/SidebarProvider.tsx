@@ -5,18 +5,25 @@ import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import type { MeetingTag } from '@/lib/meeting-tags';
 
 
 interface SidebarItem {
   id: string;
   title: string;
   type: 'folder' | 'file';
+  created_at?: string;
+  started_at?: string | null;
+  tags?: MeetingTag[];
   children?: SidebarItem[];
 }
 
 export interface CurrentMeeting {
   id: string;
   title: string;
+  created_at?: string;
+  started_at?: string | null;
+  tags?: MeetingTag[];
 }
 
 // Search result type for transcript search
@@ -86,10 +93,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string }>;
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at?: string, started_at?: string | null, tags?: MeetingTag[] }>;
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
-          title: meeting.title
+          title: meeting.title,
+          created_at: meeting.created_at,
+          started_at: meeting.started_at ?? null,
+          tags: meeting.tags ?? [],
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -119,7 +129,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       title: 'Meeting Notes',
       type: 'folder' as const,
       children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
+        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, created_at: meeting.created_at, started_at: meeting.started_at ?? null, tags: meeting.tags ?? [], type: 'file' as const }))
       ]
     },
   ];

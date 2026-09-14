@@ -356,6 +356,12 @@ export function useRecordingStop(
           // Refetch meetings and set current meeting
           await refetchMeetings();
 
+          // Surface pending-tag link warnings (change:
+          // tags-before-during-recording): the meeting itself is saved.
+          for (const warning of responseData.tag_warnings ?? []) {
+            toast.warning(warning);
+          }
+
           try {
             const meetingData = await storageService.getMeeting(meetingId);
             if (meetingData) {

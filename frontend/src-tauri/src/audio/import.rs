@@ -635,11 +635,18 @@ async fn run_import<R: Runtime>(
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
+    // Start-time proxy for the import (change: recording-start-time): the
+    // source file's mtime approximates when it was recorded; fall back to
+    // the import moment when unreadable. Read up-front — the copy must not
+    // disturb the source, and the value is needed at DB insert below.
+    let import_started_at = file_modified_utc(&source).unwrap_or_else(chrono::Utc::now);
+
     let meeting_id = create_meeting_with_transcripts(
         app_state.db_manager.pool(),
         &title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
+        import_started_at,
     )
     .await?;
 
@@ -683,12 +690,21 @@ fn emit_progress<R: Runtime>(app: &AppHandle<R>, stage: &str, progress: u32, mes
     );
 }
 
+/// File modification time as UTC, for the import start-time proxy (change:
+/// recording-start-time). Returns None when metadata/mtime is unreadable —
+/// callers fall back to the import moment.
+fn file_modified_utc(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(modified))
+}
+
 /// Create a new meeting with transcripts in the database
 async fn create_meeting_with_transcripts(
     pool: &sqlx::SqlitePool,
     title: &str,
     segments: &[TranscriptSegment],
     folder_path: String,
+    started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let meeting_id = format!("meeting-{}", Uuid::new_v4());
     let now = chrono::Utc::now();
@@ -704,13 +720,14 @@ async fn create_meeting_with_transcripts(
 
     // Insert meeting
     sqlx::query(
-        "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO meetings (id, title, created_at, updated_at, started_at, folder_path)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&meeting_id)
     .bind(title)
     .bind(now)
     .bind(now)
+    .bind(started_at)
     .bind(&folder_path)
     .execute(&mut *tx)
     .await
@@ -1476,5 +1493,64 @@ mod tests {
         println!("  - More opportunities for missing speech onset (first words)");
         println!("  - Less contextual information for transcription accuracy");
         println!("  - More fragmented output requiring more post-processing");
+    }
+
+    // Change: recording-start-time — import start-time proxy (file mtime).
+
+    #[test]
+    fn file_modified_utc_round_trips_filesystem_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio.mp3");
+        std::fs::write(&path, b"fake-audio").unwrap();
+
+        let got = file_modified_utc(&path).expect("mtime must be readable");
+        let expected = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let expected: chrono::DateTime<chrono::Utc> = expected.into();
+        assert_eq!(got, expected);
+        assert!(got <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn file_modified_utc_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(file_modified_utc(&dir.path().join("nope.mp3")).is_none());
+    }
+
+    #[tokio::test]
+    async fn import_insert_stores_explicit_started_at() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let started = chrono::DateTime::parse_from_rfc3339("2026-09-10T18:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let meeting_id = create_meeting_with_transcripts(
+            &pool,
+            "Imported",
+            &[],
+            "/tmp/folder".to_string(),
+            started,
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT started_at FROM meetings WHERE id = ?")
+                .bind(&meeting_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let stored = stored.expect("started_at must be non-empty");
+        assert!(stored.starts_with("2026-09-10T18:05:00"));
     }
 }

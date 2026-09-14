@@ -6,8 +6,15 @@ use sqlx::FromRow;
 pub struct MeetingModel {
     pub id: String,
     pub title: String,
+    /// When the DB row was created (stop/import time). Display prefers
+    /// `started_at` — see below. Ordering (`created_at DESC`) is unchanged.
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    /// When the recording actually began (change: recording-start-time).
+    /// Nullable: pre-feature rows are backfilled with `created_at` (their
+    /// stop time) by migration; readers fall back to `created_at`.
+    #[sqlx(default)]
+    pub started_at: Option<DateTimeUtc>,
     pub folder_path: Option<String>,
     #[sqlx(default)]
     pub diarization_status: Option<String>,
@@ -232,4 +239,44 @@ pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+// ===== Meeting tags (change: meeting-notes-list-display-tags) =====
+
+/// Fixed palette keys for tag colors. The stored `color` is a palette key
+/// (e.g. "blue"), never raw CSS, so the palette can be re-skinned later.
+pub const MEETING_TAG_PALETTE: &[&str] = &[
+    "blue", "green", "purple", "amber", "rose", "cyan", "teal", "orange", "lime",
+    "fuchsia",
+];
+
+/// Deterministic default palette key for a tag name (FNV-1a over the
+/// lowercased trimmed name). Same name always yields the same color.
+pub fn default_tag_color(name: &str) -> &'static str {
+    let lowered = name.trim().to_lowercase();
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in lowered.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    MEETING_TAG_PALETTE[(hash as usize) % MEETING_TAG_PALETTE.len()]
+}
+
+/// Tag dictionary row.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingTag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub created_at: DateTimeUtc,
+    pub updated_at: DateTimeUtc,
+}
+
+/// Tag with usage count for autocomplete ordering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTagWithUsage {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub usage_count: i64,
 }

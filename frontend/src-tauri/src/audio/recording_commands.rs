@@ -1537,14 +1537,16 @@ pub async fn get_recording_state() -> serde_json::Value {
 /// Returns the path if a meeting name was set and folder structure initialized
 #[tauri::command]
 pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
+    Ok(current_meeting_folder().map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Meeting folder of the active recording, if any. Shared helper for
+/// commands that operate on per-recording `metadata.json` keys.
+pub(crate) fn current_meeting_folder() -> Option<std::path::PathBuf> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
-    if let Some(manager) = manager_guard.as_ref() {
-        Ok(manager
-            .get_meeting_folder()
-            .map(|p| p.to_string_lossy().to_string()))
-    } else {
-        Ok(None)
-    }
+    manager_guard
+        .as_ref()
+        .and_then(|manager| manager.get_meeting_folder())
 }
 
 /// Get accumulated transcript segments from current recording session

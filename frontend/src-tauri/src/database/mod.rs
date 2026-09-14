@@ -4,3 +4,4 @@ pub mod models;
 pub mod repositories;
 pub mod setup;
 pub mod speaker_commands;
+pub mod tag_commands;

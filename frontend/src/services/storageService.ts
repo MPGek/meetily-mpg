@@ -16,6 +16,7 @@ export interface SaveMeetingRequest {
 
 export interface SaveMeetingResponse {
   meeting_id: string;
+  tag_warnings?: string[];
 }
 
 export interface Meeting {

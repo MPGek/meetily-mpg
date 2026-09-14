@@ -3,6 +3,7 @@
 import { Transcript, TranscriptSegmentData } from '@/types';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
+import { MeetingTagsBar } from '@/components/MeetingTags';
 import { AudioPlayer, AudioPlayerHandle, PlaybackState } from '@/components/AudioPlayer';
 import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -195,6 +196,7 @@ export function TranscriptPanel({
           meetingFolderPath={meetingFolderPath}
           onRefetchTranscripts={onRefetchTranscripts}
         />
+        <MeetingTagsBar meetingId={meetingId} />
       </div>
 
       {/* Audio player bar under the top buttons */}
