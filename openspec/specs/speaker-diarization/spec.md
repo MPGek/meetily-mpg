@@ -15,7 +15,7 @@ The system SHALL run speaker diarization exclusively on the enhanced model set (
 - **THEN** the system SHALL log the error, notify the frontend that the enhanced models are required, and SHALL NOT run diarization with a fallback model set
 
 ### Requirement: Diarization model management
-The system SHALL support the enhanced diarization model set (pyannote `segmentation-3.0` + TitaNet-Large) bundled at build time, resolving model files through a 3-location fallback chain — `app_data_dir/models` → `resource_dir/models` → `CARGO_MANIFEST_DIR/models` (dev) — and verified by file existence and size (>1 KB; SHA-256 when published). There SHALL be no runtime download or removal capability. The `check_diarization_models` command and the diarization engine SHALL use the same resolver so their readiness decisions never disagree. The system SHALL remove stale model files from the model directory when model status is checked.
+The system SHALL support the enhanced diarization model set (pyannote `segmentation-3.0` + TitaNet-Large) resolving model files through a 3-location fallback chain — `app_data_dir/models` → `resource_dir/models` → `CARGO_MANIFEST_DIR/models` (dev) — and verified by file existence and size (>1 KB; SHA-256 when published). There SHALL be no runtime download or removal capability. The VBx PLDA parameter files SHALL NOT be bundled: the vendored parameters require 256-dimensional embeddings while the enhanced TitaNet-Large family is 192-dimensional, so the `vbx` clusterer kind SHALL fail with an actionable error on this model family (no silent kind switch). The `check_diarization_models` command and the diarization engine SHALL use the same resolver so their readiness decisions never disagree. The system SHALL remove stale model files from the model directory when model status is checked.
 
 #### Scenario: Download diarization models
 - **WHEN** user opens the diarization settings section
@@ -36,6 +36,14 @@ The system SHALL support the enhanced diarization model set (pyannote `segmentat
 #### Scenario: Missing or corrupt model detected
 - **WHEN** a required enhanced model file is missing or fails verification in all three fallback locations
 - **THEN** the system SHALL report the model as unavailable in the settings panel and diarization SHALL fail with a clear error listing all searched locations and noting that the models are bundled at build time near the executable
+
+#### Scenario: VBx clusterer with the enhanced 192-d model family
+- **WHEN** offline diarization runs with clusterer kind `vbx` on the enhanced TitaNet-Large model set (192-d embeddings, incompatible with the 256-d PLDA parameters)
+- **THEN** the run SHALL fail with an actionable error naming the `vbx` embedding-dimension requirement, and SHALL NOT silently switch clusterers
+
+#### Scenario: Automatic-count and AHC kinds without PLDA assets
+- **WHEN** offline diarization runs with clusterer kind `ahc` or `nmesc` and no PLDA parameter files are present
+- **THEN** diarization SHALL succeed normally, as the PLDA files are not required for those kinds
 
 ### Requirement: Enhanced model resolution across install locations
 The system SHALL resolve the enhanced diarization model directory by searching `app_data_dir/models`, then `resource_dir/models` (Tauri bundled resources next to the executable), then `CARGO_MANIFEST_DIR/models` (dev), in that priority order. The first location where *both* `segmentation-3.0.onnx` and `titanet_large.onnx` pass `verify_enhanced_integrity` (existence + size >1 KB) SHALL be selected as the active models directory. `app_data` takes priority so a user-placed override wins; `resource_dir` is the production bundle location; `manifest` is dev fallback.
@@ -61,11 +69,11 @@ The system SHALL resolve the enhanced diarization model directory by searching `
 - **THEN** diarization SHALL succeed via the manifest fallback location without requiring files in AppData or resources
 
 ### Requirement: Speaker diarization pipeline
-The system SHALL provide a speaker diarization pipeline using the enhanced polyvoice ONNX model set (pyannote `segmentation-3.0` segmentation, TitaNet-Large speaker embedding, and agglomerative clustering) that processes recorded audio and assigns speaker labels to transcript segments. The pipeline SHALL resolve its segmentation and embedding models through the 3-location fallback chain and SHALL utilize multiple CPU cores during embedding extraction, process stereo channels concurrently, and cap memory growth for long recordings. Clustering SHALL honor runtime-configurable merge parameters and an always-enforced speaker-count ceiling as specified by the diarization-param-tuning capability, with built-in defaults chosen by the measured sweep protocol.
+The system SHALL provide a speaker diarization pipeline using the enhanced polyvoice ONNX model set (pyannote `segmentation-3.0` segmentation with calibrated onset/offset hysteresis binarization, TitaNet-Large speaker embedding extracted over dense resegmentation windows, and automatic speaker-count clustering) that processes recorded audio and assigns speaker labels to transcript segments. The pipeline SHALL resolve its segmentation and embedding models through the 3-location fallback chain and SHALL utilize multiple CPU cores during embedding extraction, process stereo channels concurrently, and cap memory growth for long recordings. Offline clustering SHALL run the resegmentation-based architecture (dense embedding windows, hysteresis binarization, overlap-aware two-speaker assignment, gap-fill) with the clusterer kind (automatic-count NME-SC or VBx, or fixed-threshold AHC) and its parameters resolved from the runtime-configurable parameter surface specified by the diarization-param-tuning capability, with built-in defaults chosen by the measured sweep protocol.
 
 #### Scenario: Successful diarization of a meeting
 - **WHEN** diarization is triggered for a saved meeting with valid audio and the enhanced models are present in any fallback location
-- **THEN** the system runs segmentation, embedding extraction, and clustering via the resolved model directory, and assigns `speaker` values ("SPEAKER_00", "SPEAKER_01", etc.) to matching transcript segments
+- **THEN** the system runs segmentation, dense embedding extraction, resegmentation, and clustering via the resolved model directory, and assigns `speaker` values ("SPEAKER_00", "SPEAKER_01", etc.) to matching transcript segments
 
 #### Scenario: Diarization handles missing audio file
 - **WHEN** diarization is triggered but the meeting has no audio file
@@ -85,11 +93,15 @@ The system SHALL provide a speaker diarization pipeline using the enhanced polyv
 
 #### Scenario: Long recordings process without unbounded memory growth
 - **WHEN** offline diarization runs on a recording of any length
-- **THEN** the system SHALL process each channel in overlapping chunks, accumulating only embeddings and segment metadata between chunks, so peak memory does not grow linearly with recording duration
+- **THEN** the system SHALL process each channel in overlapping chunks, accumulating only embeddings, frame posteriors, and segment metadata between chunks, so peak memory does not grow linearly with recording duration
 
 #### Scenario: Offline clustering respects the speaker-count ceiling
 - **WHEN** offline diarization clusters a channel's embeddings
-- **THEN** the number of distinct speaker labels in the result does not exceed the effective ceiling (user max-speakers when set, otherwise the configured default ceiling), and the clustering merge threshold and gap-merge window come from the resolved runtime parameters
+- **THEN** the number of distinct speaker labels in the result does not exceed the effective ceiling (user max-speakers when set, otherwise the configured default ceiling), and the clusterer kind, merge threshold, and gap-fill window come from the resolved runtime parameters
+
+#### Scenario: Speaker count is inferred automatically
+- **WHEN** offline diarization runs with an automatic-count clusterer kind (vbx or nmesc) and no user max-speakers is set
+- **THEN** the pipeline SHALL select the number of speakers from the embedding data rather than a fixed similarity threshold, subject to the enforced ceiling
 
 ### Requirement: Diarization trigger modes
 The system SHALL support automatic diarization after recording stops (when enabled) and manual diarization on any past meeting.
@@ -182,7 +194,7 @@ The system SHALL assign speaker labels to system-source transcripts by diarizing
 - **THEN** the segment's `speaker` SHALL remain NULL
 
 ### Requirement: Per-channel offline diarization
-The system SHALL process the microphone (left) and system (right) channels of a stereo recording independently during offline diarization, splitting the audio into two mono streams before segmentation.
+The system SHALL process the microphone (left) and system (right) channels of a stereo recording independently during offline diarization, splitting the audio into two mono streams before segmentation. The decision to split channels SHALL be based on the channel layout of the actually decoded audio, not on container/header metadata alone; when the decoded audio has two channels the system SHALL treat the recording as stereo and SHALL NOT downmix it into a single stream, even when the container reports missing or conflicting channel information.
 
 #### Scenario: Stereo recording diarized per channel
 - **WHEN** offline diarization runs on a stereo recording (2 channels, left=microphone, right=system)
@@ -191,6 +203,10 @@ The system SHALL process the microphone (left) and system (right) channels of a 
 #### Scenario: Silent channel produces no speakers
 - **WHEN** one channel of a stereo recording contains no speech
 - **THEN** the system SHALL produce no speaker segments for that channel and its transcripts SHALL remain unlabeled rather than failing the whole run
+
+#### Scenario: Container metadata lacks channel count
+- **WHEN** the container/header metadata does not expose a channel count but the decoded audio has two channels
+- **THEN** the system SHALL diarize the microphone and system channels independently and SHALL NOT mix them into a single stream
 
 ### Requirement: Channel-specific speaker IDs
 The system SHALL namespace speaker IDs by source channel so that cluster indices from the two independent diarization runs do not collide.
@@ -208,11 +224,15 @@ The system SHALL namespace speaker IDs by source channel so that cluster indices
 - **THEN** transcripts with `source_device="Microphone"` (or NULL) SHALL be matched against microphone-channel segments, and transcripts with `source_device="System"` SHALL be matched against system-channel segments
 
 ### Requirement: Mono recording fallback
-The system SHALL treat mono recordings (or files without a distinct system channel) as a single remote-only source during offline diarization.
+The system SHALL treat mono recordings (or files whose decoded audio has a single channel) as a single remote-only source during offline diarization. The system SHALL take the mono path only when the decoded audio genuinely has one channel; missing or unknown container metadata SHALL NOT by itself force a stereo recording onto the mono path.
 
 #### Scenario: Mono recording diarized as remote
 - **WHEN** offline diarization runs on a mono recording
 - **THEN** the system SHALL run the diarization pipeline once on the mono stream and assign all matched transcripts `SPEAKER_NN` IDs regardless of `source_device`
+
+#### Scenario: Unknown metadata on a stereo file
+- **WHEN** offline diarization runs on a file whose decoded audio has two channels but whose metadata reports one channel or is unknown
+- **THEN** the system SHALL follow the per-channel stereo path and SHALL NOT use the mono fallback
 
 ### Requirement: Prefixed speaker ID rendering
 The transcript view SHALL render both speaker ID namespaces correctly and degrade gracefully for legacy labels.
@@ -264,7 +284,7 @@ The system SHALL persist diarization configuration in user settings.
 
 ### Requirement: Clustering distinguishes distinct speakers
 
-The system SHALL cluster speaker embeddings with a fixed cosine-similarity threshold calibrated to the enhanced TitaNet-Large model family, so that distinct speakers in the audio are assigned distinct speaker labels rather than being merged into a single cluster.
+The system SHALL cluster speaker embeddings so that distinct speakers in the audio are assigned distinct speaker labels rather than being merged into a single cluster: with automatic-count kinds (vbx, nmesc) via speaker-count inference over the TitaNet-Large embedding set, and with the AHC kind via a fixed cosine-similarity threshold calibrated to the enhanced TitaNet-Large model family.
 
 #### Scenario: Multi-speaker meeting produces distinct labels
 
@@ -278,26 +298,28 @@ The system SHALL cluster speaker embeddings with a fixed cosine-similarity thres
 
 ### Requirement: Max speakers setting caps cluster count
 
-The system SHALL apply the user-configured `maxSpeakers` setting as a hard ceiling on the number of clusters produced during offline diarization when set, and SHALL apply the configured default speaker-count ceiling when the setting is unset or zero — the ceiling is always enforced (diarization-param-tuning).
+The system SHALL apply the user-configured `maxSpeakers` setting as a hard ceiling on the number of clusters produced during offline diarization when set, and SHALL apply the configured default speaker-count ceiling when the setting is unset or zero — the ceiling is always enforced for every clusterer kind (diarization-param-tuning). The effective ceiling SHALL be clamped to the clustering backend's supported maximum (255).
 
 #### Scenario: Max speakers set
 
 - **WHEN** offline diarization runs and the `maxSpeakers` setting is a positive value N
-- **THEN** the clustering SHALL produce at most min(N, configured default ceiling) distinct speaker labels
+- **THEN** the clustering SHALL produce at most min(N, configured default ceiling, 255) distinct speaker labels
 
 #### Scenario: Max speakers unset
 
 - **WHEN** offline diarization runs and the `maxSpeakers` setting is unset or zero
 - **THEN** the clustering SHALL apply the configured default speaker-count ceiling and infer the speaker count automatically within it
 
-### Requirement: Singleton cluster pruning
+### Requirement: Offline diarization reports overlapping speakers
+The offline pipeline SHALL assign up to two speakers to detected overlap regions, emitting temporally overlapping output segments with distinct speaker labels, and SHALL preserve single-label segments outside overlap regions.
 
-The system SHALL dissolve single-segment clusters by reassigning their segments to the nearest larger speaker cluster, preventing spurious fragment speakers from inflating the speaker count.
+#### Scenario: Overlap yields two speaker segments
+- **WHEN** offline diarization processes a region where two speakers talk simultaneously and both are active clusters
+- **THEN** the output SHALL contain overlapping-time-range segments labeled with the two distinct speakers rather than collapsing the region to one speaker
 
-#### Scenario: Singleton fragment reassigned
-
-- **WHEN** clustering produces a cluster containing fewer than two segments
-- **THEN** the system SHALL reassign that cluster's segments to the nearest cluster with at least two segments
+#### Scenario: Non-overlap regions stay single-labeled
+- **WHEN** offline diarization processes speech from a single active speaker
+- **THEN** the output segments for that region SHALL carry exactly one speaker label each
 
 ### Requirement: Batch embedding extraction
 The system SHALL extract speaker embeddings from all detected segments in a batch rather than one segment at a time.

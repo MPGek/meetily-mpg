@@ -69,3 +69,25 @@ The system SHALL align each **final** (non-partial) transcript segment's word to
 #### Scenario: Offline re-diarization repairs legacy meetings
 - **WHEN** offline diarization runs on a saved meeting whose transcript rows carry unrefined word tokens and alignment is enabled and available
 - **THEN** each segment's word tokens SHALL be refined against the meeting audio before tokens are attributed to speakers and cross-speaker segments are split
+
+### Requirement: Windowless audio decoding for alignment repair
+When the system extracts an audio span from a meeting's recorded audio for word-alignment refinement, it SHALL launch the external decoder without creating a visible console window on Windows.
+
+#### Scenario: Offline re-diarization repair
+- **WHEN** the user runs speaker re-analysis with word alignment enabled and audio spans are extracted from the meeting recording
+- **THEN** no console windows appear during the refinement
+
+#### Scenario: Stop-time finalize repair
+- **WHEN** recording stops and segments lacking refined tokens are refined from the saved meeting audio
+- **THEN** no console windows appear during the refinement
+
+### Requirement: Per-channel refinement uses the decoded channel layout
+When word-level refinement reads a meeting's saved audio per channel, the system SHALL determine whether the audio is stereo from the actually decoded audio, not from container/header metadata, so refined token times are mapped to the same microphone or system channel the segment was transcribed from.
+
+#### Scenario: Refining a segment from a stereo recording with unknown metadata
+- **WHEN** offline repair refines word tokens for a meeting whose saved audio has two decoded channels but no channel count in its metadata
+- **THEN** refinement SHALL read the segment's audio span from its `source_device` channel and SHALL NOT collapse both channels into one
+
+#### Scenario: Mono meeting refinement
+- **WHEN** offline repair refines word tokens for a meeting whose decoded audio has a single channel
+- **THEN** refinement SHALL read the span from that single stream

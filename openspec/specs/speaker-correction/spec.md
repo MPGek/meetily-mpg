@@ -6,11 +6,15 @@ Defines the shared behavior of inline speaker corrections in transcript editing 
 ## Requirements
 
 ### Requirement: Inline block correction enrolls the speaker
-When a user assigns a registry speaker (existing or newly created) to a transcript block — single-block or apply-to-all, in offline or live mode — the system SHALL enroll the embeddings whose time windows cover that block as ground-truth prototypes of that speaker, in addition to wiring the transcript/cluster mapping. Every enrolled prototype row SHALL carry full provenance (`meeting_id`, `cluster_label`, `audio_start_time`, `audio_end_time`) so the prototype is playable and navigable in the Voiceprint Browser. Enrollment SHALL obey the per-person prototype cap and SHALL keep microphone and system channel embeddings in separate seed sets. A correction that produces no retrievable audio embeddings (e.g. a legacy meeting with no cached clips) SHALL still apply the label mapping without error.
+When a user assigns a registry speaker (existing or newly created) to a transcript block — single-block or apply-to-all, in offline or live mode — the system SHALL enroll the embeddings whose time windows cover that block as ground-truth prototypes of that speaker, in addition to wiring the transcript/cluster mapping. For a single-block correction, enrollment SHALL be limited to embeddings whose time window overlaps the corrected block and whose capture channel matches the block's channel; the rest of the cluster SHALL NOT be enrolled, so a correction on a mixed cluster never moves sibling speakers' audio into the corrected speaker's set. Every enrolled prototype row SHALL carry full provenance (`meeting_id`, `cluster_label`, `audio_start_time`, `audio_end_time`) so the prototype is playable and navigable in the Voiceprint Browser. Enrollment SHALL obey the per-person prototype cap and SHALL keep microphone and system channel embeddings in separate seed sets. A correction that produces no retrievable audio embeddings (e.g. a legacy meeting with no cached clips) SHALL still apply the label mapping without error.
 
 #### Scenario: Offline single-block correction enrolls
-- **WHEN** the user assigns "Bob" to one speaker block of an offline diarized meeting and that block's time window overlaps cached embeddings
-- **THEN** the block SHALL be overridden to "Bob", and the overlapping offline embeddings SHALL be enrolled as Bob's prototypes with full provenance
+- **WHEN** the user assigns "Bob" to one speaker block of an offline diarized meeting and that block's time window overlaps cached embeddings of that block's cluster and channel
+- **THEN** the block SHALL be overridden to "Bob", and only the overlapping embeddings on that channel SHALL be enrolled as Bob's prototypes with full provenance
+
+#### Scenario: Correcting one speaker of a mixed cluster does not contaminate the others
+- **WHEN** a cluster contains blocks attributed to Bob, Carol, and Dave, and the user corrects only Bob's block to "Bob"
+- **THEN** only Bob's block's exemplars SHALL enter Bob's prototype set; Carol's and Dave's exemplars SHALL NOT be enrolled for Bob and SHALL remain attributed to their own speakers
 
 #### Scenario: Offline apply-to-all correction enrolls the cluster
 - **WHEN** the user assigns "Bob" to a cluster via "apply to all blocks of this speaker"
