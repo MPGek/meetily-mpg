@@ -1,6 +1,7 @@
 use crate::audio::audio_file::find_audio_file;
 use crate::audio::decoder::{
-    convert_to_wav_with_ffmpeg, decode_audio_file, needs_ffmpeg_conversion, probe_audio_metadata,
+    convert_to_wav_with_ffmpeg, decode_audio_file, detect_channel_layout, needs_ffmpeg_conversion,
+    ChannelLayout,
 };
 use crate::audio::ffmpeg::find_ffmpeg_path;
 use crate::audio::speaker_recognition::{l2_normalize_in_place, Prototype};
@@ -206,6 +207,14 @@ pub async fn start_diarization<R: Runtime>(
     max_speakers: Option<i32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DiarizationResult, String> {
+    // Never start while retranscription is replacing transcript rows: the two
+    // jobs write the same rows and cluster mappings (D4).
+    if crate::audio::retranscription::is_retranscription_in_progress() {
+        return Err(
+            "Retranscription is in progress; wait for it to finish before running speaker analysis"
+                .to_string(),
+        );
+    }
     let _guard = DiarizationGuard::acquire()?;
     DIARIZATION_CANCELLED.store(false, Ordering::SeqCst);
 
@@ -893,11 +902,20 @@ fn run_diarization_blocking_with_app<R: Runtime>(
             (None, audio_path.clone())
         };
 
-    // Probe channel count (Symphonia header read, no full decode).
+    // Resolve the channel layout from the decoded audio (metadata fast path,
+    // first-packet decode when the container omits the count) — never default
+    // a missing count to mono, which silently downmixed stereo recordings.
     emit_progress(app, meeting_id, "decoding", 15, "Streaming audio...");
-    let (_, channels) = probe_audio_metadata(&source_path)
+    let layout = detect_channel_layout(&source_path)
         .map_err(|e| format!("Failed to probe audio metadata: {}", e))?;
-    let is_stereo = channels == 2;
+    let channel_split = channel_split_for_layout(layout);
+    let mut is_stereo = layout.is_stereo();
+    if channel_split == ChannelSplit::NativeDecoded {
+        warn!(
+            "Channel layout unknown for {}; passing the native stream without downmixing",
+            source_path.display()
+        );
+    }
     timings.decode_secs = decode_start.elapsed().as_secs_f64();
 
     emit_progress(
@@ -917,78 +935,41 @@ fn run_diarization_blocking_with_app<R: Runtime>(
         .map_err(|e| format!("Diarization failed: {}", e))?;
 
     let channel_start = Instant::now();
-    let (mic_result, sys_result): (
-        Result<
-            (
-                Vec<DiarizationSegment>,
-                Vec<ClusteredEmbedding>,
-                StageTimings,
-            ),
-            String,
-        >,
-        Result<
-            (
-                Vec<DiarizationSegment>,
-                Vec<ClusteredEmbedding>,
-                StageTimings,
-            ),
-            String,
-        >,
-    ) = match find_ffmpeg_path() {
-        Some(ffmpeg) => {
-            if is_stereo {
+    let (mic_result, sys_result): (ChannelRunResult, ChannelRunResult) =
+        match (find_ffmpeg_path(), channel_split) {
+            // Unknown layout: never downmix. An unknown stereo file must at
+            // worst be split, not collapsed, so decode the native stream and
+            // split it — this also re-derives the real layout from the audio.
+            (_, ChannelSplit::NativeDecoded) => {
+                let (mic, sys, stereo) =
+                    diarize_decoded_channels(&diarizer, &source_path, config)?;
+                is_stereo = stereo;
+                (mic, sys)
+            }
+            (Some(ffmpeg), ChannelSplit::Stereo) => {
                 let left = spawn_ffmpeg_pcm(&ffmpeg, &source_path, Some(0))?;
                 let right = spawn_ffmpeg_pcm(&ffmpeg, &source_path, Some(1))?;
                 rayon::join(
                     || run_channel_diarization_stream(&diarizer, left, config),
                     || run_channel_diarization_stream(&diarizer, right, config),
                 )
-            } else {
+            }
+            (Some(ffmpeg), ChannelSplit::Mono) => {
                 let mono = spawn_ffmpeg_pcm(&ffmpeg, &source_path, None)?;
                 let mic = run_channel_diarization_stream(&diarizer, mono, config);
                 (mic, Ok((Vec::new(), Vec::new(), StageTimings::default())))
             }
-        }
-        None => {
-            // ffmpeg unavailable: fall back to full Symphonia decode (higher peak memory).
-            warn!("ffmpeg not found; falling back to in-memory Symphonia decode for diarization");
-            let decoded = decode_audio_file(&source_path)
-                .map_err(|e| format!("Failed to decode audio: {}", e))?;
-            let (left, right) = decoded.extract_channels();
-            let mic_stream = left.unwrap_or_default();
-            if let Some(sys_stream) = right {
-                rayon::join(
-                    || {
-                        run_channel_diarization(
-                            &diarizer,
-                            &mic_stream,
-                            decoded.sample_rate,
-                            config,
-                            "mic",
-                        )
-                    },
-                    || {
-                        run_channel_diarization(
-                            &diarizer,
-                            &sys_stream,
-                            decoded.sample_rate,
-                            config,
-                            "sys",
-                        )
-                    },
-                )
-            } else {
-                let mic = run_channel_diarization(
-                    &diarizer,
-                    &mic_stream,
-                    decoded.sample_rate,
-                    config,
-                    "mic",
+            (None, _) => {
+                // ffmpeg unavailable: fall back to full Symphonia decode (higher peak memory).
+                warn!(
+                    "ffmpeg not found; falling back to in-memory Symphonia decode for diarization"
                 );
-                (mic, Ok((Vec::new(), Vec::new(), StageTimings::default())))
+                let (mic, sys, stereo) =
+                    diarize_decoded_channels(&diarizer, &source_path, config)?;
+                is_stereo = stereo;
+                (mic, sys)
             }
-        }
-    };
+        };
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
         return Err("Diarization cancelled".to_string());
@@ -1074,20 +1055,49 @@ fn run_diarization_blocking_with_app<R: Runtime>(
     ))
 }
 
-fn run_channel_diarization(
-    diarizer: &PolyvoiceDiarizer,
-    samples: &[f32],
-    sample_rate: u32,
-    config: &DiarizationConfig,
-    channel_name: &str,
-) -> Result<
+/// How offline diarization should obtain the microphone/system streams for a
+/// resolved channel layout. `NativeDecoded` is the no-downmix path taken when
+/// the layout cannot be determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelSplit {
+    /// Two decoded channels: spawn independent left/right streams.
+    Stereo,
+    /// A genuinely single-channel recording: one downmixed mono stream.
+    Mono,
+    /// Layout unknown: decode the native stream and split it, never downmix.
+    NativeDecoded,
+}
+
+/// Map a detected layout onto the channel-split strategy. Only a genuinely
+/// single-channel layout selects `Mono` (the `ffmpeg -ac 1` path); `Unknown`
+/// selects the native split instead of a silent downmix.
+fn channel_split_for_layout(layout: ChannelLayout) -> ChannelSplit {
+    if layout.is_stereo() {
+        ChannelSplit::Stereo
+    } else if layout.is_mono() {
+        ChannelSplit::Mono
+    } else {
+        ChannelSplit::NativeDecoded
+    }
+}
+
+/// Per-channel diarization run output, or the channel's failure.
+type ChannelRunResult = Result<
     (
         Vec<DiarizationSegment>,
         Vec<ClusteredEmbedding>,
         StageTimings,
     ),
     String,
-> {
+>;
+
+fn run_channel_diarization(
+    diarizer: &PolyvoiceDiarizer,
+    samples: &[f32],
+    sample_rate: u32,
+    config: &DiarizationConfig,
+    channel_name: &str,
+) -> ChannelRunResult {
     info!(
         "Running diarization on {} channel ({} samples, {}Hz)",
         channel_name,
@@ -1096,6 +1106,44 @@ fn run_channel_diarization(
     );
     // Fallback path: diarization always processes recordings in chunks.
     run_chunked_polyvoice_diarization(diarizer, samples, sample_rate, config)
+}
+
+/// Decode a recording's native stream with Symphonia and diarize each channel
+/// independently, returning the mic/system runs plus whether the decoded
+/// layout is stereo. Used when ffmpeg is unavailable and when the layout could
+/// not be resolved from the container/first packet: the native stream is split
+/// rather than downmixed, so a hidden stereo recording is never collapsed.
+fn diarize_decoded_channels(
+    diarizer: &PolyvoiceDiarizer,
+    source_path: &Path,
+    config: &DiarizationConfig,
+) -> Result<(ChannelRunResult, ChannelRunResult, bool), String> {
+    let decoded = decode_audio_file(source_path).map_err(|e| {
+        format!(
+            "Failed to decode audio for channel splitting: {} — the recording's channel layout could not be determined. Re-export the audio or install ffmpeg so it can be split without downmixing.",
+            e
+        )
+    })?;
+    let sample_rate = decoded.sample_rate;
+    let (left, right) = decoded.extract_channels();
+    let mic_stream = left.unwrap_or_default();
+    match right {
+        Some(sys_stream) => {
+            let (mic, sys) = rayon::join(
+                || run_channel_diarization(diarizer, &mic_stream, sample_rate, config, "mic"),
+                || run_channel_diarization(diarizer, &sys_stream, sample_rate, config, "sys"),
+            );
+            Ok((mic, sys, true))
+        }
+        None => {
+            let mic = run_channel_diarization(diarizer, &mic_stream, sample_rate, config, "mic");
+            Ok((
+                mic,
+                Ok((Vec::new(), Vec::new(), StageTimings::default())),
+                false,
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2731,6 +2779,35 @@ mod spike_tests {
         DiarizationConfig::default()
     }
 
+    #[test]
+    fn unknown_layout_never_selects_the_downmix_path() {
+        use crate::audio::decoder::ChannelLayout;
+        // An unknown layout must decode the native stream and split it; it must
+        // never take the `ffmpeg -ac 1` mono path.
+        assert_eq!(
+            channel_split_for_layout(ChannelLayout::Unknown),
+            ChannelSplit::NativeDecoded
+        );
+        assert_ne!(
+            channel_split_for_layout(ChannelLayout::Unknown),
+            ChannelSplit::Mono
+        );
+        // Only genuinely single-channel decoded audio may downmix.
+        assert_eq!(
+            channel_split_for_layout(ChannelLayout::Known(1)),
+            ChannelSplit::Mono
+        );
+        assert_eq!(
+            channel_split_for_layout(ChannelLayout::Known(2)),
+            ChannelSplit::Stereo
+        );
+        // Any multi-channel layout is treated as stereo (left/right split).
+        assert_eq!(
+            channel_split_for_layout(ChannelLayout::Known(6)),
+            ChannelSplit::Stereo
+        );
+    }
+
     fn find_models_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("MEETILY_MODELS_DIR") {
             let p = PathBuf::from(dir);
@@ -3165,8 +3242,9 @@ mod spike_tests {
             ),
             "flag-free harness parity requires default() to equal the built-in constants"
         );
-        let (_, channels) = probe_audio_metadata(&source).expect("probe audio");
-        let is_stereo = channels == 2;
+        let is_stereo = detect_channel_layout(&source)
+            .expect("probe audio")
+            .is_stereo();
         let ffmpeg = find_ffmpeg_path().expect("ffmpeg required for parity check");
 
         // App path: streaming windows over the ffmpeg PCM pipe.

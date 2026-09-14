@@ -379,6 +379,23 @@ impl SpeakerRepository {
         .await
     }
 
+    /// Read the capture channel recorded for a meeting's cluster, when known.
+    /// Used to scope prototype cleanup to the cluster's own channel.
+    pub async fn get_cluster_channel(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+    ) -> Result<Option<String>, SqlxError> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT channel FROM meeting_speakers WHERE meeting_id = ? AND cluster_label = ?",
+        )
+        .bind(meeting_id)
+        .bind(cluster_label)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.and_then(|(channel,)| channel))
+    }
+
     /// Link a cluster to a speaker with `matched_by='user'` (manual edit).
     /// Persists the binding and (when a centroid already exists) leaves it in
     /// place. Returns the speaker id bound.
@@ -552,6 +569,173 @@ impl SpeakerRepository {
 
         tx.commit().await?;
         Ok(enrolled)
+    }
+
+    /// Re-bind a cluster to a speaker with cluster-wide scope: first demote the
+    /// prototypes a previous binding left with another speaker (so they do not
+    /// keep the cluster's audio and the new speaker gets a full seed set), then
+    /// enroll the cluster's best-K cache rows. Shared by the offline binding
+    /// commands and the online finalize path so both behave identically.
+    pub async fn rebind_cluster(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+        channel: Option<&str>,
+        speaker_id: &str,
+    ) -> Result<usize, SqlxError> {
+        Self::demote_foreign_prototypes(
+            pool,
+            meeting_id,
+            cluster_label,
+            channel,
+            speaker_id,
+            None,
+        )
+        .await?;
+        Self::enroll_cluster(pool, meeting_id, cluster_label, speaker_id).await
+    }
+
+    /// Enroll only the cluster exemplars overlapping a corrected block's time
+    /// window and capture channel as prototypes of `speaker_id`. Foreign
+    /// prototypes already overlapping that window are demoted to cache first,
+    /// so a repeated correction of the same block converges on the newest
+    /// speaker instead of leaving the audio with the previous one. Best-K by
+    /// duration, no-op on an empty/inverted window. No audio re-processing.
+    pub async fn enroll_block_window(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+        channel: &str,
+        window: (f64, f64),
+        speaker_id: &str,
+    ) -> Result<usize, SqlxError> {
+        let (start, end) = window;
+        if end <= start {
+            return Ok(0);
+        }
+
+        let mut tx = pool.begin().await?;
+
+        // Demote other speakers' overlapping prototypes so this correction can
+        // reclaim them. Runs before enrollment, inside the same transaction.
+        Self::demote_foreign_prototypes_conn(
+            &mut tx,
+            meeting_id,
+            cluster_label,
+            Some(channel),
+            speaker_id,
+            Some(window),
+        )
+        .await?;
+
+        // Reparent the best-K unassigned cache rows overlapping the block.
+        sqlx::query(
+            "UPDATE speaker_embeddings SET speaker_id = ?
+             WHERE id IN (
+                 SELECT id FROM speaker_embeddings
+                 WHERE meeting_id = ? AND cluster_label = ? AND channel = ?
+                   AND speaker_id IS NULL
+                   AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
+                   AND audio_start_time < ? AND audio_end_time > ?
+                 ORDER BY duration_secs DESC LIMIT ?
+             )",
+        )
+        .bind(speaker_id)
+        .bind(meeting_id)
+        .bind(cluster_label)
+        .bind(channel)
+        .bind(end)
+        .bind(start)
+        .bind(ENROLLMENT_BEST_K as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        let enrolled = Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
+
+        tx.commit().await?;
+        Ok(enrolled)
+    }
+
+    /// Demote prototype rows a previous binding left on a cluster back to
+    /// unassigned cache, so re-binding (block-scoped or cluster-wide) never
+    /// leaves one speaker holding another's audio. Rows owned by
+    /// `keep_speaker_id` are retained; `channel`/`window` narrow the scope when
+    /// provided. A row covered by a transcript block overridden to its current
+    /// speaker is left in place: a legitimate per-block correction wins over
+    /// the cluster default. Returns the number of demoted rows.
+    pub async fn demote_foreign_prototypes(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+        channel: Option<&str>,
+        keep_speaker_id: &str,
+        window: Option<(f64, f64)>,
+    ) -> Result<usize, SqlxError> {
+        let mut tx = pool.begin().await?;
+        let demoted = Self::demote_foreign_prototypes_conn(
+            &mut tx,
+            meeting_id,
+            cluster_label,
+            channel,
+            keep_speaker_id,
+            window,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(demoted)
+    }
+
+    /// Connection-scoped body of [`Self::demote_foreign_prototypes`], usable
+    /// inside a caller's transaction (block enrollment).
+    async fn demote_foreign_prototypes_conn(
+        conn: &mut SqliteConnection,
+        meeting_id: &str,
+        cluster_label: &str,
+        channel: Option<&str>,
+        keep_speaker_id: &str,
+        window: Option<(f64, f64)>,
+    ) -> Result<usize, SqlxError> {
+        let mut sql = String::from(
+            "UPDATE speaker_embeddings SET speaker_id = NULL
+             WHERE meeting_id = ? AND cluster_label = ?
+               AND speaker_id IS NOT NULL
+               AND speaker_id <> ?",
+        );
+        if channel.is_some() {
+            sql.push_str(" AND channel = ?");
+        }
+        if window.is_some() {
+            sql.push_str(
+                " AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
+                  AND audio_start_time < ? AND audio_end_time > ?",
+            );
+        }
+        sql.push_str(
+            " AND NOT EXISTS (
+                 SELECT 1 FROM transcripts t
+                 WHERE t.meeting_id = speaker_embeddings.meeting_id
+                   AND t.speaker = speaker_embeddings.cluster_label
+                   AND t.speaker_override_id = speaker_embeddings.speaker_id
+                   AND t.audio_start_time IS NOT NULL AND t.audio_end_time IS NOT NULL
+                   AND speaker_embeddings.audio_start_time IS NOT NULL
+                   AND speaker_embeddings.audio_end_time IS NOT NULL
+                   AND t.audio_start_time < speaker_embeddings.audio_end_time
+                   AND t.audio_end_time > speaker_embeddings.audio_start_time
+             )",
+        );
+
+        let mut query = sqlx::query(&sql)
+            .bind(meeting_id)
+            .bind(cluster_label)
+            .bind(keep_speaker_id);
+        if let Some(ch) = channel {
+            query = query.bind(ch);
+        }
+        if let Some((start, end)) = window {
+            query = query.bind(end).bind(start);
+        }
+        let rows = query.execute(&mut *conn).await?;
+        Ok(rows.rows_affected() as usize)
     }
 
     /// Enroll chunk embeddings as ground truth for a speaker: picks the
@@ -1695,8 +1879,9 @@ mod tests {
 
     #[tokio::test]
     async fn block_correction_enrolls_cluster_cache() {
-        // Simulates assign_block_speaker: set the per-block override, then
-        // enroll the block's cluster cached exemplars (reparent).
+        // Cluster-wide enrollment path: enroll_cluster reparents the cluster's
+        // best-K cache rows. Used by apply-to-all, not by single-block
+        // corrections (which use enroll_block_window).
         let pool = setup_pool().await;
         insert_meeting(&pool, "m1").await;
         let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
@@ -1800,6 +1985,510 @@ mod tests {
 
         let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
         assert_eq!(stats.prototype_count, 0);
+    }
+
+    async fn insert_transcript_window(
+        pool: &SqlitePool,
+        id: &str,
+        meeting_id: &str,
+        speaker: Option<&str>,
+        start: f64,
+        end: f64,
+        source_device: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, audio_start_time, audio_end_time, source_device)
+             VALUES (?, ?, 'text', '2026-01-01T00:00:00Z', ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(meeting_id)
+        .bind(speaker)
+        .bind(start)
+        .bind(end)
+        .bind(source_device)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enroll_block_window_only_enrolls_overlapping_channel_rows_capped_at_k() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        // 10 mic exemplars inside the window, 2 far outside, 1 system inside.
+        let mut mic: Vec<Exemplar> = (0..10)
+            .map(|i| Exemplar {
+                embedding: emb(&[100.0 + i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: (i + 1) as f64,
+                start_secs: Some(10.0 + i as f32),
+                end_secs: Some(11.0 + i as f32),
+            })
+            .collect();
+        mic.push(Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 50.0,
+            start_secs: Some(0.0),
+            end_secs: Some(5.0),
+        });
+        mic.push(Exemplar {
+            embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+            duration_secs: 50.0,
+            start_secs: Some(200.0),
+            end_secs: Some(205.0),
+        });
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[9.0; 4]),
+            &mic,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        let sys = vec![Exemplar {
+            embedding: emb(&[7.0, 0.0, 0.0, 0.0]),
+            duration_secs: 99.0,
+            start_secs: Some(10.0),
+            end_secs: Some(12.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "system",
+            &emb(&[8.0; 4]),
+            &sys,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        // Window 9..22 overlaps all 10 mic exemplars -> exactly K reparented.
+        let n = SpeakerRepository::enroll_block_window(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            (9.0, 22.0),
+            &alice.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, ENROLLMENT_BEST_K, "capped at K within the window");
+
+        let alice_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&alice.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(alice_rows.0, ENROLLMENT_BEST_K as i64);
+
+        // The two far mic rows and the system row never enrolled.
+        let mic_cache: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL AND channel = 'mic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mic_cache.0, 4);
+        let sys_cache: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL AND channel = 'system'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sys_cache.0, 1, "other channel excluded by channel filter");
+    }
+
+    #[tokio::test]
+    async fn demote_foreign_prototypes_keeps_override_pinned_rows() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+        let carol = SpeakerRepository::find_or_create_by_name(&pool, "Carol")
+            .await
+            .unwrap();
+
+        // Two system exemplars, both enrolled to Bob.
+        let exemplars = vec![
+            Exemplar {
+                embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+                duration_secs: 4.0,
+                start_secs: Some(10.0),
+                end_secs: Some(14.0),
+            },
+            Exemplar {
+                embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+                duration_secs: 4.0,
+                start_secs: Some(20.0),
+                end_secs: Some(24.0),
+            },
+        ];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "system",
+            &emb(&[9.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &bob.id)
+            .await
+            .unwrap();
+
+        // A sibling block overridden to Bob pins the first exemplar.
+        insert_transcript_window(&pool, "t1", "m1", Some("SPEAKER_00"), 9.0, 15.0, "System").await;
+        SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+            .await
+            .unwrap();
+
+        // Demoting the pinned window changes nothing.
+        let d1 = SpeakerRepository::demote_foreign_prototypes(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            Some("system"),
+            &carol.id,
+            Some((9.0, 15.0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(d1, 0, "pinned row is protected from demotion");
+
+        // Demoting the unpinned window returns the second exemplar to cache.
+        let d2 = SpeakerRepository::demote_foreign_prototypes(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            Some("system"),
+            &carol.id,
+            Some((19.0, 25.0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(d2, 1);
+
+        let bob_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&bob.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bob_rows.0, 1, "Bob keeps only the pinned exemplar");
+    }
+
+    #[tokio::test]
+    async fn repeated_block_correction_converges_on_latest_speaker() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        let exemplars = vec![Exemplar {
+            embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+            duration_secs: 4.0,
+            start_secs: Some(10.0),
+            end_secs: Some(14.0),
+        }];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[9.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        insert_transcript_window(&pool, "t1", "m1", Some("SPEAKER_00"), 9.0, 15.0, "Microphone").await;
+
+        // First correction: Alice.
+        SpeakerRepository::set_transcript_override(&pool, "t1", &alice.id)
+            .await
+            .unwrap();
+        let n1 = SpeakerRepository::enroll_block_window(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            (9.0, 15.0),
+            &alice.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n1, 1);
+
+        // Re-correction of the same block: Bob.
+        SpeakerRepository::set_transcript_override(&pool, "t1", &bob.id)
+            .await
+            .unwrap();
+        let n2 = SpeakerRepository::enroll_block_window(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            (9.0, 15.0),
+            &bob.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n2, 1);
+
+        let alice_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&alice.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let bob_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&bob.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(alice_rows.0, 0, "previous owner loses the block's audio");
+        assert_eq!(bob_rows.0, 1, "latest correction owns the block's audio");
+    }
+
+    #[tokio::test]
+    async fn mixed_cluster_block_correction_does_not_enroll_siblings() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alex = SpeakerRepository::find_or_create_by_name(&pool, "Alex")
+            .await
+            .unwrap();
+
+        // One cluster covering three people; the longest exemplars are not
+        // Alex's (this is what the whole-cluster best-K used to enroll).
+        let exemplars = vec![
+            Exemplar {
+                embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+                duration_secs: 17.4,
+                start_secs: Some(46.8),
+                end_secs: Some(105.0),
+            },
+            Exemplar {
+                embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+                duration_secs: 22.0,
+                start_secs: Some(235.0),
+                end_secs: Some(257.0),
+            },
+            Exemplar {
+                embedding: emb(&[3.0, 0.0, 0.0, 0.0]),
+                duration_secs: 9.1,
+                start_secs: Some(287.6),
+                end_secs: Some(296.7),
+            },
+        ];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_02",
+            "system",
+            &emb(&[9.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        let before = SpeakerRepository::get_meeting_speakers(&pool, "m1")
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].speaker_id.is_none());
+
+        // Correct only Alex's block.
+        insert_transcript_window(&pool, "t_alex", "m1", Some("SPEAKER_02"), 287.6, 296.7, "System")
+            .await;
+        SpeakerRepository::set_transcript_override(&pool, "t_alex", &alex.id)
+            .await
+            .unwrap();
+        let n = SpeakerRepository::enroll_block_window(
+            &pool,
+            "m1",
+            "SPEAKER_02",
+            "system",
+            (287.6, 296.7),
+            &alex.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "only Alex's own exemplar is enrolled");
+
+        let alex_rows: Vec<(f64, f64)> = sqlx::query_as(
+            "SELECT audio_start_time, audio_end_time FROM speaker_embeddings WHERE speaker_id = ?",
+        )
+        .bind(&alex.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(alex_rows.len(), 1);
+        assert!((alex_rows[0].0 - 287.6).abs() < 0.01);
+        assert!((alex_rows[0].1 - 296.7).abs() < 0.01);
+
+        // Sibling exemplars remain unassigned cache.
+        let cache: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cache.0, 2, "sibling speakers' exemplars are untouched");
+
+        // A single-block correction never binds the cluster.
+        let after = SpeakerRepository::get_meeting_speakers(&pool, "m1")
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].speaker_id.is_none());
+        assert!(after[0].matched_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn null_cluster_block_correction_enrolls_only_overlapping_rows() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        let exemplars = vec![
+            Exemplar {
+                embedding: emb(&[1.0, 0.0, 0.0, 0.0]),
+                duration_secs: 5.0,
+                start_secs: Some(100.0),
+                end_secs: Some(105.0),
+            },
+            Exemplar {
+                embedding: emb(&[2.0, 0.0, 0.0, 0.0]),
+                duration_secs: 9.0,
+                start_secs: Some(200.0),
+                end_secs: Some(205.0),
+            },
+        ];
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_05",
+            "system",
+            &emb(&[9.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        insert_transcript_window(&pool, "t1", "m1", None, 99.0, 106.0, "System").await;
+        let resolved = SpeakerRepository::resolve_cluster_by_time_overlap(
+            &pool, "m1", "system", 99.0, 106.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("SPEAKER_05"));
+
+        let n = SpeakerRepository::enroll_block_window(
+            &pool,
+            "m1",
+            resolved.as_deref().unwrap(),
+            "system",
+            (99.0, 106.0),
+            &bob.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "only the overlapping exemplar is enrolled");
+
+        let bob_rows: Vec<(f64, f64)> = sqlx::query_as(
+            "SELECT audio_start_time, audio_end_time FROM speaker_embeddings WHERE speaker_id = ?",
+        )
+        .bind(&bob.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bob_rows.len(), 1);
+        assert!((bob_rows[0].0 - 100.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn cluster_rebind_demotes_previous_speakers_prototypes() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+        let carol = SpeakerRepository::find_or_create_by_name(&pool, "Carol")
+            .await
+            .unwrap();
+
+        let exemplars: Vec<Exemplar> = (0..12)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: i as f64,
+                start_secs: Some(i as f32 * 10.0),
+                end_secs: Some(i as f32 * 10.0 + i as f32),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[9.0; 4]),
+            &exemplars,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &bob.id)
+            .await
+            .unwrap();
+
+        // Re-binding to Carol (shared offline/online path): demote Bob's
+        // prototypes first, then enroll the best-K.
+        let n = SpeakerRepository::rebind_cluster(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            Some("mic"),
+            &carol.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, ENROLLMENT_BEST_K, "Carol receives a full best-K seed set");
+
+        let bob_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&bob.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let carol_rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&carol.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bob_rows.0, 0, "previous speaker keeps nothing");
+        assert_eq!(carol_rows.0, ENROLLMENT_BEST_K as i64);
     }
 
     #[tokio::test]

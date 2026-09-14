@@ -60,11 +60,23 @@ pub async fn assign_speaker(
         .await
         .map_err(|e| format!("Failed to bind speaker: {}", e))?;
 
-    // Enroll the cluster's cached exemplars as prototypes (no-op when the
-    // cluster has no cache, e.g. a legacy meeting without diarization).
-    let _ = SpeakerRepository::enroll_cluster(pool, &meeting_id, &cluster_label, &speaker.id)
+    // A cluster-wide (re-)binding is a whole-cluster statement: drop prototypes
+    // a previous binding left with another speaker before re-enrolling, so the
+    // new speaker receives the cluster's full best-K seed set and the previous
+    // speaker keeps nothing. Rows pinned by a covering per-block override
+    // survive (a legitimate block correction wins over the cluster default).
+    let channel = SpeakerRepository::get_cluster_channel(pool, &meeting_id, &cluster_label)
         .await
-        .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
+        .unwrap_or(None);
+    let _ = SpeakerRepository::rebind_cluster(
+        pool,
+        &meeting_id,
+        &cluster_label,
+        channel.as_deref(),
+        &speaker.id,
+    )
+    .await
+    .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
 
     Ok(AssignedSpeaker {
         meeting_id,
@@ -75,7 +87,7 @@ pub async fn assign_speaker(
 }
 
 /// Response for `assign_block_speaker`: the registry speaker now overridden
-/// on a single transcript block (no cluster change, no enrollment).
+/// on a single transcript block (no cluster change; block-scoped enrollment).
 #[derive(Debug, Serialize)]
 pub struct AssignedBlockSpeaker {
     pub transcript_id: String,
@@ -85,9 +97,11 @@ pub struct AssignedBlockSpeaker {
 
 /// Link a single transcript block to a registry speaker via a per-transcript
 /// override (design D10). The editor defaults to this scope: only the edited
-/// block is relabeled. In addition to the override, the block's cluster cached
-/// exemplars are enrolled as the speaker's prototypes so a single-block
-/// correction doubles as a teaching signal (no-op on clusters with no cache).
+/// block is relabeled. In addition to the override, the cluster exemplars
+/// overlapping that block's time window and channel are enrolled as the
+/// speaker's prototypes (never the whole cluster), so a single-block
+/// correction doubles as a teaching signal without pulling in sibling
+/// speakers' audio. No-op on clusters with no cache.
 /// Pass `speaker_id` for an existing person or `new_name` to create one.
 #[tauri::command]
 pub async fn assign_block_speaker(
@@ -118,57 +132,69 @@ pub async fn assign_block_speaker(
         return Err(format!("Transcript {} not found", transcript_id));
     }
 
-    // Enroll the block's cluster cached exemplars as the speaker's prototypes.
-    // First try to get the cluster label directly from the transcript.
+    // Enroll only the embeddings covering this block as the speaker's
+    // prototypes (window- and channel-scoped). A correction inside a mixed
+    // cluster must never pull sibling speakers' exemplars into this speaker.
+    // No-op when the block has no timecodes or the cluster has no cache.
     let transcript_info = SpeakerRepository::get_transcript_cluster(pool, &transcript_id)
         .await
         .map_err(|e| format!("Failed to load transcript cluster: {}", e))?;
 
     if let Some((meeting_id, cluster_label)) = transcript_info {
-        if let Some(cluster_label) = cluster_label {
-            // Transcript has a cluster label - use it directly
-            let enrolled =
-                SpeakerRepository::enroll_cluster(pool, &meeting_id, &cluster_label, &speaker.id)
-                    .await
-                    .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
-            if enrolled == 0 {
-                tracing::warn!(
-                    meeting_id = %meeting_id,
-                    cluster_label = %cluster_label,
-                    speaker_id = %speaker.id,
-                    "enroll_cluster returned 0: no exemplars reparented"
-                );
-            }
+        let time_info = SpeakerRepository::get_transcript_time_info(pool, &transcript_id)
+            .await
+            .map_err(|e| format!("Failed to load transcript time info: {}", e))?;
+        let (start, end, source_device) = match time_info {
+            Some((_, start, end, source_device)) => (start, end, source_device),
+            None => (None, None, None),
+        };
+        let channel = if source_device.as_deref() == Some("System") {
+            "system"
         } else {
-            // Transcript has no cluster label (speaker column is NULL).
-            // Resolve the cluster by time-overlap matching against cached exemplars.
-            let time_info = SpeakerRepository::get_transcript_time_info(pool, &transcript_id)
-                .await
-                .map_err(|e| format!("Failed to load transcript time info: {}", e))?;
+            "mic"
+        };
 
-            if let Some((_, Some(start), Some(end), source_device)) = time_info {
-                // Determine channel from source_device: "System" -> system, otherwise -> mic
-                let channel = if source_device.as_deref() == Some("System") {
-                    "system"
-                } else {
-                    "mic"
-                };
-
-                // Resolve cluster by time overlap
-                if let Some(resolved_cluster) = SpeakerRepository::resolve_cluster_by_time_overlap(
+        match (cluster_label, start, end) {
+            (Some(cluster_label), Some(start), Some(end)) => {
+                let enrolled = SpeakerRepository::enroll_block_window(
                     pool,
                     &meeting_id,
+                    &cluster_label,
                     channel,
-                    start,
-                    end,
+                    (start, end),
+                    &speaker.id,
                 )
                 .await
-                .map_err(|e| format!("Failed to resolve cluster by time overlap: {}", e))?
+                .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
+                if enrolled == 0 {
+                    tracing::warn!(
+                        meeting_id = %meeting_id,
+                        cluster_label = %cluster_label,
+                        speaker_id = %speaker.id,
+                        "enroll_block_window returned 0: no overlapping exemplars"
+                    );
+                }
+            }
+            (None, Some(start), Some(end)) => {
+                // Transcript has no cluster label (speaker column is NULL).
+                // Resolve the cluster by time-overlap against cached exemplars.
+                if let Some(resolved_cluster) =
+                    SpeakerRepository::resolve_cluster_by_time_overlap(
+                        pool,
+                        &meeting_id,
+                        channel,
+                        start,
+                        end,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to resolve cluster by time overlap: {}", e))?
                 {
-                    let enrolled = SpeakerRepository::enroll_cluster(
+                    let enrolled = SpeakerRepository::enroll_block_window(
                         pool,
                         &meeting_id,
                         &resolved_cluster,
+                        channel,
+                        (start, end),
                         &speaker.id,
                     )
                     .await
@@ -178,7 +204,7 @@ pub async fn assign_block_speaker(
                             meeting_id = %meeting_id,
                             cluster_label = %resolved_cluster,
                             speaker_id = %speaker.id,
-                            "enroll_cluster returned 0: no exemplars reparented (resolved by time overlap)"
+                            "enroll_block_window returned 0: no overlapping exemplars (resolved by time overlap)"
                         );
                     }
                 } else {
@@ -188,6 +214,13 @@ pub async fn assign_block_speaker(
                         "no cluster found by time overlap for transcript with NULL speaker"
                     );
                 }
+            }
+            _ => {
+                tracing::debug!(
+                    meeting_id = %meeting_id,
+                    transcript_id = %transcript_id,
+                    "transcript has no timecodes; block label applied without enrollment"
+                );
             }
         }
     }
@@ -238,9 +271,21 @@ pub async fn apply_block_speaker_to_cluster(
         .await
         .map_err(|e| format!("Failed to bind speaker: {}", e))?;
 
-    let _ = SpeakerRepository::enroll_cluster(pool, &meeting_id, &cluster_label, &speaker.id)
+    // Drop prototypes a previous binding of this cluster left with another
+    // speaker before re-enrolling, so re-applying to all blocks does not keep
+    // stale voiceprints and the new speaker gets a full seed set.
+    let channel = SpeakerRepository::get_cluster_channel(pool, &meeting_id, &cluster_label)
         .await
-        .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
+        .unwrap_or(None);
+    let _ = SpeakerRepository::rebind_cluster(
+        pool,
+        &meeting_id,
+        &cluster_label,
+        channel.as_deref(),
+        &speaker.id,
+    )
+    .await
+    .map_err(|e| format!("Failed to enroll speaker: {}", e))?;
 
     Ok(AssignedSpeaker {
         meeting_id,

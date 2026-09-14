@@ -36,6 +36,7 @@ export function TranscriptButtonGroup({
   const router = useRouter();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
   const [isDiarizing, setIsDiarizing] = useState(false);
+  const [isRetranscribing, setIsRetranscribing] = useState(false);
   const [modelsReady, setModelsReady] = useState(false);
 
   useEffect(() => {
@@ -58,7 +59,53 @@ export function TranscriptButtonGroup({
     if (onRefetchTranscripts) {
       await onRefetchTranscripts();
     }
-  }, [onRefetchTranscripts]);
+
+    // Enhance replaces every transcript row, so speaker attribution is only
+    // re-established by a fresh (channel-correct) analysis. When diarization is
+    // enabled with auto-run, re-run it immediately; otherwise the backend has
+    // marked the meeting as not analyzed and the Speakers button below is the
+    // affordance to recover labels. Retranscription releases its guard before
+    // emitting the completion event, so this run is strictly ordered after the
+    // insert transaction commits (fix-enhance-diarization-channel-and-speaker-flow D3/D4).
+    if (!meetingId) return;
+    const settings = loadDiarizationSettings();
+    if (!settings.enabled || !settings.autoRun) return;
+    setIsDiarizing(true);
+    try {
+      const status = await recordingService.checkDiarizationModels();
+      if (!status.ready) {
+        toast.error('Enhanced diarization models not bundled', {
+          description:
+            'Speaker labels could not be restored automatically. The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time near the executable.',
+          action: {
+            label: 'Open Settings',
+            onClick: () => router.push('/settings?tab=general'),
+          },
+          duration: 10000,
+        });
+        return;
+      }
+      await recordingService.startDiarization(
+        meetingId,
+        settings.maxSpeakers > 0 ? settings.maxSpeakers : undefined
+      );
+    } catch (err) {
+      console.error('Auto speaker analysis after Enhance failed:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      const isModelMissing = /model.*not found|download models/i.test(message);
+      toast.error('Speaker analysis failed', {
+        description: message,
+        action: isModelMissing
+          ? {
+              label: 'Open Settings',
+              onClick: () => router.push('/settings?tab=general'),
+            }
+          : undefined,
+      });
+    } finally {
+      setIsDiarizing(false);
+    }
+  }, [onRefetchTranscripts, meetingId, router]);
 
   const openSettings = () => {
     router.push('/settings?tab=general');
@@ -146,8 +193,12 @@ export function TranscriptButtonGroup({
             size="sm"
             variant="outline"
             onClick={handleReanalyzeSpeakers}
-            disabled={isDiarizing}
-            title="Identify who spoke when"
+            disabled={isDiarizing || isRetranscribing}
+            title={
+              isRetranscribing
+                ? 'Waiting for retranscription to finish'
+                : 'Identify who spoke when'
+            }
           >
             {isDiarizing ? (
               <RefreshCw className="xl:mr-2 animate-spin" size={18} />
@@ -185,6 +236,7 @@ export function TranscriptButtonGroup({
           meetingId={meetingId}
           meetingFolderPath={meetingFolderPath}
           onComplete={handleRetranscribeComplete}
+          onProcessingChange={setIsRetranscribing}
         />
       )}
     </div>

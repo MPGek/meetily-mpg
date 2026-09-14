@@ -10,7 +10,16 @@ import type { MeetingTag, MeetingTagWithUsage } from '@/lib/meeting-tags';
  */
 export function usePendingRecordingTags(isRecording: boolean) {
   const [pending, setPending] = useState<MeetingTag[]>([]);
-  const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<MeetingTag[]>(pending);
+  const isRecordingRef = useRef(isRecording);
+  const syncChain = useRef<Promise<unknown>>(Promise.resolve());
+
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
 
   const load = useCallback(async () => {
     try {
@@ -28,10 +37,27 @@ export function usePendingRecordingTags(isRecording: boolean) {
     }
   }, []);
 
-  // Reload when recording starts (fresh backend init) and clear when it ends.
+  // On recording start, push the pre-start selection so it travels with the
+  // session (the backend initializes an empty set at start), then confirm the
+  // canonical set. Without a local selection this is a plain reload; clear
+  // local state when recording ends.
   useEffect(() => {
     if (isRecording) {
-      load();
+      const ids = pendingRef.current.map((t) => t.id);
+      (async () => {
+        if (ids.length > 0) {
+          for (const delay of [0, 300]) {
+            if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+            try {
+              await invoke('set_recording_pending_tags', { tagIds: ids });
+              break;
+            } catch (e) {
+              console.error('Failed to carry pre-start pending tags into recording:', e);
+            }
+          }
+        }
+        await load();
+      })();
     } else {
       setPending([]);
     }
@@ -40,18 +66,17 @@ export function usePendingRecordingTags(isRecording: boolean) {
   // Initial load covers reload-UI-mid-recording: backend still has the set.
   useEffect(() => {
     load();
-    return () => {
-      if (syncTimer.current) clearTimeout(syncTimer.current);
-    };
   }, [load]);
 
+  // Serialized immediate writes: no debounce timer that can be dropped when
+  // recording stops or the page unmounts; the chain keeps last-write-wins
+  // ordering. Pre-start edits stay local — the start transition pushes them.
   const sync = useCallback((ids: string[]) => {
-    if (syncTimer.current) clearTimeout(syncTimer.current);
-    syncTimer.current = setTimeout(() => {
-      invoke<string[]>('set_recording_pending_tags', { tagIds: ids }).catch((e) =>
-        console.error('Failed to sync pending tags:', e)
-      );
-    }, 150);
+    if (!isRecordingRef.current) return;
+    syncChain.current = syncChain.current
+      .catch(() => {})
+      .then(() => invoke<string[]>('set_recording_pending_tags', { tagIds: ids }))
+      .catch((e) => console.error('Failed to sync pending tags:', e));
   }, []);
 
   const toggle = useCallback(

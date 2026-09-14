@@ -30,8 +30,18 @@ static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
 struct RetranscriptionGuard;
 
 impl RetranscriptionGuard {
-    /// Create guard and set flag atomically
+    /// Create guard and set flag atomically.
+    ///
+    /// Refuses to start while diarization is running: both jobs mutate the same
+    /// transcript rows and `meeting_speakers`, so their writes must not
+    /// interleave (fix-enhance-diarization-channel-and-speaker-flow D4).
     fn acquire() -> Result<Self, String> {
+        if crate::audio::diarization::is_diarization_in_progress() {
+            return Err(
+                "Speaker analysis is in progress; wait for it to finish before retranscribing"
+                    .to_string(),
+            );
+        }
         if RETRANSCRIPTION_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -93,7 +103,7 @@ pub async fn start_retranscription<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
+    let guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
 
     // Reset cancellation flag
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
@@ -112,8 +122,12 @@ pub async fn start_retranscription<R: Runtime>(
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
 
-    // Guard will automatically clear flag on drop
-    // No need for manual: RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
+    // Release the guard BEFORE signalling completion. The transcript insert
+    // transaction has committed above, so a consumer that reacts to
+    // `retranscription-complete` (the auto speaker re-analysis) can start
+    // diarization immediately without hitting the busy guard, and its writes
+    // are strictly sequenced after the commit (D4).
+    drop(guard);
 
     match &result {
         Ok(res) => {
@@ -630,6 +644,38 @@ async fn run_retranscription<R: Runtime>(
 
     // Wrap delete+insert+update in a transaction to prevent data loss
     let pool = app_state.db_manager.pool();
+
+    // Snapshot user-confirmed identities before the rows are replaced. Both
+    // per-block overrides (`speaker_override_id`) and cluster-level user
+    // confirmations (`meeting_speakers.matched_by='user'`) are carried forward
+    // onto the new rows whose time ranges overlap them — a `matched_by='user'`
+    // identity is never lost by retranscription. Auto cluster labels are not
+    // carried; they are re-derived by the post-Enhance analysis (D3).
+    let prior_overrides: Vec<(String, f64, f64)> = match sqlx::query_as(
+        "SELECT COALESCE(t.speaker_override_id, ms.speaker_id), \
+                COALESCE(t.audio_start_time, 0.0), COALESCE(t.audio_end_time, 0.0) \
+         FROM transcripts t \
+         LEFT JOIN meeting_speakers ms \
+           ON ms.meeting_id = t.meeting_id \
+          AND ms.cluster_label = t.speaker \
+          AND ms.matched_by = 'user' \
+         WHERE t.meeting_id = ? \
+           AND (t.speaker_override_id IS NOT NULL OR ms.speaker_id IS NOT NULL)",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                "Failed to snapshot prior user-confirmed identities for {}: {}",
+                meeting_id, e
+            );
+            Vec::new()
+        }
+    };
+
     let mut conn = pool
         .acquire()
         .await
@@ -644,10 +690,19 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
+    let mut carried_overrides = 0usize;
     for segment in &segments {
+        let override_id = best_overriding_override(
+            segment.audio_start_time,
+            segment.audio_end_time,
+            &prior_overrides,
+        );
+        if override_id.is_some() {
+            carried_overrides += 1;
+        }
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, source_device, speaker_override_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -657,6 +712,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(segment.audio_end_time)
         .bind(segment.duration)
         .bind(&segment.source_device)
+        .bind(&override_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -667,10 +723,34 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
 
     info!(
-        "Updated {} transcripts for meeting {} in transaction",
+        "Updated {} transcripts for meeting {} in transaction ({} carried user override(s))",
         segments.len(),
-        meeting_id
+        meeting_id,
+        carried_overrides
     );
+
+    // The new rows carry no cluster labels, so every `auto` meeting_speakers
+    // binding (and its centroid) belongs to the discarded segmentation and
+    // MUST NOT drive displayed attribution, confidence, or confirmation state
+    // before re-analysis. User-confirmed bindings and enrolled prototypes are
+    // preserved; the meeting is marked as not analyzed so the existing speaker
+    // analysis affordance is the path forward (D3).
+    if let Err(e) = sqlx::query(
+        "DELETE FROM meeting_speakers WHERE meeting_id = ? AND (matched_by IS NULL OR matched_by <> 'user')",
+    )
+    .bind(&meeting_id)
+    .execute(pool)
+    .await
+    {
+        warn!("Failed to clear stale auto cluster bindings: {}", e);
+    }
+    if let Err(e) = sqlx::query("UPDATE meetings SET diarization_status = NULL WHERE id = ?")
+        .bind(&meeting_id)
+        .execute(pool)
+        .await
+    {
+        warn!("Failed to mark meeting as not analyzed: {}", e);
+    }
 
     // Write updated transcripts.json and metadata.json to the meeting folder
     emit_progress(
@@ -1125,10 +1205,61 @@ async fn transcribe_segment(
     }
 }
 
+/// Pick the prior user override whose time range overlaps a newly transcribed
+/// row by the most. Returns `None` when nothing overlaps: a user-confirmed
+/// identity is carried strictly by real time overlap, never by proximity or by
+/// cluster label, so re-segmentation cannot attach it to the wrong block (D3).
+fn best_overriding_override(
+    start: Option<f64>,
+    end: Option<f64>,
+    prior: &[(String, f64, f64)],
+) -> Option<String> {
+    let start = start.unwrap_or(0.0);
+    let end = end.unwrap_or(0.0);
+    let mut best: Option<(&str, f64)> = None;
+    for (speaker_id, prior_start, prior_end) in prior {
+        let overlap = end.min(*prior_end) - start.max(*prior_start);
+        if overlap > 0.0 && best.map_or(true, |(_, best_overlap)| overlap > best_overlap) {
+            best = Some((speaker_id.as_str(), overlap));
+        }
+    }
+    best.map(|(speaker_id, _)| speaker_id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::constants::AUDIO_EXTENSIONS;
+
+    #[test]
+    fn test_best_overriding_override_carries_by_overlap() {
+        let prior = vec![
+            ("alice".to_string(), 0.0, 10.0),
+            ("bob".to_string(), 10.0, 20.0),
+        ];
+        // New row inside alice's range keeps alice.
+        assert_eq!(
+            best_overriding_override(Some(2.0), Some(5.0), &prior).as_deref(),
+            Some("alice")
+        );
+        // Overlapping both ranges keeps the larger overlap.
+        assert_eq!(
+            best_overriding_override(Some(8.0), Some(12.0), &prior).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            best_overriding_override(Some(9.0), Some(15.0), &prior).as_deref(),
+            Some("bob")
+        );
+        // No overlap carries nothing (adjacent/zero-width is not an overlap).
+        assert_eq!(best_overriding_override(Some(20.0), Some(25.0), &prior), None);
+        assert_eq!(best_overriding_override(Some(10.0), Some(10.0), &prior), None);
+        // Missing times resolve to 0.0 and still overlap a 0-based range.
+        assert_eq!(
+            best_overriding_override(None, Some(1.0), &prior).as_deref(),
+            Some("alice")
+        );
+    }
 
     #[test]
     fn test_create_transcript_segments_empty() {

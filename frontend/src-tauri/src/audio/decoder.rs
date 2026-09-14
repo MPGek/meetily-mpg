@@ -637,10 +637,53 @@ pub fn decode_audio_file_with_progress(
     })
 }
 
+/// Channel layout of an audio file, resolved from Symphonia.
+///
+/// `Unknown` means the layout could not be determined even after decoding the
+/// first packet. Callers MUST NOT treat `Unknown` as mono or downmix it: an
+/// unknown layout is passed through natively so a stereo source is at worst
+/// split rather than collapsed (change:
+/// fix-enhance-diarization-channel-and-speaker-flow, D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelLayout {
+    Known(u16),
+    Unknown,
+}
+
+impl ChannelLayout {
+    /// Concrete channel count when known.
+    pub fn channels(self) -> Option<u16> {
+        match self {
+            Self::Known(c) => Some(c),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Two or more decoded channels are treated as stereo (left=microphone,
+    /// right=system) for channel extraction.
+    pub fn is_stereo(self) -> bool {
+        matches!(self, Self::Known(c) if c >= 2)
+    }
+
+    /// Mono ONLY when the decoded audio genuinely has a single channel.
+    pub fn is_mono(self) -> bool {
+        matches!(self, Self::Known(1))
+    }
+}
+
 /// Probe an audio file's sample rate and channel count using Symphonia's header
-/// reader without decoding any packets. Used by the ffmpeg streaming
-/// diarization path to decide mono vs stereo channel splitting.
-pub fn probe_audio_metadata(path: &Path) -> Result<(u32, u16)> {
+/// reader without decoding any packets.
+///
+/// The channel count is `None` when the container does not report one; callers
+/// that need a reliable layout must use [`detect_channel_layout`] instead of
+/// defaulting a missing count to mono.
+pub fn probe_audio_metadata(path: &Path) -> Result<(u32, Option<u16>)> {
+    probe_header_metadata(path)
+}
+
+/// Read only the container/header metadata: sample rate and the channel count
+/// when the container reports one. No packets are decoded.
+fn probe_header_metadata(path: &Path) -> Result<(u32, Option<u16>)> {
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("Failed to open audio file '{}': {}", path.display(), e))?;
 
@@ -671,13 +714,113 @@ pub fn probe_audio_metadata(path: &Path) -> Result<(u32, u16)> {
         .codec_params
         .sample_rate
         .ok_or_else(|| anyhow!("Unknown sample rate"))?;
-    let channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count() as u16)
-        .unwrap_or(1);
+    let channels = track.codec_params.channels.map(|c| c.count() as u16);
 
     Ok((sample_rate, channels))
+}
+
+/// Determine an audio file's channel layout from the decoded audio.
+///
+/// Metadata fast path: when the container reports a channel count, that count
+/// is returned without decoding any packet. When the container omits it (common
+/// for AAC-in-MP4 recordings), the first audio packet is decoded and the real
+/// channel count is read from its spec — never coerced to mono.
+pub fn detect_channel_layout(path: &Path) -> Result<ChannelLayout> {
+    let (_, metadata_channels) = probe_header_metadata(path)?;
+    if let Some(channels) = metadata_channels {
+        return Ok(resolve_channel_layout(Some(channels), None));
+    }
+
+    let decoded_channels = match decode_first_packet_channels(path) {
+        Ok(Some(channels)) => {
+            info!(
+                "Channel count resolved from decoded audio (metadata omitted it): {}",
+                channels
+            );
+            Some(channels)
+        }
+        Ok(None) => {
+            warn!(
+                "Channel layout unknown for '{}': metadata omitted a channel count and no packet decoded",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                "Channel layout unknown for '{}': first-packet decode failed: {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    };
+
+    Ok(resolve_channel_layout(None, decoded_channels))
+}
+
+/// Resolve a layout from the container's reported channel count (fast path)
+/// falling back to the first decoded packet. A missing container count is never
+/// coerced to mono — the decoded value wins, and when both are absent the
+/// layout stays `Unknown`.
+fn resolve_channel_layout(
+    metadata_channels: Option<u16>,
+    decoded_channels: Option<u16>,
+) -> ChannelLayout {
+    match (metadata_channels, decoded_channels) {
+        (Some(c), _) => ChannelLayout::Known(c),
+        (None, Some(c)) => ChannelLayout::Known(c),
+        (None, None) => ChannelLayout::Unknown,
+    }
+}
+
+/// Decode packets until the first buffer yields a spec, returning its real
+/// channel count. `Ok(None)` when no packet could be decoded.
+fn decode_first_packet_channels(path: &Path) -> Result<Option<u16>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("Failed to open audio file '{}': {}", path.display(), e))?;
+
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| anyhow!("Failed to probe audio format: {}", e))?;
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| anyhow!("No audio track found in file"))?;
+    let track_id = track.id;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| anyhow!("Failed to create decoder: {}", e))?;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(_) => return Ok(None),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) => return Ok(Some(decoded.spec().channels.count() as u16)),
+            Err(_) => continue,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1052,12 +1195,61 @@ mod tests {
 
         let (sr_s, ch_s) = probe_audio_metadata(&stereo).expect("stereo probe");
         assert_eq!(sr_s, 48000);
-        assert_eq!(ch_s, 2);
+        assert_eq!(ch_s, Some(2));
 
         let (sr_m, ch_m) = probe_audio_metadata(&mono).expect("mono probe");
         assert_eq!(sr_m, 16000);
-        assert_eq!(ch_m, 1);
+        assert_eq!(ch_m, Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_channel_layout_header_fast_path() {
+        let dir = std::env::temp_dir().join(format!("meetily_layout_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stereo = dir.join("stereo.wav");
+        let mono = dir.join("mono.wav");
+        write_pcm_wav(&stereo, 2, 48000, 48000);
+        write_pcm_wav(&mono, 1, 16000, 16000);
+
+        // Metadata reports the count: the header fast path returns it with no decode.
+        assert_eq!(
+            detect_channel_layout(&stereo).expect("stereo layout"),
+            ChannelLayout::Known(2)
+        );
+        assert!(detect_channel_layout(&stereo).unwrap().is_stereo());
+        assert_eq!(
+            detect_channel_layout(&mono).expect("mono layout"),
+            ChannelLayout::Known(1)
+        );
+        assert!(detect_channel_layout(&mono).unwrap().is_mono());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_channel_layout_metadata_missing_uses_decoded() {
+        // Metadata omits the channel count but the decoded audio is stereo:
+        // the decoded layout (2) wins and is never downgraded to mono.
+        assert_eq!(
+            resolve_channel_layout(None, Some(2)),
+            ChannelLayout::Known(2)
+        );
+        assert_eq!(resolve_channel_layout(None, Some(2)).channels(), Some(2));
+        assert!(resolve_channel_layout(None, Some(2)).is_stereo());
+        // Truly single-channel decoded audio stays mono.
+        assert_eq!(
+            resolve_channel_layout(None, Some(1)),
+            ChannelLayout::Known(1)
+        );
+        // Neither source yields a count: unknown, never coerced to mono.
+        assert_eq!(
+            resolve_channel_layout(None, None),
+            ChannelLayout::Unknown
+        );
+        assert_eq!(resolve_channel_layout(None, None).channels(), None);
+        assert!(!resolve_channel_layout(None, None).is_mono());
     }
 }

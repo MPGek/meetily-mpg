@@ -30,6 +30,7 @@ interface RetranscribeDialogProps {
   meetingId: string;
   meetingFolderPath: string | null;
   onComplete?: () => void;
+  onProcessingChange?: (processing: boolean) => void;
 }
 
 interface RetranscriptionProgress {
@@ -57,6 +58,7 @@ export function RetranscribeDialog({
   meetingId,
   meetingFolderPath,
   onComplete,
+  onProcessingChange,
 }: RetranscribeDialogProps) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
   const [isProcessing, setIsProcessing] = useState(false);
@@ -82,6 +84,12 @@ export function RetranscribeDialog({
 
   // Track previous open state to only reset on closed→open transition
   const prevOpenRef = useRef(false);
+
+  // Surface processing state so sibling controls (Speakers) can disable while
+  // retranscription is writing.
+  useEffect(() => {
+    onProcessingChange?.(isProcessing);
+  }, [isProcessing, onProcessingChange]);
 
   // Helper to get selected model details (memoized)
   const selectedModelDetails = useMemo((): ModelOption | undefined => {

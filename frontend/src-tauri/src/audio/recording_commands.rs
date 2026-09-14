@@ -155,9 +155,27 @@ fn meeting_span_source(
             return None;
         }
     };
-    let stereo = crate::audio::decoder::probe_audio_metadata(&audio_path)
-        .map(|(_, ch)| ch >= 2)
-        .unwrap_or(false);
+    // Resolve the layout from the decoded audio (first-packet fallback when the
+    // container omits the channel count) so spans are read from the same channel
+    // the segment was transcribed from.
+    let layout = match crate::audio::decoder::detect_channel_layout(&audio_path) {
+        Ok(layout) => layout,
+        Err(e) => {
+            warn!(
+                "Alignment repair: channel layout detection failed for {}: {}",
+                audio_path.display(),
+                e
+            );
+            crate::audio::decoder::ChannelLayout::Unknown
+        }
+    };
+    if layout.channels().is_none() {
+        warn!(
+            "Alignment repair: channel layout unknown for {}; treating spans as mono",
+            audio_path.display()
+        );
+    }
+    let stereo = layout.is_stereo();
     match FileSpanSource::new(audio_path, stereo) {
         Ok(s) => Some(Box::new(s)),
         Err(e) => {
@@ -1799,7 +1817,27 @@ pub async fn finalize_online_session(
     // per-person cap). This covers live renames and post-stop manual bindings.
     let mut enrolled = 0usize;
     for (cluster_label, speaker_id) in &session_data.live_bindings {
-        match SpeakerRepository::enroll_cluster(pool, &meeting_id, cluster_label, speaker_id).await
+        // Re-binding (demote a previous speaker's prototypes, then enroll the
+        // best-K) is shared with the offline commands so both behave the same.
+        let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
+            Some("mic")
+        } else if cluster_label.starts_with("SPEAKER_") {
+            if session_data.cluster_embeddings.saw_system_audio {
+                Some("system")
+            } else {
+                Some("mic")
+            }
+        } else {
+            None
+        };
+        match SpeakerRepository::rebind_cluster(
+            pool,
+            &meeting_id,
+            cluster_label,
+            channel,
+            speaker_id,
+        )
+        .await
         {
             Ok(n) => enrolled += n,
             Err(e) => warn!(

@@ -330,12 +330,32 @@ impl RecordingSaver {
         Ok(())
     }
 
-    /// Write metadata.json to disk (atomic write with temp file)
+    /// Write metadata.json to disk (atomic write with temp file).
+    /// Read-modify-merge: keys the `MeetingMetadata` struct does not model
+    /// (e.g. `pending_tag_ids`, change: tags-before-during-recording) survive
+    /// rewrites; struct fields win on overlap. Shares the metadata write
+    /// lock with `summary::metadata` so concurrent field writers never
+    /// interleave a torn replace.
     fn write_metadata(&self, folder: &PathBuf, metadata: &MeetingMetadata) -> Result<()> {
+        let _guard = crate::summary::metadata::METADATA_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let metadata_path = folder.join("metadata.json");
         let temp_path = folder.join(".metadata.json.tmp");
 
-        let json_string = serde_json::to_string_pretty(metadata)?;
+        let mut root = serde_json::Map::new();
+        if let Ok(raw) = std::fs::read_to_string(&metadata_path) {
+            if let Ok(serde_json::Value::Object(existing)) = serde_json::from_str::<serde_json::Value>(&raw) {
+                root = existing;
+            }
+        }
+        if let serde_json::Value::Object(fields) = serde_json::to_value(metadata)? {
+            for (k, v) in fields {
+                root.insert(k, v);
+            }
+        }
+
+        let json_string = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
         std::fs::write(&temp_path, json_string)?;
         std::fs::rename(&temp_path, &metadata_path)?; // Atomic
 
@@ -828,6 +848,44 @@ mod tests {
         // Sub-5% gap (and under 30s) must not warn.
         let warning = build_audio_warning(Some(188.0), Some(190.0), 0);
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_write_metadata_preserves_unmodeled_keys() {
+        // Stop-time finalize must not erase the pending_tag_ids key written
+        // by summary::metadata (change: tags-before-during-recording).
+        let dir = tempfile::TempDir::new().unwrap();
+        let folder = dir.path().to_path_buf();
+        let saver = RecordingSaver::default();
+        let metadata = MeetingMetadata {
+            version: "1.0".to_string(),
+            meeting_id: None,
+            meeting_name: Some("m".to_string()),
+            created_at: "2026-09-14T00:00:00Z".to_string(),
+            completed_at: None,
+            duration_seconds: None,
+            devices: DeviceInfo {
+                microphone: None,
+                system_audio: None,
+            },
+            audio_file: String::new(),
+            transcript_file: "transcripts.json".to_string(),
+            sample_rate: 48000,
+            status: "recording".to_string(),
+            audio_warning: None,
+        };
+        saver.write_metadata(&folder, &metadata).unwrap();
+        crate::summary::metadata::write_pending_tag_ids_to_metadata(
+            &folder,
+            &["tag-1".to_string()],
+        )
+        .unwrap();
+        saver.write_metadata(&folder, &metadata).unwrap();
+
+        let raw = std::fs::read_to_string(folder.join("metadata.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["pending_tag_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(value["status"], "recording");
     }
 
     #[test]
