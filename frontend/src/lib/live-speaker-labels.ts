@@ -1,5 +1,5 @@
 import type { SpeakerTurn } from '@/services/recordingService';
-import type { Transcript } from '@/types';
+import type { LiveTranscriptBlock, LiveTranscriptBlocks, Transcript } from '@/types';
 
 /**
  * Pure helpers for live speaker-label re-matching and binding rewrite.
@@ -116,4 +116,69 @@ export function rematchTranscripts(
     return t;
   });
   return changed ? next : transcripts;
+}
+
+/**
+ * Store the latest display revision of a transcript block's live word-level
+ * diarization sub-rows. Revisions are per parent sequence_id and monotonic: a
+ * stale (older-or-equal) revision is ignored, so re-attribution replaces the
+ * previous rendering instead of stacking rows. Returns the input map when
+ * nothing changed.
+ */
+export function upsertLiveBlocks(
+  prev: Map<number, LiveTranscriptBlocks>,
+  payload: LiveTranscriptBlocks
+): Map<number, LiveTranscriptBlocks> {
+  const existing = prev.get(payload.parent_sequence_id);
+  if (existing && existing.revision >= payload.revision) return prev;
+  const next = new Map(prev);
+  next.set(payload.parent_sequence_id, payload);
+  return next;
+}
+
+/** Resolution inputs for sub-row user assignments (live-speaker-labels delta). */
+export interface LiveBlockResolution {
+  /** Cluster-wide (apply-to-all) label bindings: cluster label -> name. */
+  clusterBindings?: ReadonlyMap<string, string>;
+  /** Parent-level single-block pin for the transcript being rendered. */
+  pinned?: { cluster: string; name: string };
+  /** Window-scoped per-turn overrides (cluster + time window). */
+  windowOverrides?: ReadonlyArray<{ cluster: string; start: number; end: number; name: string }>;
+}
+
+/**
+ * Apply live user assignments across a block's sub-rows: a window-scoped
+ * override lands on the sub-row whose time window it covers, a parent pin and
+ * a cluster binding apply to every sub-row of that cluster. Returns new block
+ * objects only for changed rows, so unchanged rows keep their identity.
+ */
+export function resolveLiveBlocks(
+  blocks: LiveTranscriptBlock[],
+  ctx: LiveBlockResolution
+): LiveTranscriptBlock[] {
+  return blocks.map(b => {
+    const override = ctx.windowOverrides?.find(
+      o => o.cluster === b.speaker && o.start < b.end && o.end > b.start
+    );
+    let name: string | undefined;
+    let matchedBy: string | undefined;
+    if (override) {
+      name = override.name;
+      matchedBy = 'user';
+    } else if (ctx.pinned && ctx.pinned.cluster === b.speaker) {
+      name = ctx.pinned.name;
+      matchedBy = 'user';
+    } else {
+      const bound = ctx.clusterBindings?.get(b.speaker);
+      if (bound) {
+        name = bound;
+        matchedBy = 'user';
+      }
+    }
+
+    const displayName = name ?? b.display_name;
+    const nextMatchedBy = matchedBy ?? b.matched_by;
+    if (displayName === b.display_name && nextMatchedBy === b.matched_by) return b;
+    return { ...b, display_name: displayName, matched_by: nextMatchedBy };
+  });
 }

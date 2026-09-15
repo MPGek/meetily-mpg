@@ -78,23 +78,28 @@ pub fn start_transcription_task<R: Runtime>(
         let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
         let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
 
-        // Live word-alignment queue (word-level-diarization-alignment D4):
-        // final blocks with tokens are handed off here and refined off the
-        // worker's emit path. Absent when the feature is disabled.
+        // Post-finalize block pipeline (word-level-diarization-alignment D4 +
+        // live-word-level-diarization D2): final blocks with tokens are handed
+        // off here and refined off the worker's emit path; the same consumer
+        // then runs the display-only live word-diarization reconcile. Always
+        // created so live attribution still runs on the engine's own timestamps
+        // when alignment is disabled (the consumer skips alignment then).
         let (alignment_queue, alignment_consumer): (
             Option<Arc<crate::audio::word_alignment::queue::AlignmentQueue>>,
             Option<tokio::task::JoinHandle<()>>,
-        ) = if crate::audio::word_alignment::settings::is_enabled() {
+        ) = {
             let q = Arc::new(crate::audio::word_alignment::queue::AlignmentQueue::new(
                 crate::audio::word_alignment::queue::QUEUE_CAPACITY_BYTES,
             ));
             let consumer =
                 crate::audio::word_alignment::queue::spawn_consumer(app.clone(), q.clone());
-            info!("🧩 Live word-alignment consumer started");
+            info!("🧩 Live word-alignment / diarization-reconcile consumer started");
             (Some(q), Some(consumer))
-        } else {
-            (None, None)
         };
+
+        // Consumer that re-evaluates held blocks whenever new live turns arrive.
+        let diarization_cascade =
+            crate::audio::live_diarization_reconcile::spawn_cascade(app.clone());
 
         // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
         let chunks_queued = Arc::new(AtomicU64::new(0));
@@ -555,6 +560,11 @@ pub fn start_transcription_task<R: Runtime>(
             )
             .await;
         }
+
+        // Stop the live-diarization reconcile cascade after the queued blocks
+        // have been submitted; display-only, so leftovers fall back to
+        // stop-time finalize.
+        crate::audio::live_diarization_reconcile::close_cascade(diarization_cascade).await;
 
         info!("✅ Parallel transcription task completed - all workers finished, ready for model unload");
     })

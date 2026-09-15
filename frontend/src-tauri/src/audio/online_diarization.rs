@@ -760,47 +760,60 @@ impl OnlineDiarizationProcessor {
                                         );
                                     }
                                 }
+                                let turn_label = format!("{}_{:02}", prefix, speaker_index);
+                                // A user-bound cluster labels its turns with
+                                // the user's chosen name; otherwise the
+                                // automatic recognition name (if any) is shown.
+                                let bound_speaker = prototype_store.as_ref().and_then(|store| {
+                                    store.read().ok().and_then(|s| {
+                                        s.bindings().get(&turn_label).cloned()
+                                    })
+                                });
+                                let display_name = match &bound_speaker {
+                                    Some(spk_id) => prototype_store
+                                        .as_ref()
+                                        .and_then(|store| {
+                                            store
+                                                .read()
+                                                .ok()
+                                                .and_then(|s| s.names.get(spk_id).cloned())
+                                        })
+                                        .or_else(|| recognition.as_ref().and_then(|r| r.1.clone())),
+                                    None => recognition.as_ref().and_then(|r| r.1.clone()),
+                                };
+                                let matched_by = if bound_speaker.is_some() {
+                                    Some("user".to_string())
+                                } else if recognition.is_some() {
+                                    Some("auto".to_string())
+                                } else {
+                                    None
+                                };
+                                let turn_event = SpeakerTurn {
+                                    start_time: channel.mapper.to_abs(turn_start as f64),
+                                    end_time: channel.mapper.to_abs(turn_end as f64),
+                                    speaker: turn_label,
+                                    source_device: source_device.to_string(),
+                                    display_name,
+                                    matched_by,
+                                    match_score: recognition.as_ref().map(|r| r.2),
+                                };
+                                // Publish to the live diarization registry so the
+                                // reconcile stage can attribute words live
+                                // (live-word-level-diarization D3). Unconditional
+                                // (also drives the turn-stability instrumentation
+                                // when no frontend sender is attached).
+                                crate::audio::live_diarization_reconcile::registry().publish(
+                                    crate::audio::live_diarization_reconcile::LiveTurn {
+                                        start_time: turn_event.start_time,
+                                        end_time: turn_event.end_time,
+                                        speaker: turn_event.speaker.clone(),
+                                        source_device: turn_event.source_device.clone(),
+                                        display_name: turn_event.display_name.clone(),
+                                        matched_by: turn_event.matched_by.clone(),
+                                        match_score: turn_event.match_score,
+                                    },
+                                );
                                 if let Some(sender) = &turn_sender {
-                                    let turn_label = format!("{}_{:02}", prefix, speaker_index);
-                                    // A user-bound cluster labels its turns with
-                                    // the user's chosen name; otherwise the
-                                    // automatic recognition name (if any) is shown.
-                                    let bound_speaker =
-                                        prototype_store.as_ref().and_then(|store| {
-                                            store.read().ok().and_then(|s| {
-                                                s.bindings().get(&turn_label).cloned()
-                                            })
-                                        });
-                                    let display_name = match &bound_speaker {
-                                        Some(spk_id) => prototype_store
-                                            .as_ref()
-                                            .and_then(|store| {
-                                                store
-                                                    .read()
-                                                    .ok()
-                                                    .and_then(|s| s.names.get(spk_id).cloned())
-                                            })
-                                            .or_else(|| {
-                                                recognition.as_ref().and_then(|r| r.1.clone())
-                                            }),
-                                        None => recognition.as_ref().and_then(|r| r.1.clone()),
-                                    };
-                                    let matched_by = if bound_speaker.is_some() {
-                                        Some("user".to_string())
-                                    } else if recognition.is_some() {
-                                        Some("auto".to_string())
-                                    } else {
-                                        None
-                                    };
-                                    let turn_event = SpeakerTurn {
-                                        start_time: channel.mapper.to_abs(turn_start as f64),
-                                        end_time: channel.mapper.to_abs(turn_end as f64),
-                                        speaker: turn_label,
-                                        source_device: source_device.to_string(),
-                                        display_name,
-                                        matched_by,
-                                        match_score: recognition.as_ref().map(|r| r.2),
-                                    };
                                     if let Err(e) = sender.send(turn_event) {
                                         warn!("Failed to send online speaker turn: {}", e);
                                     }

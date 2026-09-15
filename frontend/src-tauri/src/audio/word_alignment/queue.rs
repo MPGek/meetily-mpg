@@ -8,7 +8,10 @@
 //! listener upsert persists the refinement. Partial results are never queued.
 //! Overflow drops the **oldest** pending block (that block keeps ASR tokens —
 //! a spec fallback mode). At stop the queue is closed and drained with a
-//! per-block timeout before finalize.
+//! per-block timeout before finalize. The consumer also hands each block to
+//! the live word-level diarization reconcile stage (display-only) once its
+//! best-available tokens are known — refined when alignment ran, otherwise the
+//! engine's own timestamps (live-word-level-diarization D2).
 
 use super::engine::AlignmentEngine;
 use super::refine::SEGMENT_ALIGN_TIMEOUT;
@@ -159,32 +162,41 @@ pub fn spawn_consumer<R: Runtime>(
                 active_engine =
                     tokio::task::spawn_blocking(|| settings::current().engine()).await.ok().flatten();
             }
-            let Some(engine) = active_engine.clone() else {
-                continue;
-            };
 
-            let Some(tokens) = update.tokens.as_mut() else {
-                continue;
-            };
-            if tokens.is_empty() || tokens.iter().all(|t| t.refined) {
-                continue;
-            }
-
-            let ok = align_tokens_with_timeout(
-                engine,
-                tokens,
-                samples.to_vec(),
-                update.audio_start_time as f32,
-                update.audio_end_time as f32,
-                SEGMENT_ALIGN_TIMEOUT,
-            );
-            if ok {
-                // Re-emit for the same sequence_id; the listener upserts the
-                // buffered segment with refined timestamps (text unchanged).
-                if let Err(e) = app.emit("transcript-update", &update) {
-                    log::warn!("Failed to re-emit refined transcript-update: {}", e);
+            let has_tokens = update
+                .tokens
+                .as_ref()
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+            if has_tokens {
+                if let Some(engine) = active_engine.clone() {
+                    let tokens = update.tokens.as_mut().expect("checked above");
+                    if !tokens.iter().all(|t| t.refined) {
+                        let ok = align_tokens_with_timeout(
+                            engine,
+                            tokens,
+                            samples.to_vec(),
+                            update.audio_start_time as f32,
+                            update.audio_end_time as f32,
+                            SEGMENT_ALIGN_TIMEOUT,
+                        );
+                        if ok {
+                            // Re-emit for the same sequence_id; the listener
+                            // upserts the buffered segment with refined
+                            // timestamps (text unchanged).
+                            if let Err(e) = app.emit("transcript-update", &update) {
+                                log::warn!("Failed to re-emit refined transcript-update: {}", e);
+                            }
+                        }
+                    }
                 }
             }
+
+            // Live token→speaker attribution (display-only), run on the block's
+            // best-available tokens: refined when alignment ran, otherwise the
+            // transcription engine's own timestamps
+            // (live-word-level-diarization D2). No-op without live turns.
+            crate::audio::live_diarization_reconcile::submit(&app, &update);
         }
         log::info!("Alignment queue consumer finished (queue closed and drained)");
     })

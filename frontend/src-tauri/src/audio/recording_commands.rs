@@ -585,6 +585,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         let mut stored_ids = ONLINE_EXPECTED_SPEAKER_IDS.lock().unwrap();
         *stored_ids = expected_ids.clone();
     }
+
+    // Fresh live word-diarization session: clear live turns + the provisional
+    // block set so no state from a previous recording leaks in
+    // (live-word-level-diarization).
+    crate::audio::live_diarization_reconcile::reset_session();
+
     if online_mode.is_online() {
         let (embedding_sender, embedding_receiver) =
             tokio::sync::mpsc::unbounded_channel::<super::recording_state::AudioChunk>();

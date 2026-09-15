@@ -75,6 +75,9 @@ pub mod speaker_recognition;
 // Post-ASR CTC word-level forced alignment (word-level-diarization-alignment)
 pub mod word_alignment;
 
+// Live token-level speaker attribution + display splitting (live-word-level-diarization)
+pub mod live_diarization_reconcile;
+
 // Self-contained voiceprint audio clips (voiceprint-audio-clips-and-verification)
 pub mod voiceprint_clips;
 

@@ -130,6 +130,30 @@ export interface TranscriptSegmentData {
   speaker_label?: string; // User-assigned speaker name
   speaker_matched_by?: string; // 'user' | 'auto' | 'fallback'
   speaker_match_score?: number; // cosine similarity 0..1
+  // Live word-level diarization: display sub-rows for a split block
+  // (live-word-level-diarization). Present only while recording.
+  blocks?: LiveTranscriptBlock[];
+}
+
+// One display sub-row emitted by live word-level diarization for a transcript
+// block that spans more than one live speaker.
+export interface LiveTranscriptBlock {
+  start: number; // recording-relative seconds
+  end: number;
+  text: string;
+  speaker: string; // raw cluster label (drives color/identity)
+  display_name?: string; // recognized/bound name to show instead of the label
+  matched_by?: string; // 'user' | 'auto'
+  match_score?: number;
+}
+
+// Payload of the `live-transcript-blocks` event: the current display revision
+// of one parent transcript block. Children carry no sequence_id of their own.
+export interface LiveTranscriptBlocks {
+  parent_sequence_id: number;
+  source_device: string;
+  revision: number;
+  blocks: LiveTranscriptBlock[];
 }
 
 // Speaker diarization types

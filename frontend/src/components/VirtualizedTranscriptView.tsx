@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import { Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Pause, Play } from "lucide-react";
-import { TranscriptSegmentData } from "@/types";
+import { TranscriptSegmentData, LiveTranscriptBlock } from "@/types";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -41,8 +41,15 @@ export interface VirtualizedTranscriptViewProps {
     onLoadMore?: () => void;
 
     // Speaker label editing. Third arg is the transcript id for single-block
-    // updates (used by the live view to relabel just that segment).
-    onUpdateSpeakerLabel?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
+    // updates (used by the live view to relabel just that segment); the
+    // optional time window scopes a live sub-row override.
+    onUpdateSpeakerLabel?: (
+        speaker: string,
+        label: string,
+        transcriptId?: string,
+        startTime?: number,
+        endTime?: number
+    ) => Promise<void>;
 
     // Meeting ID for speaker registry operations
     meetingId?: string;
@@ -136,7 +143,7 @@ function SpeakerLabel({
     speaker: string;
     label?: string;
     color: string;
-    onUpdate?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
+    onUpdate?: (speaker: string, label: string, transcriptId?: string, startTime?: number, endTime?: number) => Promise<void>;
     meetingId?: string;
     transcriptId?: string;
     startTime?: number;
@@ -215,7 +222,7 @@ function SpeakerLabel({
             // Scope-aware local propagation: apply-to-all passes no
             // transcriptId so the updater relabels every block of the
             // cluster; single-block passes the id (design D11).
-            await onUpdate(speaker, sp.name, scopeAll ? undefined : transcriptId);
+            await onUpdate(speaker, sp.name, scopeAll ? undefined : transcriptId, startTime, endTime);
         } catch (error) {
             console.error("Failed to assign speaker:", error);
             // Backend write runs before onUpdate, so the local label was never
@@ -248,7 +255,7 @@ function SpeakerLabel({
                     );
                 }
             }
-            await onUpdate(speaker, label, scopeAll ? undefined : transcriptId);
+            await onUpdate(speaker, label, scopeAll ? undefined : transcriptId, startTime, endTime);
             toast.success("Speaker confirmed");
         } catch (error) {
             console.error("Failed to confirm speaker:", error);
@@ -285,7 +292,7 @@ function SpeakerLabel({
                     );
                 }
             }
-            await onUpdate(speaker, trimmed, scopeAll ? undefined : transcriptId);
+            await onUpdate(speaker, trimmed, scopeAll ? undefined : transcriptId, startTime, endTime);
         } catch (error) {
             console.error("Failed to create speaker:", error);
             toast.error("Failed to assign speaker");
@@ -440,6 +447,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     onPlayFrom,
     isActive,
     isAudioPlaying,
+    blocks,
 }: {
     id: string;
     timestamp: number;
@@ -454,11 +462,19 @@ const TranscriptSegment = memo(function TranscriptSegment({
     speaker_matched_by?: string;
     speaker_match_score?: number;
     hasAudioTime?: boolean;
-    onUpdateSpeakerLabel?: (speaker: string, label: string, transcriptId?: string) => Promise<void>;
+    onUpdateSpeakerLabel?: (
+        speaker: string,
+        label: string,
+        transcriptId?: string,
+        startTime?: number,
+        endTime?: number
+    ) => Promise<void>;
     meetingId?: string;
     onPlayFrom?: (startTime: number) => void;
     isActive?: boolean;
     isAudioPlaying?: boolean;
+    /** Live word-level diarization sub-rows (only when a block was split). */
+    blocks?: LiveTranscriptBlock[];
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -492,6 +508,64 @@ const TranscriptSegment = memo(function TranscriptSegment({
     ) : null;
 
     const speakerColor = hasSpeaker ? getSpeakerColor(speaker) : undefined;
+
+    // Live word-level diarization: render one sub-row per speaker run instead
+    // of the single-segment bubble. Only present for blocks that were actually
+    // split (>1 run); single-speaker blocks render exactly as before.
+    if (blocks && blocks.length > 1) {
+        return (
+            <div
+                id={`segment-${id}`}
+                className={isActive ? 'mb-3 bg-blue-50/70 rounded-lg ring-1 ring-blue-300' : 'mb-3'}
+            >
+                <div className="flex items-start gap-2">
+                    <Tooltip>
+                        <TooltipTrigger>
+                            <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                                {formatRecordingTime(timestamp)}
+                            </span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                            {confidence !== undefined && showConfidence && (
+                                <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
+                            )}
+                        </TooltipContent>
+                    </Tooltip>
+                    {playButton}
+                    <div className="flex-1 space-y-2">
+                        {blocks.map((block, index) => {
+                            const blockColor = getSpeakerColor(block.speaker);
+                            return (
+                                <div key={`${block.speaker}-${block.start}-${index}`}>
+                                    <div className="flex items-center gap-1.5 mb-1 ml-1">
+                                        <span
+                                            className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                            style={{ backgroundColor: blockColor }}
+                                        />
+                                        <SpeakerLabel
+                                            speaker={block.speaker}
+                                            label={block.display_name}
+                                            color={blockColor}
+                                            onUpdate={onUpdateSpeakerLabel}
+                                            meetingId={meetingId}
+                                            transcriptId={id}
+                                            startTime={block.start}
+                                            endTime={block.end}
+                                            matchedBy={block.matched_by}
+                                            matchScore={block.match_score}
+                                        />
+                                    </div>
+                                    <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap ml-1">
+                                        {cleanStopWords(block.text) || block.text}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            </div>
+        );
+    }
 
     if (isLegacy) {
         // Legacy neutral style - left-aligned, no bubble
@@ -863,6 +937,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         onPlayFrom={onPlayFrom}
                                         isActive={activeSegmentId === segment.id}
                                         isAudioPlaying={isAudioPlaying}
+                                        blocks={segment.blocks}
                                     />
                                 </div>
                             );
@@ -931,6 +1006,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         onPlayFrom={onPlayFrom}
                                         isActive={activeSegmentId === segment.id}
                                         isAudioPlaying={isAudioPlaying}
+                                        blocks={segment.blocks}
                                     />
                                 </motion.div>
                             );

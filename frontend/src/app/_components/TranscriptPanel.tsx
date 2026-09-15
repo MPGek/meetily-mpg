@@ -32,7 +32,7 @@ export function TranscriptPanel({
   showModal
 }: TranscriptPanelProps) {
   // Contexts
-  const { transcripts, transcriptContainerRef, isFollowingBottom, scrollToBottom, copyTranscript, applyLiveSpeakerLabel } = useTranscripts();
+  const { transcripts, transcriptContainerRef, isFollowingBottom, scrollToBottom, copyTranscript, applyLiveSpeakerLabel, getLiveBlocksFor } = useTranscripts();
   const { transcriptModelConfig, selectedLanguage } = useConfig();
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
@@ -53,8 +53,10 @@ export function TranscriptPanel({
       speaker_label: t.speaker_label,
       speaker_matched_by: t.speaker_matched_by,
       speaker_match_score: t.speaker_match_score,
+      // Live word-level diarization sub-rows (split blocks only).
+      blocks: getLiveBlocksFor(t),
     })),
-    [transcripts]
+    [transcripts, getLiveBlocksFor]
   );
 
   return (
@@ -125,12 +127,8 @@ export function TranscriptPanel({
                 isStopping={isStopping}
                 enableStreaming={isRecording}
                 showConfidence={true}
-                onUpdateSpeakerLabel={async (speaker, label, transcriptId) => {
-                  if (transcriptId) {
-                    applyLiveSpeakerLabel(speaker, label, transcriptId);
-                  } else {
-                    applyLiveSpeakerLabel(speaker, label);
-                  }
+                onUpdateSpeakerLabel={async (speaker, label, transcriptId, startTime, endTime) => {
+                  applyLiveSpeakerLabel(speaker, label, transcriptId, startTime, endTime);
                 }}
               />
             </div>

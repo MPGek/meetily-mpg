@@ -7,6 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { LiveTranscriptBlocks } from '@/types';
 
 export interface RecordingState {
   is_recording: boolean;
@@ -275,6 +276,21 @@ export class RecordingService {
    */
   async onSpeakerTurn(callback: (turn: SpeakerTurn) => void): Promise<UnlistenFn> {
     return listen<SpeakerTurn>('online-speaker-turn', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for live word-level diarization display revisions
+   * (live-word-level-diarization). Each payload is a new revision of one
+   * transcript block's display sub-rows; the frontend keeps only the latest
+   * revision per parent sequence_id.
+   * @returns Unlisten function
+   */
+  async onLiveTranscriptBlocks(
+    callback: (payload: LiveTranscriptBlocks) => void
+  ): Promise<UnlistenFn> {
+    return listen<LiveTranscriptBlocks>('live-transcript-blocks', (event) => {
       callback(event.payload);
     });
   }

@@ -4,9 +4,11 @@ import {
   rewriteTurnsForBinding,
   rewriteTurnsInWindow,
   rematchTranscripts,
+  upsertLiveBlocks,
+  resolveLiveBlocks,
 } from "../../src/lib/live-speaker-labels";
 import type { SpeakerTurn } from "../../src/services/recordingService";
-import type { Transcript } from "../../src/types";
+import type { LiveTranscriptBlock, LiveTranscriptBlocks, Transcript } from "../../src/types";
 
 const turn = (partial: Partial<SpeakerTurn>): SpeakerTurn => ({
   start_time: 0,
@@ -122,5 +124,75 @@ describe("rematchTranscripts freeze", () => {
     expect(out[0].speaker).toBe("SPEAKER_07");
     expect(out[0].speaker_label).toBe("Dana");
     expect(out[0].speaker_matched_by).toBe("auto");
+  });
+});
+
+const liveBlocks = (partial: Partial<LiveTranscriptBlocks>): LiveTranscriptBlocks => ({
+  parent_sequence_id: 7,
+  source_device: "Microphone",
+  revision: 1,
+  blocks: [],
+  ...partial,
+});
+
+const block = (partial: Partial<LiveTranscriptBlock>): LiveTranscriptBlock => ({
+  start: 0,
+  end: 1,
+  text: "hi",
+  speaker: "SPEAKER_00",
+  ...partial,
+});
+
+describe("upsertLiveBlocks", () => {
+  test("a newer revision replaces the previous rendering (no duplicate rows)", () => {
+    const first = upsertLiveBlocks(new Map(), liveBlocks({ revision: 1 }));
+    const second = upsertLiveBlocks(first, { ...liveBlocks({ revision: 2 }), blocks: [block({}), block({ start: 1, end: 2, speaker: "SPEAKER_01" })] });
+    expect(second.size).toBe(1);
+    expect(second.get(7)?.revision).toBe(2);
+    expect(second.get(7)?.blocks).toHaveLength(2);
+  });
+
+  test("a stale revision is ignored", () => {
+    const current = upsertLiveBlocks(new Map(), liveBlocks({ revision: 3 }));
+    const out = upsertLiveBlocks(current, liveBlocks({ revision: 2 }));
+    expect(out).toBe(current);
+    expect(out.get(7)?.revision).toBe(3);
+  });
+});
+
+describe("resolveLiveBlocks across a live split", () => {
+  const split = [
+    block({ start: 0, end: 1, speaker: "SPEAKER_00", text: "A" }),
+    block({ start: 1, end: 2, speaker: "SPEAKER_01", text: "B" }),
+  ];
+
+  test("pinned cluster label applies to every sub-row of that cluster", () => {
+    const out = resolveLiveBlocks(split, { pinned: { cluster: "SPEAKER_01", name: "Alice" } });
+    expect(out[0].display_name).toBeUndefined();
+    expect(out[1]).toMatchObject({ display_name: "Alice", matched_by: "user" });
+  });
+
+  test("a window-scoped override lands only on the covering sub-row", () => {
+    const out = resolveLiveBlocks(split, {
+      windowOverrides: [{ cluster: "SPEAKER_01", start: 1, end: 2, name: "Bob" }],
+    });
+    expect(out[0].display_name).toBeUndefined();
+    expect(out[1]).toMatchObject({ display_name: "Bob", matched_by: "user" });
+  });
+
+  test("a cluster binding applies to all sub-rows of the cluster", () => {
+    const out = resolveLiveBlocks(split, {
+      clusterBindings: new Map([["SPEAKER_00", "Carol"]]),
+    });
+    expect(out[0]).toMatchObject({ display_name: "Carol", matched_by: "user" });
+    expect(out[1].display_name).toBeUndefined();
+  });
+
+  test("an unrelated override leaves the auto display name in place", () => {
+    const withAuto = [block({ start: 0, end: 1, speaker: "SPEAKER_00", display_name: "Dana", matched_by: "auto" })];
+    const out = resolveLiveBlocks(withAuto, {
+      windowOverrides: [{ cluster: "SPEAKER_09", start: 0, end: 1, name: "Eve" }],
+    });
+    expect(out[0]).toMatchObject({ display_name: "Dana", matched_by: "auto" });
   });
 });

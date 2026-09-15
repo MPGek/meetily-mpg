@@ -1,14 +1,14 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
-import { Transcript, TranscriptUpdate } from '@/types';
+import { Transcript, TranscriptUpdate, LiveTranscriptBlock, LiveTranscriptBlocks } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
 import { recordingService, type SpeakerTurn } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
 import { loadDiarizationSettings } from '@/lib/diarization';
-import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow } from '@/lib/live-speaker-labels';
+import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveLiveBlocks } from '@/lib/live-speaker-labels';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
@@ -24,7 +24,19 @@ interface TranscriptContextType {
   clearTranscripts: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
-  applyLiveSpeakerLabel: (clusterLabel: string, name: string, transcriptId?: string) => void;
+  applyLiveSpeakerLabel: (
+    clusterLabel: string,
+    name: string,
+    transcriptId?: string,
+    startTime?: number,
+    endTime?: number
+  ) => void;
+  /**
+   * Live word-level diarization sub-rows for a transcript, resolved against
+   * live user assignments. Undefined unless the block was split into >1
+   * speaker run (live-word-level-diarization).
+   */
+  getLiveBlocksFor: (transcript: Transcript) => LiveTranscriptBlock[] | undefined;
 }
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
@@ -48,6 +60,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const finalFlushRef = useRef<(() => void) | null>(null);
   const turnsRef = useRef<SpeakerTurn[]>([]);
+  // Live word-level diarization: latest display revision per parent
+  // sequence_id (live-word-level-diarization). Display-only.
+  const [liveBlocks, setLiveBlocks] = useState<Map<number, LiveTranscriptBlocks>>(new Map());
+  const liveBlocksRef = useRef<Map<number, LiveTranscriptBlocks>>(new Map());
+  // Window-scoped single-turn overrides, re-keyed onto the covering sub-row
+  // when a block is live-split (live-speaker-labels delta).
+  const windowOverridesRef = useRef<Array<{ cluster: string; start: number; end: number; name: string }>>([]);
   // User-assigned live labels by transcript id: a transcript the user has
   // explicitly assigned a speaker to is frozen for the rest of the session —
   // it is never re-matched against the live turn stream, so no later
@@ -233,6 +252,34 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  // Listen for live word-level diarization display revisions and keep only the
+  // latest revision per parent sequence_id (replace semantics, no duplicate
+  // rows across re-attribution).
+  useEffect(() => {
+    let unlistenLiveBlocks: (() => void) | undefined;
+
+    const setupLiveBlocksListener = async () => {
+      try {
+        unlistenLiveBlocks = await recordingService.onLiveTranscriptBlocks((payload) => {
+          const next = upsertLiveBlocks(liveBlocksRef.current, payload);
+          if (next === liveBlocksRef.current) return;
+          liveBlocksRef.current = next;
+          setLiveBlocks(next);
+        });
+      } catch (error) {
+        console.error('Failed to setup live-transcript-blocks listener:', error);
+      }
+    };
+
+    setupLiveBlocksListener();
+
+    return () => {
+      if (unlistenLiveBlocks) {
+        unlistenLiveBlocks();
+      }
+    };
+  }, []);
+
   // Initialize IndexedDB and listen for recording-started/stopped events
   useEffect(() => {
     let unlistenRecordingStarted: (() => void) | undefined;
@@ -250,6 +297,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             turnsRef.current = [];
             userAssignmentsRef.current = new Map();
             clusterBindingsRef.current = new Map();
+            // Reset live word-level diarization display state too.
+            liveBlocksRef.current = new Map();
+            windowOverridesRef.current = [];
+            setLiveBlocks(new Map());
 
             // Generate unique meeting ID
             const meetingId = `meeting-${Date.now()}`;
@@ -678,6 +729,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     turnsRef.current = [];
     userAssignmentsRef.current = new Map();
     clusterBindingsRef.current = new Map();
+    liveBlocksRef.current = new Map();
+    windowOverridesRef.current = [];
+    setLiveBlocks(new Map());
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -709,7 +763,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // bind/prototype update already done by the backend). When a transcriptId
   // is given (single-block scope), only that segment is relabeled via its
   // per-turn override; the backend already recorded it in session state.
-  const applyLiveSpeakerLabel = useCallback((clusterLabel: string, name: string, transcriptId?: string) => {
+  const applyLiveSpeakerLabel = useCallback((
+    clusterLabel: string,
+    name: string,
+    transcriptId?: string,
+    startTime?: number,
+    endTime?: number
+  ) => {
     // Mutate refs OUTSIDE the state updater so the assignment maps stay in
     // sync and are never re-run/re-ordered by React batching.
     if (transcriptId !== undefined) {
@@ -717,9 +777,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       // transcript's window (so a later re-match can't see the stale auto
       // turn for that window) and freeze just this transcript.
       const target = transcriptsRef.current.find(t => t.id === transcriptId);
+      const tStart = startTime ?? target?.audio_start_time ?? 0;
+      const tEnd = endTime ?? target?.audio_end_time ?? tStart;
       if (target) {
-        const tStart = target.audio_start_time ?? 0;
-        const tEnd = target.audio_end_time ?? tStart;
         turnsRef.current = rewriteTurnsInWindow(
           turnsRef.current,
           clusterLabel,
@@ -729,6 +789,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           name
         );
       }
+      // Record the window-scoped override so a later live split re-keys the
+      // name onto the covering sub-row only.
+      windowOverridesRef.current = [
+        ...windowOverridesRef.current.filter(
+          o => !(o.cluster === clusterLabel && o.start === tStart && o.end === tEnd)
+        ),
+        { cluster: clusterLabel, start: tStart, end: tEnd, name },
+      ];
       pinTranscript(transcriptId, clusterLabel, name);
     } else {
       // Apply-to-all: record the cluster binding and rewrite every turn of
@@ -753,6 +821,21 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
+  // Resolve a transcript's live word-level diarization sub-rows against the
+  // session's live user assignments. Only blocks split into >1 speaker run are
+  // returned, so single-speaker blocks render exactly as before.
+  const getLiveBlocksFor = useCallback((transcript: Transcript): LiveTranscriptBlock[] | undefined => {
+    const seq = transcript.sequence_id;
+    if (seq === undefined || seq === null) return undefined;
+    const payload = liveBlocks.get(seq);
+    if (!payload || payload.blocks.length < 2) return undefined;
+    return resolveLiveBlocks(payload.blocks, {
+      clusterBindings: clusterBindingsRef.current,
+      pinned: userAssignmentsRef.current.get(transcript.id),
+      windowOverrides: windowOverridesRef.current,
+    });
+  }, [liveBlocks]);
+
   const value: TranscriptContextType = {
     transcripts,
     transcriptsRef,
@@ -768,6 +851,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     currentMeetingId,
     markMeetingAsSaved,
     applyLiveSpeakerLabel,
+    getLiveBlocksFor,
   };
 
   return (
