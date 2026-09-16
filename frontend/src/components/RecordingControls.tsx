@@ -10,10 +10,14 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import Analytics from '@/lib/analytics';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { DiarizationStatusLines } from '@/components/DiarizationStatusLines';
+import type { RecordingTelemetry } from '@/services/diarizationStatusService';
 
 interface RecordingControlsProps {
   isRecording: boolean;
   barHeights: string[];
+  /** Live recording telemetry, sampled by the parent while recording. */
+  recordingTelemetry?: RecordingTelemetry | null;
   onRecordingStop: (callApi?: boolean) => void;
   onRecordingStart: () => void;
   onTranscriptReceived: (summary: SummaryResponse) => void;
@@ -31,6 +35,7 @@ interface RecordingControlsProps {
 export const RecordingControls: React.FC<RecordingControlsProps> = ({
   isRecording,
   barHeights,
+  recordingTelemetry,
   onRecordingStop,
   onRecordingStart,
   onTranscriptReceived,
@@ -484,6 +489,13 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                       />
                     ))}
                   </div>
+
+                  {/* Two per-channel diarization status lines, immediately to
+                      the right of the animated indicator. Hidden when not
+                      recording and when diarization is off. */}
+                  {isRecording && recordingTelemetry?.active && recordingTelemetry.diarization.mode !== 'off' && (
+                    <DiarizationStatusLines telemetry={recordingTelemetry} />
+                  )}
                 </>
               )}
             </>

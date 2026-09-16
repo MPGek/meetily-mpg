@@ -740,6 +740,12 @@ impl ContinuousVadProcessor {
     pub fn processed_ms(&self) -> f64 {
         self.processed_samples as f64 / 16.0
     }
+
+    /// Whether the detector is currently inside a speech region. Read by the
+    /// pipeline's live telemetry; does not affect detection.
+    pub fn is_in_speech(&self) -> bool {
+        self.in_speech
+    }
 }
 
 /// Legacy function for backward compatibility - now uses the optimized approach

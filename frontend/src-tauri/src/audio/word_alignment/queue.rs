@@ -142,6 +142,16 @@ impl AlignmentQueue {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Held audio bytes (for the live status lines).
+    pub fn bytes(&self) -> usize {
+        self.state.lock().unwrap().bytes
+    }
+
+    /// Blocks dropped to stay within capacity (0 normally).
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
 }
 
 /// Spawn the consumer task that refines queued blocks and re-emits refined
@@ -161,6 +171,10 @@ pub fn spawn_consumer<R: Runtime>(
             if active_engine.is_none() {
                 active_engine =
                     tokio::task::spawn_blocking(|| settings::current().engine()).await.ok().flatten();
+                // Publish engine state for the live status block: a disabled or
+                // not-yet-downloaded model must read as unavailable, not as a
+                // failure (online-diarization-telemetry).
+                crate::audio::telemetry::set_alignment_engine_loaded(active_engine.is_some());
             }
 
             let has_tokens = update
@@ -181,6 +195,9 @@ pub fn spawn_consumer<R: Runtime>(
                             SEGMENT_ALIGN_TIMEOUT,
                         );
                         if ok {
+                            // Live activity for the status block: the aligner
+                            // produced refined timestamps.
+                            crate::audio::telemetry::note_alignment_refined();
                             // Re-emit for the same sequence_id; the listener
                             // upserts the buffered segment with refined
                             // timestamps (text unchanged).

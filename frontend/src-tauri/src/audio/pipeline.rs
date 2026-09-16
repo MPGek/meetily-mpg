@@ -665,6 +665,9 @@ pub struct AudioPipeline {
     metrics_batcher: Option<AudioMetricsBatcher>,
     // Ring buffer for synchronized audio interleaving
     ring_buffer: AudioMixerRingBuffer,
+    // Live telemetry: published buffer fills and voice-activity activity
+    // (online-diarization-telemetry). None only if telemetry is not installed.
+    telemetry: Option<Arc<super::telemetry::PipelineTelemetry>>,
     // Recording sender for stereo interleaved audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
     // Throttle: only surface the first saver-delivery failure per run so a dead
@@ -782,6 +785,23 @@ impl AudioPipeline {
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
 
+        // Live telemetry for this session. Thresholds come from the same
+        // constants that drive the operations they gate, so the reported fill
+        // always matches what actually fires.
+        let telemetry = super::telemetry::install_pipeline(sample_rate);
+        for channel in [
+            telemetry.channel(&DeviceType::Microphone),
+            telemetry.channel(&DeviceType::System),
+        ] {
+            channel
+                .vad_dispatch
+                .set_threshold(vad_dispatch_threshold_samples as u64);
+            channel
+                .mix
+                .set_threshold(ring_buffer.window_size_samples as u64);
+            channel.set_pending_triggers(500, 25_000);
+        }
+
         Self {
             receiver,
             transcription_sender,
@@ -798,6 +818,7 @@ impl AudioPipeline {
             metrics_batcher: Some(AudioMetricsBatcher::new()),
             // Initialize ring buffer
             ring_buffer,
+            telemetry: Some(telemetry),
             recording_sender_for_mixed: None, // Will be set by manager
             recording_save_failure_reported: false,
             // Initialize VAD accumulation buffers
@@ -812,6 +833,47 @@ impl AudioPipeline {
             vad_mic_anchors: Vec::new(),
             vad_sys_anchors: Vec::new(),
         }
+    }
+
+    /// Publish one channel's live telemetry: the fills of the buffers that gate
+    /// this channel's operations, and its voice-activity activity. Called once
+    /// per audio chunk; touches only atomics.
+    fn publish_channel_telemetry(&self, device_type: &DeviceType) {
+        let Some(telemetry) = self.telemetry.as_deref() else {
+            return;
+        };
+        let channel = telemetry.channel(device_type);
+
+        let (dispatch_fill, vad, pending, mix_fill) = match device_type {
+            DeviceType::Microphone => (
+                self.vad_buffer_mic.len(),
+                &self.vad_processor_mic,
+                &self.vad_pending_mic,
+                self.ring_buffer.mic_buffer.len(),
+            ),
+            DeviceType::System => (
+                self.vad_buffer_sys.len(),
+                &self.vad_processor_sys,
+                &self.vad_pending_sys,
+                self.ring_buffer.system_buffer.len(),
+            ),
+        };
+
+        channel.vad_dispatch.set_fill(dispatch_fill as u64);
+        channel.set_vad_frames(
+            super::telemetry::PipelineTelemetry::frames_from_processed_ms(vad.processed_ms()),
+        );
+        channel.set_vad_speaking(vad.is_in_speech());
+        channel.set_pending(
+            pending.len() as u64,
+            pending
+                .iter()
+                .map(|segment| {
+                    (segment.end_timestamp_ms - segment.start_timestamp_ms).max(0.0) as u64
+                })
+                .sum(),
+        );
+        channel.mix.set_fill(mix_fill as u64);
     }
 
     /// Merge accumulated VAD segments and dispatch to transcription.
@@ -1032,9 +1094,22 @@ impl AudioPipeline {
                         }
                     }
 
+                    // STEP 1.5: live input level for the status lines. Measured
+                    // on the mono samples this channel is actually using, before
+                    // they move into the recording ring buffer.
+                    if let Some(telemetry) = self.telemetry.as_deref() {
+                        telemetry
+                            .channel(&chunk.device_type)
+                            .set_level(&chunk.data);
+                    }
+
                     // STEP 2: Add mono audio to ring buffer for recording (move, no clone)
                     self.ring_buffer
                         .add_samples(chunk.device_type.clone(), chunk.data);
+
+                    // STEP 2.5: publish this channel's live telemetry (fills and
+                    // voice-activity activity) for the status lines.
+                    self.publish_channel_telemetry(&chunk.device_type);
 
                     // STEP 3: Interleave stereo from ring buffer for recording
                     while self.ring_buffer.can_mix() {

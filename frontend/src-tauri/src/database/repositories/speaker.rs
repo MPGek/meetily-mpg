@@ -129,6 +129,16 @@ pub struct ClearAllResult {
     pub total_deleted: i64,
 }
 
+/// Result of a bulk purge of the unconfirmed cache layer: how many cache rows
+/// were removed and the storage they reclaimed (embeddings and stored clips).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PurgeUnconfirmedCachesResult {
+    pub deleted_caches: i64,
+    pub deleted_embedding_bytes: i64,
+    pub deleted_clip_count: i64,
+    pub deleted_clip_bytes: i64,
+}
+
 pub struct SpeakerRepository;
 
 impl SpeakerRepository {
@@ -1707,6 +1717,48 @@ impl SpeakerRepository {
             deleted_prototypes: proto.0,
             deleted_caches: caches.0,
             total_deleted: total.0,
+        })
+    }
+
+    /// Bulk removal of the unconfirmed cache layer only. Deletes every
+    /// `speaker_embeddings` row owned by a meeting cluster (`speaker_id IS NULL`),
+    /// leaving enrolled prototypes, the speaker registry, cluster bindings and
+    /// their centroids, expected-speaker allowlists, and transcript overrides
+    /// untouched. The aggregates are read inside the same transaction as the
+    /// delete, so the reported totals describe exactly the removed rows.
+    /// Purged caches are reproducible only by re-running diarization.
+    pub async fn purge_unconfirmed_caches(
+        pool: &SqlitePool,
+    ) -> Result<PurgeUnconfirmedCachesResult, SqlxError> {
+        let mut tx = pool.begin().await?;
+
+        let (deleted_caches, deleted_embedding_bytes, deleted_clip_count, deleted_clip_bytes): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(LENGTH(embedding)), 0),
+                    COUNT(audio_blob),
+                    COALESCE(SUM(LENGTH(audio_blob)), 0)
+             FROM speaker_embeddings
+             WHERE speaker_id IS NULL",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM speaker_embeddings WHERE speaker_id IS NULL")
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(PurgeUnconfirmedCachesResult {
+            deleted_caches,
+            deleted_embedding_bytes,
+            deleted_clip_count,
+            deleted_clip_bytes,
         })
     }
 }
@@ -4230,5 +4282,383 @@ mod tests {
             SpeakerRepository::verify_meeting_caches(&pool, "m2").await.unwrap(),
             1
         );
+    }
+
+    /// Insert an unassigned cache row (meeting-owned) with an optional clip.
+    async fn insert_cache_row(
+        pool: &SqlitePool,
+        id: &str,
+        meeting_id: &str,
+        cluster_label: &str,
+        embedding: &[f32],
+        clip: Option<&[u8]>,
+    ) {
+        sqlx::query(
+            "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, verified_at, created_at)
+             VALUES (?, ?, 'titanet_large', 'mic', 3.0, NULL, ?, ?, 10.0, 13.0, ?, ?, ?, 0, NULL, '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(embedding_to_bytes(embedding))
+        .bind(meeting_id)
+        .bind(cluster_label)
+        .bind(clip)
+        .bind(clip.map(|_| "opus"))
+        .bind(clip.map(|_| 16000i64))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_unconfirmed_caches_deletes_only_caches() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        for i in 0..3 {
+            insert_prototype_with_clip(&pool, &format!("proto-{i}"), &alice.id, "m1", None).await;
+        }
+        for i in 0..4 {
+            insert_cache_row(
+                &pool,
+                &format!("cache-{i}"),
+                "m1",
+                "SPEAKER_00",
+                &[i as f32; 4],
+                None,
+            )
+            .await;
+        }
+
+        let before = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(before.prototype_count, 3);
+        assert_eq!(before.cache_count, 4);
+
+        let res = SpeakerRepository::purge_unconfirmed_caches(&pool)
+            .await
+            .unwrap();
+        assert_eq!(res.deleted_caches, 4);
+
+        let after = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(after.prototype_count, 3, "prototypes must survive the purge");
+        assert_eq!(after.cache_count, 0, "every cache row must be removed");
+
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(std::slice::from_ref(&alice.id)),
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+        assert_eq!(protos.len(), 3, "prototypes still load for recognition");
+    }
+
+    #[tokio::test]
+    async fn purge_unconfirmed_caches_preserves_bindings_and_overrides() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        let centroid = embedding_to_bytes(&[7.0f32; 192]);
+        sqlx::query(
+            "INSERT INTO meeting_speakers (meeting_id, cluster_label, speaker_id, centroid, channel, matched_by, match_score)
+             VALUES ('m1', 'SPEAKER_00', ?, ?, 'mic', 'auto', 0.81)",
+        )
+        .bind(&alice.id)
+        .bind(&centroid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO meeting_expected_speakers (meeting_id, speaker_id) VALUES ('m1', ?)")
+            .bind(&alice.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, speaker_override_id)
+             VALUES ('t1', 'm1', 'text', '2026-01-01T00:00:00Z', 'SPEAKER_00', ?)",
+        )
+        .bind(&alice.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for i in 0..3 {
+            insert_cache_row(
+                &pool,
+                &format!("cache-{i}"),
+                "m1",
+                "SPEAKER_00",
+                &[i as f32; 4],
+                None,
+            )
+            .await;
+        }
+
+        SpeakerRepository::purge_unconfirmed_caches(&pool)
+            .await
+            .unwrap();
+
+        // Registry speaker intact.
+        assert_eq!(SpeakerRepository::list_speakers(&pool).await.unwrap().len(), 1);
+
+        // Cluster binding, centroid, and provenance intact.
+        let binding: MeetingSpeaker = sqlx::query_as::<_, MeetingSpeaker>(
+            "SELECT meeting_id, cluster_label, speaker_id, centroid, channel, matched_by, match_score
+             FROM meeting_speakers WHERE meeting_id = 'm1' AND cluster_label = 'SPEAKER_00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(binding.speaker_id.as_deref(), Some(alice.id.as_str()));
+        assert_eq!(binding.centroid.as_deref(), Some(centroid.as_slice()));
+        assert_eq!(binding.channel.as_deref(), Some("mic"));
+        assert_eq!(binding.matched_by.as_deref(), Some("auto"));
+        assert_eq!(binding.match_score, Some(0.81));
+
+        // Allowlist intact.
+        let expected = SpeakerRepository::get_expected_speakers(&pool, "m1")
+            .await
+            .unwrap();
+        assert_eq!(expected, vec![alice.id.clone()]);
+
+        // Per-transcript override intact.
+        let override_id: Option<String> =
+            sqlx::query_scalar("SELECT speaker_override_id FROM transcripts WHERE id = 't1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(override_id.as_deref(), Some(alice.id.as_str()));
+
+        // Re-match still runs from the cached centroid.
+        let centroids = SpeakerRepository::get_cluster_centroids(&pool, "m1")
+            .await
+            .unwrap();
+        assert_eq!(centroids.len(), 1);
+        assert_eq!(centroids[0].centroid, vec![7.0f32; 192]);
+    }
+
+    #[tokio::test]
+    async fn purge_unconfirmed_caches_reports_reclaimed_storage() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        // A prototype clip must survive and stay out of the reported totals.
+        let proto_clip = vec![1u8; 50];
+        insert_prototype_with_clip(&pool, "proto-1", &alice.id, "m1", Some(&proto_clip)).await;
+
+        let clip_a = vec![2u8; 100];
+        let clip_b = vec![3u8; 25];
+        insert_cache_row(&pool, "cache-a", "m1", "SPEAKER_00", &[1.0; 192], Some(&clip_a)).await;
+        insert_cache_row(&pool, "cache-b", "m1", "SPEAKER_01", &[2.0; 192], Some(&clip_b)).await;
+        insert_cache_row(&pool, "cache-c", "m1", "SPEAKER_02", &[3.0; 192], None).await;
+
+        let res = SpeakerRepository::purge_unconfirmed_caches(&pool)
+            .await
+            .unwrap();
+        assert_eq!(res.deleted_caches, 3);
+        assert_eq!(
+            res.deleted_embedding_bytes,
+            3 * 192 * 4,
+            "three 192-d f32 embeddings"
+        );
+        assert_eq!(res.deleted_clip_count, 2, "only rows carrying a clip count");
+        assert_eq!(res.deleted_clip_bytes, 125);
+
+        let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(stats.prototype_count, 1);
+        assert_eq!(stats.clip_count, 1);
+        assert_eq!(stats.audio_bytes, 50);
+        let loaded = SpeakerRepository::get_voiceprint_audio(&pool, "proto-1")
+            .await
+            .unwrap()
+            .expect("prototype clip survives");
+        assert_eq!(loaded.0, proto_clip);
+    }
+
+    #[tokio::test]
+    async fn purge_unconfirmed_caches_on_empty_layer_is_a_noop() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        insert_prototype_with_clip(&pool, "proto-1", &alice.id, "m1", None).await;
+
+        let res = SpeakerRepository::purge_unconfirmed_caches(&pool)
+            .await
+            .unwrap();
+        assert_eq!(res.deleted_caches, 0);
+        assert_eq!(res.deleted_embedding_bytes, 0);
+        assert_eq!(res.deleted_clip_count, 0);
+        assert_eq!(res.deleted_clip_bytes, 0);
+
+        let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(stats.prototype_count, 1);
+    }
+
+    #[tokio::test]
+    async fn purge_unconfirmed_caches_keeps_enrollment_semantics() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        insert_meeting(&pool, "m2").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        // m1: a fully enrolled cluster (prototypes keep m1 provenance).
+        let enrolled_exemplars: Vec<Exemplar> = (0..4)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 1.0, 0.0, 0.0]),
+                duration_secs: 5.0 + i as f64,
+                start_secs: Some(i as f32),
+                end_secs: Some(i as f32 + 5.0),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[9.0; 4]),
+            &enrolled_exemplars,
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+                .await
+                .unwrap(),
+            4
+        );
+
+        // m2: a cluster still sitting as caches only.
+        let pending_exemplars: Vec<Exemplar> = (0..3)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 2.0, 0.0, 0.0]),
+                duration_secs: 4.0 + i as f64,
+                start_secs: Some(i as f32),
+                end_secs: Some(i as f32 + 4.0),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m2",
+            "SPEAKER_01",
+            "mic",
+            &emb(&[8.0; 4]),
+            &pending_exemplars,
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+
+        let res = SpeakerRepository::purge_unconfirmed_caches(&pool)
+            .await
+            .unwrap();
+        assert_eq!(res.deleted_caches, 3);
+
+        // Enrollment from a purged cluster is a documented no-op, not an error.
+        // (`enroll_cluster` returns the speaker's prototype count, so a fresh
+        // speaker must stay at zero.)
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+        assert_eq!(
+            SpeakerRepository::enroll_cluster(&pool, "m2", "SPEAKER_01", &bob.id)
+                .await
+                .unwrap(),
+            0,
+            "no caches left to enroll"
+        );
+
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(std::slice::from_ref(&alice.id)),
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+        assert_eq!(protos.len(), 4, "pre-existing prototypes still load");
+    }
+
+    #[tokio::test]
+    async fn purge_unconfirmed_caches_keeps_prototypes_with_live_provenance() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+
+        // 12 exemplars: best K=8 enroll, 4 stay as caches in the SAME meeting the
+        // prototypes point at, so prototype provenance outlives the purge.
+        let exemplars: Vec<Exemplar> = (0..12)
+            .map(|i| Exemplar {
+                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                duration_secs: i as f64,
+                start_secs: Some(i as f32 * 10.0),
+                end_secs: Some(i as f32 * 10.0 + i as f32),
+            })
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[99.0; 4]),
+            &exemplars,
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+
+        let before = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(before.prototype_count, ENROLLMENT_BEST_K as i64);
+        assert_eq!(before.cache_count, 4);
+
+        let res = SpeakerRepository::purge_unconfirmed_caches(&pool)
+            .await
+            .unwrap();
+        assert_eq!(res.deleted_caches, 4);
+
+        let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
+        assert_eq!(
+            stats.prototype_count, ENROLLMENT_BEST_K as i64,
+            "provenanced prototypes survive the purge"
+        );
+        assert_eq!(stats.cache_count, 0);
+
+        let protos = SpeakerRepository::load_prototypes(
+            &pool,
+            Some(std::slice::from_ref(&alice.id)),
+            "titanet_large",
+        )
+        .await
+        .unwrap();
+        assert_eq!(protos.len(), ENROLLMENT_BEST_K);
+
+        // Prototypes still point at the meeting whose caches were purged.
+        let rows: Vec<SpeakerEmbedding> = sqlx::query_as::<_, SpeakerEmbedding>(
+            "SELECT id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at FROM speaker_embeddings WHERE speaker_id = ?",
+        )
+        .bind(&alice.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), ENROLLMENT_BEST_K);
+        for r in &rows {
+            assert_eq!(r.meeting_id.as_deref(), Some("m1"));
+        }
     }
 }

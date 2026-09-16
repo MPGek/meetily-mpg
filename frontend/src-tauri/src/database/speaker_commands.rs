@@ -1,6 +1,7 @@
 use crate::database::models::Speaker;
 use crate::database::repositories::speaker::{
-    ClearAllResult, SpeakerRepository, SpeakerStorageStats, VoiceprintBrowser,
+    ClearAllResult, PurgeUnconfirmedCachesResult, SpeakerRepository, SpeakerStorageStats,
+    VoiceprintBrowser,
 };
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
@@ -572,4 +573,21 @@ pub async fn clear_all_voiceprints(
         }
     }
     Ok(result)
+}
+
+/// Bulk removal of the unconfirmed cache layer only: every embedding owned by a
+/// meeting cluster is deleted, while enrolled prototypes, the speaker registry,
+/// cluster bindings/centroids, expected speakers, and transcript overrides are
+/// left untouched. Purged caches are reproducible only by re-running diarization.
+#[tauri::command]
+pub async fn purge_unconfirmed_caches(
+    state: tauri::State<'_, AppState>,
+) -> Result<PurgeUnconfirmedCachesResult, String> {
+    let pool = state.db_manager.pool();
+    // Deliberately no in-memory PrototypeStore reset here, unlike
+    // clear_all_voiceprints: cache rows are never loaded into the store, and
+    // clearing it would discard in-session user bindings for no benefit.
+    SpeakerRepository::purge_unconfirmed_caches(pool)
+        .await
+        .map_err(|e| format!("Failed to purge unconfirmed caches: {}", e))
 }

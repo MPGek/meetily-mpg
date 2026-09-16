@@ -32,6 +32,10 @@ pub const TITANET_CLUSTER_THRESHOLD: f32 = 0.60; // tuned default (swept)
 /// Enhanced TitaNet recognition threshold – experimental.
 pub const TITANET_RECOGNITION_THRESHOLD: f32 = 0.68; // experimental threshold
 
+/// Enhanced TitaNet-Large embedding dimension (single source of truth for the
+/// family; surfaced in the live diarization status lines).
+pub const ENHANCED_EMBEDDING_DIM: usize = 192;
+
 /// Enhanced artifact filenames (repo-managed; co-located in models_dir).
 pub const ENHANCED_SEGMENTATION_FILE: &str = "segmentation-3.0.onnx";
 pub const ENHANCED_EMBEDDING_FILE: &str = "titanet_large.onnx";
@@ -207,7 +211,7 @@ impl TitanetAdapter {
     ) -> Result<Self, polyvoice::embedder::EmbedderError> {
         Self::new_with_layout(
             model_path,
-            192,
+            ENHANCED_EMBEDDING_DIM,
             pool_size,
             polyvoice::onnx::ExecutionProvider::Cpu,
             resolve_titanet_layout(),

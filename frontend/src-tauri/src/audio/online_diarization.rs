@@ -15,8 +15,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use log::{info, warn};
 use serde::Serialize;
@@ -24,6 +24,7 @@ use sqlx::SqlitePool;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::diarization::ClusteredEmbedding;
+use super::live_diarization_reconcile::LiveTurnRegistry;
 use super::recording_saver::TranscriptSegment;
 use super::recording_state::{AudioChunk, DeviceType};
 use super::speaker_recognition::{MatchResult, Prototype};
@@ -79,6 +80,309 @@ impl DiarizationMode {
 
     pub fn is_online(self) -> bool {
         matches!(self, DiarizationMode::Efficient | DiarizationMode::Fast)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live telemetry (change: online-diarization-telemetry)
+// ---------------------------------------------------------------------------
+
+/// Diarization channel a status line describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarChannel {
+    Microphone,
+    System,
+}
+
+impl DiarChannel {
+    /// Source-device key used by the live turn stream.
+    pub fn source_device(self) -> &'static str {
+        match self {
+            DiarChannel::Microphone => "Microphone",
+            DiarChannel::System => "System",
+        }
+    }
+}
+
+/// Display state of one channel's status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarChannelState {
+    /// No online diarization session is available.
+    Unavailable,
+    /// Mono session: there is no system channel to report on.
+    Inactive,
+    /// Efficient mode: clustering is deferred to recording stop.
+    Deferred,
+    /// Chunks are being embedded but no stable turn exists yet.
+    Accumulating,
+    /// Embedding and turn order are healthy.
+    Healthy,
+    /// Published turns are no longer ordered in time.
+    Warning,
+    /// Embedding stopped and the session's diarization was disabled.
+    Error,
+}
+
+/// Resolve one channel's display state from its counters and session context.
+/// Kept pure so every state is testable without an engine or audio.
+pub(crate) fn resolve_channel_state(
+    available: bool,
+    mode: DiarizationMode,
+    channel: DiarChannel,
+    has_system_device: bool,
+    engine_disabled: bool,
+    chunks: u64,
+    turns: u64,
+    ordered: bool,
+) -> DiarChannelState {
+    if !available {
+        return DiarChannelState::Unavailable;
+    }
+    if channel == DiarChannel::System && !has_system_device {
+        return DiarChannelState::Inactive;
+    }
+    if engine_disabled && chunks > 0 {
+        return DiarChannelState::Error;
+    }
+    if mode == DiarizationMode::Efficient {
+        return DiarChannelState::Deferred;
+    }
+    if turns > 0 {
+        return if ordered {
+            DiarChannelState::Healthy
+        } else {
+            DiarChannelState::Warning
+        };
+    }
+    DiarChannelState::Accumulating
+}
+
+/// The most recent stable turn on a channel, as shown in its status line.
+#[derive(Debug, Clone, Serialize)]
+pub struct LastTurn {
+    pub speaker: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+}
+
+/// One channel's status line.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelStatusLine {
+    pub channel: DiarChannel,
+    pub state: DiarChannelState,
+    pub chunks: u64,
+    pub embed_ok: u64,
+    pub embed_failed: u64,
+    pub buffered: u64,
+    /// Audio seconds covered by the buffered embeddings.
+    pub buffered_secs: f32,
+    pub turns: u64,
+    pub ordered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<LastTurn>,
+}
+
+/// Per-channel counters updated from the chunk path.
+#[derive(Debug, Default)]
+struct ChannelStats {
+    chunks: AtomicU64,
+    embed_ok: AtomicU64,
+    embed_failed: AtomicU64,
+    buffered: AtomicU64,
+    /// Audio covered by the buffered embeddings, in milliseconds: the buffer
+    /// read as work done rather than a bare count.
+    buffered_ms: AtomicU64,
+    turns: AtomicU64,
+}
+
+/// Session-scoped online diarization stats. Counters are cheap atomics written
+/// from the chunk path; the status command reads them on its own interval, so
+/// no event is emitted per audio chunk.
+pub struct OnlineDiarizationStats {
+    mode: DiarizationMode,
+    has_system_device: bool,
+    available: AtomicBool,
+    engine_disabled: AtomicBool,
+    mic: ChannelStats,
+    sys: ChannelStats,
+}
+
+impl OnlineDiarizationStats {
+    pub fn new(mode: DiarizationMode, has_system_device: bool) -> Self {
+        Self {
+            mode,
+            has_system_device,
+            available: AtomicBool::new(false),
+            engine_disabled: AtomicBool::new(false),
+            mic: ChannelStats::default(),
+            sys: ChannelStats::default(),
+        }
+    }
+
+    pub fn mode(&self) -> DiarizationMode {
+        self.mode
+    }
+
+    /// Mark the processor as constructed. Until then the lines report
+    /// unavailable rather than showing zeros as live values.
+    pub fn mark_available(&self) {
+        self.available.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the processor was constructed for this session.
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::SeqCst)
+    }
+
+    fn channel(&self, channel: DiarChannel) -> &ChannelStats {
+        match channel {
+            DiarChannel::Microphone => &self.mic,
+            DiarChannel::System => &self.sys,
+        }
+    }
+
+    pub(crate) fn record_chunk(&self, channel: DiarChannel) {
+        self.channel(channel)
+            .chunks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_embed_ok(&self, channel: DiarChannel) {
+        self.channel(channel)
+            .embed_ok
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_embed_failed(&self, channel: DiarChannel) {
+        self.channel(channel)
+            .embed_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffered(&self, channel: DiarChannel, audio_ms: u64) {
+        let stats = self.channel(channel);
+        stats.buffered.fetch_add(1, Ordering::Relaxed);
+        stats.buffered_ms.fetch_add(audio_ms, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_turn(&self, channel: DiarChannel) {
+        self.channel(channel).turns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The session's diarization was disabled (embedding or pipeline failure).
+    pub(crate) fn disable(&self) {
+        self.engine_disabled.store(true, Ordering::SeqCst);
+    }
+
+    /// One channel's status line. Turn count, turn order and the last turn come
+    /// from the shared live turn registry, so there is a single source of truth
+    /// for what the live stream published.
+    pub fn line(&self, channel: DiarChannel, registry: &LiveTurnRegistry) -> ChannelStatusLine {
+        let stats = self.channel(channel);
+        let chunks = stats.chunks.load(Ordering::Relaxed);
+        let turns = stats.turns.load(Ordering::Relaxed);
+        let source_device = channel.source_device();
+        let ordered = registry.is_ordered(source_device);
+        let last_turn = registry
+            .turns(source_device)
+            .last()
+            .map(|turn| LastTurn {
+                speaker: turn.speaker.clone(),
+                display_name: turn.display_name.clone(),
+                matched_by: turn.matched_by.clone(),
+                score: turn.match_score,
+            });
+
+        ChannelStatusLine {
+            channel,
+            state: resolve_channel_state(
+                self.available.load(Ordering::SeqCst),
+                self.mode,
+                channel,
+                self.has_system_device,
+                self.engine_disabled.load(Ordering::SeqCst),
+                chunks,
+                turns,
+                ordered,
+            ),
+            chunks,
+            embed_ok: stats.embed_ok.load(Ordering::Relaxed),
+            embed_failed: stats.embed_failed.load(Ordering::Relaxed),
+            buffered: stats.buffered.load(Ordering::Relaxed),
+            buffered_secs: stats.buffered_ms.load(Ordering::Relaxed) as f32 / 1000.0,
+            turns,
+            ordered,
+            last_turn,
+        }
+    }
+}
+
+/// Read-only snapshot backing the two live status lines.
+#[derive(Debug, Clone, Serialize)]
+pub struct OnlineDiarizationStatus {
+    /// True while an online diarization session is running.
+    pub active: bool,
+    pub mode: DiarizationMode,
+    pub available: bool,
+    pub model_tag: String,
+    pub embedding_dim: usize,
+    pub recognition_threshold: f32,
+    /// Prototype and session-binding counts; `None` when no store is loaded.
+    pub prototypes: Option<usize>,
+    pub bindings: Option<usize>,
+    pub mic: ChannelStatusLine,
+    pub sys: ChannelStatusLine,
+}
+
+// Session-scoped stats for the live status lines. Installed at recording start
+// and cleared at stop, so a stopped session's counters are never presented as
+// live values.
+static ONLINE_DIARIZATION_STATS: Mutex<Option<Arc<OnlineDiarizationStats>>> = Mutex::new(None);
+
+/// Install a fresh stats holder for a new session, clearing any previous one.
+pub fn begin_stats(mode: DiarizationMode, has_system_device: bool) -> Arc<OnlineDiarizationStats> {
+    let stats = Arc::new(OnlineDiarizationStats::new(mode, has_system_device));
+    if let Ok(mut slot) = ONLINE_DIARIZATION_STATS.lock() {
+        *slot = Some(stats.clone());
+    }
+    stats
+}
+
+/// The running session's stats, if any.
+pub fn current_stats() -> Option<Arc<OnlineDiarizationStats>> {
+    ONLINE_DIARIZATION_STATS.lock().ok().and_then(|s| s.clone())
+}
+
+/// Drop the session's stats (recording stopped).
+pub fn clear_stats() {
+    if let Ok(mut slot) = ONLINE_DIARIZATION_STATS.lock() {
+        *slot = None;
+    }
+}
+
+/// Map a pipeline device type to its diarization channel.
+fn diar_channel(device: &DeviceType) -> DiarChannel {
+    match device {
+        DeviceType::System => DiarChannel::System,
+        DeviceType::Microphone => DiarChannel::Microphone,
+    }
+}
+
+/// Apply a stats update when telemetry is attached, otherwise do nothing.
+/// Takes the handle by reference (not through the processor) so the chunk path
+/// can update counters while the engine is still borrowed mutably.
+fn record_stats<F: FnOnce(&OnlineDiarizationStats)>(
+    stats: &Option<Arc<OnlineDiarizationStats>>,
+    update: F,
+) {
+    if let Some(stats) = stats.as_deref() {
+        update(stats);
     }
 }
 
@@ -479,6 +783,9 @@ pub struct OnlineDiarizationProcessor {
     attempted_sys: usize,
     failed_mic: usize,
     failed_sys: usize,
+    /// Live status counters for the two channel lines. None when telemetry is
+    /// not attached; every update no-ops in that case.
+    stats: Option<Arc<OnlineDiarizationStats>>,
     _guard: OnlineDiarizationGuard,
 }
 
@@ -589,6 +896,7 @@ impl OnlineDiarizationProcessor {
             attempted_sys: 0,
             failed_mic: 0,
             failed_sys: 0,
+            stats: None,
             _guard: guard,
         })
     }
@@ -601,18 +909,32 @@ impl OnlineDiarizationProcessor {
         self.engine.is_none()
     }
 
+    /// Attach the session's live status counters. Kept separate from
+    /// construction so telemetry never affects the diarization engine itself.
+    pub fn attach_stats(&mut self, stats: Arc<OnlineDiarizationStats>) {
+        stats.mark_available();
+        self.stats = Some(stats);
+    }
+
     /// Routes one audio chunk to the active engine. No-op in the error state
     /// or when the chunk is too short to embed. A single chunk that fails to
     /// embed or feed is skipped (logged) rather than disabling the whole
     /// session: engine error state is reserved for init failures, so a
     /// transient bad chunk never wipes the remaining recording's labels.
     pub fn process_chunk(&mut self, chunk: AudioChunk) {
-        let Some(engine) = self.engine.as_mut() else {
-            return;
-        };
         if chunk.data.len() < MIN_SEGMENT_SAMPLES {
             return;
         }
+
+        // Clone the telemetry handle up front: the engine borrow below holds
+        // `self.engine` mutably for the rest of this function, so counters are
+        // updated through this handle instead of through `self`.
+        let diar = diar_channel(&chunk.device_type);
+        let stats = self.stats.clone();
+
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
 
         let samples: std::borrow::Cow<'_, [f32]> = if chunk.sample_rate != 16000 {
             match super::audio_processing::resample(&chunk.data, chunk.sample_rate, 16000) {
@@ -629,6 +951,11 @@ impl OnlineDiarizationProcessor {
         if chunk.device_type == DeviceType::System {
             self.saw_system_audio = true;
         }
+
+        // Live status: count every chunk that reached the engine. Chunks that
+        // never got here (error state, too short, failed resample) are not
+        // reported as received.
+        record_stats(&stats, |s| s.record_chunk(diar));
 
         // Capture live-emission state before borrowing the engine, so the
         // Fast-mode loop can send turns without conflicting borrows.
@@ -648,12 +975,16 @@ impl OnlineDiarizationProcessor {
                     DeviceType::System => self.attempted_sys += 1,
                 }
                 let embedding = match extractor.embed(&samples) {
-                    Ok(emb) => emb,
+                    Ok(emb) => {
+                        record_stats(&stats, |s| s.record_embed_ok(diar));
+                        emb
+                    }
                     Err(e) => {
                         match chunk.device_type {
                             DeviceType::Microphone => self.failed_mic += 1,
                             DeviceType::System => self.failed_sys += 1,
                         }
+                        record_stats(&stats, |s| s.record_embed_failed(diar));
                         // Preserve layout hint when relevant
                         if e.to_string().contains("audio_signal")
                             || e.to_string().contains("Expected:80")
@@ -671,6 +1002,8 @@ impl OnlineDiarizationProcessor {
                     DeviceType::Microphone => mic.push(start, end, embedding),
                     DeviceType::System => sys.push(start, end, embedding),
                 }
+                let buffered_ms = ((end - start).max(0.0) * 1000.0) as u64;
+                record_stats(&stats, |s| s.record_buffered(diar, buffered_ms));
             }
             Engine::Fast {
                 mic,
@@ -693,12 +1026,19 @@ impl OnlineDiarizationProcessor {
                 // Fast mode embeds each chunk itself (pipeline turns carry no
                 // embedding) for live recognition, buffering, and enrollment.
                 let chunk_embedding = match extractor.embed(&samples) {
-                    Ok(emb) => emb,
+                    Ok(emb) => {
+                        record_stats(&stats, |s| s.record_embed_ok(diar));
+                        emb
+                    }
                     Err(e) => {
                         match chunk.device_type {
                             DeviceType::Microphone => self.failed_mic += 1,
                             DeviceType::System => self.failed_sys += 1,
                         }
+                        record_stats(&stats, |s| {
+                            s.record_embed_failed(diar);
+                            s.disable();
+                        });
                         if e.to_string().contains("audio_signal")
                             || e.to_string().contains("Expected:80")
                         {
@@ -731,6 +1071,8 @@ impl OnlineDiarizationProcessor {
                 // BEFORE the pipeline feed, so the emb_buf borrow ends before
                 // the match (allowing self.engine = None in the Err arm).
                 emb_buf.push(start, end, chunk_embedding.clone());
+                let buffered_ms = (duration.max(0.0) * 1000.0) as u64;
+                record_stats(&stats, |s| s.record_buffered(diar, buffered_ms));
 
                 channel
                     .mapper
@@ -747,6 +1089,7 @@ impl OnlineDiarizationProcessor {
                                     end: turn_end,
                                     speaker: speaker_index,
                                 });
+                                record_stats(&stats, |s| s.record_turn(diar));
                                 // Record this chunk's embedding under the
                                 // pipeline speaker, for seeding a newly created
                                 // person's prototypes on live rename.
@@ -826,6 +1169,7 @@ impl OnlineDiarizationProcessor {
                             "StreamingPipeline feed failed ({}), disabling online diarization",
                             e
                         );
+                        record_stats(&stats, |s| s.disable());
                         self.engine = None;
                     }
                 }
@@ -1156,6 +1500,258 @@ mod tests {
 
     fn store_with(mic_prefix: &str) -> PrototypeStore {
         PrototypeStore::new(mic_prefix.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Live telemetry (change: online-diarization-telemetry)
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn state(
+        available: bool,
+        mode: DiarizationMode,
+        channel: DiarChannel,
+        has_system: bool,
+        disabled: bool,
+        chunks: u64,
+        turns: u64,
+        ordered: bool,
+    ) -> DiarChannelState {
+        resolve_channel_state(
+            available, mode, channel, has_system, disabled, chunks, turns, ordered,
+        )
+    }
+
+    #[test]
+    fn telemetry_counters_stay_isolated_per_channel() {
+        let stats = OnlineDiarizationStats::new(DiarizationMode::Fast, true);
+        stats.mark_available();
+        stats.record_chunk(DiarChannel::Microphone);
+        stats.record_buffered(DiarChannel::Microphone, 2400);
+
+        let registry = LiveTurnRegistry::new();
+        let mic = stats.line(DiarChannel::Microphone, &registry);
+        let sys = stats.line(DiarChannel::System, &registry);
+
+        assert_eq!(mic.chunks, 1);
+        assert_eq!(sys.chunks, 0);
+        assert_eq!(mic.embed_ok, 0);
+        assert_eq!(sys.embed_ok, 0);
+        // Buffered audio is derived per channel, not shared.
+        assert_eq!(mic.buffered_secs, 2.4);
+        assert_eq!(sys.buffered_secs, 0.0);
+    }
+
+    #[test]
+    fn telemetry_each_counter_advances_once_per_event() {
+        let stats = OnlineDiarizationStats::new(DiarizationMode::Fast, true);
+        stats.mark_available();
+        stats.record_chunk(DiarChannel::Microphone);
+        stats.record_embed_ok(DiarChannel::Microphone);
+        stats.record_embed_failed(DiarChannel::Microphone);
+        stats.record_buffered(DiarChannel::Microphone, 2400);
+        stats.record_turn(DiarChannel::Microphone);
+
+        let line = stats.line(DiarChannel::Microphone, &LiveTurnRegistry::new());
+        assert_eq!(line.chunks, 1);
+        assert_eq!(line.embed_ok, 1);
+        assert_eq!(line.embed_failed, 1);
+        assert_eq!(line.buffered, 1);
+        assert_eq!(line.buffered_secs, 2.4);
+        assert_eq!(line.turns, 1);
+    }
+
+    #[test]
+    fn telemetry_line_reports_registry_last_turn() {
+        use crate::audio::live_diarization_reconcile::LiveTurn;
+
+        let stats = OnlineDiarizationStats::new(DiarizationMode::Fast, true);
+        stats.mark_available();
+        stats.record_turn(DiarChannel::Microphone);
+
+        let registry = LiveTurnRegistry::new();
+        registry.publish(LiveTurn {
+            start_time: 1.0,
+            end_time: 3.0,
+            speaker: "MIC_SPEAKER_01".to_string(),
+            source_device: "Microphone".to_string(),
+            display_name: Some("Alice".to_string()),
+            matched_by: Some("auto".to_string()),
+            match_score: Some(0.74),
+        });
+
+        let line = stats.line(DiarChannel::Microphone, &registry);
+        let last = line.last_turn.expect("last turn recorded");
+        assert_eq!(last.speaker, "MIC_SPEAKER_01");
+        assert_eq!(last.display_name.as_deref(), Some("Alice"));
+        assert_eq!(last.matched_by.as_deref(), Some("auto"));
+        assert_eq!(last.score, Some(0.74));
+        assert!(line.ordered);
+        assert_eq!(line.state, DiarChannelState::Healthy);
+
+        // The system channel is untouched by a microphone turn.
+        let sys = stats.line(DiarChannel::System, &registry);
+        assert!(sys.last_turn.is_none());
+        assert_eq!(sys.turns, 0);
+    }
+
+    #[test]
+    fn telemetry_new_session_starts_from_zero() {
+        let _guard = crate::audio::telemetry::TELEMETRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = begin_stats(DiarizationMode::Fast, true);
+        first.mark_available();
+        first.record_chunk(DiarChannel::Microphone);
+        assert_eq!(
+            current_stats()
+                .unwrap()
+                .line(DiarChannel::Microphone, &LiveTurnRegistry::new())
+                .chunks,
+            1
+        );
+
+        let second = begin_stats(DiarizationMode::Fast, true);
+        second.mark_available();
+        assert_eq!(
+            current_stats()
+                .unwrap()
+                .line(DiarChannel::Microphone, &LiveTurnRegistry::new())
+                .chunks,
+            0
+        );
+
+        clear_stats();
+        assert!(current_stats().is_none());
+    }
+
+    #[test]
+    fn telemetry_state_unavailable_without_session() {
+        assert_eq!(
+            state(
+                false,
+                DiarizationMode::Fast,
+                DiarChannel::Microphone,
+                true,
+                false,
+                0,
+                0,
+                true
+            ),
+            DiarChannelState::Unavailable
+        );
+    }
+
+    #[test]
+    fn telemetry_state_mono_system_is_inactive_not_error() {
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Fast,
+                DiarChannel::System,
+                false,
+                true,
+                5,
+                0,
+                true
+            ),
+            DiarChannelState::Inactive
+        );
+    }
+
+    #[test]
+    fn telemetry_state_efficient_defers_without_warning() {
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Efficient,
+                DiarChannel::Microphone,
+                true,
+                false,
+                7,
+                0,
+                true
+            ),
+            DiarChannelState::Deferred
+        );
+    }
+
+    #[test]
+    fn telemetry_state_no_speech_is_not_a_warning() {
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Fast,
+                DiarChannel::Microphone,
+                true,
+                false,
+                0,
+                0,
+                true
+            ),
+            DiarChannelState::Accumulating
+        );
+    }
+
+    #[test]
+    fn telemetry_state_follows_turn_order() {
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Fast,
+                DiarChannel::Microphone,
+                true,
+                false,
+                4,
+                3,
+                true
+            ),
+            DiarChannelState::Healthy
+        );
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Fast,
+                DiarChannel::Microphone,
+                true,
+                false,
+                4,
+                3,
+                false
+            ),
+            DiarChannelState::Warning
+        );
+    }
+
+    #[test]
+    fn telemetry_state_error_only_for_channel_that_fed() {
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Fast,
+                DiarChannel::Microphone,
+                true,
+                true,
+                4,
+                0,
+                true
+            ),
+            DiarChannelState::Error
+        );
+        // Engine disabled but this channel never fed: still just waiting.
+        assert_eq!(
+            state(
+                true,
+                DiarizationMode::Fast,
+                DiarChannel::System,
+                true,
+                true,
+                0,
+                0,
+                true
+            ),
+            DiarChannelState::Accumulating
+        );
     }
 
     #[test]

@@ -170,6 +170,18 @@ impl LiveTurnRegistry {
             .unwrap_or_default()
     }
 
+    /// Whether every turn published on this channel so far kept time order.
+    /// True for a channel that has published nothing yet (nothing to regress).
+    pub fn is_ordered(&self, source_device: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .monotonic
+            .get(source_device)
+            .copied()
+            .unwrap_or(true)
+    }
+
     /// Any stable turn published on any channel (Fast-mode-active gate).
     pub fn has_any_turns(&self) -> bool {
         self.inner
@@ -569,6 +581,22 @@ mod tests {
             matched_by: None,
             match_score: None,
         }
+    }
+
+    #[test]
+    fn is_ordered_flags_only_the_regressing_channel() {
+        let registry = LiveTurnRegistry::new();
+        // Nothing published yet: nothing to regress.
+        assert!(registry.is_ordered("Microphone"));
+
+        registry.publish(turn("MIC_SPEAKER_00", 1.0, 3.0, "Microphone"));
+        registry.publish(turn("MIC_SPEAKER_00", 4.0, 6.0, "Microphone"));
+        assert!(registry.is_ordered("Microphone"));
+
+        // A turn that starts before the previous one on the microphone only.
+        registry.publish(turn("MIC_SPEAKER_00", 2.0, 5.0, "Microphone"));
+        assert!(!registry.is_ordered("Microphone"));
+        assert!(registry.is_ordered("System"));
     }
 
     fn update(seq: u64, device: &str, start: f64, end: f64, tokens: Vec<Token>) -> TranscriptUpdate {

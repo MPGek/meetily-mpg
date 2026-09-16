@@ -1045,17 +1045,39 @@ pub async fn api_save_meeting_title<R: Runtime>(
 /// `metadata.json`) to a newly saved meeting. Best-effort per tag: returns
 /// human-readable warnings for skipped/failed ids, never errors — the meeting
 /// save must not fail because of tags (change: tags-before-during-recording).
+/// Resolve the folder whose `metadata.json` holds the pending tag ids: prefer
+/// the frontend-provided path when it exists, otherwise fall back to the
+/// recorder's last folder (change: tags-persistence-and-palette).
+fn resolve_recording_folder(provided: Option<&str>) -> Option<std::path::PathBuf> {
+    if let Some(path) = provided {
+        let candidate = std::path::PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    crate::summary::metadata::take_last_recording_folder()
+}
+
 async fn link_recording_pending_tags(
     pool: &sqlx::SqlitePool,
     meeting_id: &str,
-    folder_path: Option<&str>,
+    folder: Option<&std::path::Path>,
 ) -> Vec<String> {
-    let Some(folder) = folder_path else {
+    let Some(folder) = folder else {
         return Vec::new();
     };
-    let pending = match crate::summary::metadata::read_pending_tag_ids_from_metadata(
-        std::path::Path::new(folder),
-    ) {
+    if !folder.exists() {
+        log_warn!(
+            "Recording folder not found for {} ({}); pending tags were not linked",
+            meeting_id,
+            folder.display()
+        );
+        return vec![
+            "Recording folder was not found, so tags for this recording were not linked."
+                .to_string(),
+        ];
+    }
+    let pending = match crate::summary::metadata::read_pending_tag_ids_from_metadata(folder) {
         Ok(ids) => ids,
         Err(e) => {
             log_warn!("Failed to read pending tags for {}: {}", meeting_id, e);
@@ -1161,9 +1183,9 @@ pub async fn api_save_transcript<R: Runtime>(    _app: AppHandle<R>,
             // tags-before-during-recording). Best-effort per tag: stale ids
             // (tag deleted mid-recording) are skipped with a warning, and a
             // tag failure never fails the meeting save.
+            let resolved_folder = resolve_recording_folder(pending_tags_folder.as_deref());
             let tag_warnings =
-                link_recording_pending_tags(pool, &meeting_id, pending_tags_folder.as_deref())
-                    .await;
+                link_recording_pending_tags(pool, &meeting_id, resolved_folder.as_deref()).await;
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",
@@ -1624,8 +1646,7 @@ mod pending_tags_tests {
         .unwrap();
 
         let warnings =
-            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path().to_str().unwrap()))
-                .await;
+            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path())).await;
         assert!(warnings.is_empty(), "unexpected warnings");
 
         let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
@@ -1659,8 +1680,7 @@ mod pending_tags_tests {
         .unwrap();
 
         let warnings =
-            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path().to_str().unwrap()))
-                .await;
+            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path())).await;
         assert_eq!(warnings.len(), 1);
 
         let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
@@ -1675,5 +1695,48 @@ mod pending_tags_tests {
         let pool = setup_pool().await;
         let warnings = link_recording_pending_tags(&pool, "meeting-1", None).await;
         assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_folder_warns_instead_of_dropping_tags() {
+        let pool = setup_pool().await;
+        let missing = std::path::Path::new("does-not-exist-anywhere");
+        let warnings = link_recording_pending_tags(&pool, "meeting-1", Some(missing)).await;
+        assert_eq!(warnings.len(), 1, "missing folder must warn, not silently drop");
+    }
+
+    #[tokio::test]
+    async fn pending_tags_link_via_last_recording_folder_fallback() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("meeting-1")
+            .bind("M")
+            .bind("2026-09-11T15:30:00Z")
+            .bind("2026-09-11T15:30:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let work = TagsRepository::create_tag(&pool, "Fallback", None).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::json!({ "pending_tag_ids": [&work.id] }).to_string(),
+        )
+        .unwrap();
+
+        crate::summary::metadata::set_last_recording_folder(Some(dir.path().to_path_buf()));
+        let resolved = resolve_recording_folder(None);
+        assert_eq!(resolved.as_deref(), Some(dir.path()));
+
+        let warnings = link_recording_pending_tags(&pool, "meeting-1", resolved.as_deref()).await;
+        assert!(warnings.is_empty(), "unexpected warnings");
+
+        let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(linked["meeting-1"].len(), 1);
+        assert_eq!(linked["meeting-1"][0].id, work.id);
     }
 }

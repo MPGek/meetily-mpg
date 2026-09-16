@@ -18,6 +18,28 @@ const METADATA_FILE: &str = "metadata.json";
 const METADATA_TEMP_FILE_PREFIX: &str = ".metadata.json.";
 pub(crate) static METADATA_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+/// Folder of the recording that most recently set up its meeting directory.
+/// Used as a server-side fallback for save-time pending-tag linking when the
+/// frontend cannot provide `folder_path` (change: tags-persistence-and-palette).
+static LAST_RECORDING_FOLDER: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
+
+/// Remember the recording folder for the active/last recording.
+pub(crate) fn set_last_recording_folder(folder: Option<PathBuf>) {
+    let mut guard = LAST_RECORDING_FOLDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = folder;
+}
+
+/// Take (and clear) the folder remembered by [`set_last_recording_folder`].
+/// Single-use so a later unrelated save cannot link another recording's tags.
+pub(crate) fn take_last_recording_folder() -> Option<PathBuf> {
+    LAST_RECORDING_FOLDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 pub(crate) fn read_summary_language_from_metadata(folder: &Path) -> Result<Option<String>> {
     read_language_field_from_metadata(folder, SUMMARY_LANGUAGE_FIELD)
 }

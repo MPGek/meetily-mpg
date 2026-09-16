@@ -22,9 +22,11 @@ use super::{
     RecordingManager,
 };
 
+use super::embedder::{ENHANCED_EMBEDDING_DIM, ENHANCED_MODEL_TAG, TITANET_RECOGNITION_THRESHOLD};
 use super::online_diarization::{
-    DiarizationMode, OnlineClusterEmbeddings, OnlineDiarizationProcessor, PrototypeStore,
-    SpeakerAssignment, SpeakerTurn,
+    begin_stats, clear_stats, current_stats, ChannelStatusLine, DiarChannel, DiarChannelState,
+    DiarizationMode, OnlineClusterEmbeddings, OnlineDiarizationProcessor, OnlineDiarizationStatus,
+    PrototypeStore, SpeakerAssignment, SpeakerTurn,
 };
 use crate::database::repositories::speaker::SpeakerRepository;
 
@@ -580,6 +582,15 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let online_mode = DiarizationMode::parse(diarization_mode.as_deref());
     let expected_ids = expected_speaker_ids.clone().unwrap_or_default();
 
+    // Every new session starts from zero activity: drop any telemetry left
+    // behind by a previous run (including one that never reached
+    // stop_recording), so a diarization-off or crashed-previous session can
+    // never show stale counts.
+    clear_stats();
+    crate::audio::telemetry::clear_pipeline();
+    crate::audio::telemetry::clear_asr();
+    crate::audio::telemetry::clear_alignment();
+
     // Store expected speaker IDs so stop_recording can include them in session data.
     {
         let mut stored_ids = ONLINE_EXPECTED_SPEAKER_IDS.lock().unwrap();
@@ -600,6 +611,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         // system device was selected the session is stereo, so mic clusters
         // are namespaced MIC_SPEAKER_NN; otherwise mono, so SPEAKER_NN.
         let has_system_device = system_device.is_some();
+
+        // Live status counters for this session (online-diarization-telemetry).
+        // Installed before the processor starts, so the status lines report
+        // unavailable (not stale values) if model initialization fails.
+        let stats = begin_stats(online_mode, has_system_device);
 
         // Channel carrying live speaker turns (Fast mode) from the blocking
         // processor back to the async side for emission to the frontend.
@@ -673,6 +689,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                         return Err(e);
                     }
                 };
+                // Attach the live status counters so the two status lines can
+                // report this channel's progress while the recording runs.
+                processor.attach_stats(stats);
                 let mut receiver = embedding_receiver;
                 while let Some(chunk) = receiver.blocking_recv() {
                     processor.process_chunk(chunk);
@@ -1022,6 +1041,13 @@ pub async fn stop_recording<R: Runtime>(
         let mut global_task = ONLINE_DIARIZATION_TASK.lock().unwrap();
         global_task.take()
     };
+
+    // The recording is over: stop serving live status counters so a stopped
+    // session's values are never presented as live (online-diarization-telemetry).
+    clear_stats();
+    crate::audio::telemetry::clear_pipeline();
+    crate::audio::telemetry::clear_asr();
+    crate::audio::telemetry::clear_alignment();
 
     let speaker_assignments: Option<Vec<SpeakerAssignment>> = if let Some(task_handle) = online_task
     {
@@ -1967,6 +1993,158 @@ pub async fn finalize_online_session(
     }))
 }
 
+/// One channel's pipeline buffer fills and voice-activity activity.
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineStatus {
+    pub sample_rate: u32,
+    pub mic: crate::audio::telemetry::ChannelPipelineFill,
+    pub sys: crate::audio::telemetry::ChannelPipelineFill,
+}
+
+/// Diarization's model identity and readiness.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiarizationModelActivity {
+    pub mode: DiarizationMode,
+    pub model_tag: String,
+    pub embedding_dim: usize,
+    pub recognition_threshold: f32,
+    pub loaded: bool,
+    pub prototypes: Option<usize>,
+    pub bindings: Option<usize>,
+}
+
+/// Every model kind the recording relies on, with readiness and activity.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelsActivity {
+    pub vad: crate::audio::telemetry::VadActivity,
+    pub asr: crate::audio::telemetry::AsrActivity,
+    pub alignment: crate::audio::telemetry::AlignmentActivity,
+    pub diarization: DiarizationModelActivity,
+}
+
+/// Read-only snapshot backing the live status lines and their tooltip.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingTelemetry {
+    /// True while an online diarization session is running.
+    pub active: bool,
+    pub diarization: OnlineDiarizationStatus,
+    pub pipeline: PipelineStatus,
+    pub models: ModelsActivity,
+}
+
+/// Diarization section: the running session's per-channel counters, or an
+/// inactive shape when nothing is running.
+async fn online_diarization_status() -> Result<OnlineDiarizationStatus, String> {
+    let stats = current_stats();
+    let registry = crate::audio::live_diarization_reconcile::registry();
+
+    let (prototypes, bindings) = {
+        let store = ONLINE_DIARIZATION_STORE.lock().unwrap();
+        let read = store.as_ref().and_then(|s| s.read().ok());
+        match read {
+            Some(read) => (
+                Some(read.prototypes.len()),
+                Some(read.bindings().len()),
+            ),
+            None => (None, None),
+        }
+    };
+
+    let (active, mode, available, mic, sys) = match stats.as_deref() {
+        Some(stats) => (
+            stats.mode().is_online(),
+            stats.mode(),
+            stats.is_available(),
+            stats.line(DiarChannel::Microphone, &registry),
+            stats.line(DiarChannel::System, &registry),
+        ),
+        None => {
+            let unavailable = |channel| ChannelStatusLine {
+                channel,
+                state: DiarChannelState::Unavailable,
+                chunks: 0,
+                embed_ok: 0,
+                embed_failed: 0,
+                buffered: 0,
+                buffered_secs: 0.0,
+                turns: 0,
+                ordered: true,
+                last_turn: None,
+            };
+            (
+                false,
+                DiarizationMode::Off,
+                false,
+                unavailable(DiarChannel::Microphone),
+                unavailable(DiarChannel::System),
+            )
+        }
+    };
+
+    Ok(OnlineDiarizationStatus {
+        active,
+        mode,
+        available,
+        model_tag: ENHANCED_MODEL_TAG.to_string(),
+        embedding_dim: ENHANCED_EMBEDDING_DIM,
+        recognition_threshold: TITANET_RECOGNITION_THRESHOLD,
+        prototypes,
+        bindings,
+        mic,
+        sys,
+    })
+}
+
+/// Read-only snapshot of the whole recording: diarization, the pipeline buffer
+/// fills that gate its operations, and the activity of every model in use
+/// (online-diarization-telemetry). Sampled by the frontend on an interval; the
+/// chunk path never emits an event.
+///
+/// Returns an inactive shape when no session is running, so a stopped session's
+/// counters are never presented as live values.
+#[tauri::command]
+pub async fn get_recording_telemetry() -> Result<RecordingTelemetry, String> {
+    let diarization = online_diarization_status().await?;
+
+    let pipeline = match crate::audio::telemetry::pipeline() {
+        Some(pipeline) => {
+            let (mic, sys) = pipeline.snapshots();
+            PipelineStatus {
+                sample_rate: pipeline.sample_rate(),
+                mic,
+                sys,
+            }
+        }
+        None => PipelineStatus {
+            sample_rate: 0,
+            mic: Default::default(),
+            sys: Default::default(),
+        },
+    };
+
+    let models = ModelsActivity {
+        vad: crate::audio::telemetry::vad_activity(),
+        asr: crate::audio::telemetry::asr_activity(),
+        alignment: crate::audio::telemetry::alignment_activity(),
+        diarization: DiarizationModelActivity {
+            mode: diarization.mode,
+            model_tag: diarization.model_tag.clone(),
+            embedding_dim: diarization.embedding_dim,
+            recognition_threshold: diarization.recognition_threshold,
+            loaded: diarization.available,
+            prototypes: diarization.prototypes,
+            bindings: diarization.bindings,
+        },
+    };
+
+    Ok(RecordingTelemetry {
+        active: diarization.active,
+        diarization,
+        pipeline,
+        models,
+    })
+}
+
 /// Assign a live speaker during Fast-mode recording.
 ///
 /// Two scopes (design D10):
@@ -2103,5 +2281,110 @@ mod tests {
         update.tokens = None;
         let segment = transcript_segment_from_update(&update);
         assert!(segment.tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn recording_telemetry_reports_inactive_and_active_shapes() {
+        use crate::audio::online_diarization::clear_stats;
+        use crate::audio::recording_state::DeviceType;
+        use crate::audio::telemetry::{
+            clear_alignment, clear_asr, clear_pipeline, install_pipeline, VAD_MODEL_IDENTITY,
+            TELEMETRY_TEST_LOCK,
+        };
+
+        let _guard = TELEMETRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // No session: an inactive shape, never zeros presented as live values.
+        clear_stats();
+        clear_pipeline();
+        clear_asr();
+        clear_alignment();
+
+        let idle = get_recording_telemetry().await.expect("idle telemetry");
+        assert!(!idle.active);
+        assert!(!idle.diarization.available);
+        assert_eq!(idle.diarization.mode, DiarizationMode::Off);
+        assert_eq!(idle.diarization.mic.state, DiarChannelState::Unavailable);
+        assert_eq!(idle.diarization.sys.state, DiarChannelState::Unavailable);
+        assert!(idle.diarization.mic.last_turn.is_none());
+        // Every model kind is named even when nothing is running.
+        assert_eq!(idle.models.vad.identity, VAD_MODEL_IDENTITY);
+        assert!(!idle.models.vad.loaded);
+        assert!(!idle.models.asr.loaded);
+        assert_eq!(idle.models.asr.engine, None);
+        assert!(!idle.models.alignment.loaded);
+        // The global context needed to read a score is always present.
+        assert_eq!(idle.models.diarization.model_tag, ENHANCED_MODEL_TAG);
+        assert_eq!(
+            idle.models.diarization.embedding_dim,
+            ENHANCED_EMBEDDING_DIM
+        );
+        assert_eq!(
+            idle.models.diarization.recognition_threshold,
+            TITANET_RECOGNITION_THRESHOLD
+        );
+        // No pipeline: no fills are claimed.
+        assert_eq!(idle.pipeline.sample_rate, 0);
+        assert_eq!(idle.pipeline.mic.vad_dispatch.threshold, 0);
+
+        // A running session: diarization counters, pipeline fills, model activity.
+        let stats = begin_stats(DiarizationMode::Fast, true);
+        stats.mark_available();
+        stats.record_chunk(DiarChannel::Microphone);
+        stats.record_embed_ok(DiarChannel::Microphone);
+        stats.record_buffered(DiarChannel::Microphone, 2400);
+
+        let pipeline = install_pipeline(48000);
+        let mic = pipeline.channel(&DeviceType::Microphone);
+        mic.vad_dispatch.set_threshold(9600);
+        mic.vad_dispatch.set_fill(4800);
+        mic.set_vad_frames(40);
+        mic.set_vad_speaking(true);
+        mic.mix.set_threshold(28800);
+
+        let running = get_recording_telemetry().await.expect("running telemetry");
+        assert!(running.active);
+        assert_eq!(running.diarization.mic.chunks, 1);
+        assert_eq!(running.diarization.mic.embed_ok, 1);
+        assert_eq!(running.diarization.mic.buffered, 1);
+        assert_eq!(running.diarization.sys.chunks, 0);
+        // Embedded but no stable turn yet: waiting, not a warning.
+        assert_eq!(
+            running.diarization.mic.state,
+            DiarChannelState::Accumulating
+        );
+        // Fill is reported against the operation it gates, per channel.
+        assert_eq!(running.pipeline.sample_rate, 48000);
+        assert!((running.pipeline.mic.vad_dispatch.fraction - 0.5).abs() < 0.001);
+        assert!(!running.pipeline.mic.vad_dispatch.fired);
+        assert_eq!(running.pipeline.mic.vad_dispatch.threshold, 9600);
+        assert_eq!(running.pipeline.sys.vad_dispatch.fill, 0);
+        assert_eq!(running.pipeline.sys.mix.threshold, 0);
+        // Voice activity is visible per channel.
+        assert!(running.models.vad.loaded);
+        assert_eq!(running.models.vad.mic_frames, 40);
+        assert!(running.models.vad.mic_speaking);
+        assert!(!running.models.vad.sys_speaking);
+
+        // The wire contract the frontend renders from.
+        let json = serde_json::to_value(&running).expect("serialize telemetry");
+        assert_eq!(json["active"], true);
+        assert_eq!(json["diarization"]["mode"], "fast");
+        assert_eq!(json["diarization"]["mic"]["state"], "accumulating");
+        assert!(json["pipeline"]["mic"]["vad_dispatch"]["threshold"].is_number());
+        // The level meter is part of the wire contract, with its sample age.
+        assert!(json["pipeline"]["mic"]["level"]["age_ms"].is_number());
+        assert!(json["pipeline"]["mic"]["level"]["rms"].is_number());
+        assert_eq!(json["models"]["vad"]["identity"], VAD_MODEL_IDENTITY);
+
+        // Stopped: inactive again, with no stale counters or fills.
+        clear_stats();
+        clear_pipeline();
+        let stopped = get_recording_telemetry().await.expect("stopped telemetry");
+        assert!(!stopped.active);
+        assert_eq!(stopped.pipeline.sample_rate, 0);
+        assert_eq!(stopped.diarization.mic.chunks, 0);
     }
 }

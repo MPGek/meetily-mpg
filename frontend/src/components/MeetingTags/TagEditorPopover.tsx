@@ -8,7 +8,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import {
   MeetingTag,
   MeetingTagWithUsage,
-  TAG_PALETTE_KEYS,
+  nextColor,
   tagPillClass,
 } from '@/lib/meeting-tags';
 
@@ -16,11 +16,6 @@ interface TagEditorPopoverProps {
   meetingId: string;
   assigned: MeetingTag[];
   onChanged: () => void;
-}
-
-function nextColor(color: string): string {
-  const i = TAG_PALETTE_KEYS.indexOf(color);
-  return TAG_PALETTE_KEYS[(i + 1 + TAG_PALETTE_KEYS.length) % TAG_PALETTE_KEYS.length];
 }
 
 /** Tag picker for one meeting: pick existing, create new, remove, delete. */

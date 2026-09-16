@@ -324,6 +324,11 @@ impl RecordingSaver {
             warn!("Failed to init pending tags: {}", e);
         }
 
+        // Remember this folder so save-time tag linking can resolve it even
+        // when the frontend cannot supply `folder_path`
+        // (change: tags-persistence-and-palette).
+        crate::summary::metadata::set_last_recording_folder(Some(meeting_folder.clone()));
+
         self.meeting_folder = Some(meeting_folder);
         self.metadata = Some(metadata);
 

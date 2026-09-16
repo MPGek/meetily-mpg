@@ -286,6 +286,53 @@ function ConfirmClearAllDialog({
   );
 }
 
+function ConfirmPurgeCachesDialog({
+  open,
+  onClose,
+  onConfirm,
+  cacheCount,
+  clipCount,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  cacheCount: number;
+  clipCount: number;
+}) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden />
+      <div role="dialog" aria-modal="true" aria-label="Confirm unconfirmed cache purge" className="relative bg-white rounded-lg shadow-xl w-[420px] border p-4">
+        <h4 className="font-semibold text-sm mb-2">Remove unconfirmed caches?</h4>
+        <p className="text-sm text-gray-600 mb-3">
+          This will permanently delete <span className="font-medium">{cacheCount}</span> unconfirmed cache embeddings
+          {clipCount > 0 && (
+            <>
+              {' '}and <span className="font-medium">{clipCount}</span> stored voice{' '}
+              {clipCount === 1 ? 'clip' : 'clips'}
+            </>
+          )}
+          , and cannot be undone.
+        </p>
+        <div className="bg-amber-50 border border-amber-200 rounded p-3 text-xs mb-3 text-amber-900">
+          Confirmed speaker prototypes are kept, so recognition and existing speaker names are unaffected. Caches are the
+          source used when naming a cluster, so they can be recreated only by running diarization again for the affected
+          meetings.
+        </div>
+        <div className="flex justify-end gap-2">
+          <button className="text-xs px-3 py-1.5 bg-gray-100 rounded" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="text-xs px-3 py-1.5 bg-red-600 text-white rounded" onClick={onConfirm} aria-label="Confirm purge unconfirmed caches">
+            Confirm purge
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function VoiceprintBrowser() {
   const [data, setData] = useState<VoiceprintBrowserData | null>(null);
   const [stats, setStats] = useState<StorageStats | null>(null);
@@ -297,6 +344,7 @@ export default function VoiceprintBrowser() {
   const [error, setError] = useState<string | null>(null);
   const [speakersList, setSpeakersList] = useState<SpeakerLite[]>([]);
   const [clearAllOpen, setClearAllOpen] = useState(false);
+  const [purgeCachesOpen, setPurgeCachesOpen] = useState(false);
   const player = useAudioPlayer(audioPath);
 
   // Collapse/expand state — set of expanded group ids: `speaker:${id}` / `meeting:${id}`
@@ -569,12 +617,32 @@ export default function VoiceprintBrowser() {
     }
   };
 
+  const handlePurgeCachesConfirm = async () => {
+    try {
+      const res = await invoke<{ deleted_caches: number; deleted_embedding_bytes: number; deleted_clip_count: number; deleted_clip_bytes: number }>('purge_unconfirmed_caches');
+      setPurgeCachesOpen(false);
+      player.pause();
+      setPlayingRowId(null);
+      setFailedRowId(null);
+      setPendingRange(null);
+      await load();
+      window.alert(`Removed ${res.deleted_caches} unconfirmed caches. Reclaimed ${formatBytes(res.deleted_embedding_bytes + res.deleted_clip_bytes)}.`);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   if (error) return <div className="p-4 text-red-600">{error}</div>;
   if (!data) return <div className="p-4">Loading voiceprints…</div>;
 
   const allSpeakerIds = data.speakers.map((sp) => `speaker:${sp.speaker_id}`);
   const allMeetingIds = data.unconfirmed.map((mg) => `meeting:${mg.meeting_id}`);
   const allIds = [...allSpeakerIds, ...allMeetingIds];
+  // Cache rows carrying a stored clip — the clips a purge would remove.
+  const cacheClipCount = data.unconfirmed.reduce(
+    (n, mg) => n + mg.caches.filter((c) => c.has_audio).length,
+    0
+  );
   const isAllExpanded = allIds.length > 0 && allIds.every((k) => expanded.has(k));
   const isAllCollapsed = allIds.every((k) => !expanded.has(k));
 
@@ -585,15 +653,26 @@ export default function VoiceprintBrowser() {
         <div className="bg-white p-4 rounded border">
           <div className="flex items-center justify-between mb-2">
             <h3 className="font-semibold">Storage</h3>
-            <button
-              onClick={() => setClearAllOpen(true)}
-              disabled={stats.prototype_count + stats.cache_count === 0}
-              className="text-xs px-2 py-1 bg-red-100 text-red-700 rounded disabled:opacity-40 flex items-center gap-1 hover:bg-red-200"
-              title="Remove all voiceprints and cached embeddings"
-              aria-label="Remove all voiceprints and cached embeddings"
-            >
-              <Trash2 className="h-3 w-3" /> Remove all
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setPurgeCachesOpen(true)}
+                disabled={stats.cache_count === 0}
+                className="text-xs px-2 py-1 bg-amber-100 text-amber-800 rounded disabled:opacity-40 flex items-center gap-1 hover:bg-amber-200"
+                title="Remove unconfirmed caches only, keeping confirmed speaker voiceprints"
+                aria-label="Remove unconfirmed caches only"
+              >
+                <Trash2 className="h-3 w-3" /> Remove unconfirmed caches
+              </button>
+              <button
+                onClick={() => setClearAllOpen(true)}
+                disabled={stats.prototype_count + stats.cache_count === 0}
+                className="text-xs px-2 py-1 bg-red-100 text-red-700 rounded disabled:opacity-40 flex items-center gap-1 hover:bg-red-200"
+                title="Remove all voiceprints and cached embeddings"
+                aria-label="Remove all voiceprints and cached embeddings"
+              >
+                <Trash2 className="h-3 w-3" /> Remove all
+              </button>
+            </div>
           </div>
           <div className="text-sm text-gray-600 flex gap-4 flex-wrap">
             <span>Speakers: {stats.registry_count}</span>
@@ -908,6 +987,13 @@ export default function VoiceprintBrowser() {
         onClose={() => setClearAllOpen(false)}
         onConfirm={handleClearAllConfirm}
         stats={stats}
+      />
+      <ConfirmPurgeCachesDialog
+        open={purgeCachesOpen}
+        onClose={() => setPurgeCachesOpen(false)}
+        onConfirm={handlePurgeCachesConfirm}
+        cacheCount={stats?.cache_count ?? 0}
+        clipCount={cacheClipCount}
       />
     </div>
   );

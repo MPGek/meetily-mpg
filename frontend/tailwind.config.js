@@ -5,6 +5,9 @@ module.exports = {
     './src/pages/**/*.{js,ts,jsx,tsx,mdx}',
     './src/components/**/*.{js,ts,jsx,tsx,mdx}',
     './src/app/**/*.{js,ts,jsx,tsx,mdx}',
+    // Class maps live in src/lib (tag palette, status lines); without this
+    // glob Tailwind purges those classes and the pills render uncolored.
+    './src/lib/**/*.{js,ts,jsx,tsx,mdx}',
   ],
   theme: {
   	extend: {

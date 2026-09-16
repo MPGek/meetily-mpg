@@ -398,6 +398,21 @@ export class RecordingService {
   }
 
   /**
+   * Bulk removal of the unconfirmed cache layer only. Deletes every embedding
+   * owned by a meeting cluster and keeps enrolled prototypes, the speaker
+   * registry, cluster bindings/centroids, expected speakers, and transcript
+   * overrides. Returns the deleted cache count and the reclaimed storage.
+   */
+  async purgeUnconfirmedCaches(): Promise<{
+    deleted_caches: number;
+    deleted_embedding_bytes: number;
+    deleted_clip_count: number;
+    deleted_clip_bytes: number;
+  }> {
+    return invoke('purge_unconfirmed_caches');
+  }
+
+  /**
    * Relabel a single transcript block via a per-transcript speaker override.
    * Does NOT touch the cluster mapping or enroll embeddings.
    */

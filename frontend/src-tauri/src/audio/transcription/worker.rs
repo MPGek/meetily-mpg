@@ -91,6 +91,8 @@ pub fn start_transcription_task<R: Runtime>(
             let q = Arc::new(crate::audio::word_alignment::queue::AlignmentQueue::new(
                 crate::audio::word_alignment::queue::QUEUE_CAPACITY_BYTES,
             ));
+            // Publish the queue for the live status block (online-diarization-telemetry).
+            crate::audio::telemetry::install_alignment_queue(q.clone());
             let consumer =
                 crate::audio::word_alignment::queue::spawn_consumer(app.clone(), q.clone());
             info!("🧩 Live word-alignment / diarization-reconcile consumer started");
@@ -138,6 +140,16 @@ pub fn start_transcription_task<R: Runtime>(
                     .unwrap_or_else(|| "unknown".to_string());
 
                 let engine_name = engine_clone.provider_name();
+
+                // Publish engine identity + queue counters for the live status
+                // block (online-diarization-telemetry). `loaded` is driven by
+                // the model actually being resident, not by the config.
+                crate::audio::telemetry::install_asr(
+                    chunks_queued_clone.clone(),
+                    chunks_completed_clone.clone(),
+                    Some(engine_name.to_string()),
+                    initial_model_loaded.then(|| current_model.clone()),
+                );
 
                 if initial_model_loaded {
                     info!(
@@ -349,6 +361,13 @@ pub fn start_transcription_task<R: Runtime>(
                                                 "Worker {}: Failed to emit transcript update: {}",
                                                 worker_id, e
                                             );
+                                        }
+
+                                        // Live evidence the recogniser is working
+                                        // (online-diarization-telemetry): the most
+                                        // recent final recognition, final blocks only.
+                                        if !is_partial {
+                                            crate::audio::telemetry::note_asr_result(&update.text);
                                         }
 
                                         // Hand the completed block to the

@@ -21,6 +21,10 @@ import { PendingTagsPicker } from '@/components/MeetingTags';
 import { useTranscriptRecovery } from '@/hooks/useTranscriptRecovery';
 import { TranscriptRecovery } from '@/components/TranscriptRecovery';
 import { indexedDBService } from '@/services/indexedDBService';
+import {
+  fetchRecordingTelemetry,
+  type RecordingTelemetry,
+} from '@/services/diarizationStatusService';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
 
@@ -28,6 +32,7 @@ export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
+  const [recordingTelemetry, setRecordingTelemetry] = useState<RecordingTelemetry | null>(null);
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
 
   // Use contexts for state management
@@ -178,6 +183,9 @@ export default function Home() {
 
   useEffect(() => {
     if (recordingState.isRecording) {
+      // Single recording-interval tick samples both the animated bars and the
+      // recording telemetry snapshot, so no second timer is created. 150 ms is
+      // the required refresh rate; producer granularity still bounds the data.
       const interval = setInterval(() => {
         setBarHeights(prev => {
           const newHeights = [...prev];
@@ -186,10 +194,17 @@ export default function Home() {
           newHeights[2] = Math.random() * 20 + 10 + 'px';
           return newHeights;
         });
-      }, 300);
+
+        fetchRecordingTelemetry()
+          .then(setRecordingTelemetry)
+          .catch(() => setRecordingTelemetry(null));
+      }, 150);
 
       return () => clearInterval(interval);
     }
+
+    // Not recording: never keep presenting a stopped session's counters.
+    setRecordingTelemetry(null);
   }, [recordingState.isRecording]);
 
   // Computed values using global status
@@ -252,6 +267,7 @@ export default function Home() {
                       onTranscriptReceived={() => { }} // Not actually used by RecordingControls
                       onStopInitiated={() => setIsStopping(true)}
                       barHeights={barHeights}
+                      recordingTelemetry={recordingTelemetry}
                       onTranscriptionError={(message) => {
                         showModal('errorAlert', message);
                       }}

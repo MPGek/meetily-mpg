@@ -245,9 +245,50 @@ pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
 
 /// Fixed palette keys for tag colors. The stored `color` is a palette key
 /// (e.g. "blue"), never raw CSS, so the palette can be re-skinned later.
+/// Must stay in sync with `frontend/src/lib/meeting-tags.ts`
+/// (`TAG_PILL_STYLES`); `frontend/src/lib/tag-palette.json` is the parity
+/// reference used by the tests (change: tags-persistence-and-palette).
 pub const MEETING_TAG_PALETTE: &[&str] = &[
-    "blue", "green", "purple", "amber", "rose", "cyan", "teal", "orange", "lime",
+    "blue",
+    "green",
+    "purple",
+    "amber",
+    "rose",
+    "cyan",
+    "teal",
+    "orange",
+    "lime",
     "fuchsia",
+    "red",
+    "yellow",
+    "emerald",
+    "sky",
+    "indigo",
+    "violet",
+    "pink",
+    "slate",
+    "gray",
+    "zinc",
+    "neutral",
+    "stone",
+    "blue-deep",
+    "green-deep",
+    "purple-deep",
+    "amber-deep",
+    "rose-deep",
+    "cyan-deep",
+    "teal-deep",
+    "orange-deep",
+    "lime-deep",
+    "fuchsia-deep",
+    "red-deep",
+    "yellow-deep",
+    "emerald-deep",
+    "sky-deep",
+    "indigo-deep",
+    "violet-deep",
+    "pink-deep",
+    "slate-deep",
 ];
 
 /// Deterministic default palette key for a tag name (FNV-1a over the
@@ -279,4 +320,33 @@ pub struct MeetingTagWithUsage {
     pub name: String,
     pub color: String,
     pub usage_count: i64,
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::MEETING_TAG_PALETTE;
+
+    #[test]
+    fn palette_has_forty_unique_keys() {
+        assert_eq!(MEETING_TAG_PALETTE.len(), 40);
+        let mut seen = std::collections::HashSet::new();
+        for key in MEETING_TAG_PALETTE {
+            assert!(seen.insert(*key), "duplicate palette key: {}", key);
+        }
+    }
+
+    #[test]
+    fn palette_matches_frontend_manifest() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/lib/tag-palette.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let frontend: Vec<String> =
+            serde_json::from_str(&raw).expect("parse tag-palette.json");
+        let backend: Vec<String> = MEETING_TAG_PALETTE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            backend, frontend,
+            "backend palette must match the frontend manifest"
+        );
+    }
 }

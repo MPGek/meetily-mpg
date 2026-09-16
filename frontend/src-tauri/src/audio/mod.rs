@@ -81,6 +81,10 @@ pub mod live_diarization_reconcile;
 // Self-contained voiceprint audio clips (voiceprint-audio-clips-and-verification)
 pub mod voiceprint_clips;
 
+// Live recording telemetry: gated buffer fills + model activity
+// (online-diarization-telemetry)
+pub mod telemetry;
+
 pub use devices::{
     default_input_device, default_output_device, get_device_and_config, list_audio_devices,
     parse_audio_device, trigger_audio_permission, AudioDevice, AudioTranscriptionEngine,
