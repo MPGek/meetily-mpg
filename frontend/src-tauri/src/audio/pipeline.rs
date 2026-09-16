@@ -913,6 +913,9 @@ impl AudioPipeline {
             } else {
                 self.chunk_id_counter += 1;
                 if let Some(ref embedding_sender) = self.embedding_sender {
+                    // Live status: count the block in the diarization queue
+                    // even if the send later fails.
+                    crate::audio::online_diarization::record_block_enqueued();
                     if let Err(e) = embedding_sender.send(transcription_chunk) {
                         debug!("Failed to send segment to embedding channel: {}", e);
                     }

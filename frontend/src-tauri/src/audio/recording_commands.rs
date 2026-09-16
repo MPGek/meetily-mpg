@@ -2001,7 +2001,7 @@ pub struct PipelineStatus {
     pub sys: crate::audio::telemetry::ChannelPipelineFill,
 }
 
-/// Diarization's model identity and readiness.
+/// Diarization's model identity, readiness and block-queue activity.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiarizationModelActivity {
     pub mode: DiarizationMode,
@@ -2011,6 +2011,14 @@ pub struct DiarizationModelActivity {
     pub loaded: bool,
     pub prototypes: Option<usize>,
     pub bindings: Option<usize>,
+    /// Blocks queued for the diarization engine but not yet consumed.
+    pub pending_blocks: u64,
+    pub blocks_sent: u64,
+    pub blocks_completed: u64,
+    /// True while the engine works on a dequeued block.
+    pub in_flight: bool,
+    /// Blocks were submitted but the engine is not yet consuming them.
+    pub requested: bool,
 }
 
 /// Every model kind the recording relies on, with readiness and activity.
@@ -2081,6 +2089,15 @@ async fn online_diarization_status() -> Result<OnlineDiarizationStatus, String> 
         }
     };
 
+    let (blocks_sent, blocks_completed, blocks_in_flight) = match stats.as_deref() {
+        Some(stats) => (
+            stats.blocks_sent_total(),
+            stats.blocks_completed_total(),
+            stats.blocks_in_flight_now(),
+        ),
+        None => (0, 0, false),
+    };
+
     Ok(OnlineDiarizationStatus {
         active,
         mode,
@@ -2090,6 +2107,10 @@ async fn online_diarization_status() -> Result<OnlineDiarizationStatus, String> 
         recognition_threshold: TITANET_RECOGNITION_THRESHOLD,
         prototypes,
         bindings,
+        pending_blocks: blocks_sent.saturating_sub(blocks_completed),
+        blocks_sent,
+        blocks_processed: blocks_completed,
+        blocks_in_flight,
         mic,
         sys,
     })
@@ -2134,6 +2155,11 @@ pub async fn get_recording_telemetry() -> Result<RecordingTelemetry, String> {
             loaded: diarization.available,
             prototypes: diarization.prototypes,
             bindings: diarization.bindings,
+            pending_blocks: diarization.pending_blocks,
+            blocks_sent: diarization.blocks_sent,
+            blocks_completed: diarization.blocks_processed,
+            in_flight: diarization.blocks_in_flight,
+            requested: diarization.pending_blocks > 0 && !diarization.blocks_in_flight,
         },
     };
 

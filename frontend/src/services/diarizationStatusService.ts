@@ -58,6 +58,11 @@ export interface OnlineDiarizationStatus {
   /** Null when no prototype store is loaded for the session. */
   prototypes: number | null;
   bindings: number | null;
+  /** Blocks queued for the diarization engine but not yet consumed. */
+  pending_blocks: number;
+  blocks_sent: number;
+  blocks_processed: number;
+  blocks_in_flight: boolean;
   mic: DiarChannelStatus;
   sys: DiarChannelStatus;
 }
@@ -111,6 +116,8 @@ export interface VadActivity {
   mic_speaking: boolean;
   sys_frames: number;
   sys_speaking: boolean;
+  /** Speech is currently detected on any channel (indicator blink). */
+  speaking: boolean;
 }
 
 export interface AsrActivity {
@@ -120,6 +127,10 @@ export interface AsrActivity {
   queued: number;
   completed: number;
   pending: number;
+  /** True while the recogniser is consuming a segment. */
+  in_flight: boolean;
+  /** A segment was submitted but the recogniser is not yet consuming it. */
+  requested: boolean;
   last_text: string | null;
 }
 
@@ -131,6 +142,10 @@ export interface AlignmentActivity {
   queue_bytes: number;
   dropped: number;
   refined: number;
+  /** True while the aligner is refining a block. */
+  in_flight: boolean;
+  /** A block was submitted but the aligner is not yet consuming it. */
+  requested: boolean;
 }
 
 export interface DiarizationModelActivity {
@@ -141,6 +156,14 @@ export interface DiarizationModelActivity {
   loaded: boolean;
   prototypes: number | null;
   bindings: number | null;
+  /** Blocks queued for the diarization engine but not yet consumed. */
+  pending_blocks: number;
+  blocks_sent: number;
+  blocks_completed: number;
+  /** True while the engine works on a dequeued block. */
+  in_flight: boolean;
+  /** Blocks were submitted but the engine is not yet consuming them. */
+  requested: boolean;
 }
 
 /** Every model kind the recording relies on, with readiness and activity. */

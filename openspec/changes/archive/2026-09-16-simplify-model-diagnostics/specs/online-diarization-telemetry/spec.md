@@ -1,25 +1,4 @@
-# online-diarization-telemetry Specification
-
-## Purpose
-
-Gives users and developers live, per-channel visibility into online speaker diarization during a recording, so a channel that has stopped producing speaker embeddings, a low-confidence speaker match, or a broken turn timeline is visible while the meeting is still running instead of only in post-meeting logs.
-
-## Requirements
-
-### Requirement: Per-channel live status lines
-The system SHALL display exactly two channel status lines while a recording with online diarization active is in progress, one for the microphone channel and one for the system channel, placed immediately to the right of the animated recording indicator, together with a single model-indicator row beneath them. No other status row SHALL be added.
-
-#### Scenario: Two channel lines and one model row
-- **WHEN** a recording is in progress with diarization mode set to Fast or Efficient
-- **THEN** the recording controls display two channel lines to the right of the animated recording indicator, one for the microphone channel and one for the system channel, and beneath them a single row of model state indicators
-
-#### Scenario: Hidden when diarization is off
-- **WHEN** a recording is in progress with diarization mode set to Off
-- **THEN** no channel lines and no model-indicator row are displayed
-
-#### Scenario: Hidden when not recording
-- **WHEN** no recording is in progress
-- **THEN** no channel lines and no model-indicator row are displayed
+## MODIFIED Requirements
 
 ### Requirement: Channel status content
 Each status line SHALL report only its own channel's state: the channel's audio level and, when the channel has blocks in flight, the count of blocks in queue. The line SHALL NOT report speech-chunk counts, embedding success/failure counts, buffered embedding counts, stable turn counts, or last-turn details.
@@ -47,58 +26,6 @@ Each status line SHALL report only its own channel's state: the channel's audio 
 #### Scenario: Latest turn with confidence
 - **WHEN** a stable turn is published with a match score
 - **THEN** no turn detail, attribution source, or score is rendered in the status block; only the diarization model's blink state and pending-block count update
-
-### Requirement: Empty and degraded channel reporting
-The system SHALL distinguish "no activity yet", "not applicable", and "expected zero" from an actual failure: a recording without a system audio device SHALL be reported as a mono session rather than as an inactive channel, and a channel in Efficient mode SHALL state that clustering is deferred to recording stop rather than presenting a zero turn count as an anomaly.
-
-#### Scenario: Mono session
-- **WHEN** the recording has no system audio device
-- **THEN** the system line reports a mono session and does not present that channel's counters as a fault
-
-#### Scenario: Efficient mode
-- **WHEN** the diarization mode is Efficient
-- **THEN** each line states that clustering is deferred to recording stop and the zero stable-turn count is not rendered as a warning
-
-#### Scenario: No speech yet
-- **WHEN** a channel has received no speech chunks
-- **THEN** its line reports zero activity without an error or warning indication
-
-### Requirement: Channel health signals
-The system SHALL surface a channel's failure as soon as that channel stops producing embeddings for the session, and SHALL flag a channel whose published turns are no longer ordered in time, using a visually distinct error treatment for the former and warning treatment for the latter.
-
-#### Scenario: Embedding stops
-- **WHEN** a channel fails to embed a chunk such that the session's diarization is disabled
-- **THEN** that channel's line is rendered as an error state
-
-#### Scenario: Turn order regression
-- **WHEN** a channel's latest published turn starts or ends before the previous turn on that same channel
-- **THEN** that channel's line is rendered with a warning
-
-#### Scenario: Healthy session
-- **WHEN** a channel continues to embed successfully and publishes turns in time order
-- **THEN** its line is rendered in the normal state with neither warning nor error
-
-### Requirement: Non-interference with the recording pipeline
-Status sampling SHALL occur on a fixed bounded interval and SHALL NOT emit an event per audio chunk, and displaying the status lines SHALL NOT alter transcription, voice activity detection, recording, or diarization output.
-
-#### Scenario: Bounded sampling
-- **WHEN** a recording with diarization active is in progress
-- **THEN** the status is refreshed on a fixed interval and no status update is emitted for each audio chunk
-
-#### Scenario: Unchanged outputs
-- **WHEN** the status lines are displayed for an entire recording
-- **THEN** the produced transcript, the speaker assignments, and the saved audio are identical to the same recording made without the status lines
-
-### Requirement: Session scoping
-The status SHALL reflect only the current recording session: it SHALL be reset when a new recording starts and SHALL NOT present values left over from a previous session as live values.
-
-#### Scenario: Fresh session
-- **WHEN** a new recording starts after a previous online diarization session
-- **THEN** the lines begin from zero activity instead of repeating the previous session's counts
-
-#### Scenario: After recording stop
-- **WHEN** a recording has stopped and no diarization session is active
-- **THEN** counters from the stopped session are not presented as live values
 
 ### Requirement: Per-channel input level indicator
 Each channel's line SHALL show a level bar for the audio actually being processed on that channel, so a silent or dead channel is distinguishable from a busy one at a glance. The bar SHALL reflect loudness on a decibel scale with a floor for practical silence, not a raw linear amplitude, and SHALL fall to empty within half a second when no audio arrives for that channel.
@@ -173,13 +100,12 @@ The status block SHALL report, for each model the recording relies on (voice act
 - **WHEN** a model is disabled by settings or not required by the current session
 - **THEN** the status block reports it as disabled or not in use rather than as a failure
 
-### Requirement: Status refresh rate
-The status SHALL be refreshed at least every 150 milliseconds while a recording is in progress, using the recording controls' existing sampling interval rather than adding a second timer, and SHALL still emit nothing per audio chunk.
+## REMOVED Requirements
 
-#### Scenario: Refreshed at the required rate
-- **WHEN** a recording with diarization active is in progress
-- **THEN** the status is refreshed on the recording controls' interval, which is at most 150 milliseconds
+### Requirement: Global context discoverability
+**Reason**: The user removed the detailed per-model visualization. The threshold, model identifier/dimension, mode, and prototype context are no longer displayed in the status block; the simplified block shows only levels, queue counters, and blink indicators.
+**Migration**: The backend commands and counters remain available for debugging via logs and the telemetry snapshot; no replacement UI is provided.
 
-#### Scenario: No extra timer
-- **WHEN** the status lines are displayed
-- **THEN** no additional sampling timer is registered beyond the recording controls' existing interval
+### Requirement: Buffer fill and next-fire indication
+**Reason**: Buffer-fill bars (voice-activity dispatch window, pending speech accumulation, recording mix window) are part of the per-action visualization the user asked to remove. Buffer state is now conveyed only through the model blink indicators and queue counters.
+**Migration**: none; buffer state remains visible indirectly through indicator states.

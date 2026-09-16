@@ -211,6 +211,12 @@ pub struct OnlineDiarizationStats {
     engine_disabled: AtomicBool,
     mic: ChannelStats,
     sys: ChannelStats,
+    /// Speech blocks sent to the (unbounded) embedding channel this session.
+    blocks_sent: AtomicU64,
+    /// Blocks consumed (processed or dropped) by the engine path.
+    blocks_processed: AtomicU64,
+    /// True while the engine is working on a dequeued block.
+    blocks_in_flight: AtomicBool,
 }
 
 impl OnlineDiarizationStats {
@@ -222,7 +228,51 @@ impl OnlineDiarizationStats {
             engine_disabled: AtomicBool::new(false),
             mic: ChannelStats::default(),
             sys: ChannelStats::default(),
+            blocks_sent: AtomicU64::new(0),
+            blocks_processed: AtomicU64::new(0),
+            blocks_in_flight: AtomicBool::new(false),
         }
+    }
+
+    /// A block was enqueued to the diarization stage (called from the
+    /// pipeline's send path, before the engine has dequeued it).
+    pub fn record_block_enqueued(&self) {
+        self.blocks_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A dequeued block has been consumed by the engine path (processed,
+    /// dropped by a too-short check, or skipped in the error state): the
+    /// pending gauge falls by one, clamped at zero.
+    pub fn record_block_consumed(&self) {
+        self.blocks_processed.fetch_add(1, Ordering::Relaxed);
+        self.blocks_in_flight.store(false, Ordering::SeqCst);
+    }
+
+    /// The engine path started working on a dequeued block.
+    pub fn record_block_in_flight(&self) {
+        self.blocks_in_flight.store(true, Ordering::SeqCst);
+    }
+
+    /// Blocks sent to the diarization stage this session (total).
+    pub fn blocks_sent_total(&self) -> u64 {
+        self.blocks_sent.load(Ordering::Relaxed)
+    }
+
+    /// Blocks consumed by the diarization stage this session (total).
+    pub fn blocks_completed_total(&self) -> u64 {
+        self.blocks_processed.load(Ordering::Relaxed)
+    }
+
+    /// Blocks sent but not yet consumed (the pending gauge).
+    pub fn blocks_pending_now(&self) -> u64 {
+        let sent = self.blocks_sent.load(Ordering::Relaxed);
+        let processed = self.blocks_processed.load(Ordering::Relaxed);
+        sent.saturating_sub(processed)
+    }
+
+    /// Whether the engine is currently working on a consumed block.
+    pub fn blocks_in_flight_now(&self) -> bool {
+        self.blocks_in_flight.load(Ordering::SeqCst)
     }
 
     pub fn mode(&self) -> DiarizationMode {
@@ -336,6 +386,13 @@ pub struct OnlineDiarizationStatus {
     /// Prototype and session-binding counts; `None` when no store is loaded.
     pub prototypes: Option<usize>,
     pub bindings: Option<usize>,
+    /// Speech blocks sent to the diarization stage but not yet consumed.
+    pub pending_blocks: u64,
+    /// Blocks sent (total) / consumed (total) this session.
+    pub blocks_sent: u64,
+    pub blocks_processed: u64,
+    /// True while the engine works on a dequeued block.
+    pub blocks_in_flight: bool,
     pub mic: ChannelStatusLine,
     pub sys: ChannelStatusLine,
 }
@@ -363,6 +420,14 @@ pub fn current_stats() -> Option<Arc<OnlineDiarizationStats>> {
 pub fn clear_stats() {
     if let Ok(mut slot) = ONLINE_DIARIZATION_STATS.lock() {
         *slot = None;
+    }
+}
+
+/// Count one speech block enqueued to the running diarization session (called
+/// from the pipeline's send path). No-op without a session.
+pub fn record_block_enqueued() {
+    if let Some(stats) = current_stats() {
+        stats.record_block_enqueued();
     }
 }
 
@@ -922,6 +987,24 @@ impl OnlineDiarizationProcessor {
     /// session: engine error state is reserved for init failures, so a
     /// transient bad chunk never wipes the remaining recording's labels.
     pub fn process_chunk(&mut self, chunk: AudioChunk) {
+        // Every dequeued block leaves the diarization queue on exit (even
+        // when rejected as too short or skipped in the error state), and the
+        // engine is in flight while the engine work runs.
+        record_stats(&self.stats, |s| s.record_block_in_flight());
+        struct ConsumedGuard(Option<std::sync::Weak<OnlineDiarizationStats>>);
+        impl Drop for ConsumedGuard {
+            fn drop(&mut self) {
+                if let Some(stats) = self.0.as_ref().and_then(std::sync::Weak::upgrade) {
+                    stats.record_block_consumed();
+                }
+            }
+        }
+        let _guard = ConsumedGuard(
+            self.stats
+                .as_ref()
+                .map(|s| std::sync::Arc::downgrade(s)),
+        );
+
         if chunk.data.len() < MIN_SEGMENT_SAMPLES {
             return;
         }

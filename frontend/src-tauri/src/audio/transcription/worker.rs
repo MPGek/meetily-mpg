@@ -106,6 +106,9 @@ pub fn start_transcription_task<R: Runtime>(
         // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
         let chunks_queued = Arc::new(AtomicU64::new(0));
         let chunks_completed = Arc::new(AtomicU64::new(0));
+        // Live status: whether the recogniser is currently consuming a chunk
+        // (online-diarization-telemetry, indicator blink state).
+        let asr_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_finished = Arc::new(AtomicBool::new(false));
 
         info!(
@@ -125,6 +128,7 @@ pub fn start_transcription_task<R: Runtime>(
             let app_clone = app.clone();
             let work_receiver_clone = work_receiver.clone();
             let chunks_completed_clone = chunks_completed.clone();
+            let asr_in_flight_clone = asr_in_flight.clone();
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
             let align_queue_clone = alignment_queue.clone();
@@ -147,6 +151,7 @@ pub fn start_transcription_task<R: Runtime>(
                 crate::audio::telemetry::install_asr(
                     chunks_queued_clone.clone(),
                     chunks_completed_clone.clone(),
+                    asr_in_flight_clone.clone(),
                     Some(engine_name.to_string()),
                     initial_model_loaded.then(|| current_model.clone()),
                 );
@@ -236,6 +241,10 @@ pub fn start_transcription_task<R: Runtime>(
                                     Arc::from(s)
                                 },
                             );
+
+                            // Live status: the recogniser is now consuming this
+                            // chunk (cleared again at the end of the iteration).
+                            asr_in_flight_clone.store(true, Ordering::SeqCst);
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -403,6 +412,7 @@ pub fn start_transcription_task<R: Runtime>(
                                         TranscriptionError::AudioTooShort { .. } => {
                                             // Skip silently, this is expected for very short chunks
                                             info!("Worker {}: {}", worker_id, e);
+                                            asr_in_flight_clone.store(false, Ordering::SeqCst);
                                             chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
                                             continue;
                                         }
@@ -411,6 +421,7 @@ pub fn start_transcription_task<R: Runtime>(
                                                 "Worker {}: Model unloaded during transcription",
                                                 worker_id
                                             );
+                                            asr_in_flight_clone.store(false, Ordering::SeqCst);
                                             chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
                                             continue;
                                         }
@@ -427,6 +438,7 @@ pub fn start_transcription_task<R: Runtime>(
                             }
 
                             // Mark chunk as completed
+                            asr_in_flight_clone.store(false, Ordering::SeqCst);
                             let completed =
                                 chunks_completed_clone.fetch_add(1, Ordering::SeqCst) + 1;
                             let queued = chunks_queued_clone.load(Ordering::SeqCst);

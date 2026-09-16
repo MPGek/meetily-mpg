@@ -165,6 +165,10 @@ pub fn spawn_consumer<R: Runtime>(
         while let Some(job) = queue.pop().await {
             let AlignmentJob { mut update, samples } = job;
 
+            // Live status: the aligner is consuming this block (cleared when
+            // the block leaves the consumer).
+            crate::audio::telemetry::set_alignment_in_flight(true);
+
             // Resolve the engine lazily off the async thread (the first load
             // parses a ~650 MB ONNX graph); re-check so a mid-recording
             // download is picked up, and drop (keep baseline) when disabled.
@@ -214,6 +218,9 @@ pub fn spawn_consumer<R: Runtime>(
             // transcription engine's own timestamps
             // (live-word-level-diarization D2). No-op without live turns.
             crate::audio::live_diarization_reconcile::submit(&app, &update);
+
+            // The block has left the consumer: no longer in flight.
+            crate::audio::telemetry::set_alignment_in_flight(false);
         }
         log::info!("Alignment queue consumer finished (queue closed and drained)");
     })

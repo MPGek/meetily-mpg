@@ -1,5 +1,5 @@
 /**
- * Pure formatting for the live status lines and their tooltip
+ * Pure formatting for the simplified live status block
  * (online-diarization-telemetry). Kept free of React so the mapping from a
  * backend snapshot to what is shown is directly testable.
  */
@@ -8,13 +8,8 @@ import type {
   AlignmentActivity,
   AsrActivity,
   AudioLevel,
-  BufferFill,
-  ChannelPipelineFill,
   DiarChannelState,
-  DiarChannelStatus,
-  DiarLastTurn,
   DiarizationModelActivity,
-  PendingState,
   VadActivity,
 } from '../services/diarizationStatusService';
 
@@ -40,95 +35,6 @@ export const DIAR_STATE_CLASS: Record<DiarChannelState, string> = {
   error: 'text-red-600 font-medium',
 };
 
-/** Long display names are cut so two lines fit beside the recording indicator. */
-export const MAX_DIAR_NAME_CHARS = 14;
-
-export function truncateDiarName(
-  value: string,
-  max: number = MAX_DIAR_NAME_CHARS
-): string {
-  return value.length > max ? `${value.slice(0, max - 1)}\u2026` : value;
-}
-
-/** `Alice auto 0.74` — display name over label, attribution source, score. */
-export function formatDiarTurn(turn: DiarLastTurn): string {
-  const name = truncateDiarName(turn.display_name ?? turn.speaker);
-  const source =
-    turn.matched_by === 'user' ? 'user' : turn.matched_by === 'auto' ? 'auto' : '-';
-  const score = typeof turn.score === 'number' ? ` ${turn.score.toFixed(2)}` : '';
-  return `${name} ${source}${score}`;
-}
-
-/** `50%` — how full a gated buffer is, as a whole percentage. */
-export function formatPercent(fraction: number): string {
-  if (!Number.isFinite(fraction) || fraction <= 0) {
-    return '0%';
-  }
-  return `${Math.round(fraction * 100)}%`;
-}
-
-/** `12.4s` — milliseconds as seconds with one decimal. */
-export function formatSeconds(ms: number): string {
-  const seconds = Math.max(0, ms) / 1000;
-  return `${seconds.toFixed(1)}s`;
-}
-
-/**
- * A gated buffer rendered as a bar. `percent` is clamped to the track (a buffer
- * can exceed its threshold, which must not overflow the bar); `fired` carries
- * the fact that it did, separately.
- */
-export interface BufferBar {
-  label: string;
-  percent: number;
-  fired: boolean;
-  /** Fill and threshold as text, for the bar's hover title. */
-  detail: string;
-}
-
-function barFromFill(label: string, fill: BufferFill, gate: string): BufferBar {
-  return {
-    label,
-    percent: clampPercent(fill.fraction),
-    fired: fill.fired,
-    detail: `${label}: ${formatPercent(fill.fraction)} of ${gate}`,
-  };
-}
-
-/** Pending speech has no single threshold; it flushes at its duration cap. */
-function pendingBar(pending: PendingState): BufferBar {
-  const fraction =
-    pending.cap_trigger_ms > 0 ? pending.buffered_ms / pending.cap_trigger_ms : 0;
-  return {
-    label: 'p',
-    percent: clampPercent(fraction),
-    fired: pending.cap_trigger_ms > 0 && pending.buffered_ms >= pending.cap_trigger_ms,
-    detail: `p: ${formatSeconds(pending.buffered_ms)} held, flushes on ${
-      pending.gap_trigger_ms
-    }ms gap or ${pending.cap_trigger_ms}ms cap`,
-  };
-}
-
-function clampPercent(fraction: number): number {
-  if (!Number.isFinite(fraction) || fraction <= 0) {
-    return 0;
-  }
-  return Math.min(100, Math.round(fraction * 100));
-}
-
-/**
- * The three gated-buffer bars shown inside one channel line: the
- * voice-activity dispatch buffer, the pending speech held for recognition, and
- * the recording mix window. Each is labelled with the operation it gates.
- */
-export function buildBufferBars(fill: ChannelPipelineFill): BufferBar[] {
-  return [
-    barFromFill('v', fill.vad_dispatch, 'the voice-activity dispatch window'),
-    pendingBar(fill.pending),
-    barFromFill('m', fill.mix, 'the recording mix window'),
-  ];
-}
-
 /** Level below which a channel is treated as silent for the meter. */
 export const LEVEL_FLOOR_DB = -60;
 
@@ -150,7 +56,10 @@ export function levelPercent(level: AudioLevel): number {
   if (db <= LEVEL_FLOOR_DB) {
     return 0;
   }
-  return Math.min(100, Math.round(((db - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB) * 100));
+  return Math.min(
+    100,
+    Math.round(((db - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB) * 100)
+  );
 }
 
 /**
@@ -158,15 +67,19 @@ export function levelPercent(level: AudioLevel): number {
  * it has no threshold; it does mark a clipping peak so a hot channel is
  * distinguishable from a healthy one.
  */
-export function buildLevelBar(level: AudioLevel): BufferBar {
+export function buildLevelBar(level: AudioLevel): {
+  percent: number;
+  firing: boolean;
+  detail: string;
+} {
   const stale = level.age_ms > LEVEL_STALE_MS;
   const clipping = level.peak >= 0.99;
-  const db = level.rms > 0 ? `${(20 * Math.log10(level.rms)).toFixed(1)} dBFS` : 'silent';
+  const db =
+    level.rms > 0 ? `${(20 * Math.log10(level.rms)).toFixed(1)} dBFS` : 'silent';
 
   return {
-    label: 'L',
     percent: levelPercent(level),
-    fired: !stale && clipping,
+    firing: !stale && clipping,
     detail: stale
       ? `L: no audio for ${level.age_ms}ms`
       : `L: ${db} (peak ${level.peak.toFixed(2)})${clipping ? ' - clipping' : ''}`,
@@ -174,85 +87,28 @@ export function buildLevelBar(level: AudioLevel): BufferBar {
 }
 
 /**
- * One channel line's text content (without its `MIC`/`SYS` prefix and without
- * the bars). Zero-valued parts are omitted so an idle channel reads as waiting,
- * not as a fault.
+ * A one channel line's text content (without its `MIC`/`SYS` prefix). Only the
+ * level is carried per channel; counters are shown on the model row.
  */
-export function buildChannelLine(
-  line: DiarChannelStatus,
-  fill: ChannelPipelineFill
-): string {
+export function buildChannelLine(line: DiarChannelStatusLite): string {
   if (line.state === 'unavailable') {
     return 'unavailable';
   }
   if (line.state === 'inactive') {
     return 'mono session';
   }
-
-  const parts: string[] = [`${line.chunks}c`, `${line.embed_ok}/${line.embed_failed}f`];
-
-  if (fill.vad_speaking) {
-    parts.push('sp');
-  }
-  if (line.buffered_secs > 0) {
-    parts.push(formatSeconds(line.buffered_secs * 1000));
-  }
-  if (line.turns > 0) {
-    parts.push(`${line.turns}t`);
-  }
-  if (line.last_turn) {
-    parts.push(formatDiarTurn(line.last_turn));
-  }
-  parts.push(DIAR_STATE_TEXT[line.state]);
-
-  return parts.join(' \u00b7 ');
+  return DIAR_STATE_TEXT[line.state];
 }
 
-/**
- * Global context required to read a match score: mode, model identity and
- * dimension, the recognition threshold, and prototype/binding counts.
- */
-export function buildDiarContext(diar: DiarizationModelActivity): string {
-  const prototypes =
-    diar.prototypes === null
-      ? 'prototypes unavailable'
-      : `proto ${diar.prototypes} / bind ${diar.bindings ?? 0}`;
-
-  const loaded = diar.mode === 'off' ? 'off' : diar.loaded ? 'loaded' : 'not loaded';
-
-  return [
-    `${diar.mode} mode`,
-    `${diar.model_tag} ${diar.embedding_dim}d`,
-    `tau ${diar.recognition_threshold.toFixed(2)}`,
-    prototypes,
-    loaded,
-  ].join(' \u00b7 ');
-}
-
-/**
- * Legend naming what each gated buffer fires and at what threshold, so the
- * compact `v`/`p`/`m` tokens on a line are unambiguous.
- */
-export function buildBufferLegend(pipeline: {
-  sample_rate: number;
-  mic: ChannelPipelineFill;
-}): string {
-  const toMs = (samples: number) =>
-    pipeline.sample_rate > 0
-      ? `${Math.round((samples / pipeline.sample_rate) * 1000)}ms`
-      : `${samples} samples`;
-  const { gap_trigger_ms, cap_trigger_ms } = pipeline.mic.pending;
-
-  return [
-    'BUF',
-    `v = ${toMs(pipeline.mic.vad_dispatch.threshold)} voice-activity dispatch`,
-    `p = pending speech (flush on ${gap_trigger_ms}ms gap or ${cap_trigger_ms}ms cap)`,
-    `m = ${toMs(pipeline.mic.mix.threshold)} recording mix window`,
-  ].join(' \u00b7 ');
+export interface DiarChannelStatusLite {
+  state: DiarChannelState;
 }
 
 /** Colour semantics of a model indicator. */
 export type ModelIndicatorState = 'healthy' | 'idle' | 'warning' | 'error';
+
+/** Blink state of a model's indicator light. */
+export type ModelBlink = 'none' | 'green' | 'red';
 
 export const MODEL_STATE_CLASS: Record<ModelIndicatorState, string> = {
   healthy: 'bg-green-500',
@@ -261,16 +117,28 @@ export const MODEL_STATE_CLASS: Record<ModelIndicatorState, string> = {
   error: 'bg-red-500',
 };
 
+/** Colour overrides while the light blinks (green = working, red = requested). */
+export const MODEL_BLINK_CLASS: Record<ModelBlink, string> = {
+  none: '',
+  green: 'bg-green-400 animate-pulse',
+  red: 'bg-red-400 animate-pulse',
+};
+
 export interface ModelIndicator {
   key: 'vad' | 'asr' | 'align' | 'diar';
   label: string;
   state: ModelIndicatorState;
+  blink: ModelBlink;
+  /** Blocks in queue (STT / diarization); omitted when 0. */
+  pending?: number;
   title: string;
 }
 
 /**
- * One indicator per model kind in use. A disabled or not-downloaded model is
- * idle (grey), never an error, and nothing is healthy while it is not loaded.
+ * One indicator per model kind in use. A model with work in flight blinks
+ * green; a model with a submitted request it has not started consuming blinks
+ * red. A disabled or not-downloaded model is idle (grey), never an error, and
+ * nothing is healthy while it is not loaded.
  */
 export function buildModelIndicators(
   vad: VadActivity,
@@ -279,10 +147,23 @@ export function buildModelIndicators(
   diarization: DiarizationModelActivity,
   channelStates: DiarChannelState[]
 ): ModelIndicator[] {
+  const vadBlink: ModelBlink = vad.loaded && vad.speaking ? 'green' : 'none';
   const vadState: ModelIndicatorState = vad.loaded ? 'healthy' : 'idle';
 
+  const asrBlink: ModelBlink =
+    !asr.loaded || asr.pending === 0
+      ? 'none'
+      : asr.in_flight
+        ? 'green'
+        : 'red';
   const asrState: ModelIndicatorState = asr.loaded ? 'healthy' : 'idle';
 
+  const alignBlink: ModelBlink =
+    !alignment.enabled || alignment.queued_jobs === 0
+      ? 'none'
+      : alignment.in_flight
+        ? 'green'
+        : 'red';
   const alignmentState: ModelIndicatorState = !alignment.enabled
     ? 'idle'
     : alignment.dropped > 0
@@ -291,15 +172,21 @@ export function buildModelIndicators(
         ? 'healthy'
         : 'idle';
 
+  let diarBlink: ModelBlink = 'none';
   let diarizationState: ModelIndicatorState;
   if (diarization.mode === 'off') {
     diarizationState = 'idle';
   } else if (channelStates.includes('error')) {
     diarizationState = 'error';
+  } else if (!diarization.loaded) {
+    diarizationState = 'idle';
   } else if (channelStates.includes('warning')) {
     diarizationState = 'warning';
   } else {
-    diarizationState = diarization.loaded ? 'healthy' : 'idle';
+    diarizationState = 'healthy';
+    if (diarization.pending_blocks > 0) {
+      diarBlink = diarization.in_flight ? 'green' : 'red';
+    }
   }
 
   return [
@@ -307,89 +194,38 @@ export function buildModelIndicators(
       key: 'vad',
       label: 'VAD',
       state: vadState,
-      title: `Voice activity: ${vad.identity} (${vadState})`,
+      blink: vadBlink,
+      title: `Voice activity: ${vad.identity}${vad.speaking ? ' (processing)' : ''}`,
     },
     {
       key: 'asr',
       label: 'ASR',
       state: asrState,
-      title: `Speech recognition: ${[asr.engine, asr.model]
-        .filter(Boolean)
-        .join(' ') || 'idle'} (${asrState})`,
+      blink: asrBlink,
+      pending: asr.pending > 0 ? asr.pending : undefined,
+      title: `Speech recognition: ${asr.pending} pending`,
     },
     {
       key: 'align',
       label: 'ALIGN',
       state: alignmentState,
+      blink: alignBlink,
+      pending: alignment.queued_jobs > 0 ? alignment.queued_jobs : undefined,
       title: alignment.enabled
-        ? `Word alignment: ${alignment.model_id ?? 'model'} (${alignmentState})`
+        ? `Word alignment: ${alignment.model_id ?? 'model'}`
         : 'Word alignment: disabled',
     },
     {
       key: 'diar',
       label: 'DIAR',
       state: diarizationState,
+      blink: diarBlink,
+      pending:
+        diarization.pending_blocks > 0 ? diarization.pending_blocks : undefined,
       title:
         diarization.mode === 'off'
           ? 'Speaker diarization: off'
-          : `Speaker diarization: ${diarization.model_tag} (${diarizationState})`,
+          : `Speaker diarization: ${diarization.pending_blocks} pending`,
     },
-  ];
-}
-
-function asrLine(asr: AsrActivity): string {
-  if (!asr.engine) {
-    return 'ASR: idle';
-  }
-  const identity = [asr.engine, asr.model].filter(Boolean).join(' ');
-  const status = asr.loaded ? 'loaded' : 'not loaded';
-  const queue = `queue ${asr.completed}/${asr.queued}`;
-  const parts = [`ASR ${identity} ${status}`, queue];
-  if (asr.pending > 0) {
-    parts.push(`${asr.pending} pending`);
-  }
-  if (asr.last_text) {
-    parts.push(`last ${truncateDiarName(asr.last_text, 32)}`);
-  }
-  return parts.join(' \u00b7 ');
-}
-
-function alignmentLine(alignment: AlignmentActivity): string {
-  if (!alignment.enabled) {
-    return 'ALIGN: disabled';
-  }
-  const status = alignment.loaded ? 'loaded' : 'not loaded';
-  const parts = [
-    `ALIGN ${alignment.model_id ?? 'model'} ${status}`,
-    `queue ${alignment.queued_jobs}`,
-    `refined ${alignment.refined}`,
-  ];
-  if (alignment.dropped > 0) {
-    parts.push(`dropped ${alignment.dropped}`);
-  }
-  return parts.join(' \u00b7 ');
-}
-
-/**
- * Tooltip lines. Every model kind the recording uses is named, with readiness
- * and the counters that show it is working; a disabled or unloaded model reads
- * as such, never as a failure.
- */
-export function buildModelLines(
-  vad: VadActivity,
-  asr: AsrActivity,
-  alignment: AlignmentActivity,
-  diarization: DiarizationModelActivity,
-  pipeline: { sample_rate: number; mic: ChannelPipelineFill }
-): string[] {
-  const vadStatus = vad.loaded ? 'loaded' : 'not loaded';
-  const micActivity = `${vad.mic_frames}f${vad.mic_speaking ? ' sp' : ''}`;
-  const sysActivity = `${vad.sys_frames}f${vad.sys_speaking ? ' sp' : ''}`;
-  return [
-    `VAD ${vad.identity} ${vadStatus} \u00b7 mic ${micActivity} \u00b7 sys ${sysActivity}`,
-    asrLine(asr),
-    alignmentLine(alignment),
-    `DIAR ${buildDiarContext(diarization)}`,
-    buildBufferLegend(pipeline),
   ];
 }

@@ -294,6 +294,7 @@ pub fn clear_pipeline() {
 
 static ASR_QUEUED: Mutex<Option<Arc<AtomicU64>>> = Mutex::new(None);
 static ASR_COMPLETED: Mutex<Option<Arc<AtomicU64>>> = Mutex::new(None);
+static ASR_IN_FLIGHT: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 static ASR_ENGINE: Mutex<Option<String>> = Mutex::new(None);
 static ASR_MODEL: Mutex<Option<String>> = Mutex::new(None);
 static ASR_LAST_TEXT: Mutex<Option<String>> = Mutex::new(None);
@@ -313,6 +314,10 @@ pub struct AsrActivity {
     pub completed: u64,
     /// Segments queued but not yet recognised.
     pub pending: u64,
+    /// True while the recogniser is consuming a segment.
+    pub in_flight: bool,
+    /// A segment was submitted but the recogniser is not yet consuming it.
+    pub requested: bool,
     /// Most recent recognised text, truncated.
     pub last_text: Option<String>,
 }
@@ -322,6 +327,7 @@ pub struct AsrActivity {
 pub fn install_asr(
     queued: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
+    in_flight: Arc<AtomicBool>,
     engine: Option<String>,
     model: Option<String>,
 ) {
@@ -330,6 +336,9 @@ pub fn install_asr(
     }
     if let Ok(mut slot) = ASR_COMPLETED.lock() {
         *slot = Some(completed);
+    }
+    if let Ok(mut slot) = ASR_IN_FLIGHT.lock() {
+        *slot = Some(in_flight);
     }
     if let Ok(mut slot) = ASR_ENGINE.lock() {
         *slot = engine;
@@ -360,9 +369,15 @@ pub fn asr_activity() -> AsrActivity {
     };
     let queued = counter(&ASR_QUEUED);
     let completed = counter(&ASR_COMPLETED);
+    let in_flight = ASR_IN_FLIGHT
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|f| f.load(Ordering::Relaxed)))
+        .unwrap_or(false);
     let engine = ASR_ENGINE.lock().ok().and_then(|slot| slot.clone());
     let model = ASR_MODEL.lock().ok().and_then(|slot| slot.clone());
     let last_text = ASR_LAST_TEXT.lock().ok().and_then(|slot| slot.clone());
+    let pending = queued.saturating_sub(completed);
 
     AsrActivity {
         loaded: model.is_some(),
@@ -370,7 +385,9 @@ pub fn asr_activity() -> AsrActivity {
         model,
         queued,
         completed,
-        pending: queued.saturating_sub(completed),
+        pending,
+        in_flight,
+        requested: pending > 0 && !in_flight,
         last_text,
     }
 }
@@ -380,6 +397,9 @@ pub fn clear_asr() {
         *slot = None;
     }
     if let Ok(mut slot) = ASR_COMPLETED.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = ASR_IN_FLIGHT.lock() {
         *slot = None;
     }
     if let Ok(mut slot) = ASR_ENGINE.lock() {
@@ -399,6 +419,7 @@ pub fn clear_asr() {
 
 static ALIGNMENT_QUEUE: Mutex<Option<Arc<AlignmentQueue>>> = Mutex::new(None);
 static ALIGNMENT_ENGINE_LOADED: AtomicBool = AtomicBool::new(false);
+static ALIGNMENT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static ALIGNMENT_REFINED: AtomicU64 = AtomicU64::new(0);
 
 /// Word-alignment activity for the status block.
@@ -413,6 +434,10 @@ pub struct AlignmentActivity {
     pub queue_bytes: usize,
     pub dropped: usize,
     pub refined: u64,
+    /// True while the aligner is refining a block.
+    pub in_flight: bool,
+    /// A block was submitted but the aligner is not yet consuming it.
+    pub requested: bool,
 }
 
 /// Register the alignment queue, owned by the transcription worker.
@@ -424,6 +449,12 @@ pub fn install_alignment_queue(queue: Arc<AlignmentQueue>) {
 
 pub fn set_alignment_engine_loaded(loaded: bool) {
     ALIGNMENT_ENGINE_LOADED.store(loaded, Ordering::Relaxed);
+}
+
+/// Report the aligner's in-flight state (the queue consumer toggles this
+/// around refinement work).
+pub fn set_alignment_in_flight(in_flight: bool) {
+    ALIGNMENT_IN_FLIGHT.store(in_flight, Ordering::Relaxed);
 }
 
 pub fn note_alignment_refined() {
@@ -438,6 +469,8 @@ pub fn alignment_activity() -> AlignmentActivity {
         None => (0, 0, 0),
     };
 
+    let in_flight = ALIGNMENT_IN_FLIGHT.load(Ordering::Relaxed);
+
     AlignmentActivity {
         enabled: settings.enabled,
         model_id: settings.model_id,
@@ -446,6 +479,8 @@ pub fn alignment_activity() -> AlignmentActivity {
         queue_bytes,
         dropped,
         refined: ALIGNMENT_REFINED.load(Ordering::Relaxed),
+        in_flight,
+        requested: queued_jobs > 0 && !in_flight,
     }
 }
 
@@ -454,6 +489,7 @@ pub fn clear_alignment() {
         *slot = None;
     }
     ALIGNMENT_ENGINE_LOADED.store(false, Ordering::Relaxed);
+    ALIGNMENT_IN_FLIGHT.store(false, Ordering::Relaxed);
     ALIGNMENT_REFINED.store(0, Ordering::Relaxed);
 }
 
@@ -470,6 +506,8 @@ pub struct VadActivity {
     pub mic_speaking: bool,
     pub sys_frames: u64,
     pub sys_speaking: bool,
+    /// Speech is currently detected on any channel (drives the indicator).
+    pub speaking: bool,
 }
 
 pub fn vad_activity() -> VadActivity {
@@ -485,6 +523,7 @@ pub fn vad_activity() -> VadActivity {
                 mic_speaking: mic.vad_speaking,
                 sys_frames: sys.vad_frames,
                 sys_speaking: sys.vad_speaking,
+                speaking: mic.vad_speaking || sys.vad_speaking,
             }
         }
         None => VadActivity {
@@ -494,6 +533,7 @@ pub fn vad_activity() -> VadActivity {
             mic_speaking: false,
             sys_frames: 0,
             sys_speaking: false,
+            speaking: false,
         },
     }
 }
@@ -675,9 +715,11 @@ mod tests {
         // A registered engine reports its queue depth as pending work.
         let queued = Arc::new(AtomicU64::new(7));
         let completed = Arc::new(AtomicU64::new(3));
+        let in_flight = Arc::new(AtomicBool::new(false));
         install_asr(
             queued,
             completed,
+            in_flight,
             Some("Whisper".to_string()),
             Some("large-v3-turbo".to_string()),
         );
@@ -689,6 +731,20 @@ mod tests {
         assert_eq!(running.queued, 7);
         assert_eq!(running.completed, 3);
         assert_eq!(running.pending, 4);
+        assert!(!running.in_flight);
+        // Work queued but the recogniser not yet consuming it: requested.
+        assert!(running.requested);
+
+        install_asr(
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            Some("Whisper".to_string()),
+            Some("large-v3-turbo".to_string()),
+        );
+        let consuming = asr_activity();
+        assert!(consuming.in_flight);
+        assert!(!consuming.requested);
 
         // An engine whose model is not loaded is reported as not loaded, and
         // the most recent recognition is truncated to a short fragment.
@@ -706,6 +762,7 @@ mod tests {
         install_asr(
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
             Some("Whisper".to_string()),
             None,
         );

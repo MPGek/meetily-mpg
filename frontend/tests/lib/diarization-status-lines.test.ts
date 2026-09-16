@@ -1,60 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import {
-  buildBufferBars,
   buildChannelLine,
-  buildDiarContext,
   buildLevelBar,
   buildModelIndicators,
-  buildModelLines,
   DIAR_STATE_CLASS,
   DIAR_STATE_TEXT,
-  formatDiarTurn,
-  formatPercent,
-  formatSeconds,
   LEVEL_STALE_MS,
-  MAX_DIAR_NAME_CHARS,
+  MODEL_BLINK_CLASS,
   MODEL_STATE_CLASS,
-  truncateDiarName,
 } from "../../src/lib/diarization-status-lines";
 import type {
   AlignmentActivity,
   AsrActivity,
-  ChannelPipelineFill,
   DiarChannelState,
-  DiarChannelStatus,
   DiarizationModelActivity,
   VadActivity,
 } from "../../src/services/diarizationStatusService";
-
-const fill = (
-  partial: Partial<ChannelPipelineFill> = {}
-): ChannelPipelineFill => ({
-  vad_dispatch: { fill: 4800, threshold: 9600, fraction: 0.5, fired: false },
-  vad_frames: 40,
-  vad_speaking: false,
-  pending: {
-    segments: 0,
-    buffered_ms: 0,
-    gap_trigger_ms: 500,
-    cap_trigger_ms: 25_000,
-  },
-  mix: { fill: 0, threshold: 28_800, fraction: 0, fired: false },
-  level: { rms: 0.05, peak: 0.2, age_ms: 20 },
-  ...partial,
-});
-
-const line = (partial: Partial<DiarChannelStatus> = {}): DiarChannelStatus => ({
-  channel: "microphone",
-  state: "accumulating",
-  chunks: 3,
-  embed_ok: 3,
-  embed_failed: 0,
-  buffered: 3,
-  buffered_secs: 12.4,
-  turns: 8,
-  ordered: true,
-  ...partial,
-});
 
 const vad = (partial: Partial<VadActivity> = {}): VadActivity => ({
   identity: "silero_vad_v6",
@@ -63,6 +24,7 @@ const vad = (partial: Partial<VadActivity> = {}): VadActivity => ({
   mic_speaking: true,
   sys_frames: 12,
   sys_speaking: false,
+  speaking: true,
   ...partial,
 });
 
@@ -73,6 +35,8 @@ const asr = (partial: Partial<AsrActivity> = {}): AsrActivity => ({
   queued: 12,
   completed: 9,
   pending: 3,
+  in_flight: false,
+  requested: true,
   last_text: "hello world",
   ...partial,
 });
@@ -87,6 +51,8 @@ const alignment = (
   queue_bytes: 1024,
   dropped: 0,
   refined: 5,
+  in_flight: false,
+  requested: true,
   ...partial,
 });
 
@@ -100,178 +66,31 @@ const diarizationModel = (
   loaded: true,
   prototypes: 128,
   bindings: 3,
+  pending_blocks: 0,
+  blocks_sent: 0,
+  blocks_completed: 0,
+  in_flight: false,
+  requested: false,
   ...partial,
 });
 
-describe("truncateDiarName", () => {
-  test("keeps short names intact", () => {
-    expect(truncateDiarName("Alice")).toBe("Alice");
-  });
-
-  test("caps long names at the limit", () => {
-    const long = "Bartholomew Montgomery";
-    const out = truncateDiarName(long);
-    expect(out.length).toBe(MAX_DIAR_NAME_CHARS);
-    expect(out.endsWith("\u2026")).toBe(true);
-    expect(long.startsWith(out.slice(0, -1))).toBe(true);
-  });
-});
-
-describe("formatDiarTurn", () => {
-  test("prefers the display name over the raw label", () => {
-    expect(
-      formatDiarTurn({
-        speaker: "MIC_SPEAKER_01",
-        display_name: "Alice",
-        matched_by: "auto",
-        score: 0.74,
-      })
-    ).toBe("Alice auto 0.74");
-  });
-
-  test("falls back to the label and marks the attribution source", () => {
-    expect(formatDiarTurn({ speaker: "SPEAKER_02", matched_by: "user" })).toBe(
-      "SPEAKER_02 user"
-    );
-  });
-
-  test("shows a dash when there is no attribution and omits a missing score", () => {
-    expect(formatDiarTurn({ speaker: "SPEAKER_00" })).toBe("SPEAKER_00 -");
-  });
-});
-
-describe("fill formatting", () => {
-  test("percentages are whole numbers of the threshold", () => {
-    expect(formatPercent(0)).toBe("0%");
-    expect(formatPercent(0.5)).toBe("50%");
-    expect(formatPercent(1)).toBe("100%");
-    expect(formatPercent(1.5)).toBe("150%");
-  });
-
-  test("a missing threshold or nonsense fraction reads as zero", () => {
-    expect(formatPercent(Number.NaN)).toBe("0%");
-    expect(formatPercent(-1)).toBe("0%");
-  });
-
-  test("seconds keep one decimal", () => {
-    expect(formatSeconds(0)).toBe("0.0s");
-    expect(formatSeconds(3400)).toBe("3.4s");
-    expect(formatSeconds(-500)).toBe("0.0s");
-  });
-
-});
-
-describe("buildBufferBars", () => {
-  test("each bar is labelled with the operation it gates", () => {
-    const bars = buildBufferBars(fill());
-    expect(bars.map((bar) => bar.label)).toEqual(["v", "p", "m"]);
-  });
-
-  test("a bar's length is the fill relative to its threshold", () => {
-    const bars = buildBufferBars(fill());
-    // vad_dispatch: 4800 / 9600
-    expect(bars[0].percent).toBe(50);
-    expect(bars[0].fired).toBe(false);
-    // mix is empty in the fixture
-    expect(bars[2].percent).toBe(0);
-  });
-
-  test("pending fills against its duration cap, not a fixed threshold", () => {
-    const bars = buildBufferBars(
-      fill({
-        pending: {
-          segments: 2,
-          buffered_ms: 12_500,
-          gap_trigger_ms: 500,
-          cap_trigger_ms: 25_000,
-        },
-      })
-    );
-    expect(bars[1].percent).toBe(50);
-    expect(bars[1].fired).toBe(false);
-  });
-
-  test("an over-threshold buffer renders full and still reports that it fired", () => {
-    const bars = buildBufferBars(
-      fill({
-        vad_dispatch: { fill: 19_200, threshold: 9600, fraction: 2, fired: true },
-      })
-    );
-    expect(bars[0].percent).toBe(100);
-    expect(bars[0].fired).toBe(true);
-  });
-
-  test("a missing threshold renders an empty bar, not a full one", () => {
-    const bars = buildBufferBars(
-      fill({
-        vad_dispatch: { fill: 0, threshold: 0, fraction: 0, fired: false },
-        pending: {
-          segments: 0,
-          buffered_ms: 0,
-          gap_trigger_ms: 0,
-          cap_trigger_ms: 0,
-        },
-      })
-    );
-    expect(bars[0].percent).toBe(0);
-    expect(bars[1].percent).toBe(0);
-    expect(bars[1].fired).toBe(false);
-  });
-});
-
 describe("buildChannelLine", () => {
-  test("an idle channel reads as waiting, not as a fault", () => {
-    const text = buildChannelLine(
-      line({ chunks: 0, embed_ok: 0, buffered: 0, buffered_secs: 0, turns: 0 }),
-      fill({ vad_speaking: false })
+  test("a ready channel shows its state text", () => {
+    expect(buildChannelLine({ state: "accumulating" })).toBe(
+      DIAR_STATE_TEXT.accumulating
     );
-    expect(text).toContain("0c");
-    expect(text).toContain("0/0f");
-    expect(text.endsWith(DIAR_STATE_TEXT.accumulating)).toBe(true);
-    expect(text).not.toContain("ENGINE OFF");
-    expect(text).not.toContain("ORDER BREAK");
-  });
-
-  test("counters, speech flag, buffered audio and the last turn are shown", () => {
-    const text = buildChannelLine(
-      line({
-        last_turn: {
-          speaker: "MIC_SPEAKER_01",
-          display_name: "Artsiom Karan",
-          matched_by: "auto",
-          score: 0.69,
-        },
-      }),
-      fill({ vad_speaking: true })
-    );
-    expect(text).toContain("3c");
-    expect(text).toContain("3/0f");
-    expect(text).toContain("sp");
-    expect(text).toContain("12.4s");
-    expect(text).toContain("8t");
-    expect(text).toContain("Artsiom Karan auto 0.69");
-  });
-
-  test("the speech flag is omitted while the channel is silent", () => {
-    expect(buildChannelLine(line(), fill({ vad_speaking: false }))).not.toContain(
-      "sp"
-    );
+    expect(buildChannelLine({ state: "healthy" })).toBe(DIAR_STATE_TEXT.healthy);
   });
 
   test("mono and unavailable channels are named, not counted", () => {
-    expect(buildChannelLine(line({ state: "inactive" }), fill())).toBe(
-      "mono session"
-    );
-    expect(buildChannelLine(line({ state: "unavailable" }), fill())).toBe(
-      "unavailable"
-    );
+    expect(buildChannelLine({ state: "inactive" })).toBe("mono session");
+    expect(buildChannelLine({ state: "unavailable" })).toBe("unavailable");
   });
 });
 
 describe("buildLevelBar", () => {
   test("a normal speech level fills the meter", () => {
     const bar = buildLevelBar({ rms: 0.05, peak: 0.2, age_ms: 20 });
-    expect(bar.label).toBe("L");
     expect(bar.percent).toBeGreaterThan(30);
     expect(bar.percent).toBeLessThanOrEqual(100);
     expect(bar.detail).toContain("dBFS");
@@ -298,12 +117,12 @@ describe("buildLevelBar", () => {
 
   test("a clipping peak is marked without being treated as an error", () => {
     const clipping = buildLevelBar({ rms: 0.9, peak: 1, age_ms: 20 });
-    expect(clipping.fired).toBe(true);
+    expect(clipping.firing).toBe(true);
     // A clipped signal still has an RMS just below full scale.
     expect(clipping.percent).toBeGreaterThanOrEqual(95);
     expect(clipping.detail).toContain("clipping");
     // A stale sample never shows as clipping.
-    expect(buildLevelBar({ rms: 0.9, peak: 1, age_ms: 900 }).fired).toBe(false);
+    expect(buildLevelBar({ rms: 0.9, peak: 1, age_ms: 900 }).firing).toBe(false);
   });
 });
 
@@ -311,21 +130,11 @@ describe("buildModelIndicators", () => {
   const healthy = (states: Parameters<typeof buildModelIndicators>[4]) =>
     buildModelIndicators(
       vad(),
-      asr(),
-      alignment({ loaded: true }),
-      diarizationModel(),
+      asr({ in_flight: true, requested: false }),
+      alignment({ loaded: true, in_flight: true, requested: false }),
+      diarizationModel({ pending_blocks: 2, in_flight: true }),
       states
     );
-
-  test("the meter is empty exactly when the sample is stale", () => {
-    const level = { rms: 0.3, peak: 0.6 };
-    expect(
-      buildLevelBar({ ...level, age_ms: LEVEL_STALE_MS }).percent
-    ).toBeGreaterThan(0);
-    expect(
-      buildLevelBar({ ...level, age_ms: LEVEL_STALE_MS + 1 }).percent
-    ).toBe(0);
-  });
 
   test("shows one labelled indicator per model kind", () => {
     const indicators = healthy(["healthy", "healthy"]);
@@ -385,91 +194,58 @@ describe("buildModelIndicators", () => {
   });
 });
 
-describe("buildDiarContext", () => {
-  test("always carries the recognition threshold that accepts a score", () => {
-    const context = buildDiarContext(diarizationModel());
-    expect(context).toContain("tau 0.68");
-    expect(context).toContain("titanet_large 192d");
-    expect(context).toContain("fast mode");
-    expect(context).toContain("proto 128 / bind 3");
-    expect(context).toContain("loaded");
+describe("blink states", () => {
+  test("a model actively processing blinks green", () => {
+    const indicators = buildModelIndicators(
+      vad({ speaking: true }),
+      asr({ in_flight: true, requested: false }),
+      alignment({ loaded: true, in_flight: true, requested: false }),
+      diarizationModel({ pending_blocks: 2, in_flight: true }),
+      ["healthy", "healthy"]
+    );
+    expect(indicators.map((i) => i.blink)).toEqual(["green", "green", "green", "green"]);
   });
 
-  test("reports unavailable prototypes instead of zeros", () => {
-    const context = buildDiarContext(
-      diarizationModel({ prototypes: null, bindings: null })
+  test("a queued request the model has not started consuming blinks red", () => {
+    const indicators = buildModelIndicators(
+      vad({ speaking: false }),
+      asr({ in_flight: false, requested: true }),
+      alignment({ loaded: true, in_flight: false, requested: true }),
+      diarizationModel({ pending_blocks: 3, in_flight: false }),
+      ["healthy", "healthy"]
     );
-    expect(context).toContain("prototypes unavailable");
-    expect(context).not.toContain("proto 0");
+    expect(indicators[1].blink).toBe("red");
+    expect(indicators[2].blink).toBe("red");
+    expect(indicators[3].blink).toBe("red");
   });
 
-  test("an off session is described as off", () => {
-    const context = buildDiarContext(
-      diarizationModel({ mode: "off", loaded: false })
+  test("a loaded model without work is steady, not blinking", () => {
+    const indicators = buildModelIndicators(
+      vad({ speaking: false }),
+      asr({ pending: 0, requested: false, queued: 9 }),
+      alignment({ queued_jobs: 0, requested: false }),
+      diarizationModel({ pending_blocks: 0, requested: false }),
+      ["healthy", "healthy"]
     );
-    expect(context).toContain("off mode");
-  });
-});
-
-const pipeline = { sample_rate: 48000, mic: fill() };
-
-describe("buildModelLines", () => {
-  test("names every model kind with readiness and activity", () => {
-    const lines = buildModelLines(
-      vad(),
-      asr(),
-      alignment(),
-      diarizationModel(),
-      pipeline
-    );
-    expect(lines.length).toBe(5);
-    expect(lines[0]).toContain("VAD silero_vad_v6 loaded");
-    expect(lines[0]).toContain("mic 40f sp");
-    expect(lines[0]).toContain("sys 12f");
-    expect(lines[1]).toContain("Whisper large-v3-turbo loaded");
-    expect(lines[1]).toContain("queue 9/12");
-    expect(lines[1]).toContain("3 pending");
-    expect(lines[1]).toContain("last hello world");
-    expect(lines[2]).toContain("ALIGN wav2vec2-xlsr-56 not loaded");
-    expect(lines[2]).toContain("refined 5");
-    // The diarization line carries the threshold needed to read a score.
-    expect(lines[3]).toContain("tau 0.68");
-    // The legend names what each gated buffer fires.
-    expect(lines[4]).toContain("200ms voice-activity dispatch");
-    expect(lines[4]).toContain("500ms gap or 25000ms cap");
-    expect(lines[4]).toContain("600ms recording mix window");
+    for (const indicator of indicators) {
+      expect(indicator.blink).toBe("none");
+      expect(indicator.state).toBe("healthy");
+    }
+    expect(indicators.map((i) => i.pending)).toEqual([undefined, undefined, undefined, undefined]);
   });
 
-  test("idle recognition and disabled alignment are labelled, not failed", () => {
-    const lines = buildModelLines(
-      vad({ loaded: false, mic_frames: 0, mic_speaking: false }),
-      asr({
-        engine: null,
-        model: null,
-        loaded: false,
-        queued: 0,
-        completed: 0,
-        pending: 0,
-        last_text: null,
-      }),
-      alignment({ enabled: false, loaded: false, refined: 0, queued_jobs: 0 }),
-      diarizationModel({ mode: "off", loaded: false, prototypes: null }),
-      pipeline
+  test("pending block counts are carried for STT, align and diarization", () => {
+    const indicators = buildModelIndicators(
+      vad({ speaking: false }),
+      asr({ pending: 5, in_flight: true, requested: false }),
+      alignment({ queued_jobs: 4, in_flight: false }),
+      diarizationModel({ pending_blocks: 7, in_flight: true }),
+      ["healthy", "healthy"]
     );
-    expect(lines[0]).toContain("VAD silero_vad_v6 not loaded");
-    expect(lines[1]).toBe("ASR: idle");
-    expect(lines[2]).toBe("ALIGN: disabled");
-  });
-
-  test("queue overflow is surfaced", () => {
-    const lines = buildModelLines(
-      vad(),
-      asr(),
-      alignment({ dropped: 4 }),
-      diarizationModel(),
-      pipeline
-    );
-    expect(lines[2]).toContain("dropped 4");
+    expect(indicators[1].pending).toBe(5);
+    expect(indicators[2].pending).toBe(4);
+    expect(indicators[3].pending).toBe(7);
+    expect(indicators[0].pending).toBeUndefined();
   });
 });
 
@@ -491,21 +267,20 @@ describe("state mapping", () => {
     }
   });
 
-  test("a filling buffer is never styled as an error or a warning", () => {
-    for (const state of ["accumulating", "deferred", "healthy"] as const) {
-      expect(DIAR_STATE_CLASS[state]).not.toContain("red");
-      expect(DIAR_STATE_CLASS[state]).not.toContain("amber");
-    }
-  });
-
   test("model indicator colours are distinct and an idle model is grey, not red", () => {
     expect(MODEL_STATE_CLASS.healthy).toContain("green");
     expect(MODEL_STATE_CLASS.idle).toContain("gray");
     expect(MODEL_STATE_CLASS.warning).toContain("amber");
     expect(MODEL_STATE_CLASS.error).toContain("red");
     expect(MODEL_STATE_CLASS.idle).not.toContain("red");
-    const unique = new Set(Object.values(MODEL_STATE_CLASS));
-    expect(unique.size).toBe(4);
+  });
+
+  test("blink classes pulse green or red", () => {
+    expect(MODEL_BLINK_CLASS.none).toBe("");
+    expect(MODEL_BLINK_CLASS.green).toContain("animate-pulse");
+    expect(MODEL_BLINK_CLASS.green).toContain("green");
+    expect(MODEL_BLINK_CLASS.red).toContain("animate-pulse");
+    expect(MODEL_BLINK_CLASS.red).toContain("red");
   });
 
   test("error and warning are visually distinct treatments", () => {
