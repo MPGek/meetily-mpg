@@ -79,3 +79,23 @@ Each emitted live split of a block SHALL carry the block's identifying parent re
 #### Scenario: Turn stream revision does not duplicate rows
 - **WHEN** a held block is re-attributed more than once as successive stable turns arrive
 - **THEN** each emission carries the same parent reference with an increased revision, and the frontend SHALL render exactly one current revision of each block, not multiple stacked versions
+
+### Requirement: Split sub-rows render inside their parent block's surface and channel side
+
+A live split sub-row SHALL render inside its parent block's row and keep that block's visual surface: the parent record's background bubble, border, rounded corners, and active-playback highlight SHALL remain for the whole block, and every sub-row SHALL be shown inside that surface with its own speaker label rather than as bare text on the page background. Sub-rows SHALL use the parent block's `source_device` side cues from `split-transcript-ui`: content alignment, speaker label/dot placement, and timestamp side follow the parent block's channel, so a System block split into several speaker runs stays right-aligned with its labels and timestamp on the System side and a Microphone block stays left-aligned. The sub-row's own cluster label SHALL NOT move the row to the opposite side.
+
+#### Scenario: Split block keeps one background surface
+- **WHEN** a finalized block is split live into more than one speaker run
+- **THEN** the block SHALL render as one block surface carrying the parent record's background and border, containing one labeled sub-row per speaker run, and no run SHALL be rendered as bare text on the page background
+
+#### Scenario: Split System block stays on the System side
+- **WHEN** a finalized System-channel block is attributed to more than one live speaker turn and split into sub-rows
+- **THEN** every sub-row of that block SHALL render on the System side, with the System side's alignment, label order, and timestamp placement
+
+#### Scenario: Split Microphone block stays on the Microphone side
+- **WHEN** a finalized Microphone-channel block is split into sub-rows
+- **THEN** every sub-row SHALL render on the Microphone side
+
+#### Scenario: A sub-row label never flips the side
+- **WHEN** one sub-row of a System block carries a cluster label that differs from the block's other sub-rows
+- **THEN** that sub-row SHALL keep its own label on the System side and SHALL NOT be rendered in the Microphone-side layout

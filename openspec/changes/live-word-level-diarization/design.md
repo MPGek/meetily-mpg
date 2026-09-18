@@ -73,6 +73,13 @@ Sub-row `speaker` is the raw cluster label; `display_name`/`matched_by`/`match_s
 
 The reconcile consumer activates only when the online processor published at least one registry turn for a channel. Efficient/Off produce no registry entries → no event, no provisional holding; existing segment-level flow and stop-time finalize unchanged.
 
+### D8: Sub-rows render inside the parent block surface, channel-aware
+
+Two decisions about the `blocks.length > 1` rendering branch:
+
+1. **Surface: the split never replaces the parent row.** The block keeps the parent record's row shape — background bubble, border, rounded corners, active highlight — and the sub-rows render inside it, one labeled run each. Alternatives considered: (a) one bubble per run — rejected, because two adjacent runs of the same record become indistinguishable from two separate records and each live revision re-emit would visually re-split/re-join blocks; (b) parent bubble plus sub-rows printed beneath it on the page background — rejected, because it drops the "one record" reading and leaves half the text visually unattributed, which is exactly the reported defect ("all transcript blocks must have a background").
+2. **Side: the side comes from the parent block's `source_device`**, never from the sub-row's cluster label, and ordering per channel mirrors the single-record rows of `split-transcript-ui` (Microphone: timestamp, play, label, text on the left; System mirrored on the right). The rule lives in a small pure helper (`frontend/src/lib/source-side-layout.ts`) with unit tests, so it cannot drift from the variants. This rule was previously shared through the turn-grouping helper; `drop-turn-grouping` deletes that module, so the rule is re-established here as part of the sub-row rendering.
+
 ## Risks / Trade-offs
 
 - [polyvoice turns may not be strictly append-only/monotonic] → Spike: log emitted stable turn (start, end, speaker) sequence over real recordings and assert monotonic non-overlap; if revisions exist, degrade D4 to "decidable only on next confirmed-later turn" (never regresses, only delays splits). Mitigated anyway because a wrong attribution self-corrects at stop-time finalize.

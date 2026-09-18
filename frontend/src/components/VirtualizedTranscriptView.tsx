@@ -14,6 +14,7 @@ import { Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Pause, Play } from "lucide-react";
 import { TranscriptSegmentData, LiveTranscriptBlock } from "@/types";
+import { sourceSideLayout } from "@/lib/source-side-layout";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -509,39 +510,30 @@ const TranscriptSegment = memo(function TranscriptSegment({
 
     const speakerColor = hasSpeaker ? getSpeakerColor(speaker) : undefined;
 
-    // Live word-level diarization: render one sub-row per speaker run instead
-    // of the single-segment bubble. Only present for blocks that were actually
-    // split (>1 run); single-speaker blocks render exactly as before.
+    // Live word-level diarization: a split block renders as one block surface
+    // for its channel, with one labeled sub-row per speaker run inside it. Only
+    // present for blocks that were actually split (>1 run); single-speaker
+    // blocks render exactly as before.
     if (blocks && blocks.length > 1) {
-        return (
-            <div
-                id={`segment-${id}`}
-                className={isActive ? 'mb-3 bg-blue-50/70 rounded-lg ring-1 ring-blue-300' : 'mb-3'}
-            >
-                <div className="flex items-start gap-2">
-                    <Tooltip>
-                        <TooltipTrigger>
-                            <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
-                                {formatRecordingTime(timestamp)}
-                            </span>
-                        </TooltipTrigger>
-                        <TooltipContent>
-                            {confidence !== undefined && showConfidence && (
-                                <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
-                            )}
-                        </TooltipContent>
-                    </Tooltip>
-                    {playButton}
-                    <div className="flex-1 space-y-2">
+        const side = sourceSideLayout(source_device);
+        const surface = (
+            <div className="flex-1 max-w-[90%]">
+                <div
+                    className={`rounded-lg px-3 py-2 ${side.bubbleClass} ${isActive ? `ring-2 ${side.activeRingColor}` : ''}`}
+                    style={hasSpeaker ? (side.isSystem ? { borderRightColor: speakerColor, borderRightWidth: 3 } : { borderLeftColor: speakerColor, borderLeftWidth: 3 }) : undefined}
+                >
+                    <div className="space-y-2">
                         {blocks.map((block, index) => {
                             const blockColor = getSpeakerColor(block.speaker);
                             return (
                                 <div key={`${block.speaker}-${block.start}-${index}`}>
-                                    <div className="flex items-center gap-1.5 mb-1 ml-1">
-                                        <span
-                                            className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
-                                            style={{ backgroundColor: blockColor }}
-                                        />
+                                    <div className={side.labelRowClass}>
+                                        {side.dotPosition === 'before' && (
+                                            <span
+                                                className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                                style={{ backgroundColor: blockColor }}
+                                            />
+                                        )}
                                         <SpeakerLabel
                                             speaker={block.speaker}
                                             label={block.display_name}
@@ -554,14 +546,56 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                             matchedBy={block.matched_by}
                                             matchScore={block.match_score}
                                         />
+                                        {side.dotPosition === 'after' && (
+                                            <span
+                                                className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                                style={{ backgroundColor: blockColor }}
+                                            />
+                                        )}
                                     </div>
-                                    <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap ml-1">
+                                    <div className={side.textClass}>
                                         {cleanStopWords(block.text) || block.text}
                                     </div>
                                 </div>
                             );
                         })}
                     </div>
+                </div>
+            </div>
+        );
+        const timestampLabel = (
+            <Tooltip>
+                <TooltipTrigger>
+                    <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                        {formatRecordingTime(timestamp)}
+                    </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                    {confidence !== undefined && showConfidence && (
+                        <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
+                    )}
+                </TooltipContent>
+            </Tooltip>
+        );
+
+        if (side.isSystem) {
+            return (
+                <div id={`segment-${id}`} className="mb-3">
+                    <div className="flex items-start gap-2 justify-end">
+                        {surface}
+                        {playButton}
+                        {timestampLabel}
+                    </div>
+                </div>
+            );
+        }
+
+        return (
+            <div id={`segment-${id}`} className="mb-3">
+                <div className="flex items-start gap-2">
+                    {timestampLabel}
+                    {playButton}
+                    {surface}
                 </div>
             </div>
         );
