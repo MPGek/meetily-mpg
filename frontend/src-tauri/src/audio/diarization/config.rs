@@ -2,9 +2,7 @@
 //! persisted clustering overrides the frontend mirrors to the backend, and the
 //! `DiarizationConfig` both the batch pass and a live session resolve from.
 
-use super::DIARIZATION_CHUNK_DURATION_SECS;
 use std::sync::atomic::{AtomicU64, Ordering};
-
 
 /// Fixed concurrency profile: the ONNX session pool size is the smaller of 8
 /// or 75% of the logical CPU core count (rounded up, minimum 1). There is no
@@ -245,21 +243,88 @@ pub fn set_clustering_overrides(
     );
 }
 
-#[tauri::command]
-pub async fn set_diarization_clustering_settings(
-    cluster_threshold: Option<f32>,
-    cluster_ceiling: Option<usize>,
-    gap_merge_secs: Option<f32>,
-    clusterer: Option<String>,
-) -> Result<(), String> {
-    let kind = match clusterer.as_deref() {
-        None => None,
-        Some(raw) => Some(ClustererKindSetting::parse(raw).ok_or_else(|| {
-            format!(
-                "Unknown diarizationClusterer '{raw}' (expected vbx|nmesc|ahc)"
-            )
-        })?),
-    };
-    set_clustering_overrides(cluster_threshold, cluster_ceiling, gap_merge_secs, kind);
-    Ok(())
+pub(crate) const DIARIZATION_SAMPLE_RATE: u32 = 16000;
+
+/// Fixed chunk duration for offline diarization (seconds). Diarization always
+/// processes recordings in chunks to keep peak memory bounded.
+pub(crate) const DIARIZATION_CHUNK_DURATION_SECS: f32 = 600.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diarization_config_uses_fixed_profile() {
+        let cfg = DiarizationConfig::default();
+        assert!(cfg.max_sessions >= 1 && cfg.max_sessions <= 8);
+        assert_eq!(cfg.chunk_overlap_secs, 5.0);
+        assert_eq!(cfg.chunk_duration_secs(), 600.0);
+    }
+
+    #[test]
+    fn diarization_config_clustering_defaults() {
+        let cfg = DiarizationConfig::default();
+        assert_eq!(cfg.cluster_threshold, 0.60);
+        assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
+        assert_eq!(cfg.cluster_ceiling, 128);
+        assert_eq!(cfg.gap_merge_secs, 0.3);
+        // Built-in default kind is ahc (6.2 sweep: nmesc under-clusters).
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        assert_eq!(cfg.embed_window_secs, DEFAULT_EMBED_WINDOW_SECS);
+        assert_eq!(cfg.embed_window_secs, 5.0);
+        assert_eq!(cfg.min_speech_secs, 0.25);
+        let bin = cfg.binarization.expect("v2 default enables calibrated binarization");
+        assert!(bin.offset < bin.onset, "hysteresis: offset below onset");
+        assert!(bin.min_duration_on > 0.0 && bin.min_duration_off > 0.0);
+        // Built-in threshold equals the family default (single source of truth).
+        assert_eq!(
+            cfg.cluster_threshold,
+            crate::audio::embedder::TITANET_CLUSTER_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn resolved_config_prefers_stored_overrides_and_falls_back_to_defaults() {
+        // Save/restore the process globals so the test is parallel-safe:
+        // no other test reads the clustering overrides.
+        let saved = (
+            stored_cluster_threshold(),
+            stored_cluster_ceiling(),
+            stored_gap_merge_secs(),
+            stored_clusterer_kind(),
+        );
+        // Unset -> built-in defaults.
+        set_clustering_overrides(None, None, None, None);
+        let cfg = DiarizationConfig::resolved();
+        assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
+        assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
+        assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        // Stored override wins per key.
+        set_clustering_overrides(Some(0.35), Some(12), Some(0.3), Some(ClustererKindSetting::Ahc));
+        let cfg = DiarizationConfig::resolved();
+        assert_eq!(cfg.cluster_threshold, 0.35);
+        assert_eq!(cfg.cluster_ceiling, 12);
+        assert_eq!(cfg.gap_merge_secs, 0.3);
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        // Partial override: only the ceiling is stored, others fall back.
+        set_clustering_overrides(None, Some(7), None, None);
+        let cfg = DiarizationConfig::resolved();
+        assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
+        assert_eq!(cfg.cluster_ceiling, 7);
+        assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
+        assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        set_clustering_overrides(saved.0, saved.1, saved.2, saved.3);
+    }
+
+    #[test]
+    fn fixed_pool_size_respects_floor_and_cap() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let expected = (((cores as f64) * 0.75).ceil() as usize).min(8).max(1);
+        assert_eq!(fixed_pool_size(), expected);
+        assert!(fixed_pool_size() >= 1);
+        assert!(fixed_pool_size() <= 8);
+    }
 }
