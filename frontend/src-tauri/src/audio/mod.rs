@@ -70,14 +70,20 @@ pub mod diarization;
 // Online diarization module (speaker identification during recording via polyvoice)
 pub mod online_diarization;
 
-// Speaker recognition core (cosine matching against enrolled voiceprints)
-pub mod speaker_recognition;
+// Speaker recognition core (cosine matching against enrolled voiceprints).
+// Moved into the diarization tree by 05-unified-diarization-engine; this alias
+// keeps every existing `audio::speaker_recognition::*` path resolving, so the
+// move stays behavior-preserving.
+pub use diarization::identity::matching as speaker_recognition;
 
 // Post-ASR CTC word-level forced alignment (word-level-diarization-alignment)
 pub mod word_alignment;
 
-// Live token-level speaker attribution + display splitting (live-word-level-diarization)
-pub mod live_diarization_reconcile;
+// Live token-level speaker attribution + display splitting
+// (live-word-level-diarization). Moved into the diarization tree by
+// 05-unified-diarization-engine; the alias keeps existing
+// `audio::live_diarization_reconcile::*` paths resolving.
+pub use diarization::streaming::reconcile as live_diarization_reconcile;
 
 // Self-contained voiceprint audio clips (voiceprint-audio-clips-and-verification)
 pub mod voiceprint_clips;
