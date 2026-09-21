@@ -8,7 +8,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex, RwLock,
+    Arc, Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
@@ -21,15 +21,10 @@ use super::{
     DeviceMonitorType,
     RecordingManager,
 };
+use super::diarization::engine::{DiarizationEngine, LiveSessionConfig, LiveSpeakerAssignment};
 use super::sync_ext::LockRecover;
 
-use super::embedder::{ENHANCED_EMBEDDING_DIM, ENHANCED_MODEL_TAG, TITANET_RECOGNITION_THRESHOLD};
-use super::online_diarization::{
-    begin_stats, clear_stats, current_stats, ChannelStatusLine, DiarChannel, DiarChannelState,
-    DiarizationMode, OnlineClusterEmbeddings, OnlineDiarizationProcessor, OnlineDiarizationStatus,
-    PrototypeStore, SpeakerAssignment, SpeakerTurn,
-};
-use crate::database::repositories::speaker::SpeakerRepository;
+use super::online_diarization::{clear_stats, DiarizationMode, OnlineDiarizationStatus};
 
 // Import transcription modules
 use super::transcription::{self, reset_speech_detected_flag};
@@ -48,56 +43,6 @@ static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
-// Online diarization worker: consumes embedding chunks and returns the
-// processor (for finalize) when the channel closes
-static ONLINE_DIARIZATION_TASK: Mutex<
-    Option<JoinHandle<Result<Option<OnlineDiarizationProcessor>, String>>>,
-> = Mutex::new(None);
-
-// Shared prototype store for live Fast-mode recognition (design D6).
-// Created at recording start, shared between the processor task and the
-// assign_live_speaker command. Cleared at recording stop.
-pub(crate) static ONLINE_DIARIZATION_STORE: Mutex<Option<Arc<RwLock<PrototypeStore>>>> =
-    Mutex::new(None);
-
-// Session data retained between recording stop and the frontend-initiated
-// finalize_online_session call (which needs the meeting_id created by the
-// frontend save). Holds cluster embeddings for persistence + enrollment,
-// the raw per-channel chunk buffers for ground-truth block enrollment, and
-// the expected-speaker list for the meeting row.
-pub(crate) struct OnlineSessionData {
-    pub cluster_embeddings: OnlineClusterEmbeddings,
-    pub live_bindings: std::collections::HashMap<String, String>,
-    pub expected_speaker_ids: Vec<String>,
-    /// Raw timestamped mic-channel chunk embeddings (`(start, end, embedding)`),
-    /// for enrolling user-assigned blocks as ground truth.
-    pub mic_embeddings: Vec<(f32, f32, Vec<f32>)>,
-    /// Raw timestamped system-channel chunk embeddings.
-    pub sys_embeddings: Vec<(f32, f32, Vec<f32>)>,
-}
-
-pub(crate) static ONLINE_SESSION_DATA: Mutex<Option<OnlineSessionData>> = Mutex::new(None);
-
-// Expected speaker IDs passed at recording start, stored so stop_recording
-// can include them in the session data for finalize_online_session.
-static ONLINE_EXPECTED_SPEAKER_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// A single-turn (single-block) speaker override recorded during Fast-mode
-/// recording (design D10): relabels the transcript(s) overlapping
-/// [start_secs, end_secs] of the given cluster to a registry speaker.
-/// Display-only during recording; applied at stop-time finalize.
-#[derive(Debug, Clone)]
-pub(crate) struct TurnOverride {
-    pub cluster_label: String,
-    pub start_secs: f64,
-    pub end_secs: f64,
-    pub speaker_id: String,
-}
-
-// Per-turn overrides recorded mid-recording (scope='block' in
-// assign_live_speaker). Consumed and cleared by finalize_online_session, which
-// applies them to the meeting's transcripts after the meeting row exists.
-pub(crate) static ONLINE_TURN_OVERRIDES: Mutex<Vec<TurnOverride>> = Mutex::new(Vec::new());
 
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
@@ -144,49 +89,6 @@ fn transcript_segment_from_update(
     }
 }
 
-/// Resolve a repair-path span source over a meeting's saved audio file
-/// (word-level-diarization-alignment 5.6). The mic/system channel mapping is
-/// baked into the returned source. `None` when the file/ffmpeg is unavailable.
-fn meeting_span_source(
-    folder: &std::path::Path,
-) -> Option<Box<dyn crate::audio::word_alignment::refine::AudioSpanSource>> {
-    use crate::audio::word_alignment::refine::FileSpanSource;
-    let audio_path = match crate::audio::audio_file::find_audio_file(folder) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("Alignment repair: no audio file in meeting folder: {}", e);
-            return None;
-        }
-    };
-    // Resolve the layout from the decoded audio (first-packet fallback when the
-    // container omits the channel count) so spans are read from the same channel
-    // the segment was transcribed from.
-    let layout = match crate::audio::decoder::detect_channel_layout(&audio_path) {
-        Ok(layout) => layout,
-        Err(e) => {
-            warn!(
-                "Alignment repair: channel layout detection failed for {}: {}",
-                audio_path.display(),
-                e
-            );
-            crate::audio::decoder::ChannelLayout::Unknown
-        }
-    };
-    if layout.channels().is_none() {
-        warn!(
-            "Alignment repair: channel layout unknown for {}; treating spans as mono",
-            audio_path.display()
-        );
-    }
-    let stereo = layout.is_stereo();
-    match FileSpanSource::new(audio_path, stereo) {
-        Ok(s) => Some(Box::new(s)),
-        Err(e) => {
-            warn!("Alignment repair: span source init failed: {}", e);
-            None
-        }
-    }
-}
 
 // ============================================================================
 // RECORDING COMMANDS
@@ -592,127 +494,19 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     crate::audio::telemetry::clear_asr();
     crate::audio::telemetry::clear_alignment();
 
-    // Store expected speaker IDs so stop_recording can include them in session data.
-    {
-        let mut stored_ids = ONLINE_EXPECTED_SPEAKER_IDS.lock_or_recover();
-        *stored_ids = expected_ids.clone();
-    }
-
-    // Fresh live word-diarization session: clear live turns + the provisional
-    // block set so no state from a previous recording leaks in
-    // (live-word-level-diarization).
-    crate::audio::live_diarization_reconcile::reset_session();
-
-    if online_mode.is_online() {
-        // Bounded: same reasoning as `transcription_sender` (already-coalesced
-        // segments, so 32 pending is a large multi-minute backlog).
-        let (embedding_sender, embedding_receiver) =
-            tokio::sync::mpsc::channel::<super::recording_state::AudioChunk>(32);
-        manager.set_embedding_sender(Some(embedding_sender));
-
-        // Fix the microphone label prefix for the whole session: when a
-        // system device was selected the session is stereo, so mic clusters
-        // are namespaced MIC_SPEAKER_NN; otherwise mono, so SPEAKER_NN.
-        let has_system_device = system_device.is_some();
-
-        // Live status counters for this session (online-diarization-telemetry).
-        // Installed before the processor starts, so the status lines report
-        // unavailable (not stale values) if model initialization fails.
-        let stats = begin_stats(online_mode, has_system_device);
-
-        // Channel carrying live speaker turns (Fast mode) from the blocking
-        // processor back to the async side for emission to the frontend.
-        let (turn_sender, mut turn_receiver) =
-            tokio::sync::mpsc::unbounded_channel::<SpeakerTurn>();
-        let app_for_turns = app.clone();
-        let _turn_forwarder = tokio::spawn(async move {
-            while let Some(turn) = turn_receiver.recv().await {
-                if let Err(e) = app_for_turns.emit("online-speaker-turn", turn) {
-                    warn!("Failed to emit online speaker turn: {}", e);
-                }
-            }
-        });
-
-        // Load prototype store for live recognition (Fast mode) and store
-        // it in a static so the assign_live_speaker command can access it.
-        let candidate_ids = if expected_ids.is_empty() {
-            None
-        } else {
-            Some(expected_ids.clone())
-        };
-        // Fresh session: clear any stale per-turn overrides from a previous run.
-        ONLINE_TURN_OVERRIDES.lock_or_recover().clear();
-        let pool = {
-            let state = app.state::<crate::state::AppState>();
-            state.db_manager.pool().clone()
-        };
-        let store_model_tag = crate::audio::embedder::ENHANCED_MODEL_TAG;
-        let prototype_store = match PrototypeStore::load_with_model(
-            &pool,
-            candidate_ids,
-            has_system_device,
-            store_model_tag,
-        )
-        .await
-        {
-            Ok(store) => {
-                let arc = Arc::new(RwLock::new(store));
-                {
-                    let mut global_store = ONLINE_DIARIZATION_STORE.lock_or_recover();
-                    *global_store = Some(arc.clone());
-                }
-                Some(arc)
-            }
-            Err(e) => {
-                warn!("Failed to load prototype store: {}", e);
-                None
-            }
-        };
-
-        let app_for_processor = app.clone();
-        let app_for_event = app.clone();
-        let task = tokio::task::spawn_blocking(
-            move || -> Result<Option<OnlineDiarizationProcessor>, String> {
-                let max_speakers_usize = max_speakers.filter(|m| *m > 0).unwrap_or(0) as usize;
-                let mut processor = match OnlineDiarizationProcessor::new_with_app(
-                    &app_for_processor,
-                    online_mode,
-                    max_speakers_usize,
-                    has_system_device,
-                    Some(turn_sender),
-                    prototype_store,
-                ) {
-                    Ok(processor) => processor,
-                    Err(e) => {
-                        warn!("Online diarization unavailable: {}", e);
-                        let _ = app_for_event.emit(
-                            "online-diarization-unavailable",
-                            serde_json::json!({ "error": e }),
-                        );
-                        return Err(e);
-                    }
-                };
-                // Attach the live status counters so the two status lines can
-                // report this channel's progress while the recording runs.
-                processor.attach_stats(stats);
-                let mut receiver = embedding_receiver;
-                while let Some(chunk) = receiver.blocking_recv() {
-                    processor.process_chunk(chunk);
-                }
-                Ok(Some(processor))
-            },
-        );
-        {
-            let mut global_task = ONLINE_DIARIZATION_TASK.lock_or_recover();
-            *global_task = Some(task);
-        }
-        info!(
-            "🎙️ Online diarization processor spawned (mode: {:?})",
-            online_mode
-        );
-    } else {
-        info!("ℹ️ Online diarization disabled (mode: {:?})", online_mode);
-    }
+    // The live diarization session owns its own state, models and drain task;
+    // the engine hands back the sender the pipeline feeds (None when off).
+    let live_chunk_sender = DiarizationEngine::start_live_session(
+        &app,
+        LiveSessionConfig {
+            mode: online_mode,
+            max_speakers,
+            has_system_device: system_device.is_some(),
+            expected_speaker_ids: expected_ids.clone(),
+        },
+    )
+    .await;
+    manager.set_embedding_sender(live_chunk_sender);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -1037,133 +831,28 @@ pub async fn stop_recording<R: Runtime>(
         info!("ℹ️ No transcription task found to wait for");
     }
 
-    // Step 2.5: Finalize online diarization (if active) and collect speaker assignments.
-    // The embedding channel was closed when the pipeline stopped, so the consumer
-    // task has drained all speech chunks and returned the processor.
-    let online_task = {
-        let mut global_task = ONLINE_DIARIZATION_TASK.lock_or_recover();
-        global_task.take()
-    };
+    // Step 2.5: Finalize online diarization (if active) and collect speaker
+    // assignments. The manager is !Sync (cpal streams), so its data is read
+    // synchronously here, before the engine's await.
+    let transcripts_for_diarization = manager_for_cleanup
+        .as_ref()
+        .map(|manager| manager.get_transcript_segments());
+    let meeting_folder_for_diarization = manager_for_cleanup
+        .as_ref()
+        .and_then(|m| m.get_meeting_folder());
+    let speaker_assignments = DiarizationEngine::finalize_session(
+        transcripts_for_diarization,
+        meeting_folder_for_diarization,
+    )
+    .await;
 
     // The recording is over: stop serving live status counters so a stopped
-    // session's values are never presented as live (online-diarization-telemetry).
-    clear_stats();
+    // session's values are never presented as live
+    // (online-diarization-telemetry). The diarization counters are cleared by
+    // the engine above.
     crate::audio::telemetry::clear_pipeline();
     crate::audio::telemetry::clear_asr();
     crate::audio::telemetry::clear_alignment();
-
-    let speaker_assignments: Option<Vec<SpeakerAssignment>> = if let Some(task_handle) = online_task
-    {
-        info!("⏳ Finalizing online diarization...");
-        let processor = match task_handle.await {
-            Ok(Ok(Some(processor))) => Some(processor),
-            Ok(Ok(None)) => None,
-            Ok(Err(e)) => {
-                warn!("⚠️ Online diarization unavailable: {}", e);
-                None
-            }
-            Err(e) => {
-                warn!("⚠️ Online diarization task panicked: {:?}", e);
-                None
-            }
-        };
-
-        // Extract the in-memory transcript segments synchronously; the
-        // RecordingManager is !Sync (cpal streams), so no reference may be
-        // held across an await.
-        let transcripts = manager_for_cleanup
-            .as_ref()
-            .map(|manager| manager.get_transcript_segments());
-        let meeting_folder = manager_for_cleanup
-            .as_ref()
-            .and_then(|m| m.get_meeting_folder());
-
-        if let (Some(mut processor), Some(mut transcripts)) = (processor, transcripts) {
-            // Stop-time repair (word-level-diarization-alignment 5.6): before
-            // the N-way split, refine any segment still lacking refined tokens
-            // (alignment off/missing during recording, or a block dropped by
-            // queue overflow) against the saved post-flush meeting file.
-            let align_settings = crate::audio::word_alignment::settings::current();
-            match tokio::task::spawn_blocking(move || {
-                if align_settings.enabled {
-                    if let Some(folder) = &meeting_folder {
-                        if let Some(source) = meeting_span_source(folder) {
-                            let n = crate::audio::word_alignment::refine::refine_segment_tokens(
-                                &mut transcripts,
-                                source.as_ref(),
-                                &align_settings,
-                            );
-                            if n > 0 {
-                                info!(
-                                    "Stop-time alignment repair: refined {} segment(s) before split",
-                                    n
-                                );
-                            }
-                        }
-                    }
-                }
-                processor.finalize(&transcripts)
-            })
-            .await
-            {
-                Ok(Ok((assignments, cluster_embeddings, live_bindings))) => {
-                    info!(
-                        "✅ Online diarization finalized: {} speaker assignments, {} live bindings",
-                        assignments.len(),
-                        live_bindings.len()
-                    );
-                    // Store cluster embeddings + live bindings for the
-                    // frontend-initiated finalize_online_session call, which
-                    // persists them once the meeting row exists.
-                    let stored_expected = ONLINE_EXPECTED_SPEAKER_IDS.lock_or_recover().clone();
-                    {
-                        let mut session_data = ONLINE_SESSION_DATA.lock_or_recover();
-                        // Move the raw buffers out of the cluster embeddings so
-                        // the full chunk set is held exactly once between stop
-                        // and finalize_online_session (no double-buffer clone).
-                        let OnlineClusterEmbeddings {
-                            mic,
-                            sys,
-                            saw_system_audio,
-                            model_tag,
-                            mic_raw,
-                            sys_raw,
-                        } = cluster_embeddings;
-                        *session_data = Some(OnlineSessionData {
-                            mic_embeddings: mic_raw,
-                            sys_embeddings: sys_raw,
-                            cluster_embeddings: OnlineClusterEmbeddings {
-                                mic,
-                                sys,
-                                saw_system_audio,
-                                model_tag,
-                                mic_raw: Vec::new(),
-                                sys_raw: Vec::new(),
-                            },
-                            live_bindings,
-                            expected_speaker_ids: stored_expected,
-                        });
-                    }
-                    Some(assignments)
-                }
-                Ok(Err(e)) => {
-                    warn!("⚠️ Online diarization finalize failed: {}", e);
-                    None
-                }
-                Err(e) => {
-                    warn!("⚠️ Online diarization finalize panicked: {:?}", e);
-                    None
-                }
-            }
-        } else {
-            info!("ℹ️ Online diarization processor not available");
-            None
-        }
-    } else {
-        info!("ℹ️ No online diarization task was active");
-        None
-    };
-
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(
         "recording-shutdown-progress",
@@ -1792,203 +1481,6 @@ pub async fn attempt_device_reconnect(
 // SPEAKER IDENTITY REGISTRY — online session finalization
 // ============================================================================
 
-/// Finalize an online diarization session after the meeting row has been
-/// created by the frontend. Persists cluster centroids + exemplar caches,
-/// runs auto-recognition, enrolls session embeddings, and persists the
-/// expected-speaker allowlist. Called once per recording stop.
-#[tauri::command]
-pub async fn finalize_online_session(
-    meeting_id: String,
-    state: tauri::State<'_, crate::state::AppState>,
-) -> Result<serde_json::Value, String> {
-    let pool = state.db_manager.pool();
-
-    // Take the pending session data. When none is present (e.g. a non-online
-    // recording that still navigates through finalize), no-op gracefully so the
-    // frontend may finalize unconditionally and never drop live bindings.
-    let Some(session_data) = ONLINE_SESSION_DATA.lock_or_recover().take() else {
-        return Ok(serde_json::json!({
-            "meeting_id": meeting_id,
-            "live_bindings": 0,
-            "enrolled": 0,
-        }));
-    };
-
-    // Persist the expected-speaker allowlist FIRST (empty list = match all),
-    // so the stop-time auto-recognition below is restricted to the session's
-    // expected speakers instead of falling back to all registry speakers.
-    if !session_data.expected_speaker_ids.is_empty() {
-        SpeakerRepository::set_expected_speakers(
-            pool,
-            &meeting_id,
-            &session_data.expected_speaker_ids,
-        )
-        .await
-        .map_err(|e| format!("Failed to persist expected speakers: {}", e))?;
-    }
-
-    // Persist cluster centroids + exemplar caches and auto-assign recognized speakers.
-    // Matching is enhanced-only; the session tag is informational.
-    if !session_data.cluster_embeddings.mic.is_empty()
-        || !session_data.cluster_embeddings.sys.is_empty()
-    {
-        super::diarization::persist_and_recognize_session(
-            pool,
-            &meeting_id,
-            &session_data.cluster_embeddings.mic,
-            &session_data.cluster_embeddings.sys,
-            session_data.cluster_embeddings.saw_system_audio,
-        )
-        .await?;
-    }
-
-    // Enroll session embeddings for user-assigned clusters (best-8 reparenting,
-    // per-person cap). This covers live renames and post-stop manual bindings.
-    let mut enrolled = 0usize;
-    for (cluster_label, speaker_id) in &session_data.live_bindings {
-        // Re-binding (demote a previous speaker's prototypes, then enroll the
-        // best-K) is shared with the offline commands so both behave the same.
-        let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
-            Some("mic")
-        } else if cluster_label.starts_with("SPEAKER_") {
-            if session_data.cluster_embeddings.saw_system_audio {
-                Some("system")
-            } else {
-                Some("mic")
-            }
-        } else {
-            None
-        };
-        match SpeakerRepository::rebind_cluster(
-            pool,
-            &meeting_id,
-            cluster_label,
-            channel,
-            speaker_id,
-        )
-        .await
-        {
-            Ok(n) => enrolled += n,
-            Err(e) => warn!(
-                "Failed to enroll session cluster {} → {}: {}",
-                cluster_label, speaker_id, e
-            ),
-        }
-    }
-
-    // Persist live user bindings as matched_by='user' so a cluster renamed
-    // mid-recording is NEVER overwritten later by auto-recognition or
-    // re-match (design D8: user bindings always win). Only binding rows are
-    // written here; enrollment above already reparented the embeddings.
-    for (cluster_label, speaker_id) in &session_data.live_bindings {
-        if let Err(e) =
-            SpeakerRepository::set_user_binding(pool, &meeting_id, cluster_label, speaker_id).await
-        {
-            warn!(
-                "Failed to persist live user binding {label} → {speaker_id}: {e}",
-                label = cluster_label
-            );
-        }
-        // Also write the user's identity onto the stored transcript rows of the
-        // cluster, so each row resolves to the user via the override join even
-        // if the meeting_speakers render-time join is unavailable.
-        if let Err(e) = SpeakerRepository::apply_cluster_binding_overrides(
-            pool,
-            &meeting_id,
-            cluster_label,
-            speaker_id,
-        )
-        .await
-        {
-            warn!("Failed to persist cluster binding overrides for {cluster_label}: {e}");
-        }
-    }
-
-    // Apply live per-turn overrides (single-block relabels recorded during
-    // Fast-mode recording) to the meeting's transcripts. Applied after
-    // auto-recognition so the user's explicit choice always wins.
-    let turn_overrides: Vec<(String, f64, f64, String)> = ONLINE_TURN_OVERRIDES
-        .lock()
-        .unwrap()
-        .drain(..)
-        .map(|o| (o.cluster_label, o.start_secs, o.end_secs, o.speaker_id))
-        .collect();
-
-    // Ground-truth enrollment for each single-block override: the chunk
-    // embeddings overlapping the relabeled block's time window become
-    // prototypes of the chosen speaker, improving the global registry. A user
-    // pick is ground truth — it should strengthen the person's identity.
-    for (cluster_label, start, end, speaker_id) in &turn_overrides {
-        let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
-            Some("mic")
-        } else if cluster_label.starts_with("SPEAKER_") {
-            if session_data.cluster_embeddings.saw_system_audio {
-                Some("system")
-            } else {
-                Some("mic")
-            }
-        } else {
-            None
-        };
-        let Some(channel) = channel else { continue };
-        let buffer = if channel == "mic" {
-            &session_data.mic_embeddings
-        } else {
-            &session_data.sys_embeddings
-        };
-        match SpeakerRepository::enroll_embeddings_from_buffer(
-            pool,
-            speaker_id,
-            channel,
-            buffer,
-            (*start as f32, *end as f32),
-            &meeting_id,
-            cluster_label,
-        )
-        .await
-        {
-            Ok(n) => {
-                if n > 0 {
-                    enrolled += n;
-                    info!(
-                        "Ground-truth enrollment: {} embeddings for {} from override {} [{:.1}s-{:.1}s]",
-                        n, speaker_id, cluster_label, start, end
-                    );
-                }
-            }
-            Err(e) => warn!(
-                "Failed to enroll ground-truth embeddings for {} from {}: {}",
-                speaker_id, cluster_label, e
-            ),
-        }
-    }
-
-    if !turn_overrides.is_empty() {
-        SpeakerRepository::apply_turn_overrides(pool, &meeting_id, &turn_overrides)
-            .await
-            .map_err(|e| format!("Failed to apply turn overrides: {}", e))?;
-    }
-
-    // Clear the global prototype store (session ended).
-    {
-        let mut store = ONLINE_DIARIZATION_STORE.lock_or_recover();
-        *store = None;
-    }
-
-    info!(
-        "✅ Online session finalized for {}: {} live bindings, {} enrolled embeddings, {} expected speakers",
-        meeting_id,
-        session_data.live_bindings.len(),
-        enrolled,
-        session_data.expected_speaker_ids.len()
-    );
-
-    Ok(serde_json::json!({
-        "meeting_id": meeting_id,
-        "live_bindings": session_data.live_bindings.len(),
-        "enrolled": enrolled,
-    }))
-}
 
 /// One channel's pipeline buffer fills and voice-activity activity.
 #[derive(Debug, Clone, Serialize)]
@@ -2037,81 +1529,6 @@ pub struct RecordingTelemetry {
     pub models: ModelsActivity,
 }
 
-/// Diarization section: the running session's per-channel counters, or an
-/// inactive shape when nothing is running.
-async fn online_diarization_status() -> Result<OnlineDiarizationStatus, String> {
-    let stats = current_stats();
-    let registry = crate::audio::live_diarization_reconcile::registry();
-
-    let (prototypes, bindings) = {
-        let store = ONLINE_DIARIZATION_STORE.lock_or_recover();
-        let read = store.as_ref().and_then(|s| s.read().ok());
-        match read {
-            Some(read) => (
-                Some(read.prototypes.len()),
-                Some(read.bindings().len()),
-            ),
-            None => (None, None),
-        }
-    };
-
-    let (active, mode, available, mic, sys) = match stats.as_deref() {
-        Some(stats) => (
-            stats.mode().is_online(),
-            stats.mode(),
-            stats.is_available(),
-            stats.line(DiarChannel::Microphone, &registry),
-            stats.line(DiarChannel::System, &registry),
-        ),
-        None => {
-            let unavailable = |channel| ChannelStatusLine {
-                channel,
-                state: DiarChannelState::Unavailable,
-                chunks: 0,
-                embed_ok: 0,
-                embed_failed: 0,
-                buffered: 0,
-                buffered_secs: 0.0,
-                turns: 0,
-                ordered: true,
-                last_turn: None,
-            };
-            (
-                false,
-                DiarizationMode::Off,
-                false,
-                unavailable(DiarChannel::Microphone),
-                unavailable(DiarChannel::System),
-            )
-        }
-    };
-
-    let (blocks_sent, blocks_completed, blocks_in_flight) = match stats.as_deref() {
-        Some(stats) => (
-            stats.blocks_sent_total(),
-            stats.blocks_completed_total(),
-            stats.blocks_in_flight_now(),
-        ),
-        None => (0, 0, false),
-    };
-
-    Ok(OnlineDiarizationStatus {
-        active,
-        mode,
-        available,
-        model_tag: ENHANCED_MODEL_TAG.to_string(),
-        embedding_dim: ENHANCED_EMBEDDING_DIM,
-        recognition_threshold: TITANET_RECOGNITION_THRESHOLD,
-        prototypes,
-        bindings,
-        pending_blocks: blocks_sent.saturating_sub(blocks_completed),
-        blocks_sent,
-        blocks_processed: blocks_completed,
-        blocks_in_flight,
-        mic,
-        sys,
-    })
-}
 
 /// Read-only snapshot of the whole recording: diarization, the pipeline buffer
 /// fills that gate its operations, and the activity of every model in use
@@ -2122,7 +1539,7 @@ async fn online_diarization_status() -> Result<OnlineDiarizationStatus, String> 
 /// counters are never presented as live values.
 #[tauri::command]
 pub async fn get_recording_telemetry() -> Result<RecordingTelemetry, String> {
-    let diarization = online_diarization_status().await?;
+    let diarization = DiarizationEngine::telemetry_snapshot().await?;
 
     let pipeline = match crate::audio::telemetry::pipeline() {
         Some(pipeline) => {
@@ -2178,7 +1595,23 @@ pub async fn get_recording_telemetry() -> Result<RecordingTelemetry, String> {
 ///   the turn(s) overlapping that time range via a per-turn override (no
 ///   cluster binding, no prototype merge); applied to the matched transcript
 ///   at stop-time finalize.
+
+/// Finalize an online diarization session after the meeting row has been
+/// created by the frontend. The work lives in the engine; this is the command
+/// surface (05 task 5.4).
 #[tauri::command]
+pub async fn finalize_online_session(
+    meeting_id: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<serde_json::Value, String> {
+    DiarizationEngine::persist_session(state.db_manager.pool(), meeting_id).await
+}
+
+/// Assign a speaker to a live cluster (or to a single turn with
+/// `scope == "block"`) while a recording runs. The work lives in the engine;
+/// this is the command surface (05 task 5.5).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn assign_live_speaker(
     cluster_label: String,
     speaker_id: Option<String>,
@@ -2188,68 +1621,27 @@ pub async fn assign_live_speaker(
     end_time: Option<f64>,
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<crate::database::speaker_commands::AssignedSpeaker, String> {
-    let pool = state.db_manager.pool();
-
-    // Find or create the registry speaker.
-    let speaker = match (speaker_id.as_ref(), new_name.as_ref()) {
-        (Some(id), _) => SpeakerRepository::get_speaker(pool, id)
-            .await
-            .map_err(|e| format!("Failed to load speaker: {}", e))?
-            .ok_or_else(|| format!("Speaker {} not found", id))?,
-        (None, Some(name)) => SpeakerRepository::find_or_create_by_name(pool, name)
-            .await
-            .map_err(|e| format!("Failed to find-or-create speaker: {}", e))?,
-        (None, None) => {
-            return Err("Either speaker_id or new_name must be provided".to_string());
-        }
-    };
-
-    let is_block_scope = scope.as_deref() == Some("block") && start_time.is_some();
-
-    if is_block_scope {
-        // Single-turn override: record only (no cluster binding). Applied to
-        // the matched transcript at stop-time finalize.
-        let start = start_time.unwrap_or(0.0);
-        let end = end_time.filter(|e| *e > start).unwrap_or(start + 1.0);
-        ONLINE_TURN_OVERRIDES.lock_or_recover().push(TurnOverride {
-            cluster_label: cluster_label.clone(),
-            start_secs: start,
-            end_secs: end,
-            speaker_id: speaker.id.clone(),
-        });
-        info!(
-            "Live per-turn override: {} [{:.1}s-{:.1}s] -> {}",
-            cluster_label, start, end, speaker.name
-        );
-    } else {
-        // Cluster-wide binding: update the in-memory prototype store so
-        // subsequent chunks of this cluster match. Fail loudly when no live
-        // prototype store is active so a correction cannot silently disappear
-        // and later revert to a predicted label at stop.
-        let store_guard = ONLINE_DIARIZATION_STORE.lock_or_recover();
-        let store_arc = store_guard.as_ref().ok_or_else(|| {
-            "No live diarization session active; cannot assign a live speaker".to_string()
-        })?;
-        store_arc
-            .write()
-            .map_err(|_| "Live prototype store is locked".to_string())?
-            .bind(&cluster_label, &speaker.id, &speaker.name);
-    }
-
-    // The actual DB persistence (meeting_speakers + enrollment / transcript
-    // overrides) happens at stop-time via finalize_online_session.
-
-    Ok(crate::database::speaker_commands::AssignedSpeaker {
-        meeting_id: String::new(), // No meeting_id yet during live recording
-        cluster_label,
-        speaker_id: speaker.id,
-        name: speaker.name,
-    })
+    DiarizationEngine::assign_live_speaker(
+        state.db_manager.pool(),
+        LiveSpeakerAssignment {
+            cluster_label,
+            speaker_id,
+            new_name,
+            scope,
+            start_time,
+            end_time,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::embedder::{
+        ENHANCED_EMBEDDING_DIM, ENHANCED_MODEL_TAG, TITANET_RECOGNITION_THRESHOLD,
+    };
+    use crate::audio::online_diarization::{begin_stats, DiarChannel, DiarChannelState};
     use crate::audio::token_assignment::Token;
 
     fn sample_update() -> TranscriptUpdate {
