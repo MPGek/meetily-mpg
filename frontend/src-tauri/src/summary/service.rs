@@ -532,9 +532,8 @@ impl SummaryService {
         };
         debug_log::reset_iteration_counter();
 
-        let client = reqwest::Client::new();
         let result = generate_meeting_summary(
-            &client,
+            crate::llm::shared_client(),
             &provider,
             &model_name,
             &final_api_key,

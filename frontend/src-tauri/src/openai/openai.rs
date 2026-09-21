@@ -125,16 +125,22 @@ pub async fn get_openai_models(api_key: Option<String>) -> Result<Vec<OpenAIMode
         }
     }
 
-    // Fetch from API
+    // Fetch from API (bounded retry on transient failures via the shared
+    // HTTP layer; any resulting error — send failure, non-success status
+    // after retries, auth failure — falls back to the hardcoded list exactly
+    // as a single failed attempt did before).
     log::info!("Fetching OpenAI models from API...");
-    let client = reqwest::Client::new();
-
-    let response = match client
-        .get("https://api.openai.com/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
+    let policy = crate::llm::RetryPolicy::short();
+    let response = match crate::llm::send_with_retry(
+        || {
+            crate::llm::shared_client()
+                .get("https://api.openai.com/v1/models")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .timeout(Duration::from_secs(5))
+        },
+        &policy,
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
@@ -142,15 +148,6 @@ pub async fn get_openai_models(api_key: Option<String>) -> Result<Vec<OpenAIMode
             return Ok(get_fallback_models());
         }
     };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        log::warn!(
-            "OpenAI API returned status {}. Using fallback models.",
-            status
-        );
-        return Ok(get_fallback_models());
-    }
 
     let api_response: OpenAIApiResponse = match response.json().await {
         Ok(data) => data,

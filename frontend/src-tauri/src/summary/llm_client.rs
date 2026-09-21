@@ -2,11 +2,9 @@ use crate::summary::debug_log::{self, DebugLogEntry, DebugLogResult};
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-
-const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
 
 // Generic structure for OpenAI-compatible API chat messages
 #[derive(Debug, Serialize)]
@@ -279,13 +277,28 @@ pub async fn generate_summary(
         iteration,
     });
 
-    // Send request with timeout and cancellation support
-    let request_future = client
-        .post(api_url)
-        .headers(headers)
-        .json(&request_body)
-        .timeout(REQUEST_TIMEOUT_DURATION)
-        .send();
+    // Send request (bounded retry on transient failures, no retry on auth
+    // failures) and race it against cancellation, exactly as before — now
+    // around the whole retrying future instead of a single `.send()`. A
+    // successful `Ok(response)` from `send_with_retry` is already a
+    // successful HTTP status; failed statuses come back as `Err(LlmError)`.
+    let retry_policy = crate::llm::RetryPolicy::default();
+    let request_future = crate::llm::send_with_retry(
+        || client.post(&api_url).headers(headers.clone()).json(&request_body),
+        &retry_policy,
+    );
+
+    let log_error = |err_msg: &str| {
+        if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
+            let result = DebugLogResult::Error {
+                end_timestamp: debug_log::iso_timestamp(),
+                elapsed_secs: debug_log::elapsed_secs(&call_start),
+                error_message: err_msg.to_string(),
+                partial_response: None,
+            };
+            debug_log::write_debug_log(log_dir, entry, &result);
+        }
+    };
 
     // Use tokio::select to race between cancellation and request completion
     let response = if let Some(token) = cancellation_token {
@@ -294,20 +307,8 @@ pub async fn generate_summary(
                 match result {
                     Ok(resp) => resp,
                     Err(e) => {
-                        let err_msg = if e.is_timeout() {
-                            "LLM request timed out after 60 seconds".to_string()
-                        } else {
-                            format!("Failed to send request to LLM: {}", e)
-                        };
-                        if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
-                            let result = DebugLogResult::Error {
-                                end_timestamp: debug_log::iso_timestamp(),
-                                elapsed_secs: debug_log::elapsed_secs(&call_start),
-                                error_message: err_msg.clone(),
-                                partial_response: None,
-                            };
-                            debug_log::write_debug_log(log_dir, entry, &result);
-                        }
+                        let err_msg = e.to_string();
+                        log_error(&err_msg);
                         return Err(err_msg);
                     }
                 }
@@ -320,44 +321,14 @@ pub async fn generate_summary(
         match request_future.await {
             Ok(resp) => resp,
             Err(e) => {
-                let err_msg = if e.is_timeout() {
-                    "LLM request timed out after 60 seconds".to_string()
-                } else {
-                    format!("Failed to send request to LLM: {}", e)
-                };
-                if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
-                    let result = DebugLogResult::Error {
-                        end_timestamp: debug_log::iso_timestamp(),
-                        elapsed_secs: debug_log::elapsed_secs(&call_start),
-                        error_message: err_msg.clone(),
-                        partial_response: None,
-                    };
-                    debug_log::write_debug_log(log_dir, entry, &result);
-                }
+                let err_msg = e.to_string();
+                log_error(&err_msg);
                 return Err(err_msg);
             }
         }
     };
 
     let status_code = response.status().as_u16();
-
-    if !response.status().is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        let err_msg = format!("LLM API request failed: {}", error_body);
-        if let (Some(ref log_dir), Some(ref entry)) = (&debug_log_dir, &debug_entry) {
-            let result = DebugLogResult::Error {
-                end_timestamp: debug_log::iso_timestamp(),
-                elapsed_secs: debug_log::elapsed_secs(&call_start),
-                error_message: err_msg.clone(),
-                partial_response: Some(error_body),
-            };
-            debug_log::write_debug_log(log_dir, entry, &result);
-        }
-        return Err(err_msg);
-    }
 
     // Parse response based on provider
     let result: Result<String, String> = if provider == &LLMProvider::Claude {

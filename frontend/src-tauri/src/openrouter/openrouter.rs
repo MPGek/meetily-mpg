@@ -1,4 +1,3 @@
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tauri::command;
 
@@ -39,22 +38,21 @@ struct OpenRouterResponse {
 }
 
 #[command]
-pub fn get_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
-    let client = Client::new();
-    let response = client
-        .get("https://openrouter.ai/api/v1/models")
-        .send()
-        .map_err(|e| format!("Failed to make HTTP request: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "HTTP request failed with status: {}",
-            response.status()
-        ));
-    }
+pub async fn get_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
+    let policy = crate::llm::RetryPolicy::short();
+    let response = crate::llm::send_with_retry(
+        || {
+            crate::llm::shared_client()
+                .get("https://openrouter.ai/api/v1/models")
+        },
+        &policy,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let api_response: OpenRouterResponse = response
         .json()
+        .await
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
     let models = api_response
