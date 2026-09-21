@@ -21,6 +21,7 @@
 //! Fast mode only: Efficient/Off never publish turns, so the pre-checks here
 //! make the whole module a no-op for them.
 
+use crate::audio::sync_ext::LockRecover;
 use crate::audio::token_assignment::{assign_tokens_to_speakers, SpeakerTurn, Token};
 use crate::audio::transcription::TranscriptUpdate;
 use serde::Serialize;
@@ -112,7 +113,7 @@ impl LiveTurnRegistry {
     /// when the turn went backwards in time for its channel (spike
     /// instrumentation, task 1.1); the turn is still recorded.
     pub fn publish(&self, turn: LiveTurn) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_or_recover();
         let monotonic = {
             let last = inner
                 .channels
@@ -207,7 +208,7 @@ impl LiveTurnRegistry {
 
     /// Reset for a new recording session (same process).
     pub fn clear(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_or_recover();
         inner.channels.clear();
         inner.monotonic.clear();
         drop(inner);

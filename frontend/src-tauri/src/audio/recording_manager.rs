@@ -29,7 +29,7 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
-    embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    embedding_sender: Option<mpsc::Sender<AudioChunk>>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -67,12 +67,13 @@ impl RecordingManager {
         microphone_device: Option<Arc<AudioDevice>>,
         system_device: Option<Arc<AudioDevice>>,
         auto_save: bool,
-    ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
+    ) -> Result<mpsc::Receiver<AudioChunk>> {
         info!("Starting recording manager (auto_save: {})", auto_save);
 
-        // Set up transcription channel
-        let (transcription_sender, transcription_receiver) =
-            mpsc::unbounded_channel::<AudioChunk>();
+        // Set up transcription channel. Bounded: VAD already coalesces into
+        // up-to-25s segments (pipeline.rs), so 32 pending is a large
+        // multi-minute backlog before a stalled consumer starts dropping.
+        let (transcription_sender, transcription_receiver) = mpsc::channel::<AudioChunk>(32);
         // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
         // Pipeline will mix mic + system audio professionally and send to this channel
         // Pass auto_save to control whether audio checkpoints are created
@@ -186,7 +187,7 @@ impl RecordingManager {
     pub async fn start_recording_with_defaults_and_auto_save(
         &mut self,
         auto_save: bool,
-    ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
+    ) -> Result<mpsc::Receiver<AudioChunk>> {
         #[cfg(target_os = "macos")]
         {
             info!("🎙️ [macOS] Starting recording with smart device selection (Bluetooth override enabled)");
@@ -476,12 +477,12 @@ impl RecordingManager {
     }
 
     /// Attach the online diarization embedding channel (created by the caller)
-    pub fn set_embedding_sender(&mut self, sender: Option<mpsc::UnboundedSender<AudioChunk>>) {
+    pub fn set_embedding_sender(&mut self, sender: Option<mpsc::Sender<AudioChunk>>) {
         self.embedding_sender = sender;
     }
 
     /// Drop the embedding channel so the online diarization task can finish
-    pub fn take_embedding_sender(&mut self) -> Option<mpsc::UnboundedSender<AudioChunk>> {
+    pub fn take_embedding_sender(&mut self) -> Option<mpsc::Sender<AudioChunk>> {
         self.embedding_sender.take()
     }
 

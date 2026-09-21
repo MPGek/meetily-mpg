@@ -33,6 +33,7 @@ pub mod recording_saver;
 pub mod recording_state;
 pub mod simple_level_monitor;
 pub mod stream;
+pub mod sync_ext;
 pub mod system_audio_commands;
 pub mod system_detector; // NEW: Playback device detection for BT warnings
 

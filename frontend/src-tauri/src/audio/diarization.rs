@@ -1008,7 +1008,7 @@ fn run_diarization_blocking_with_app<R: Runtime>(
     )?;
     timings.matching_secs = matching_start.elapsed().as_secs_f64();
 
-    let peak_mb = memory_sampler.stop();
+    let peak_mb = memory_sampler.finish();
     let overall_secs = overall_start.elapsed().as_secs_f64();
 
     info!(
@@ -2079,10 +2079,57 @@ fn channel_chunks(
 // ===== ffmpeg streaming decode =====
 
 /// A spawned ffmpeg process streaming 16 kHz mono f32le PCM on stdout.
+/// Poll a background thread's `JoinHandle` for up to `timeout`, joining it if
+/// it finishes in time. Returns whether it joined within the timeout, leaving
+/// the handle in place (still `Some`) if it did not, so a caller can retry or
+/// fall back to an untimed join. `std::thread::JoinHandle` has no native
+/// timed join, so this polls `is_finished()` on a short sleep interval.
+/// Shared by the ffmpeg stderr reader (`PcmStream`) and `MemorySampler`, the
+/// two background threads this change gives an explicit, bounded-time stop.
+fn join_within(handle: &mut Option<std::thread::JoinHandle<()>>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match handle.as_ref() {
+            None => return true,
+            Some(h) if h.is_finished() => break,
+            Some(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Some(_) => return false,
+        }
+    }
+    if let Some(h) = handle.take() {
+        let _ = h.join();
+    }
+    true
+}
+
+/// Drain `reader` into a buffer, checking `stop` between bounded reads so the
+/// loop can be asked to stop instead of only ending at EOF (`Ok(0)`) or a read
+/// error. Generic over `Read` so it can be driven by a test double as well as
+/// a real ffmpeg `ChildStderr` pipe.
+fn drain_with_stop<R: Read>(mut reader: R, stop: &AtomicBool) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => break, // pipe closed (ffmpeg exited)
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 struct PcmStream {
     child: Child,
     stdout: ChildStdout,
     stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_stop: Arc<AtomicBool>,
+    stderr_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PcmStream {
@@ -2103,10 +2150,24 @@ impl PcmStream {
         Ok(())
     }
 
-    /// Kill the process (used on cancellation).
+    /// Kill the process (used on cancellation) and wait, bounded, for the
+    /// stderr-reader thread to drain and exit — killing the child closes its
+    /// stderr pipe, so the reader observes EOF promptly, but this makes the
+    /// wait explicit and bounded instead of leaving the thread to exit on
+    /// its own time with no one watching.
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !self.stop(Duration::from_millis(500)) {
+            log::warn!("ffmpeg stderr-reader thread did not stop within 500ms of kill()");
+        }
+    }
+
+    /// Signal the stderr-reader thread to stop and wait up to `timeout` for
+    /// it to exit. Returns whether it joined within the timeout.
+    fn stop(&mut self, timeout: Duration) -> bool {
+        self.stderr_stop.store(true, Ordering::Relaxed);
+        join_within(&mut self.stderr_handle, timeout)
     }
 }
 
@@ -2197,13 +2258,14 @@ fn spawn_ffmpeg_pcm(
         .ok_or_else(|| "ffmpeg stderr was not captured".to_string())?;
 
     // Drain stderr in a background thread so the pipe cannot fill and deadlock
-    // the ffmpeg process.
+    // the ffmpeg process. The thread checks `stderr_stop` between bounded
+    // reads so it can be asked to stop before the pipe closes.
     let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf_clone = Arc::clone(&stderr_buf);
-    std::thread::spawn(move || {
-        let mut stderr = stderr;
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
+    let stderr_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let stderr_stop_clone = Arc::clone(&stderr_stop);
+    let stderr_handle = std::thread::spawn(move || {
+        let buf = drain_with_stop(stderr, &stderr_stop_clone);
         *stderr_buf_clone.lock().unwrap() = buf;
     });
 
@@ -2211,6 +2273,8 @@ fn spawn_ffmpeg_pcm(
         child,
         stdout,
         stderr: stderr_buf,
+        stderr_stop,
+        stderr_handle: Some(stderr_handle),
     })
 }
 
@@ -2620,10 +2684,10 @@ struct MemorySampler {
 
 impl Drop for MemorySampler {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // A generous fixed timeout: `Drop` is a safety net, not the primary
+        // stop path (see `finish`), so it still waits for the sampler thread
+        // rather than leaking it, but bounded instead of an untimed join.
+        self.stop(Duration::from_secs(1));
     }
 }
 
@@ -2675,12 +2739,86 @@ impl MemorySampler {
         }
     }
 
-    fn stop(mut self) -> u64 {
+    /// Signal the sampler thread to stop and wait up to `timeout` for it to
+    /// exit. Returns whether it joined within the timeout.
+    fn stop(&mut self, timeout: Duration) -> bool {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        join_within(&mut self.handle, timeout)
+    }
+
+    /// Stop the sampler (bounded by a generous fixed timeout) and return the
+    /// peak resident memory observed, in MiB. The primary, explicit stop path
+    /// (`Drop` remains a safety net for the case this is not called).
+    fn finish(mut self) -> u64 {
+        self.stop(Duration::from_secs(1));
         self.peak_bytes.load(Ordering::Relaxed) / 1024 / 1024
+    }
+}
+
+#[cfg(test)]
+mod stop_signal_tests {
+    use super::*;
+
+    /// A `Read` that never reaches EOF and sleeps a bit on every call before
+    /// returning a few bytes — simulating a pipe with no data ready yet, so a
+    /// loop reading it would otherwise never stop on its own. Exercises the
+    /// same generic seam (`drain_with_stop<R: Read>`) `PcmStream`'s real
+    /// stderr-reader thread is built on; `PcmStream` itself cannot be
+    /// constructed in a unit test without a real OS child process (it owns a
+    /// `std::process::Child`/`ChildStdout`).
+    struct TricklingReader {
+        delay: Duration,
+    }
+
+    impl Read for TricklingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let n = buf.len().min(4);
+            for b in buf.iter_mut().take(n) {
+                *b = 0;
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn drain_with_stop_exits_a_would_otherwise_block_forever_reader_within_the_timeout() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let _ = drain_with_stop(
+                TricklingReader {
+                    delay: Duration::from_millis(10),
+                },
+                &stop_clone,
+            );
+        });
+        let mut handle_opt = Some(handle);
+
+        // Give the reader thread a couple of iterations before asking it to
+        // stop, then prove `join_within` (the same helper `PcmStream::stop`
+        // and `MemorySampler::stop` use) observes the stop within its bound.
+        std::thread::sleep(Duration::from_millis(30));
+        stop.store(true, Ordering::Relaxed);
+
+        let joined = join_within(&mut handle_opt, Duration::from_millis(500));
+        assert!(joined, "reader thread did not stop within the timeout");
+    }
+
+    #[test]
+    fn memory_sampler_stop_joins_promptly() {
+        let mut sampler = MemorySampler::start();
+        let start = Instant::now();
+        let joined = sampler.stop(Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        assert!(joined, "MemorySampler did not stop within the timeout");
+        // The sampler polls every 500ms; a prompt stop should not need to
+        // wait for anywhere near that, let alone several iterations of it.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "stop() took {:?}, expected a prompt join",
+            elapsed
+        );
     }
 }
 

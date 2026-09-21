@@ -650,9 +650,9 @@ impl AudioCapture {
 /// VAD-driven audio processing pipeline
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
-    receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    transcription_sender: mpsc::UnboundedSender<AudioChunk>,
-    embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    receiver: mpsc::Receiver<AudioChunk>,
+    transcription_sender: mpsc::Sender<AudioChunk>,
+    embedding_sender: Option<mpsc::Sender<AudioChunk>>,
     state: Arc<RecordingState>,
     vad_processor_mic: ContinuousVadProcessor,
     vad_processor_sys: ContinuousVadProcessor,
@@ -669,7 +669,7 @@ pub struct AudioPipeline {
     // (online-diarization-telemetry). None only if telemetry is not installed.
     telemetry: Option<Arc<super::telemetry::PipelineTelemetry>>,
     // Recording sender for stereo interleaved audio
-    recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    recording_sender_for_mixed: Option<mpsc::Sender<AudioChunk>>,
     // Throttle: only surface the first saver-delivery failure per run so a dead
     // channel is reported without spamming the recording error surface.
     recording_save_failure_reported: bool,
@@ -712,9 +712,9 @@ fn remap_segment_times_to_real(anchors: &[(f64, f64)], segments: &mut [SpeechSeg
 
 impl AudioPipeline {
     pub fn new(
-        receiver: mpsc::UnboundedReceiver<AudioChunk>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
-        embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        receiver: mpsc::Receiver<AudioChunk>,
+        transcription_sender: mpsc::Sender<AudioChunk>,
+        embedding_sender: Option<mpsc::Sender<AudioChunk>>,
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
@@ -908,17 +908,31 @@ impl AudioPipeline {
                 channels: 1,
             };
 
-            if let Err(e) = self.transcription_sender.send(transcription_chunk.clone()) {
-                warn!("Failed to send merged segment: {}", e);
-            } else {
-                self.chunk_id_counter += 1;
-                if let Some(ref embedding_sender) = self.embedding_sender {
-                    // Live status: count the block in the diarization queue
-                    // even if the send later fails.
-                    crate::audio::online_diarization::record_block_enqueued();
-                    if let Err(e) = embedding_sender.send(transcription_chunk) {
-                        debug!("Failed to send segment to embedding channel: {}", e);
+            match self.transcription_sender.try_send(transcription_chunk.clone()) {
+                Ok(()) => {
+                    self.chunk_id_counter += 1;
+                    if let Some(ref embedding_sender) = self.embedding_sender {
+                        match embedding_sender.try_send(transcription_chunk) {
+                            Ok(()) => {
+                                // Live status: count the block in the
+                                // diarization queue now that it is actually
+                                // enqueued (not on a dropped/failed send).
+                                crate::audio::online_diarization::record_block_enqueued();
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("embedding_sender channel full (32 capacity); dropping segment");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("Failed to send segment to embedding channel: closed");
+                            }
+                        }
                     }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("transcription_sender channel full (32 capacity); dropping merged segment");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("Failed to send merged segment: channel closed");
                 }
             }
         }
@@ -1127,14 +1141,26 @@ impl AudioPipeline {
                                     device_type: DeviceType::Microphone,
                                     channels: 2,
                                 };
-                                if sender.send(recording_chunk).is_err() {
-                                    // The saver channel is closed/unavailable.
-                                    // Log and surface (throttled) instead of
-                                    // silently discarding the recording chunk.
-                                    warn!("Failed to deliver recording chunk to saver (channel closed/unavailable) - audio may be lost");
-                                    if !self.recording_save_failure_reported {
-                                        self.recording_save_failure_reported = true;
-                                        self.state.report_error(AudioError::SaveUnavailable);
+                                match sender.try_send(recording_chunk) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(chunk)) => {
+                                        // Bounded channel at capacity: drop and
+                                        // log rather than grow memory
+                                        // unboundedly while the saver stalls.
+                                        warn!(
+                                            "recording saver channel full (128 capacity); dropping chunk {}",
+                                            chunk.chunk_id
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        // The saver channel is closed/unavailable.
+                                        // Log and surface (throttled) instead of
+                                        // silently discarding the recording chunk.
+                                        warn!("Failed to deliver recording chunk to saver (channel closed/unavailable) - audio may be lost");
+                                        if !self.recording_save_failure_reported {
+                                            self.recording_save_failure_reported = true;
+                                            self.state.report_error(AudioError::SaveUnavailable);
+                                        }
                                     }
                                 }
                             }
@@ -1261,8 +1287,8 @@ impl AudioPipeline {
 /// Simple audio pipeline manager
 pub struct AudioPipelineManager {
     pipeline_handle: Option<JoinHandle<Result<()>>>,
-    audio_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
-    embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    audio_sender: Option<mpsc::Sender<AudioChunk>>,
+    embedding_sender: Option<mpsc::Sender<AudioChunk>>,
 }
 
 impl AudioPipelineManager {
@@ -1278,11 +1304,11 @@ impl AudioPipelineManager {
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
-        embedding_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        transcription_sender: mpsc::Sender<AudioChunk>,
+        embedding_sender: Option<mpsc::Sender<AudioChunk>>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
-        recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        recording_sender: Option<mpsc::Sender<AudioChunk>>,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
@@ -1299,8 +1325,10 @@ impl AudioPipelineManager {
             system_device_name, system_device_kind
         );
 
-        // Create audio processing channel
-        let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        // Create audio processing channel. Bounded: ~6.4s of buffered audio
+        // at the 50ms mixing window before a stalled consumer starts
+        // dropping chunks, instead of growing memory unboundedly.
+        let (audio_sender, audio_receiver) = mpsc::channel::<AudioChunk>(128);
 
         // Set sender in state for audio captures to use
         state.set_audio_sender(audio_sender.clone());
@@ -1374,7 +1402,11 @@ impl AudioPipelineManager {
                 channels: 1,
             };
 
-            if let Err(e) = sender.send(flush_chunk) {
+            // A rare, critical control signal (not a per-chunk audio
+            // producer), so this awaits delivery rather than using
+            // `try_send`'s drop-on-full policy: losing it would reintroduce
+            // the 30+s shutdown delay this function exists to eliminate.
+            if let Err(e) = sender.send(flush_chunk).await {
                 warn!("Failed to send flush signal: {}", e);
             } else {
                 info!("📤 Sent flush signal to pipeline");
@@ -1394,7 +1426,7 @@ impl AudioPipelineManager {
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
                     };
-                    let _ = sender.send(additional_flush);
+                    let _ = sender.send(additional_flush).await;
                 }
 
                 info!("📤 Sent additional flush signals for reliability");

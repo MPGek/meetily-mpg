@@ -69,7 +69,7 @@ pub struct RecordingSaver {
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
-    chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
+    chunk_receiver: Option<mpsc::Receiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
 }
 
@@ -169,7 +169,7 @@ impl RecordingSaver {
     ///
     /// # Arguments
     /// * `auto_save` - If true, creates checkpoints and enables saving. If false, audio chunks are discarded.
-    pub fn start_accumulation(&mut self, auto_save: bool) -> mpsc::UnboundedSender<AudioChunk> {
+    pub fn start_accumulation(&mut self, auto_save: bool) -> mpsc::Sender<AudioChunk> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
@@ -178,8 +178,11 @@ impl RecordingSaver {
             );
         }
 
-        // Create channel for receiving audio chunks
-        let (sender, receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        // Create channel for receiving audio chunks. Bounded: matches
+        // `audio_sender`'s reasoning (recording-save-durability's existing
+        // checkpoint-failure requirements already assume this path can
+        // occasionally drop a segment).
+        let (sender, receiver) = mpsc::channel::<AudioChunk>(128);
         self.chunk_receiver = Some(receiver);
 
         // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
