@@ -5,6 +5,8 @@ name: "Validation Check"
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -63,3 +65,47 @@ jobs:
           echo "1. Run **Build and Test - DevTest** for unsigned builds" >> $GITHUB_STEP_SUMMARY
           echo "2. Run **Build and Test** for signed builds on all platforms" >> $GITHUB_STEP_SUMMARY
           echo "3. Run **Release** to create a production release" >> $GITHUB_STEP_SUMMARY
+
+  frontend-checks:
+    name: Frontend Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          pnpm install
+
+      - name: Type check
+        run: |
+          cd frontend
+          pnpm exec tsc --noEmit -p .
+
+      - name: Lint
+        continue-on-error: true
+        run: |
+          cd frontend
+          pnpm exec next lint
+
+      - name: Unit tests
+        run: |
+          cd frontend
+          bun test tests/

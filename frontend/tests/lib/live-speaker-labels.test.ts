@@ -82,7 +82,8 @@ describe("rewriteTurnsInWindow", () => {
     // overlapping system SPEAKER_01 turn rewritten
     expect(out[0]).toMatchObject({ display_name: "Alice", matched_by: "user" });
     // non-overlapping same-cluster turn left unchanged
-    expect(out[1]).toMatchObject({ display_name: undefined, matched_by: undefined });
+    expect(out[1].display_name).toBeUndefined();
+    expect(out[1].matched_by).toBeUndefined();
     // wrong channel left unchanged
     expect(out[2].display_name).toBeUndefined();
     // different cluster left unchanged

@@ -223,7 +223,7 @@ describe("blink states", () => {
     const indicators = buildModelIndicators(
       vad({ speaking: false }),
       asr({ pending: 0, requested: false, queued: 9 }),
-      alignment({ queued_jobs: 0, requested: false }),
+      alignment({ loaded: true, queued_jobs: 0, requested: false }),
       diarizationModel({ pending_blocks: 0, requested: false }),
       ["healthy", "healthy"]
     );
