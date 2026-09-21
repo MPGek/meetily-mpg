@@ -161,3 +161,56 @@ pub fn diarize_wav_samples(
         embeddings,
     })
 }
+
+/// TitaNet-Large embedder (16 kHz, 192 dims) with layout-correct `[B, 80, T]`
+/// adapter. Same embedder family as the offline path, kept concrete because
+/// the live engines call `polyvoice::embedder::Embedder` on it directly.
+pub(crate) type DiarizationEmbedder = crate::audio::embedder::TitanetAdapter;
+
+/// The live path's embedder, built here so the batch and live paths have one
+/// construction site (05 task 2.3). Pool size stays 1: a live session embeds
+/// one chunk at a time. The error text is the batch path's, verbatim.
+pub(crate) fn create_streaming_embedder(
+    embedding_model: &Path,
+) -> Result<DiarizationEmbedder, String> {
+    if !embedding_model.exists() {
+        return Err(format!(
+            "Enhanced embedding model not found at {}. The enhanced diarization models (segmentation-3.0 + TitaNet-Large) are bundled at build time; rebuild with network or install a build that includes them.",
+            embedding_model.display()
+        ));
+    }
+    DiarizationEmbedder::new(embedding_model, 1)
+        .map_err(|e| format!("Failed to create enhanced TitaNet embedder: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 2.3 routed the live path through this module; the message a user
+    /// sees when the bundled models are missing must still name the exact file
+    /// that was looked for, and still say the models are bundled at build time.
+    #[test]
+    fn streaming_embedder_error_names_the_searched_path() {
+        let missing = std::env::temp_dir().join("meetily-no-such-titanet-model.onnx");
+        assert!(
+            !missing.exists(),
+            "fixture path must not exist for this test to mean anything"
+        );
+
+        // `expect_err` would need `Debug` on the adapter, which wraps an ONNX
+        // session; match instead.
+        let err = match create_streaming_embedder(&missing) {
+            Err(err) => err,
+            Ok(_) => panic!("missing model must error"),
+        };
+        assert!(
+            err.contains(&missing.display().to_string()),
+            "error must name the searched path, got: {err}"
+        );
+        assert!(
+            err.contains("bundled at build time"),
+            "error must keep the bundled-at-build-time wording, got: {err}"
+        );
+    }
+}

@@ -2,5 +2,6 @@
 //! the offline token split.
 
 pub mod clusters;
+pub mod offline_split;
 
 pub use clusters::*;

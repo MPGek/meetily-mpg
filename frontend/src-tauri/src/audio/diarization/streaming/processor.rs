@@ -12,15 +12,16 @@ use polyvoice::embedder::Embedder as _;
 
 use crate::audio::recording_saver::TranscriptSegment;
 use crate::audio::recording_state::{AudioChunk, DeviceType};
-use crate::audio::token_assignment::{assign_tokens_to_speakers, SpeakerTurn as TokenTurn};
 
 use super::super::core::cluster::{EmbeddingBuffer, SpeakerSegment};
+use super::super::core::timeline::{find_best_speaker, split_tokens_by_speaker};
+use super::super::persist::clusters::{clustered_embeddings, EmbeddingLabeling};
 use super::super::identity::prototypes::PrototypeStore;
 use super::super::telemetry::{
     diar_channel, record_stats, DiarizationMode, OnlineDiarizationStats,
 };
-use super::super::ClusteredEmbedding;
-use super::engine::{create_enhanced_embedder, create_fast_channel, Engine};
+use super::super::core::factory::create_streaming_embedder;
+use super::engine::{create_fast_channel, Engine};
 use super::guard::OnlineDiarizationGuard;
 use super::units::{OnlineClusterEmbeddings, SpeakerAssignment, SpeakerTurn};
 
@@ -123,7 +124,7 @@ impl OnlineDiarizationProcessor {
 
         let engine = match mode {
             DiarizationMode::Efficient => {
-                let extractor = create_enhanced_embedder(&embedding_model)?;
+                let extractor = create_streaming_embedder(&embedding_model)?;
                 Engine::Efficient {
                     extractor,
                     mic: EmbeddingBuffer::default(),
@@ -135,7 +136,7 @@ impl OnlineDiarizationProcessor {
                 let sys = create_fast_channel(&embedding_model)?;
                 // Fast mode embeds chunks itself (the pipeline turns carry no
                 // embedding). Reuse one extractor for both channels' buffers.
-                let extractor = create_enhanced_embedder(&embedding_model)?;
+                let extractor = create_streaming_embedder(&embedding_model)?;
                 Engine::Fast {
                     mic,
                     sys,
@@ -519,8 +520,8 @@ impl OnlineDiarizationProcessor {
                     // Efficient mode: embeddings are buffered per segment; cluster()
                     // returns labels aligned with the buffer entries, so group by
                     // those labels directly.
-                    let mic_clustered = cluster_embeddings_by_labels(&mic.entries, &mic_segments);
-                    let sys_clustered = cluster_embeddings_by_labels(&sys.entries, &sys_segments);
+                    let mic_clustered = clustered_embeddings(&mic.entries, EmbeddingLabeling::ByPosition(&mic_segments));
+                    let sys_clustered = clustered_embeddings(&sys.entries, EmbeddingLabeling::ByPosition(&sys_segments));
                     (
                         mic_segments,
                         sys_segments,
@@ -531,8 +532,8 @@ impl OnlineDiarizationProcessor {
                     )
                 }
                 Engine::Fast {
-                    mut mic,
-                    mut sys,
+                    mic,
+                    sys,
                     extractor: _,
                     mic_emb,
                     sys_emb,
@@ -561,9 +562,9 @@ impl OnlineDiarizationProcessor {
                     // time-overlap with the stable turns (which carry pipeline
                     // speaker ids), using the same find_best_speaker logic.
                     let mic_clustered =
-                        cluster_embeddings_by_overlap(&mic_emb.entries, &mic_segments);
+                        clustered_embeddings(&mic_emb.entries, EmbeddingLabeling::ByOverlap(&mic_segments));
                     let sys_clustered =
-                        cluster_embeddings_by_overlap(&sys_emb.entries, &sys_segments);
+                        clustered_embeddings(&sys_emb.entries, EmbeddingLabeling::ByOverlap(&sys_segments));
                     (
                         mic_segments,
                         sys_segments,
@@ -627,29 +628,15 @@ impl OnlineDiarizationProcessor {
                     } else {
                         &mic_segments
                     };
-                    let turns: Vec<TokenTurn> = segs_ref
-                        .iter()
-                        .map(|s| TokenTurn {
-                            start: s.start,
-                            end: s.end,
-                            speaker: s.speaker as i32,
-                        })
-                        .collect();
-                    let assign = assign_tokens_to_speakers(tokens, &turns);
-                    if assign.blocks.len() > 1 {
-                        for (idx, block) in assign.blocks.iter().enumerate() {
+                    let blocks = split_tokens_by_speaker(tokens, segs_ref);
+                    if blocks.len() > 1 {
+                        for (idx, block) in blocks.iter().enumerate() {
                             let mut clone = t.clone();
                             clone.audio_start_time = block.start as f64;
                             clone.audio_end_time = block.end as f64;
                             clone.duration = (block.end - block.start) as f64;
-                            let txt = tokens[block.start_idx..=block.end_idx]
-                                .iter()
-                                .map(|tok| tok.text.clone())
-                                .collect::<Vec<_>>()
-                                .join("");
-                            let txt = txt.trim();
-                            if !txt.is_empty() {
-                                clone.text = txt.to_string();
+                            if !block.text.is_empty() {
+                                clone.text = block.text.clone();
                             }
                             if idx != 0 {
                                 clone.id = format!("{}_split{}", t.id, idx);
@@ -695,91 +682,6 @@ impl OnlineDiarizationProcessor {
         );
         Ok((assignments, clusters, live_bindings))
     }
-}
-
-/// Group Efficient-mode buffered embeddings by their cluster labels (from
-/// `EmbeddingBuffer::cluster`, aligned with `entries` by position).
-fn cluster_embeddings_by_labels(
-    entries: &[(f32, f32, Vec<f32>)],
-    segments: &[SpeakerSegment],
-) -> Vec<ClusteredEmbedding> {
-    entries
-        .iter()
-        .zip(segments.iter())
-        .map(|((start, end, emb), seg)| ClusteredEmbedding {
-            speaker: seg.speaker as i32,
-            embedding: emb.clone(),
-            duration_secs: (end - start).max(0.0),
-            start_secs: Some(*start),
-            end_secs: Some(*end),
-        })
-        .collect()
-}
-
-/// Group Fast-mode buffered embeddings by pipeline speaker id via time-overlap
-/// with the stable turns (which carry speaker ids). Embeddings with no
-/// overlapping turn are dropped (no cluster to attribute).
-fn cluster_embeddings_by_overlap(
-    entries: &[(f32, f32, Vec<f32>)],
-    segments: &[SpeakerSegment],
-) -> Vec<ClusteredEmbedding> {
-    entries
-        .iter()
-        .filter_map(|(start, end, emb)| {
-            find_best_speaker(segments, *start, *end).map(|spk| ClusteredEmbedding {
-                speaker: spk as i32,
-                embedding: emb.clone(),
-                duration_secs: (end - start).max(0.0),
-                start_secs: Some(*start),
-                end_secs: Some(*end),
-            })
-        })
-        .collect()
-}
-
-fn find_best_speaker(segments: &[SpeakerSegment], t_start: f32, t_end: f32) -> Option<usize> {
-    let mut best_speaker: Option<usize> = None;
-    let mut best_overlap: f32 = 0.0;
-
-    for seg in segments {
-        let overlap_start = t_start.max(seg.start);
-        let overlap_end = t_end.min(seg.end);
-        if overlap_start < overlap_end {
-            let overlap = overlap_end - overlap_start;
-            if overlap > best_overlap {
-                best_overlap = overlap;
-                best_speaker = Some(seg.speaker);
-            }
-        }
-    }
-
-    if best_speaker.is_some() {
-        return best_speaker;
-    }
-    if segments.is_empty() {
-        return None;
-    }
-
-    let first = segments[0].speaker;
-    if segments.iter().all(|s| s.speaker == first) {
-        return Some(first);
-    }
-
-    const MAX_GAP_SECS: f32 = 30.0;
-    let mut nearest: Option<(f32, usize)> = None;
-    for seg in segments {
-        let gap = if seg.end < t_start {
-            t_start - seg.end
-        } else if seg.start > t_end {
-            seg.start - t_end
-        } else {
-            0.0
-        };
-        if gap <= MAX_GAP_SECS && nearest.map_or(true, |(g, _)| gap < g) {
-            nearest = Some((gap, seg.speaker));
-        }
-    }
-    nearest.map(|(_, spk)| spk)
 }
 
 #[cfg(test)]

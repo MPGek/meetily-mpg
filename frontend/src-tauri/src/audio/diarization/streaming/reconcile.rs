@@ -22,7 +22,9 @@
 //! make the whole module a no-op for them.
 
 use crate::audio::sync_ext::LockRecover;
-use crate::audio::token_assignment::{assign_tokens_to_speakers, SpeakerTurn, Token};
+use super::super::core::timeline::split_tokens_by_speaker;
+use super::super::DiarizationSegment;
+use crate::audio::token_assignment::Token;
 use crate::audio::transcription::TranscriptUpdate;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -280,7 +282,7 @@ pub fn attribute(tokens: &[Token], source_device: &str, registry: &LiveTurnRegis
     // assignment (same function stop-time finalize uses).
     let mut label_to_idx: HashMap<String, i32> = HashMap::new();
     let mut idx_to_label: Vec<String> = Vec::new();
-    let mut token_turns: Vec<SpeakerTurn> = Vec::with_capacity(turns.len());
+    let mut spans: Vec<DiarizationSegment> = Vec::with_capacity(turns.len());
     for t in &turns {
         let idx = match label_to_idx.get(&t.speaker) {
             Some(v) => *v,
@@ -291,26 +293,22 @@ pub fn attribute(tokens: &[Token], source_device: &str, registry: &LiveTurnRegis
                 v
             }
         };
-        token_turns.push(SpeakerTurn {
+        spans.push(DiarizationSegment {
             start: t.start_time as f32,
             end: t.end_time as f32,
             speaker: idx,
         });
     }
 
-    let assignment = assign_tokens_to_speakers(tokens, &token_turns);
-    if assignment.blocks.is_empty() || assignment.blocks[0].start_idx != 0 {
+    let token_blocks = split_tokens_by_speaker(tokens, &spans);
+    if token_blocks.is_empty() || token_blocks[0].start_idx != 0 {
         return None;
     }
 
-    let mut blocks = Vec::with_capacity(assignment.blocks.len());
-    for block in &assignment.blocks {
+    let mut blocks = Vec::with_capacity(token_blocks.len());
+    for block in &token_blocks {
         let label = idx_to_label.get(block.speaker as usize)?.clone();
-        let text = tokens[block.start_idx..=block.end_idx]
-            .iter()
-            .map(|t| t.text.as_str())
-            .collect::<String>();
-        let text = text.trim().to_string();
+        let text = block.text.clone();
         if text.is_empty() {
             continue;
         }

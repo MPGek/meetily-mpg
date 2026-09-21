@@ -2,10 +2,55 @@
 //! caches, plus auto-recognition against enrolled prototypes.
 
 use super::super::identity::matching::{l2_normalize_in_place, Prototype};
+use super::super::core::cluster::SpeakerSegment;
+use super::super::core::timeline::find_best_speaker;
 use super::super::ClusteredEmbedding;
 use crate::database::repositories::speaker::{Exemplar, SpeakerRepository};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+/// Where a channel's buffered chunk embeddings get their cluster label from.
+/// The two live modes differ only here, so they share one builder (05 task
+/// 2.2, which replaced `cluster_embeddings_by_labels`/`_by_overlap`).
+pub(crate) enum EmbeddingLabeling<'a> {
+    /// Efficient mode: clustering returned one label per buffered entry,
+    /// aligned with `entries` by position. Entries past the end of the label
+    /// list are dropped (the old `zip` truncation).
+    ByPosition(&'a [SpeakerSegment]),
+    /// Fast mode: the entries carry no label of their own, so each is
+    /// attributed to the published turn it overlaps, falling back to the
+    /// nearest turn within the gap bound and dropped when none is near enough.
+    ByOverlap(&'a [SpeakerSegment]),
+}
+
+/// Build the persistable cluster embeddings for one channel from its buffered
+/// `(start, end, embedding)` chunks.
+pub(crate) fn clustered_embeddings(
+    entries: &[(f32, f32, Vec<f32>)],
+    labeling: EmbeddingLabeling<'_>,
+) -> Vec<ClusteredEmbedding> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (start, end, embedding))| {
+            let speaker = match labeling {
+                EmbeddingLabeling::ByPosition(segments) => {
+                    segments.get(idx).map(|seg| seg.speaker as i32)
+                }
+                EmbeddingLabeling::ByOverlap(segments) => {
+                    find_best_speaker(segments, *start, *end).map(|spk| spk as i32)
+                }
+            }?;
+            Some(ClusteredEmbedding {
+                speaker,
+                embedding: embedding.clone(),
+                duration_secs: (end - start).max(0.0),
+                start_secs: Some(*start),
+                end_secs: Some(*end),
+            })
+        })
+        .collect()
+}
+
 
 /// Group a channel's clustered embeddings by cluster id, computing the
 /// L2-normalized centroid (mean of member embeddings) and a bounded set of
@@ -150,3 +195,92 @@ pub async fn persist_and_recognize_session(
 /// Enrollment later reparents the best-K=8 of these; the cache is bounded so
 /// storage grows with the number of clusters, not segments.
 pub(crate) const MAX_CLUSTER_CACHE_EXEMPLARS: usize = 32;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Four buffered chunks against three turns. The last two chunks are what
+    /// separates the two labelings: position 2 maps the 40 s chunk onto turn 2,
+    /// while overlap drops it (34 s past the last turn, outside the gap bound)
+    /// and attributes the 5-6 s chunk instead. The fourth chunk has no label
+    /// under either rule.
+    fn fixture() -> (Vec<(f32, f32, Vec<f32>)>, Vec<SpeakerSegment>) {
+        (
+            vec![
+                (0.0, 2.0, vec![1.0, 0.0]),
+                (2.0, 5.0, vec![0.9, 0.1]),
+                (40.0, 41.0, vec![0.5, 0.5]),
+                (5.0, 6.0, vec![0.0, 1.0]),
+            ],
+            vec![
+                SpeakerSegment { start: 0.0, end: 2.0, speaker: 0 },
+                SpeakerSegment { start: 2.0, end: 5.0, speaker: 1 },
+                SpeakerSegment { start: 5.0, end: 6.0, speaker: 0 },
+            ],
+        )
+    }
+
+    fn shape(v: &[ClusteredEmbedding]) -> Vec<(i32, f32, Option<f32>, Option<f32>)> {
+        v.iter()
+            .map(|c| (c.speaker, c.duration_secs, c.start_secs, c.end_secs))
+            .collect()
+    }
+
+    /// Both live modes had their own labeler before task 2.2 replaced them with
+    /// `clustered_embeddings`. These are the exact outputs the deleted
+    /// `cluster_embeddings_by_labels`/`_by_overlap` produced for this fixture,
+    /// captured from them before the deletion.
+    #[test]
+    fn one_builder_reproduces_both_pre_dedup_labelings() {
+        let (entries, segments) = fixture();
+
+        let by_position = clustered_embeddings(&entries, EmbeddingLabeling::ByPosition(&segments));
+        assert_eq!(
+            shape(&by_position),
+            vec![
+                (0, 2.0, Some(0.0), Some(2.0)),
+                (1, 3.0, Some(2.0), Some(5.0)),
+                (0, 1.0, Some(40.0), Some(41.0)),
+            ]
+        );
+
+        let by_overlap = clustered_embeddings(&entries, EmbeddingLabeling::ByOverlap(&segments));
+        assert_eq!(
+            shape(&by_overlap),
+            vec![
+                (0, 2.0, Some(0.0), Some(2.0)),
+                (1, 3.0, Some(2.0), Some(5.0)),
+                (0, 1.0, Some(5.0), Some(6.0)),
+            ]
+        );
+    }
+
+    /// The grouping the persistence step does over that output: same cluster
+    /// count and same per-cluster durations for either labeling.
+    #[test]
+    fn grouping_is_unchanged_for_both_labelings() {
+        let (entries, segments) = fixture();
+        for labeling in [
+            EmbeddingLabeling::ByPosition(&segments),
+            EmbeddingLabeling::ByOverlap(&segments),
+        ] {
+            let embeddings = clustered_embeddings(&entries, labeling);
+            let mut grouped = group_cluster_embeddings(&embeddings);
+            grouped.sort_by_key(|(spk, _, _)| *spk);
+
+            assert_eq!(grouped.len(), 2, "two clusters");
+            let durations: Vec<(i32, f64, usize)> = grouped
+                .iter()
+                .map(|(spk, _, exemplars)| {
+                    (
+                        *spk,
+                        exemplars.iter().map(|e| e.duration_secs).sum::<f64>(),
+                        exemplars.len(),
+                    )
+                })
+                .collect();
+            assert_eq!(durations, vec![(0, 3.0, 2), (1, 3.0, 1)]);
+        }
+    }
+}

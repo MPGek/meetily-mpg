@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use super::super::core::cluster::{EmbeddingBuffer, SpeakerSegment};
+use super::super::core::factory::{create_streaming_embedder, DiarizationEmbedder};
 
 /// Maps the compressed pipeline timeline (only fed samples) back to absolute
 /// recording time. Each fed chunk records an anchor; silence gaps between
@@ -67,26 +68,11 @@ pub(crate) enum Engine {
     },
 }
 
-/// TitaNet-Large embedder (16 kHz, 192 dims) with layout-correct `[B, 80, T]`
-/// adapter. Same embedder family as the offline path.
-pub(crate) type DiarizationEmbedder = crate::audio::embedder::TitanetAdapter;
-
-pub(crate) fn create_enhanced_embedder(embedding_model: &Path) -> Result<DiarizationEmbedder, String> {
-    if !embedding_model.exists() {
-        return Err(format!(
-            "Enhanced embedding model not found at {}. The enhanced diarization models (segmentation-3.0 + TitaNet-Large) are bundled at build time; rebuild with network or install a build that includes them.",
-            embedding_model.display()
-        ));
-    }
-    DiarizationEmbedder::new(embedding_model, 1)
-        .map_err(|e| format!("Failed to create enhanced TitaNet embedder: {}", e))
-}
-
 pub(crate) fn create_fast_channel(embedding_model: &Path) -> Result<FastChannel, String> {
     use polyvoice::streaming::{LatencyPreset, StreamingPipeline};
     use polyvoice::vad::{EnergyVad, VadConfig};
 
-    let extractor = create_enhanced_embedder(embedding_model)?;
+    let extractor = create_streaming_embedder(embedding_model)?;
     let vad = EnergyVad::new(-100.0, 16000, 512);
     let pipeline = StreamingPipeline::with_latency_preset(
         vad,
