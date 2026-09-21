@@ -2,5 +2,7 @@
 //! live prototype store used for recognition during a recording.
 
 pub mod matching;
+pub mod prototypes;
 
 pub use matching::*;
+pub use prototypes::*;

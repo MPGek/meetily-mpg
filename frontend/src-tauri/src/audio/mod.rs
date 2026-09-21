@@ -68,7 +68,9 @@ pub mod segmentation;
 pub mod diarization;
 
 // Online diarization module (speaker identification during recording via polyvoice)
-pub mod online_diarization;
+// Moved into the diarization tree by 05-unified-diarization-engine; the alias
+// keeps every existing `audio::online_diarization::*` path resolving.
+pub use diarization::streaming as online_diarization;
 
 // Speaker recognition core (cosine matching against enrolled voiceprints).
 // Moved into the diarization tree by 05-unified-diarization-engine; this alias

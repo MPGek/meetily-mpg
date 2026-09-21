@@ -125,6 +125,98 @@ pub(crate) fn clusterer_for_buffer(
     })
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SpeakerSegment {
+    pub(crate) start: f32,
+    pub(crate) end: f32,
+    pub(crate) speaker: usize,
+}
+
+/// (start_time, end_time, embedding_vector) buffer per channel (Efficient mode).
+#[derive(Default)]
+pub(crate) struct EmbeddingBuffer {
+    pub(crate) entries: Vec<(f32, f32, Vec<f32>)>,
+}
+
+impl EmbeddingBuffer {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn push(&mut self, start: f32, end: f32, embedding: Vec<f32>) {
+        self.entries.push((start, end, embedding));
+    }
+
+    /// Clusters the buffered embeddings through the shared `Clustering` seam
+    /// (05 D3/4.2): same kind, threshold and ceiling the batch pass resolves,
+    /// still wrapped in the singleton dissolution this capability requires.
+    pub(crate) fn cluster(
+        &self,
+        config: &crate::audio::diarization::DiarizationConfig,
+        ceiling: usize,
+    ) -> Vec<SpeakerSegment> {
+        use crate::audio::diarization::Clustering as _;
+
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        if self.entries.len() == 1 {
+            return vec![SpeakerSegment {
+                start: self.entries[0].0,
+                end: self.entries[0].1,
+                speaker: 0,
+            }];
+        }
+
+        let embeddings: Vec<Vec<f32>> = self.entries.iter().map(|e| e.2.clone()).collect();
+        let clusterer = match crate::audio::diarization::clusterer_for_buffer(config, ceiling) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Clusterer construction failed ({}), treating all segments as one speaker",
+                    e
+                );
+                return self
+                    .entries
+                    .iter()
+                    .map(|e| SpeakerSegment {
+                        start: e.0,
+                        end: e.1,
+                        speaker: 0,
+                    })
+                    .collect();
+            }
+        };
+
+        match clusterer.cluster(&embeddings) {
+            Ok(labels) => self
+                .entries
+                .iter()
+                .zip(labels)
+                .map(|(e, label)| SpeakerSegment {
+                    start: e.0,
+                    end: e.1,
+                    speaker: label,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(
+                    "AhcClusterer failed ({}), treating all segments as one speaker",
+                    e
+                );
+                self.entries
+                    .iter()
+                    .map(|e| SpeakerSegment {
+                        start: e.0,
+                        end: e.1,
+                        speaker: 0,
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +349,91 @@ mod tests {
         assert!(ClustererKindSetting::Nmesc.is_automatic_count());
         assert!(ClustererKindSetting::Vbx.is_automatic_count());
         assert!(!ClustererKindSetting::Ahc.is_automatic_count());
+    }
+
+    fn emb(v: &[f32]) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    fn buffer_of(vectors: &[Vec<f32>]) -> EmbeddingBuffer {
+        let mut b = EmbeddingBuffer::default();
+        for (i, v) in vectors.iter().enumerate() {
+            b.push(i as f32, i as f32 + 1.0, v.clone());
+        }
+        b
+    }
+
+    /// 05 task 4.2: `EmbeddingBuffer::cluster` now runs through the shared
+    /// `Clustering` seam. The singleton dissolution (`MinClusterSizeClusterer`
+    /// with min size 2) that `online-speaker-diarization` requires must be
+    /// preserved, and a two-embedding fixture must still yield one cluster.
+    #[test]
+    fn buffered_clustering_keeps_singleton_dissolution() {
+        let cfg = crate::audio::diarization::DiarizationConfig::default();
+        let ceiling = crate::audio::diarization::effective_cluster_ceiling(&cfg, None);
+
+        // Two embeddings: min-cluster-size 2 cannot leave two singletons, so
+        // they collapse into a single cluster.
+        let two = buffer_of(&[emb(&[1.0, 0.0, 0.0]), emb(&[0.0, 1.0, 0.0])]);
+        let segs = two.cluster(&cfg, ceiling);
+        assert_eq!(segs.len(), 2, "one segment per buffered entry");
+        let labels: std::collections::HashSet<usize> = segs.iter().map(|s| s.speaker).collect();
+        assert_eq!(labels.len(), 1, "two entries cannot remain two singletons");
+
+        // Two tight pairs plus one outlier: the outlier is a singleton and must
+        // be reassigned into a larger cluster rather than surviving alone.
+        let five = buffer_of(&[
+            emb(&[1.0, 0.0, 0.0]),
+            emb(&[0.99, 0.01, 0.0]),
+            emb(&[0.0, 1.0, 0.0]),
+            emb(&[0.01, 0.99, 0.0]),
+            emb(&[0.0, 0.0, 1.0]),
+        ]);
+        let segs = five.cluster(&cfg, ceiling);
+        assert_eq!(segs.len(), 5);
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for s in &segs {
+            *counts.entry(s.speaker).or_default() += 1;
+        }
+        assert!(
+            counts.values().all(|c| *c >= 2),
+            "no singleton cluster survives dissolution: {counts:?}"
+        );
+    }
+
+    /// 05 task 3.3/3.4 default equivalence: enforcing the ceiling changes the
+    /// value the clusterer receives for an unset user maximum (0 -> the
+    /// configured default), but with no stored overrides the clustering result
+    /// must be identical to the previous unbounded call.
+    #[test]
+    fn enforced_ceiling_does_not_change_default_clustering_result() {
+        let cfg = crate::audio::diarization::DiarizationConfig::default();
+        let vectors = vec![
+            emb(&[1.0, 0.0, 0.0]),
+            emb(&[0.98, 0.02, 0.0]),
+            emb(&[0.0, 1.0, 0.0]),
+            emb(&[0.02, 0.98, 0.0]),
+            emb(&[0.0, 0.1, 1.0]),
+            emb(&[0.0, 0.0, 0.99]),
+        ];
+        let buffer = buffer_of(&vectors);
+
+        // Previous live behaviour: an unset user maximum reached the clusterer
+        // as 0 (unbounded).
+        let before = buffer.cluster(&cfg, 0);
+        // New behaviour: the shared rule resolves it to the configured ceiling.
+        let ceiling = crate::audio::diarization::effective_cluster_ceiling(&cfg, None);
+        assert_eq!(ceiling, cfg.cluster_ceiling);
+        let after = buffer.cluster(&cfg, ceiling);
+
+        let labels = |segs: &[SpeakerSegment]| -> Vec<usize> {
+            segs.iter().map(|s| s.speaker).collect()
+        };
+        assert_eq!(
+            labels(&before),
+            labels(&after),
+            "with no stored overrides the enforced ceiling is inert"
+        );
     }
 }
