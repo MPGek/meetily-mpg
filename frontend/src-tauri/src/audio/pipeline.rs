@@ -1406,7 +1406,16 @@ impl AudioPipelineManager {
             // producer), so this awaits delivery rather than using
             // `try_send`'s drop-on-full policy: losing it would reintroduce
             // the 30+s shutdown delay this function exists to eliminate.
-            if let Err(e) = sender.send(flush_chunk).await {
+            // Bounded by a timeout so a stalled consumer on the now-bounded
+            // channel cannot hang stop indefinitely.
+            let flush_send = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                sender.send(flush_chunk),
+            )
+            .await;
+            if let Err(_elapsed) = flush_send {
+                warn!("Flush signal send timed out (pipeline consumer stalled); continuing to stop");
+            } else if let Ok(Err(e)) = flush_send {
                 warn!("Failed to send flush signal: {}", e);
             } else {
                 info!("📤 Sent flush signal to pipeline");
@@ -1426,7 +1435,11 @@ impl AudioPipelineManager {
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
                     };
-                    let _ = sender.send(additional_flush).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        sender.send(additional_flush),
+                    )
+                    .await;
                 }
 
                 info!("📤 Sent additional flush signals for reliability");
