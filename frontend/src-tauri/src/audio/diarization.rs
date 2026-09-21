@@ -1227,6 +1227,81 @@ fn build_clusterer(
     }
 }
 
+/// Always-on ceiling rule shared by every path (05 D3): the user maximum when
+/// it is smaller, otherwise the configured default ceiling; never below 1, so
+/// the clusterer can never run unbounded, and never above the clustering
+/// backend's 255 maximum.
+pub(crate) fn effective_cluster_ceiling(
+    config: &DiarizationConfig,
+    max_speakers: Option<i32>,
+) -> usize {
+    let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
+    let requested = user_max.min(config.cluster_ceiling).max(1);
+    let ceiling = requested.min(MAX_CLUSTERERS);
+    if ceiling < requested {
+        warn!(
+            "Speaker-count ceiling {} exceeds the clustering backend maximum; clamped to {}",
+            requested, ceiling
+        );
+    }
+    ceiling
+}
+
+/// The clustering seam (05 D3). One `cluster` entry point for every pass, so a
+/// deferred/incremental implementation can be added behind it without
+/// touching callers.
+pub trait Clustering {
+    fn cluster(&self, embeddings: &[Vec<f32>]) -> Result<Vec<usize>, String>;
+}
+
+/// Global agglomerative clustering exactly as the batch pass runs it.
+pub struct GlobalAhc {
+    inner: Box<dyn polyvoice::clusterer::Clusterer>,
+}
+
+impl Clustering for GlobalAhc {
+    fn cluster(&self, embeddings: &[Vec<f32>]) -> Result<Vec<usize>, String> {
+        self.inner.cluster(embeddings).map_err(|e| e.to_string())
+    }
+}
+
+/// Buffered clustering for the live Efficient path: the same kind, threshold
+/// and ceiling the batch pass resolves, wrapped in the singleton dissolution
+/// the `online-speaker-diarization` capability requires.
+pub struct BufferedAhc {
+    inner: polyvoice::clusterer::MinClusterSizeClusterer,
+}
+
+impl Clustering for BufferedAhc {
+    fn cluster(&self, embeddings: &[Vec<f32>]) -> Result<Vec<usize>, String> {
+        use polyvoice::clusterer::Clusterer as _;
+        self.inner.cluster(embeddings).map_err(|e| e.to_string())
+    }
+}
+
+/// Batch/global clusterer for a resolved config and effective ceiling.
+pub(crate) fn clusterer_for_batch(
+    config: &DiarizationConfig,
+    ceiling: usize,
+) -> Result<GlobalAhc, String> {
+    Ok(GlobalAhc {
+        inner: build_clusterer(config, ceiling)?,
+    })
+}
+
+/// Buffered clusterer for the live Efficient path, from the same factory.
+pub(crate) fn clusterer_for_buffer(
+    config: &DiarizationConfig,
+    ceiling: usize,
+) -> Result<BufferedAhc, String> {
+    Ok(BufferedAhc {
+        inner: polyvoice::clusterer::MinClusterSizeClusterer::new(
+            build_clusterer(config, ceiling)?,
+            2,
+        ),
+    })
+}
+
 fn create_polyvoice_diarizer(
     models_dir: &PathBuf,
     max_speakers: Option<i32>,
@@ -1245,12 +1320,9 @@ fn create_polyvoice_diarizer(
             .map_err(|e| format!("Failed to create embedder: {}", e))?;
     let model_tag = embedder.model_tag();
 
-    // Always-on ceiling: user max_speakers when smaller, else the configured
-    // default ceiling. Clamped to >= 1 so the clusterer never runs unbounded,
-    // and to the backend's 255 maximum inside `build_clusterer`.
-    let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
-    let max_clusters = user_max.min(config.cluster_ceiling).max(1);
-    let clusterer = build_clusterer(config, max_clusters)?;
+    // Always-on ceiling, resolved by the rule both paths share.
+    let max_clusters = effective_cluster_ceiling(config, max_speakers);
+    let clusterer = clusterer_for_batch(config, max_clusters)?.inner;
     log::info!(
         "Diarizer using enhanced family tag={} embed_window={:.1}s kind={}",
         model_tag,
@@ -3475,11 +3547,10 @@ mod spike_tests {
 
     #[test]
     fn effective_ceiling_is_user_max_when_smaller_and_always_positive() {
-        // Mirrors the ceiling computation in create_polyvoice_diarizer +
-        // build_clusterer (clamp to the backend's 255 maximum).
+        // The one shared rule, used by the batch path and (since 05 section 3)
+        // the live path too — no second copy of the computation here.
         let ceiling = |max_speakers: Option<i32>, config: &DiarizationConfig| -> usize {
-            let user_max = max_speakers.filter(|m| *m > 0).unwrap_or(i32::MAX) as usize;
-            user_max.min(config.cluster_ceiling).max(1).min(MAX_CLUSTERERS)
+            effective_cluster_ceiling(config, max_speakers)
         };
         let cfg = DiarizationConfig::default();
         // No user max -> default ceiling.

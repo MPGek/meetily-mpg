@@ -30,7 +30,6 @@ use super::recording_state::{AudioChunk, DeviceType};
 use super::speaker_recognition::{MatchResult, Prototype};
 use super::token_assignment::{assign_tokens_to_speakers, SpeakerTurn as TokenTurn};
 use crate::database::repositories::speaker::SpeakerRepository;
-use polyvoice::clusterer::Clusterer as _;
 use polyvoice::embedder::Embedder as _;
 
 static ONLINE_DIARIZATION_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -709,7 +708,16 @@ impl EmbeddingBuffer {
         self.entries.push((start, end, embedding));
     }
 
-    fn cluster(&self, max_speakers: usize, threshold: f32) -> Vec<SpeakerSegment> {
+    /// Clusters the buffered embeddings through the shared `Clustering` seam
+    /// (05 D3/4.2): same kind, threshold and ceiling the batch pass resolves,
+    /// still wrapped in the singleton dissolution this capability requires.
+    fn cluster(
+        &self,
+        config: &crate::audio::diarization::DiarizationConfig,
+        ceiling: usize,
+    ) -> Vec<SpeakerSegment> {
+        use crate::audio::diarization::Clustering as _;
+
         if self.entries.is_empty() {
             return Vec::new();
         }
@@ -722,13 +730,24 @@ impl EmbeddingBuffer {
         }
 
         let embeddings: Vec<Vec<f32>> = self.entries.iter().map(|e| e.2.clone()).collect();
-        let clusterer = polyvoice::clusterer::MinClusterSizeClusterer::new(
-            Box::new(polyvoice::clusterer::AhcClusterer::with_threshold(
-                max_speakers,
-                threshold,
-            )),
-            2,
-        );
+        let clusterer = match crate::audio::diarization::clusterer_for_buffer(config, ceiling) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Clusterer construction failed ({}), treating all segments as one speaker",
+                    e
+                );
+                return self
+                    .entries
+                    .iter()
+                    .map(|e| SpeakerSegment {
+                        start: e.0,
+                        end: e.1,
+                        speaker: 0,
+                    })
+                    .collect();
+            }
+        };
 
         match clusterer.cluster(&embeddings) {
             Ok(labels) => self
@@ -851,6 +870,10 @@ pub struct OnlineDiarizationProcessor {
     /// Live status counters for the two channel lines. None when telemetry is
     /// not attached; every update no-ops in that case.
     stats: Option<Arc<OnlineDiarizationStats>>,
+    /// Clustering parameters resolved once, at session start (05 D4), so a
+    /// settings change mid-recording cannot split one session across two
+    /// configurations.
+    config: crate::audio::diarization::DiarizationConfig,
     _guard: OnlineDiarizationGuard,
 }
 
@@ -940,17 +963,26 @@ impl OnlineDiarizationProcessor {
             DiarizationMode::Off => unreachable!(),
         };
 
+        // Resolve the persisted clustering settings once for the whole
+        // session (05 D4): the live path honours the same overrides the batch
+        // path reads, and a mid-recording change cannot apply to this session.
+        let config = crate::audio::diarization::DiarizationConfig::resolved();
+
         info!(
-            "Online diarization processor initialized (mode: {:?}, max_speakers: {}, prototype_store: {}, mic_prefix: {})",
+            "Online diarization processor initialized (mode: {:?}, max_speakers: {}, prototype_store: {}, mic_prefix: {}, clusterer: {}, threshold: {:.3}, ceiling: {})",
             mode,
             max_speakers,
             prototype_store.is_some(),
-            mic_prefix
+            mic_prefix,
+            config.clusterer.as_str(),
+            config.cluster_threshold,
+            config.cluster_ceiling,
         );
 
         Ok(Self {
             mode,
             max_speakers,
+            config,
             saw_system_audio: false,
             mic_prefix,
             model_tag,
@@ -1280,7 +1312,17 @@ impl OnlineDiarizationProcessor {
         };
 
         let mic_prefix = self.mic_prefix.clone();
-        let family_threshold = crate::audio::embedder::TITANET_CLUSTER_THRESHOLD;
+        // Session-resolved parameters (05 section 3): the merge threshold and
+        // clusterer kind come from the same settings the batch path reads, and
+        // the speaker-count ceiling is resolved by the shared rule instead of
+        // reaching the clusterer as an unbounded 0.
+        let user_max = if self.max_speakers > 0 {
+            Some(self.max_speakers as i32)
+        } else {
+            None
+        };
+        let ceiling =
+            crate::audio::diarization::effective_cluster_ceiling(&self.config, user_max);
         let (mic_segments, sys_segments, mic_clustered, sys_clustered, mic_raw, sys_raw) =
             match engine {
                 Engine::Efficient {
@@ -1288,8 +1330,8 @@ impl OnlineDiarizationProcessor {
                     mic,
                     sys,
                 } => {
-                    let mic_segments = mic.cluster(self.max_speakers, family_threshold);
-                    let sys_segments = sys.cluster(self.max_speakers, family_threshold);
+                    let mic_segments = mic.cluster(&self.config, ceiling);
+                    let sys_segments = sys.cluster(&self.config, ceiling);
                     // Efficient mode: embeddings are buffered per segment; cluster()
                     // returns labels aligned with the buffer entries, so group by
                     // those labels directly.
@@ -1947,5 +1989,149 @@ mod tests {
         // Thresholds unchanged for both Efficient and Fast modes.
         assert_eq!(crate::audio::embedder::TITANET_CLUSTER_THRESHOLD, 0.60);
         assert_eq!(crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD, 0.68);
+    }
+
+    fn emb(v: &[f32]) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    fn buffer_of(vectors: &[Vec<f32>]) -> EmbeddingBuffer {
+        let mut b = EmbeddingBuffer::default();
+        for (i, v) in vectors.iter().enumerate() {
+            b.push(i as f32, i as f32 + 1.0, v.clone());
+        }
+        b
+    }
+
+    /// 05 task 4.2: `EmbeddingBuffer::cluster` now runs through the shared
+    /// `Clustering` seam. The singleton dissolution (`MinClusterSizeClusterer`
+    /// with min size 2) that `online-speaker-diarization` requires must be
+    /// preserved, and a two-embedding fixture must still yield one cluster.
+    #[test]
+    fn buffered_clustering_keeps_singleton_dissolution() {
+        let cfg = crate::audio::diarization::DiarizationConfig::default();
+        let ceiling = crate::audio::diarization::effective_cluster_ceiling(&cfg, None);
+
+        // Two embeddings: min-cluster-size 2 cannot leave two singletons, so
+        // they collapse into a single cluster.
+        let two = buffer_of(&[emb(&[1.0, 0.0, 0.0]), emb(&[0.0, 1.0, 0.0])]);
+        let segs = two.cluster(&cfg, ceiling);
+        assert_eq!(segs.len(), 2, "one segment per buffered entry");
+        let labels: std::collections::HashSet<usize> = segs.iter().map(|s| s.speaker).collect();
+        assert_eq!(labels.len(), 1, "two entries cannot remain two singletons");
+
+        // Two tight pairs plus one outlier: the outlier is a singleton and must
+        // be reassigned into a larger cluster rather than surviving alone.
+        let five = buffer_of(&[
+            emb(&[1.0, 0.0, 0.0]),
+            emb(&[0.99, 0.01, 0.0]),
+            emb(&[0.0, 1.0, 0.0]),
+            emb(&[0.01, 0.99, 0.0]),
+            emb(&[0.0, 0.0, 1.0]),
+        ]);
+        let segs = five.cluster(&cfg, ceiling);
+        assert_eq!(segs.len(), 5);
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for s in &segs {
+            *counts.entry(s.speaker).or_default() += 1;
+        }
+        assert!(
+            counts.values().all(|c| *c >= 2),
+            "no singleton cluster survives dissolution: {counts:?}"
+        );
+    }
+
+    /// 05 task 3.3/3.4 default equivalence: enforcing the ceiling changes the
+    /// value the clusterer receives for an unset user maximum (0 -> the
+    /// configured default), but with no stored overrides the clustering result
+    /// must be identical to the previous unbounded call.
+    #[test]
+    fn enforced_ceiling_does_not_change_default_clustering_result() {
+        let cfg = crate::audio::diarization::DiarizationConfig::default();
+        let vectors = vec![
+            emb(&[1.0, 0.0, 0.0]),
+            emb(&[0.98, 0.02, 0.0]),
+            emb(&[0.0, 1.0, 0.0]),
+            emb(&[0.02, 0.98, 0.0]),
+            emb(&[0.0, 0.1, 1.0]),
+            emb(&[0.0, 0.0, 0.99]),
+        ];
+        let buffer = buffer_of(&vectors);
+
+        // Previous live behaviour: an unset user maximum reached the clusterer
+        // as 0 (unbounded).
+        let before = buffer.cluster(&cfg, 0);
+        // New behaviour: the shared rule resolves it to the configured ceiling.
+        let ceiling = crate::audio::diarization::effective_cluster_ceiling(&cfg, None);
+        assert_eq!(ceiling, cfg.cluster_ceiling);
+        let after = buffer.cluster(&cfg, ceiling);
+
+        let labels = |segs: &[SpeakerSegment]| -> Vec<usize> {
+            segs.iter().map(|s| s.speaker).collect()
+        };
+        assert_eq!(
+            labels(&before),
+            labels(&after),
+            "with no stored overrides the enforced ceiling is inert"
+        );
+    }
+
+    /// 05 task 3.1 / D4: the session's clustering parameters are resolved once
+    /// at construction, so a settings change mid-recording cannot split one
+    /// session across two configurations. Needs the enhanced models to build a
+    /// processor; skips when they are not installed.
+    #[test]
+    fn processor_holds_the_config_captured_at_construction() {
+        use crate::audio::diarization::{
+            set_clustering_overrides, ClustererKindSetting, DiarizationConfig,
+        };
+
+        let Ok(models_dir) = crate::audio::diarization::resolve_models_dir_standalone(None) else {
+            eprintln!("skipping: enhanced diarization models not installed");
+            return;
+        };
+
+        let saved = DiarizationConfig::resolved();
+
+        // Start the session under a known, non-default threshold.
+        set_clustering_overrides(Some(0.42), Some(9), None, Some(ClustererKindSetting::Ahc));
+        let processor = match OnlineDiarizationProcessor::new(
+            DiarizationMode::Efficient,
+            0,
+            true,
+            &models_dir,
+            None,
+            None,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: processor init unavailable ({e})");
+                set_clustering_overrides(None, None, None, None);
+                return;
+            }
+        };
+        assert_eq!(processor.config.cluster_threshold, 0.42);
+        assert_eq!(processor.config.cluster_ceiling, 9);
+
+        // A settings change after the session started must not reach it.
+        set_clustering_overrides(Some(0.81), Some(3), None, Some(ClustererKindSetting::Nmesc));
+        assert_eq!(
+            processor.config.cluster_threshold, 0.42,
+            "session config is a snapshot taken at construction"
+        );
+        assert_eq!(processor.config.cluster_ceiling, 9);
+        assert_eq!(processor.config.clusterer, ClustererKindSetting::Ahc);
+        // ... while a newly resolved config does see it.
+        assert_eq!(DiarizationConfig::resolved().cluster_threshold, 0.81);
+
+        drop(processor);
+        set_clustering_overrides(
+            Some(saved.cluster_threshold),
+            Some(saved.cluster_ceiling),
+            Some(saved.gap_merge_secs),
+            Some(saved.clusterer),
+        );
+        set_clustering_overrides(None, None, None, None);
     }
 }
