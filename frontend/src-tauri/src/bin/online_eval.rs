@@ -276,7 +276,7 @@ fn finalized_timeline(emissions: &[Emission]) -> Vec<(f64, f64, String)> {
     let mut out: Vec<(f64, f64, String)> = Vec::new();
     for emission in emissions.iter().filter(|e| e.stable) {
         let (start, end) = (emission.start, emission.end);
-        if !(end > start) {
+        if end <= start {
             continue;
         }
         let mut kept: Vec<(f64, f64, String)> = Vec::with_capacity(out.len() + 1);

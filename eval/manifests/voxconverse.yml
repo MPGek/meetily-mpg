@@ -19,6 +19,22 @@ subset_files:
 subset_gate:
   der: 12.0
   conf: 7.0
+# Online (live Fast path) gate ranges, first measured 2026-09-21 on the same 5
+# subset files with the production-faithful chunking (an ablation policy may
+# never feed a gate). Measured: DER 31.26 (FA 3.37 / Miss 14.91 / Conf 12.98),
+# so der_delta +22.86 against the offline 8.40; lag median 0.385 s / p90
+# 0.564 s; flip rate 0.030; runs per reference speaker 2.50 live and 2.50
+# final; 3.77 cluster switches per speaker-minute; 4 of 21 reference turns
+# uncovered. Bounds leave ~5-7 pp on the DER pair and roughly 2-3x headroom on
+# the streaming metrics, which move with chunk boundaries. Real-time factor
+# (measured 0.021) is recorded per run and is deliberately not gateable.
+online_gate:
+  der: 38.0
+  der_delta: 28.0
+  lag_p90: 1.5
+  flip_rate: 0.10
+  final_runs_per_speaker: 4.0
+  switch_rate_per_speaker_minute: 8.0
 normalize:
   audio_archive: voxconverse_test_wav.zip
   audio_glob: voxconverse_test_wav/*.wav

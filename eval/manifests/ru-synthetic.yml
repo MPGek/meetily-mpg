@@ -31,6 +31,21 @@ subset_files:
 # moved only 8.59 → 9.82, within noise on this artifact set).
 subset_gate:
   conf: 16.0
+# Online (live Fast path) gate ranges, first measured 2026-09-21 on the same 5
+# subset files with the production-faithful chunking. Measured: DER 41.79
+# (FA 0.00 / Miss 23.15 / Conf 18.65); lag median 1.388 s / p90 1.614 s; flip
+# rate 0.030; runs per reference speaker 2.90 live and 2.70 final; 6.63 cluster
+# switches per speaker-minute; 5 of 41 reference turns uncovered. `der_delta`
+# is deliberately not gated here: this set's offline DER is artifact-inflated
+# (see eval/README Notes), so the online path scores *better* than offline
+# (-15.98) and the difference says more about the artifacts than the pipeline.
+# Real-time factor (measured 0.016) is recorded and never gated.
+online_gate:
+  der: 48.0
+  lag_p90: 3.0
+  flip_rate: 0.10
+  final_runs_per_speaker: 4.0
+  switch_rate_per_speaker_minute: 12.0
 sources:
   - kind: hf
     url: https://huggingface.co/datasets/niobures/synthetic-speech-diarization-ru
