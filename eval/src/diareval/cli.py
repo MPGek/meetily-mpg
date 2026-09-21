@@ -29,8 +29,21 @@ def build_parser() -> argparse.ArgumentParser:
     normalize.add_argument("--dataset", required=True, help="Dataset name (see eval/manifests)")
     normalize.set_defaults(func=_dispatch("normalize"))
 
-    run = sub.add_parser("run", help="Run the diarize-eval harness over a dataset")
+    run = sub.add_parser("run", help="Run a harness binary over a dataset")
     run.add_argument("--dataset", required=True, help="Dataset name (see eval/data)")
+    run.add_argument(
+        "--mode",
+        choices=("offline", "online"),
+        default="offline",
+        help="Pipeline to measure: offline batch (default) or the live Fast-mode path",
+    )
+    run.add_argument(
+        "--chunking",
+        default=None,
+        metavar="POLICY",
+        help="Online chunking policy: production (default, the recording pipeline's "
+        "recipe) or fixed:<secs> (an ablation, never valid for a parity claim)",
+    )
     run.add_argument("--run-id", default="latest", help="Output run directory name under eval/out")
     run.add_argument("--workers", type=int, default=None, help="Parallel workers (default 4)")
     run.add_argument("--force", action="store_true", help="Reprocess files that already have outputs")
@@ -47,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     score = sub.add_parser("score", help="Score hypothesis RTTMs against references (DER)")
     score.add_argument("--dataset", required=True, help="Dataset name")
     score.add_argument("--run-id", default="latest", help="Run directory name under eval/out")
+    score.add_argument(
+        "--mode",
+        choices=("offline", "online"),
+        default="offline",
+        help="Score the run produced in this mode; an online run also reports the "
+        "streaming metrics. The two modes are never combined in one score.",
+    )
     score.set_defaults(func=_dispatch("score"))
 
     report = sub.add_parser("report", help="Write the Markdown comparison report")

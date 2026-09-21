@@ -15,9 +15,10 @@ uv sync --project eval
 # 2. DVC remote (already configured in eval/.dvc/config; recreate if moving machine)
 uv run --project eval dvc remote add -d storage "C:/Users/vasiliy.kotov/Work/Own/meetily-dvc"
 
-# 3. Harness binary (reuses the app's diarization code path; models must be
+# 3. Harness binaries (reuse the app's diarization code paths; models must be
 #    installed for the app, or pass --models-dir)
-cargo build --release --bin diarize-eval -p meetily
+cargo build --release --bin diarize-eval -p meetily   # offline batch path
+cargo build --release --bin online-eval  -p meetily   # live (Fast-mode) path
 ```
 
 ## Per-dataset commands
@@ -39,6 +40,50 @@ uv run --project eval normalize --dataset ru-synthetic
 uv run --project eval download  --dataset ru-youtube   # HF, Apache-2.0
 uv run --project eval normalize --dataset ru-youtube
 ```
+
+## Online mode: measuring the live path (add-online-diarization-eval)
+
+The live path is a second, independently addressable mode of the same
+commands. It replays a recording through the production VAD/merge chunking and
+the real `OnlineDiarizationProcessor` in Fast mode, then writes the finalized
+RTTM *and* a streaming event sidecar (`<uri>.events.jsonl`) plus a timing file
+(`<uri>.timing.json`) per recording:
+
+```powershell
+# Run and score the live path; artifacts land in eval/out/<dataset>/online/<run-id>
+uv run --project eval run   --dataset voxconverse --mode online
+uv run --project eval score --dataset voxconverse --mode online
+
+# One recording, straight from the binary (what the runner calls per file)
+./target/release/online-eval eval/data/voxconverse/wav/abjxc.wav `
+  --out-dir eval/out/voxconverse/online/manual --uri abjxc
+
+# The report shows both modes with the online-minus-offline delta
+uv run --project eval report
+```
+
+Rules that keep the numbers meaningful:
+
+- **Chunking policy.** The default `production` policy is the recording
+  pipeline's own recipe (200 ms VAD dispatch window, 500 ms gap and 25 s
+  accumulation flush triggers, `merge_segments(.., 500 ms, 25 s)`, the
+  `VadConfig::live()` minimum length). `--chunking fixed:<secs>` exists only
+  as an ablation: it changes the segmentation the pipeline sees, it is
+  labelled as such in the sidecar header and the report, and **a parity claim
+  or a gate may only ever be based on the production policy**.
+- **Modes are never mixed.** A run directory records its mode, and scoring
+  refuses to attribute a run to the other mode, so an online hypothesis can
+  never land in the calibrated offline baseline.
+- **Real-time factor is reported, never gated.** It measures the machine, not
+  the pipeline; the manifest loader rejects a bound on it. Lag is measured in
+  audio time (from a reference turn's start to the first emission covering
+  it), and a turn no emission covered is counted as uncovered rather than
+  scored as zero.
+- **Efficient mode is not scored.** Only Fast mode emits an observable turn
+  stream; see the change's design D3.
+
+Online gate bounds are declared per dataset as `online_gate:` in the
+manifests, alongside the offline `subset_gate:`, and `subset` evaluates both.
 
 Fast regression gate (≤10 recordings, ru-synthetic + voxconverse, end-to-end):
 

@@ -21,6 +21,12 @@ crate-type = ["cdylib", "rlib"]
 name = "diarize-eval"
 path = "src/bin/diarize_eval.rs"
 
+# Developer-only: replays a WAV through the live (Fast-mode) diarization path
+# and writes RTTM + a streaming event sidecar (add-online-diarization-eval).
+[[bin]]
+name = "online-eval"
+path = "src/bin/online_eval.rs"
+
 
 # Hardware acceleration features for whisper-rs
 # Cross-platform GPU acceleration with smart defaults

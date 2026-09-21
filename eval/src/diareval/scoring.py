@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 from pyannote.core import Annotation, Segment, Timeline
@@ -11,6 +12,14 @@ from pyannote.metrics.diarization import DiarizationErrorRate
 
 from .manifests import load_manifest
 from .paths import DATA_DIR, OUT_DIR
+from .runner import DEFAULT_MODE, check_mode, read_run_mode, run_dir
+from .streaming import emission_lag, flip_and_fragmentation, load_sidecar, read_rtf
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    from .streaming import _percentile as percentile
+
+    return percentile(values, pct)
 
 
 def _load_uem(path: Path) -> dict[str, Timeline]:
@@ -28,15 +37,34 @@ def score_dataset(
     run_id: str = "latest",
     files: list[str] | None = None,
     exclude: set[str] | None = None,
+    mode: str = DEFAULT_MODE,
 ) -> dict:
+    """Score one run of one dataset, in one mode.
+
+    A run is scored as the mode that produced it and nothing else: the mode
+    selects the run directory, and the directory's recorded mode must match,
+    so an online hypothesis can never be attributed to the offline baseline
+    or the two mixed into a single number (D7).
+    """
+    check_mode(mode)
     data = DATA_DIR / dataset
     ref_path = data / "rttm" / "ref.rttm"
     uem_path = data / "uem" / "ref.uem"
-    hyp_dir = OUT_DIR / dataset / run_id
+    hyp_dir = run_dir(dataset, run_id, mode, out_dir=OUT_DIR)
     if not ref_path.is_file() or not uem_path.is_file():
         raise SystemExit(f"dataset '{dataset}': missing {ref_path} or {uem_path}")
     if not hyp_dir.is_dir():
-        raise SystemExit(f"no hypothesis run at {hyp_dir} — run `run --dataset {dataset}` first")
+        raise SystemExit(
+            f"no {mode} hypothesis run at {hyp_dir} — "
+            f"run `run --dataset {dataset} --mode {mode}` first"
+        )
+    produced_in = read_run_mode(hyp_dir)
+    if produced_in != mode:
+        raise SystemExit(
+            f"refusing to score a {produced_in} run as {mode}: {hyp_dir} was produced by the "
+            f"{produced_in} harness. Score it with --mode {produced_in}, or run the {mode} "
+            f"harness first; the two modes are never combined in one score."
+        )
 
     refs = dict(load_rttm(str(ref_path)))
     if files is not None:
@@ -98,6 +126,7 @@ def score_dataset(
     result = {
         "dataset": dataset,
         "run_id": run_id,
+        "mode": mode,
         "files": len(refs),
         "excluded": excluded,
         "scored_hours": total_ref / 3600.0,
@@ -107,6 +136,9 @@ def score_dataset(
         "conf": comp["confusion"] / total_ref * 100.0,
         "baseline_der": baseline,
     }
+    if mode != DEFAULT_MODE:
+        result["streaming"] = _streaming_metrics(hyp_dir, refs, hyps, uem)
+
     out = hyp_dir / "score.json"
     out.write_text(json.dumps(result, indent=1), encoding="utf-8")
     print(
@@ -118,6 +150,79 @@ def score_dataset(
     return result
 
 
+def _streaming_metrics(hyp_dir: Path, refs: dict, hyps: dict, uem: dict) -> dict:
+    """Aggregate the streaming metrics of an online run, duration-weighted.
+
+    Every recording must have its sidecar: a missing one is an error naming
+    the recording, never a zero (spec: fail loudly). Real-time factor is
+    averaged and reported here but is never a gate (D7).
+    """
+    weighted: dict[str, float] = {}
+    weights: dict[str, float] = {}
+    lag_samples: list[float] = []
+    uncovered = 0
+    turns = 0
+    rtfs: list[float] = []
+    ablation_files: list[str] = []
+
+    for uri, ref in refs.items():
+        sidecar = load_sidecar(hyp_dir, uri)
+        if not sidecar.production_faithful:
+            ablation_files.append(uri)
+        region = uem.get(uri)
+        lag = emission_lag(sidecar, ref, region)
+        churn = flip_and_fragmentation(sidecar, ref, hyps[uri], region)
+
+        turns += lag["turns"]
+        uncovered += lag["uncovered"]
+        if lag["lag_median"] is not None:
+            # Weight a recording's lag by its covered turns so a long
+            # recording does not count as much as a short one per turn.
+            lag_samples.extend([lag["lag_median"]] * lag["covered"])
+
+        secs = churn["speech_secs"] or 0.0
+        for key in (
+            "flip_rate",
+            "switch_rate_per_speaker_minute",
+            "live_runs_per_speaker",
+            "final_runs_per_speaker",
+        ):
+            value = churn[key]
+            if value is None or secs <= 0:
+                continue
+            weighted[key] = weighted.get(key, 0.0) + value * secs
+            weights[key] = weights.get(key, 0.0) + secs
+
+        rtf = read_rtf(hyp_dir, uri)
+        if rtf is not None:
+            rtfs.append(rtf)
+
+    # Every metric key is always present: a metric with no sample reports
+    # None ("not measurable on this run"), never a missing field a report or a
+    # gate could read as zero.
+    metrics: dict = {
+        key: (weighted[key] / weights[key]) if weights.get(key, 0.0) > 0 else None
+        for key in (
+            "flip_rate",
+            "switch_rate_per_speaker_minute",
+            "live_runs_per_speaker",
+            "final_runs_per_speaker",
+        )
+    }
+    metrics["reference_turns"] = turns
+    metrics["uncovered_turns"] = uncovered
+    metrics["lag_median"] = statistics.median(lag_samples) if lag_samples else None
+    metrics["lag_p90"] = _percentile(lag_samples, 90.0) if lag_samples else None
+    # Recorded, never gated: this measures the machine, not the pipeline.
+    metrics["real_time_factor"] = (sum(rtfs) / len(rtfs)) if rtfs else None
+    if ablation_files:
+        metrics["ablation_files"] = len(ablation_files)
+        metrics["production_faithful"] = False
+    else:
+        metrics["production_faithful"] = True
+    return metrics
+
+
 def score(args) -> int:
-    score_dataset(args.dataset, args.run_id)
+    score_dataset(args.dataset, args.run_id, mode=getattr(args, "mode", DEFAULT_MODE))
     return 0

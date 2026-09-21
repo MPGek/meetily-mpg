@@ -50,6 +50,7 @@ def run_subset(
     from .scoring import score_dataset
 
     results = {}
+    online_results: dict[str, dict] = {}
     for m in manifests:
         prepare_once(m)
         run_dataset(
@@ -57,13 +58,36 @@ def run_subset(
             harness_args=harness_args,
         )
         results[m.name] = score_dataset(m.name, run_id=run_id, files=list(m.subset_files))
+        # A dataset that declares online bounds is also measured through
+        # the live path, on the same files, with production-faithful
+        # chunking (an ablation policy may never feed a gate).
+        if m.online_gate:
+            run_dataset(
+                m.name, run_id=run_id, force=force, files=list(m.subset_files),
+                mode="online", chunking="production",
+            )
+            online_results[m.name] = score_dataset(
+                m.name, run_id=run_id, files=list(m.subset_files), mode="online"
+            )
 
     print("\nsubset results:")
     for name, r in results.items():
         print(
-            f"  {name}: DER {r['der']:.2f}% "
+            f"  {name} [offline]: DER {r['der']:.2f}% "
             f"(FA {r['fa']:.2f} / Miss {r['miss']:.2f} / Conf {r['conf']:.2f})"
         )
+        online = online_results.get(name)
+        if online:
+            metrics = online.get("streaming", {})
+            print(
+                f"  {name} [online]:  DER {online['der']:.2f}% "
+                f"(delta {online['der'] - r['der']:+.2f}) "
+                f"lag p90 {_fmt(metrics.get('lag_p90'))}s "
+                f"flip {_fmt(metrics.get('flip_rate'))} "
+                f"runs/speaker live {_fmt(metrics.get('live_runs_per_speaker'))} "
+                f"final {_fmt(metrics.get('final_runs_per_speaker'))} "
+                f"| RTF {_fmt(metrics.get('real_time_factor'))} (recorded, not gated)"
+            )
 
     gate_failures: list[str] = []
     for m in manifests:
@@ -76,11 +100,63 @@ def run_subset(
                     f"{m.name}: {metric} {r[metric]:.2f}% exceeds recorded gate max "
                     f"{bound:.2f}% — regression source: {m.name} {metric.upper()}"
                 )
+    for m in manifests:
+        if not m.online_gate:
+            continue
+        online = online_results.get(m.name)
+        if online is None:
+            gate_failures.append(
+                f"{m.name}: online gate declared but no online run was scored"
+            )
+            continue
+        measured = _online_measurements(online, results[m.name])
+        for metric, bound in sorted(m.online_gate.items()):
+            value = measured.get(metric)
+            if value is None:
+                gate_failures.append(
+                    f"{m.name}: [online] {metric} is not measurable on this run "
+                    f"(no sample), so its recorded bound {bound} cannot be evaluated"
+                )
+                continue
+            if value > bound:
+                gate_failures.append(
+                    f"{m.name}: [online] {metric} {value:.3f} exceeds recorded gate "
+                    f"max {bound:.3f} - regression source: {m.name} {metric.upper()} "
+                    f"(online)"
+                )
+
     if gate_failures:
         print("\nsubset gate FAILED:")
         for line in gate_failures:
             print(f"  {line}")
         raise SystemExit(1)
-    if any(m.subset_gate for m in manifests):
+    if any(m.subset_gate or m.online_gate for m in manifests):
         print("subset gate PASSED: all recorded metric ranges met")
+    if online_results:
+        return {"offline": results, "online": online_results}
     return results
+
+def _fmt(value) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
+def _online_measurements(online: dict, offline: dict) -> dict:
+    """The gateable online metrics of one dataset, in one flat mapping.
+
+    `der_delta` is the online run's distance from the offline run over the
+    same files: the number that says whether the live path is losing quality
+    against the calibrated baseline.
+    """
+    measured = {key: online.get(key) for key in ("der", "fa", "miss", "conf")}
+    measured["der_delta"] = online["der"] - offline["der"]
+    measured.update(
+        {
+            key: value
+            for key, value in (online.get("streaming") or {}).items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+    )
+    # Recorded for information only: the manifest loader rejects a bound on
+    # it, and nothing here consults it.
+    measured.pop("real_time_factor", None)
+    return measured

@@ -20,6 +20,31 @@ KNOWN_PARSERS = {
 
 KNOWN_SOURCE_KINDS = {"http", "gdrive", "hf"}
 
+#: Metrics a subset gate may bound for the offline batch path.
+OFFLINE_GATE_METRICS = {"der", "fa", "miss", "conf"}
+
+#: Metrics a subset gate may bound for the online (live-path) run: the DER
+#: components of its own hypothesis, its distance from the offline run, and
+#: the streaming-only metrics (add-online-diarization-eval task 6.2).
+ONLINE_GATE_METRICS = {
+    "der",
+    "fa",
+    "miss",
+    "conf",
+    "der_delta",
+    "lag_median",
+    "lag_p90",
+    "flip_rate",
+    "switch_rate_per_speaker_minute",
+    "live_runs_per_speaker",
+    "final_runs_per_speaker",
+    "uncovered_turns",
+}
+
+#: Recorded on every online run and deliberately not gateable: it measures the
+#: machine, not the pipeline (D7).
+NEVER_GATED_METRICS = {"real_time_factor", "rtf"}
+
 
 class ManifestError(Exception):
     pass
@@ -60,7 +85,45 @@ class DatasetManifest:
     # Subset regression gate (diarization-param-tuning): metric -> max allowed
     # value on the subset run; `subset` fails when a metric exceeds its bound.
     subset_gate: dict[str, float] = field(default_factory=dict)
+    # The same idea for the online (live-path) run of the subset, kept
+    # separate so an online bound can never be compared against an offline
+    # measurement (add-online-diarization-eval D7).
+    online_gate: dict[str, float] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _parse_gate(
+    name: str,
+    raw: object,
+    field_name: str,
+    known: set[str],
+) -> dict[str, float]:
+    """Parse one gate block: metric -> maximum allowed value.
+
+    An unknown metric is rejected by name, and the metrics that are recorded
+    but deliberately never gated are rejected with that reason, so a manifest
+    can never quietly declare a bound nothing evaluates.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ManifestError(f"{name}: {field_name} must be a mapping of metric -> max")
+    gate: dict[str, float] = {}
+    for metric, bound in raw.items():
+        if metric in NEVER_GATED_METRICS:
+            raise ManifestError(
+                f"{name}: {field_name}.{metric} cannot be gated - it is recorded for "
+                f"information only because it measures the machine, not the pipeline"
+            )
+        if metric not in known:
+            raise ManifestError(
+                f"{name}: {field_name} unknown metric '{metric}' (known: {sorted(known)})"
+            )
+        try:
+            gate[metric] = float(bound)
+        except (TypeError, ValueError) as exc:
+            raise ManifestError(f"{name}: {field_name}.{metric} must be a number") from exc
+    return gate
 
 
 def _parse_source(raw: Any, name: str) -> Source:
@@ -109,17 +172,8 @@ def parse_manifest(data: Any, name: str) -> DatasetManifest:
             baseline = float(baseline)
         except (TypeError, ValueError) as exc:
             raise ManifestError(f"{name}: baseline_der must be a number") from exc
-    subset_gate_raw = data.get("subset_gate", {}) or {}
-    if not isinstance(subset_gate_raw, dict):
-        raise ManifestError(f"{name}: subset_gate must be a mapping of metric -> max")
-    subset_gate: dict[str, float] = {}
-    for metric, bound in subset_gate_raw.items():
-        if metric not in {"der", "fa", "miss", "conf"}:
-            raise ManifestError(f"{name}: subset_gate unknown metric '{metric}'")
-        try:
-            subset_gate[metric] = float(bound)
-        except (TypeError, ValueError) as exc:
-            raise ManifestError(f"{name}: subset_gate.{metric} must be a number") from exc
+    subset_gate = _parse_gate(name, data.get("subset_gate"), "subset_gate", OFFLINE_GATE_METRICS)
+    online_gate = _parse_gate(name, data.get("online_gate"), "online_gate", ONLINE_GATE_METRICS)
     return DatasetManifest(
         name=data["name"],
         license=str(data["license"]),
@@ -134,10 +188,11 @@ def parse_manifest(data: Any, name: str) -> DatasetManifest:
         subset_files=tuple(data.get("subset_files", ())),
         tuning=bool(data.get("tuning", False)),
         subset_gate=subset_gate,
+        online_gate=online_gate,
         extra={k: v for k, v in data.items() if k not in {
             "name", "license", "parser", "gated", "raw_files", "raw_hint",
             "sources", "channel_policy", "baseline_der", "subset", "subset_files",
-            "tuning", "subset_gate",
+            "tuning", "subset_gate", "online_gate",
         }},
     )
 

@@ -1,25 +1,92 @@
-"""Dataset-wide orchestration for the diarize-eval harness binary."""
+"""Dataset-wide orchestration for the harness binaries (offline and online)."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .paths import DATA_DIR, EVAL_ROOT, OUT_DIR
 
-HINT = (
-    "diarize-eval binary not found. Build it first:\n"
-    "  cargo build --release --bin diarize-eval -p meetily"
-)
+#: The pipeline each mode measures, and the binary that drives it. Offline is
+#: the calibrated batch path; online replays the live (Fast-mode) path
+#: (add-online-diarization-eval D1 - separate binaries, no shared tunables).
+MODES = {
+    "offline": "diarize-eval",
+    "online": "online-eval",
+}
+
+DEFAULT_MODE = "offline"
 
 
-def harness_binary() -> Path:
-    name = "diarize-eval.exe" if _is_windows() else "diarize-eval"
+def check_mode(mode: str) -> str:
+    if mode not in MODES:
+        raise SystemExit(f"unknown mode '{mode}' (expected one of {sorted(MODES)})")
+    return mode
+
+
+def harness_binary(mode: str = DEFAULT_MODE) -> Path:
+    stem = MODES[check_mode(mode)]
+    name = f"{stem}.exe" if _is_windows() else stem
     path = EVAL_ROOT.parent / "target" / "release" / name
     if not path.is_file():
-        raise SystemExit(HINT)
+        raise SystemExit(
+            f"{stem} binary not found. Build it first:\n"
+            f"  cargo build --release --bin {stem} -p meetily"
+        )
     return path
+
+
+def run_dir(
+    dataset: str,
+    run_id: str,
+    mode: str = DEFAULT_MODE,
+    out_dir: Path | None = None,
+) -> Path:
+    """Where a run's artifacts live, scoped by mode (D7).
+
+    Offline keeps its historical path so the recorded baselines stay
+    addressable; online nests under an `online/` level, so the two modes for
+    one dataset coexist and can never be scored as one set. `out_dir` lets a
+    caller supply its own output root (the one definition of the layout, used
+    by both the runner and the scorer).
+    """
+    check_mode(mode)
+    base = (out_dir or OUT_DIR) / dataset
+    return base / run_id if mode == DEFAULT_MODE else base / mode / run_id
+
+
+def write_run_meta(
+    directory: Path, dataset: str, run_id: str, mode: str, chunking: str | None
+) -> None:
+    """Record what produced this run, so scoring can refuse a mode mismatch."""
+    meta = {
+        "dataset": dataset,
+        "run_id": run_id,
+        "mode": check_mode(mode),
+        "binary": MODES[mode],
+    }
+    if chunking:
+        meta["chunking"] = chunking
+    (directory / "run.json").write_text(
+        json.dumps(meta, indent=1) + "\n", encoding="utf-8"
+    )
+
+
+def read_run_mode(directory: Path) -> str:
+    """The mode a run directory was produced in.
+
+    A directory without `run.json` predates mode scoping, so it is an offline
+    run by construction (only the offline harness existed then).
+    """
+    path = directory / "run.json"
+    if not path.is_file():
+        return DEFAULT_MODE
+    try:
+        return check_mode(str(json.loads(path.read_text(encoding="utf-8"))["mode"]))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SystemExit(f"unreadable run metadata at {path}: {exc}") from exc
 
 
 def _is_windows() -> bool:
@@ -63,11 +130,19 @@ def run_dataset(
     files: list[str] | None = None,
     harness_args: list[str] | None = None,
     skip_failures: bool = False,
+    mode: str = DEFAULT_MODE,
+    chunking: str | None = None,
 ) -> Path:
     """Diarize every WAV of a materialized dataset; resumable per file.
 
-    `harness_args` are appended verbatim to each `diarize-eval` invocation
-    (sweep per-candidate overrides, e.g. `["--cluster-threshold=0.35"]`).
+    `mode` selects the pipeline under measurement and therefore the binary and
+    the run directory (D7): `offline` is the calibrated batch path, `online`
+    replays the live path and writes an event sidecar next to each RTTM.
+    `chunking` is the online policy (`production`, or `fixed:<secs>` as an
+    ablation) and is rejected for offline runs, which have no chunking.
+
+    `harness_args` are appended verbatim to each harness invocation (sweep
+    per-candidate overrides, e.g. `["--cluster-threshold=0.35"]`).
     With `skip_failures`, files whose harness run fails are recorded in
     `failed.txt` inside the run dir and processing continues (the sweep uses
     this so one bad recording cannot abort a multi-hour grid).
@@ -87,9 +162,15 @@ def run_dataset(
     if not wavs:
         raise SystemExit(f"no WAV files for dataset '{dataset}'")
 
-    exe = harness_binary()
-    out_dir = OUT_DIR / dataset / run_id
+    check_mode(mode)
+    if chunking and mode == DEFAULT_MODE:
+        raise SystemExit(
+            "--chunking applies to online runs only; the offline path has no chunking policy"
+        )
+    exe = harness_binary(mode)
+    out_dir = run_dir(dataset, run_id, mode)
     out_dir.mkdir(parents=True, exist_ok=True)
+    write_run_meta(out_dir, dataset, run_id, mode, chunking)
     failed_file = out_dir / "failed.txt"
     already_failed: set[str] = set()
     if force:
@@ -114,7 +195,10 @@ def run_dataset(
         todo.append(wav)
 
     total = len(wavs)
-    print(f"run {dataset}: {total} recordings, {skipped} already done, {len(todo)} to process")
+    print(
+        f"run {dataset} [{mode}]: {total} recordings, {skipped} already done, "
+        f"{len(todo)} to process -> {out_dir}"
+    )
     if not todo:
         return out_dir
 
@@ -125,6 +209,12 @@ def run_dataset(
         rttm = out_dir / f"{wav.stem}.rttm"
         tmp = rttm.with_name(rttm.name + ".part")
         cmd = [str(exe), str(wav), "--out", str(tmp), "--uri", wav.stem]
+        if mode != DEFAULT_MODE:
+            # The online harness writes its sidecar and timing file itself,
+            # next to the RTTM this run resumes on.
+            cmd.extend(["--out-dir", str(out_dir)])
+            if chunking:
+                cmd.extend(["--chunking", chunking])
         if harness_args:
             cmd.extend(harness_args)
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -155,5 +245,13 @@ def run_dataset(
 
 
 def run(args) -> int:
-    run_dataset(args.dataset, args.run_id, args.workers, args.force)
+    run_dataset(
+        args.dataset,
+        args.run_id,
+        args.workers,
+        args.force,
+        harness_args=getattr(args, "harness_arg", None),
+        mode=getattr(args, "mode", DEFAULT_MODE),
+        chunking=getattr(args, "chunking", None),
+    )
     return 0

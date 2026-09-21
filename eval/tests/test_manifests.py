@@ -76,3 +76,49 @@ def test_name_must_match_stem(tmp_path: Path) -> None:
 def test_missing_manifest_raises(tmp_path: Path) -> None:
     with pytest.raises(ManifestError, match="no manifest"):
         load_manifest("absent", manifests_dir=tmp_path)
+
+
+# --------------------------------------------------------------------------
+# Online gate bounds (add-online-diarization-eval task 6.2)
+# --------------------------------------------------------------------------
+
+ONLINE_MANIFEST = """
+name: fixture-online
+license: "CC BY 4.0"
+parser: rttm_passthrough
+subset: true
+subset_files: [rec-a]
+subset_gate:
+  der: 12.0
+online_gate:
+  der_delta: 8.0
+  lag_p90: 6.0
+  flip_rate: 0.25
+"""
+
+
+def test_online_gate_bounds_load(tmp_path: Path) -> None:
+    write_manifest(tmp_path, "fixture-online", ONLINE_MANIFEST)
+    m = load_manifest("fixture-online", manifests_dir=tmp_path)
+    assert m.subset_gate == {"der": 12.0}
+    assert m.online_gate == {"der_delta": 8.0, "lag_p90": 6.0, "flip_rate": 0.25}
+
+
+def test_unknown_online_metric_is_rejected_by_name(tmp_path: Path) -> None:
+    write_manifest(
+        tmp_path,
+        "fixture-online",
+        ONLINE_MANIFEST.replace("  flip_rate: 0.25", "  labl_flip: 0.25"),
+    )
+    with pytest.raises(ManifestError, match="unknown metric 'labl_flip'"):
+        load_manifest("fixture-online", manifests_dir=tmp_path)
+
+
+def test_real_time_factor_cannot_be_gated(tmp_path: Path) -> None:
+    write_manifest(
+        tmp_path,
+        "fixture-online",
+        ONLINE_MANIFEST.replace("  flip_rate: 0.25", "  real_time_factor: 1.0"),
+    )
+    with pytest.raises(ManifestError, match="cannot be gated"):
+        load_manifest("fixture-online", manifests_dir=tmp_path)

@@ -27,6 +27,16 @@ use super::units::{OnlineClusterEmbeddings, SpeakerAssignment, SpeakerTurn};
 
 /// Receives VAD-filtered 16 kHz speech chunks and produces speaker
 /// assignments at recording stop. No-op while in the error state.
+/// One emission observed through the harness sink: the turn as the app would
+/// see it, plus whether the streaming pipeline considered it stable. The live
+/// path publishes only stable turns, so provisional ones are visible here and
+/// nowhere else (add-online-diarization-eval D4).
+#[derive(Debug, Clone)]
+pub struct EmittedTurn {
+    pub turn: SpeakerTurn,
+    pub stable: bool,
+}
+
 pub struct OnlineDiarizationProcessor {
     mode: DiarizationMode,
     max_speakers: usize,
@@ -42,6 +52,11 @@ pub struct OnlineDiarizationProcessor {
     model_tag: &'static str,
     engine: Option<Engine>,
     turn_sender: Option<UnboundedSender<SpeakerTurn>>,
+    /// Observation-only sink for *every* emission, stability flag included.
+    /// `None` on the production recording path, which is what keeps this hook
+    /// inert there: nothing branches on it and the app-facing sender, the
+    /// registry and the stop-time state are untouched by it.
+    emission_sink: Option<UnboundedSender<EmittedTurn>>,
     /// Shared live-recognition store (Fast mode). None in Efficient mode or
     /// when no registry prototypes were loaded.
     prototype_store: Option<Arc<RwLock<PrototypeStore>>>,
@@ -173,6 +188,7 @@ impl OnlineDiarizationProcessor {
             model_tag,
             engine: Some(engine),
             turn_sender,
+            emission_sink: None,
             prototype_store,
             attempted_mic: 0,
             attempted_sys: 0,
@@ -189,6 +205,14 @@ impl OnlineDiarizationProcessor {
 
     pub fn is_in_error_state(&self) -> bool {
         self.engine.is_none()
+    }
+
+    /// Attach an observation sink that receives every emission, provisional
+    /// ones included (developer harness only; the recording path never calls
+    /// this). Kept separate from construction so the production path cannot
+    /// acquire one by accident.
+    pub fn attach_emission_sink(&mut self, sink: UnboundedSender<EmittedTurn>) {
+        self.emission_sink = Some(sink);
     }
 
     /// Attach the session's live status counters. Kept separate from
@@ -260,6 +284,7 @@ impl OnlineDiarizationProcessor {
         // Capture live-emission state before borrowing the engine, so the
         // Fast-mode loop can send turns without conflicting borrows.
         let turn_sender = self.turn_sender.clone();
+        let emission_sink = self.emission_sink.clone();
         let prototype_store = self.prototype_store.clone();
         let mic_prefix = self.mic_prefix.as_str();
 
@@ -380,6 +405,28 @@ impl OnlineDiarizationProcessor {
                 match channel.pipeline.feed(&samples) {
                     Ok(turns) => {
                         for turn in turns {
+                            // Observation only: what the harness records for a
+                            // turn the live path drops as provisional. Built
+                            // before the stable branch so the branch itself is
+                            // unchanged, and only when a sink is attached.
+                            let provisional_event = match (&emission_sink, turn.stable) {
+                                (Some(_), false) => Some(SpeakerTurn {
+                                    start_time: channel.mapper.to_abs(turn.time.start),
+                                    end_time: channel.mapper.to_abs(turn.time.end),
+                                    speaker: format!("{}_{:02}", prefix, turn.speaker.0),
+                                    source_device: source_device.to_string(),
+                                    display_name: None,
+                                    matched_by: None,
+                                    match_score: None,
+                                }),
+                                _ => None,
+                            };
+                            if let (Some(sink), Some(event)) = (&emission_sink, provisional_event) {
+                                let _ = sink.send(EmittedTurn {
+                                    turn: event,
+                                    stable: false,
+                                });
+                            }
                             if turn.stable {
                                 let speaker_index = turn.speaker.0 as usize;
                                 let turn_start = turn.time.start as f32;
@@ -456,6 +503,12 @@ impl OnlineDiarizationProcessor {
                                         match_score: turn_event.match_score,
                                     },
                                 );
+                                if let Some(sink) = &emission_sink {
+                                    let _ = sink.send(EmittedTurn {
+                                        turn: turn_event.clone(),
+                                        stable: true,
+                                    });
+                                }
                                 if let Some(sender) = &turn_sender {
                                     if let Err(e) = sender.send(turn_event) {
                                         warn!("Failed to send online speaker turn: {}", e);
@@ -688,12 +741,20 @@ impl OnlineDiarizationProcessor {
 mod tests {
     use super::*;
 
+    /// One online processor may exist per process (the session guard), so the
+    /// tests that build one take this lock. Without it they would race and
+    /// their graceful "models unavailable" skip would swallow a guard error.
+    static PROCESSOR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 05 task 3.1 / D4: the session's clustering parameters are resolved once
     /// at construction, so a settings change mid-recording cannot split one
     /// session across two configurations. Needs the enhanced models to build a
     /// processor; skips when they are not installed.
     #[test]
     fn processor_holds_the_config_captured_at_construction() {
+        let _serial = PROCESSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::audio::diarization::{
             set_clustering_overrides, ClustererKindSetting, DiarizationConfig,
         };
@@ -744,5 +805,279 @@ mod tests {
             Some(saved.clusterer),
         );
         set_clustering_overrides(None, None, None, None);
+    }
+
+    /// A fixture with real speech, in 0.6 s chunks on one channel. Returns
+    /// `None` when neither an explicit `MEETILY_EVAL_WAV` nor the eval
+    /// dataset is present, so these tests skip rather than assert on silence.
+    fn speech_chunks(seconds: f64) -> Option<Vec<AudioChunk>> {
+        use crate::audio::recording_state::DeviceType;
+
+        let explicit = std::env::var("MEETILY_EVAL_WAV")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let path = explicit.or_else(|| {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()?
+                .parent()?
+                .join("eval/data/voxconverse-dev/wav");
+            std::fs::read_dir(dir)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+                .min()
+        })?;
+        let decoded = crate::audio::decoder::decode_audio_file(&path).ok()?;
+        let wanted = (decoded.sample_rate as f64 * seconds) as usize;
+        let samples: Vec<f32> = decoded.samples.into_iter().take(wanted).collect();
+        if samples.is_empty() {
+            return None;
+        }
+
+        let per_chunk = (decoded.sample_rate as f64 * 0.6) as usize;
+        Some(
+            samples
+                .chunks(per_chunk)
+                .enumerate()
+                .map(|(i, block)| AudioChunk {
+                    data: block.to_vec(),
+                    sample_rate: decoded.sample_rate,
+                    channels: 1,
+                    timestamp: i as f64 * 0.6,
+                    chunk_id: i as u64,
+                    device_type: DeviceType::Microphone,
+                })
+                .collect(),
+        )
+    }
+
+    /// Feed a fixture through a Fast-mode processor and return
+    /// `(app-facing turns, observed emissions)`. The sink is attached only
+    /// when `observe` is set, which is the production shape otherwise.
+    fn run_fast_session(
+        chunks: &[AudioChunk],
+        observe: bool,
+    ) -> Option<(Vec<SpeakerTurn>, Vec<EmittedTurn>)> {
+        let models_dir = crate::audio::diarization::resolve_models_dir_standalone(None).ok()?;
+        let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut processor = OnlineDiarizationProcessor::new(
+            DiarizationMode::Fast,
+            0,
+            false,
+            &models_dir,
+            Some(turn_tx),
+            None,
+        )
+        .ok()?;
+        if observe {
+            processor.attach_emission_sink(sink_tx);
+        }
+        for chunk in chunks {
+            processor.process_chunk(chunk.clone());
+        }
+        drop(processor);
+
+        let mut turns = Vec::new();
+        while let Ok(t) = turn_rx.try_recv() {
+            turns.push(t);
+        }
+        let mut observed = Vec::new();
+        while let Ok(e) = sink_rx.try_recv() {
+            observed.push(e);
+        }
+        Some((turns, observed))
+    }
+
+    fn turn_shape(turns: &[SpeakerTurn]) -> Vec<(String, i64, i64)> {
+        turns
+            .iter()
+            .map(|t| {
+                (
+                    t.speaker.clone(),
+                    (t.start_time * 1000.0) as i64,
+                    (t.end_time * 1000.0) as i64,
+                )
+            })
+            .collect()
+    }
+
+    /// add-online-diarization-eval task 1.1: attaching the observation sink
+    /// must not change what the app receives. The same fixture is run twice in
+    /// this process (the session guard releases on drop), once in the
+    /// production shape and once with the sink attached, and the app-facing
+    /// turn sequences must be identical.
+    #[test]
+    fn emission_sink_does_not_change_the_app_facing_turns() {
+        let _serial = PROCESSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(chunks) = speech_chunks(30.0) else {
+            eprintln!("skipping: no speech fixture (set MEETILY_EVAL_WAV)");
+            return;
+        };
+        let Some((without_sink, observed_none)) = run_fast_session(&chunks, false) else {
+            eprintln!("skipping: enhanced diarization models not installed");
+            return;
+        };
+        assert!(
+            observed_none.is_empty(),
+            "no sink attached: nothing may be observed"
+        );
+
+        let (with_sink, observed) =
+            run_fast_session(&chunks, true).expect("second session builds too");
+        assert_eq!(
+            turn_shape(&without_sink),
+            turn_shape(&with_sink),
+            "the app-facing turn stream must not depend on the observation sink"
+        );
+        assert!(
+            !observed.is_empty() || without_sink.is_empty(),
+            "with a sink attached, emissions must be observable whenever turns exist"
+        );
+        eprintln!(
+            "app-facing turns: {} (identical with and without the sink), observed emissions: {}",
+            with_sink.len(),
+            observed.len()
+        );
+    }
+
+    /// add-online-diarization-eval task 1.2: the sink sees provisional
+    /// emissions the app never receives, and the two streams differ only by
+    /// those entries.
+    #[test]
+    fn emission_sink_observes_provisional_turns() {
+        let _serial = PROCESSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(chunks) = speech_chunks(30.0) else {
+            eprintln!("skipping: no speech fixture (set MEETILY_EVAL_WAV)");
+            return;
+        };
+        let Some((app_turns, observed)) = run_fast_session(&chunks, true) else {
+            eprintln!("skipping: enhanced diarization models not installed");
+            return;
+        };
+        if observed.is_empty() {
+            eprintln!("skipping: the fixture produced no emissions");
+            return;
+        }
+
+        let stable: Vec<SpeakerTurn> = observed
+            .iter()
+            .filter(|e| e.stable)
+            .map(|e| e.turn.clone())
+            .collect();
+        assert_eq!(
+            turn_shape(&stable),
+            turn_shape(&app_turns),
+            "the stable emissions are exactly what the app receives, in order"
+        );
+        assert!(
+            observed.iter().filter(|e| !e.stable).all(|e| !e.stable),
+            "provisional entries carry stable = false"
+        );
+        let provisional = observed.iter().filter(|e| !e.stable).count();
+        assert_eq!(
+            observed.len() - stable.len(),
+            provisional,
+            "the two streams differ only by the provisional entries"
+        );
+        eprintln!(
+            "observed {} emissions: {} stable (= the app stream), {} provisional",
+            observed.len(),
+            stable.len(),
+            provisional
+        );
+    }
+
+    /// add-online-diarization-eval task 1.3: what a headless harness depends
+    /// on — an explicit models directory works, a missing model set fails with
+    /// a message naming the file it looked for, and the session guard refuses
+    /// a second processor in the same process.
+    #[test]
+    fn headless_construction_resolves_models_and_holds_the_guard() {
+        let _serial = PROCESSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // A directory with no enhanced models: the error names the file.
+        let empty = std::env::temp_dir().join("meetily-online-eval-no-models");
+        std::fs::create_dir_all(&empty).expect("temp dir");
+        let err = match OnlineDiarizationProcessor::new(
+            DiarizationMode::Fast,
+            0,
+            false,
+            &empty,
+            None,
+            None,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a directory without the enhanced models must not build"),
+        };
+        assert!(
+            err.contains("Enhanced diarization models not found")
+                && err.contains(
+                    crate::audio::embedder::enhanced_model_paths(&empty)
+                        .1
+                        .display()
+                        .to_string()
+                        .as_str()
+                ),
+            "the error must name the searched embedding model, got: {err}"
+        );
+
+        let Ok(models_dir) = crate::audio::diarization::resolve_models_dir_standalone(None) else {
+            eprintln!("skipping the rest: enhanced diarization models not installed");
+            return;
+        };
+
+        // An explicit models directory builds.
+        let first = match OnlineDiarizationProcessor::new(
+            DiarizationMode::Fast,
+            0,
+            false,
+            &models_dir,
+            None,
+            None,
+        ) {
+            Ok(p) => p,
+            Err(e) => panic!("explicit models directory must build: {e}"),
+        };
+
+        // The session guard admits only one at a time.
+        let second = OnlineDiarizationProcessor::new(
+            DiarizationMode::Fast,
+            0,
+            false,
+            &models_dir,
+            None,
+            None,
+        );
+        let guard_err = match second {
+            Err(err) => err,
+            Ok(_) => panic!("a second processor in one process must be refused"),
+        };
+        assert!(
+            guard_err.to_lowercase().contains("already"),
+            "the guard error must say a session is already running, got: {guard_err}"
+        );
+
+        // ...and the slot frees on drop, so a harness process can be reused.
+        drop(first);
+        assert!(
+            OnlineDiarizationProcessor::new(
+                DiarizationMode::Fast,
+                0,
+                false,
+                &models_dir,
+                None,
+                None,
+            )
+            .is_ok(),
+            "dropping the processor must release the session guard"
+        );
     }
 }
