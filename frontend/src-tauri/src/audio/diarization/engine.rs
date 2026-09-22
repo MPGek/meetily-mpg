@@ -491,6 +491,21 @@ impl DiarizationEngine {
             .await?;
         }
 
+        // Then name each row from its own audio, so a cluster that merged
+        // several voices cannot rename the rows whose own embeddings identify
+        // somebody else (per-row-speaker-recognition). This reads the raw
+        // per-chunk buffers the session retained, which cover the whole
+        // recording; a later re-match recomputes the same thing from the
+        // persisted exemplar cache.
+        let rows_named = super::persist::clusters::recognize_transcript_rows(
+            pool,
+            &meeting_id,
+            &session_data.mic_embeddings,
+            &session_data.sys_embeddings,
+            session_data.cluster_embeddings.saw_system_audio,
+        )
+        .await?;
+
         // Enroll session embeddings for user-assigned clusters (best-8 reparenting,
         // per-person cap). This covers live renames and post-stop manual bindings.
         let mut enrolled = 0usize;
@@ -625,10 +640,11 @@ impl DiarizationEngine {
         }
 
         info!(
-            "✅ Online session finalized for {}: {} live bindings, {} enrolled embeddings, {} expected speakers",
+            "✅ Online session finalized for {}: {} live bindings, {} enrolled embeddings, {} rows named from their own audio, {} expected speakers",
             meeting_id,
             session_data.live_bindings.len(),
             enrolled,
+            rows_named,
             session_data.expected_speaker_ids.len()
         );
 

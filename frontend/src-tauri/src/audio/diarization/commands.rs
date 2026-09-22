@@ -227,6 +227,17 @@ pub async fn rematch_meeting_speakers<R: Runtime>(
         }
     }
 
+    // The row-level automatic matches are refreshed in the same operation, so
+    // a cluster binding that just changed can never be outranked by a stale
+    // row-level name (per-row-speaker-recognition). Recomputed from the
+    // cached exemplars, so this still reads no audio.
+    let (cleared, rows_named) =
+        super::persist::clusters::refresh_transcript_row_matches(pool, &meeting_id).await?;
+    info!(
+        "Re-match for {}: {} cluster(s) reassigned, {} row-level name(s) cleared and {} recomputed from the cached exemplars",
+        meeting_id, matched, cleared, rows_named
+    );
+
     Ok(serde_json::json!({ "meeting_id": meeting_id, "matched": matched }))
 }
 

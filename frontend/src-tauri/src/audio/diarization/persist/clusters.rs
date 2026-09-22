@@ -1,10 +1,14 @@
 //! Persisting a session's clusters: per-cluster centroids and bounded exemplar
 //! caches, plus auto-recognition against enrolled prototypes.
 
-use super::super::identity::matching::{l2_normalize_in_place, Prototype};
+use super::super::identity::matching::{
+    best_match_with_threshold, l2_normalize_in_place, MatchResult, Prototype,
+};
 use super::super::core::cluster::SpeakerSegment;
 use super::super::core::timeline::find_best_speaker;
 use super::super::ClusteredEmbedding;
+use log::info;
+
 use crate::database::repositories::speaker::{Exemplar, SpeakerRepository};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -164,6 +168,24 @@ pub async fn persist_and_recognize_session(
         return Ok(());
     }
 
+    let prototypes = load_candidate_prototypes(pool, meeting_id).await?;
+
+    let mic_prefix = if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
+    persist_channel_clusters(pool, meeting_id, mic, mic_prefix, "mic", &prototypes).await?;
+    if is_stereo {
+        persist_channel_clusters(pool, meeting_id, sys, "SPEAKER", "system", &prototypes).await?;
+    }
+    Ok(())
+}
+
+/// The prototypes a meeting's recognition may match against: the meeting's
+/// expected speakers, or every speaker when no allowlist was set. Shared by
+/// the per-cluster and the per-row pass so a row and its cluster are always
+/// judged against the same candidates.
+async fn load_candidate_prototypes(
+    pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<Vec<Prototype>, String> {
     let expected = SpeakerRepository::get_expected_speakers(pool, meeting_id)
         .await
         .map_err(|e| format!("Failed to load expected speakers: {}", e))?;
@@ -172,7 +194,7 @@ pub async fn persist_and_recognize_session(
     } else {
         Some(&expected)
     };
-    let prototypes: Vec<Prototype> = SpeakerRepository::load_prototypes(
+    Ok(SpeakerRepository::load_prototypes(
         pool,
         candidates,
         crate::audio::embedder::ENHANCED_MODEL_TAG,
@@ -181,14 +203,138 @@ pub async fn persist_and_recognize_session(
     .map_err(|e| format!("Failed to load prototypes: {}", e))?
     .into_iter()
     .map(Prototype::from)
-    .collect();
+    .collect())
+}
 
-    let mic_prefix = if is_stereo { "MIC_SPEAKER" } else { "SPEAKER" };
-    persist_channel_clusters(pool, meeting_id, mic, mic_prefix, "mic", &prototypes).await?;
-    if is_stereo {
-        persist_channel_clusters(pool, meeting_id, sys, "SPEAKER", "system", &prototypes).await?;
+/// Name each transcript row of a live session from the embeddings that belong
+/// to that row, not from its cluster's centroid
+/// (per-row-speaker-recognition).
+///
+/// A live session's clustering can merge several people into one cluster, and
+/// one match per cluster then renames every row it covers. This pass matches
+/// each row against the same candidate prototypes, using only the session
+/// embeddings whose window overlaps the row and whose channel is the row's
+/// own, at the same threshold. Display resolution prefers the result over the
+/// cluster binding, and never over a user decision.
+///
+/// Rows with no overlapping embedding, and rows whose best candidate stays
+/// below the threshold, are left without a row-level match so they keep
+/// resolving through their cluster. Nothing else about the row, the cluster or
+/// its caches is touched. Returns how many rows were given a match.
+pub(crate) async fn recognize_transcript_rows(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    mic_embeddings: &[(f32, f32, Vec<f32>)],
+    sys_embeddings: &[(f32, f32, Vec<f32>)],
+    saw_system_audio: bool,
+) -> Result<usize, String> {
+    if mic_embeddings.is_empty() && sys_embeddings.is_empty() {
+        return Ok(0);
     }
-    Ok(())
+    let prototypes = load_candidate_prototypes(pool, meeting_id).await?;
+    if prototypes.is_empty() {
+        return Ok(0);
+    }
+
+    let rows = SpeakerRepository::list_transcript_windows(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to list transcript windows: {}", e))?;
+    let threshold = crate::audio::embedder::TITANET_RECOGNITION_THRESHOLD;
+    let mut matched = 0usize;
+
+    for (id, start, end, source_device) in rows {
+        let (Some(start), Some(end)) = (start, end) else {
+            continue;
+        };
+        // Same channel rule the stop-time assignment uses: a system row only
+        // exists when the session captured system audio.
+        let is_system = saw_system_audio && source_device.as_deref() == Some("System");
+        let (embeddings, channel) = if is_system {
+            (sys_embeddings, "system")
+        } else {
+            (mic_embeddings, "mic")
+        };
+
+        let mut best: Option<MatchResult> = None;
+        for (emb_start, emb_end, embedding) in embeddings {
+            let overlap = end.min(*emb_end as f64) - start.max(*emb_start as f64);
+            if overlap <= 0.0 {
+                continue;
+            }
+            if let Some(candidate) =
+                best_match_with_threshold(embedding, Some(channel), &prototypes, threshold)
+            {
+                let better = match &best {
+                    Some(previous) => candidate.score > previous.score,
+                    None => true,
+                };
+                if better {
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        if let Some(m) = best {
+            if SpeakerRepository::set_transcript_auto_match(
+                pool,
+                &id,
+                &m.speaker_id,
+                m.score as f64,
+            )
+            .await
+            .map_err(|e| format!("Failed to record the row speaker match: {}", e))?
+            {
+                matched += 1;
+            }
+        }
+    }
+
+    if matched > 0 {
+        info!(
+            "Row-level recognition named {} of the meeting's transcript rows from their own audio",
+            matched
+        );
+    }
+    Ok(matched)
+}
+
+/// Refresh a meeting's row-level automatic matches from its persisted
+/// exemplar cache, under whatever candidate set applies now
+/// (per-row-speaker-recognition, design D1).
+///
+/// Every existing row-level match is cleared first, so this is a refresh and
+/// not an accumulation: a row the current candidates no longer support goes
+/// back to resolving through its cluster, and a cluster binding that just
+/// changed can never be outranked by a stale row name. Reads only cached
+/// embeddings, never audio. Returns (cleared, recomputed).
+pub(crate) async fn refresh_transcript_row_matches(
+    pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<(u64, usize), String> {
+    let cleared = SpeakerRepository::clear_meeting_auto_matches(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to clear row speaker matches: {}", e))?;
+    let cached = SpeakerRepository::list_meeting_cached_embeddings(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load cached embeddings: {}", e))?;
+    let (sys_cached, mic_cached): (Vec<_>, Vec<_>) = cached
+        .into_iter()
+        .partition(|(_, _, _, channel)| channel == "system");
+    let strip = |v: Vec<(f32, f32, Vec<f32>, String)>| -> Vec<(f32, f32, Vec<f32>)> {
+        v.into_iter()
+            .map(|(start, end, embedding, _)| (start, end, embedding))
+            .collect()
+    };
+    let saw_system_audio = !sys_cached.is_empty();
+    let recomputed = recognize_transcript_rows(
+        pool,
+        meeting_id,
+        &strip(mic_cached),
+        &strip(sys_cached),
+        saw_system_audio,
+    )
+    .await?;
+    Ok((cleared, recomputed))
 }
 
 /// Maximum exemplar cache rows persisted per cluster (top by duration).
@@ -199,6 +345,491 @@ pub(crate) const MAX_CLUSTER_CACHE_EXEMPLARS: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::models::embedding_to_bytes;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    /// A 192-d embedding pointing at one axis, so two speakers' prototypes are
+    /// orthogonal and a query matches exactly one of them.
+    fn axis(index: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 192];
+        v[index] = 1.0;
+        v
+    }
+
+    async fn enroll(pool: &SqlitePool, speaker_id: &str, name: &str, channel: &str, emb: &[f32]) {
+        sqlx::query("INSERT INTO speakers (id, name, created_at, updated_at) VALUES (?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .bind(speaker_id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, created_at)
+             VALUES (?, ?, 'titanet_large', ?, 2.0, ?, '2026-01-01T00:00:00Z')",
+        )
+        .bind(format!("proto-{speaker_id}"))
+        .bind(embedding_to_bytes(emb))
+        .bind(channel)
+        .bind(speaker_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// per-row-speaker-recognition 2.1: a row whose own audio identifies
+    /// somebody else keeps that identity, and the cluster it belongs to is
+    /// left exactly as recognition left it.
+    #[tokio::test]
+    async fn row_is_named_from_its_own_audio_without_touching_the_cluster() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        enroll(&pool, "spk-greg", "Greg", "system", &axis(0)).await;
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+
+        // Two rows of the same merged cluster: one covered by Alex's voice,
+        // one with no embedding of its own.
+        for (id, start, end) in [("t-alex", 10.0, 12.0), ("t-uncovered", 40.0, 41.0)] {
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, audio_start_time, audio_end_time, source_device)
+                 VALUES (?, 'm1', 'text', '2026-01-01T00:00:00Z', 'SPEAKER_00', ?, ?, 'System')",
+            )
+            .bind(id)
+            .bind(start)
+            .bind(end)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // The cluster was auto-bound to Greg, as a merged cluster's centroid would be.
+        sqlx::query("INSERT INTO meeting_speakers (meeting_id, cluster_label, speaker_id, channel, matched_by, match_score) VALUES ('m1', 'SPEAKER_00', 'spk-greg', 'system', 'auto', 0.86)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let named = recognize_transcript_rows(&pool, "m1", &[], &[(10.5, 11.5, axis(1))], true)
+            .await
+            .expect("row recognition runs");
+        assert_eq!(named, 1, "only the covered row can be named");
+
+        let (auto_id, score): (Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT speaker_auto_id, speaker_auto_score FROM transcripts WHERE id = 't-alex'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(auto_id.as_deref(), Some("spk-alex"));
+        assert!(score.unwrap() > 0.9, "an exact prototype match scores high");
+
+        let uncovered: Option<String> =
+            sqlx::query_scalar("SELECT speaker_auto_id FROM transcripts WHERE id = 't-uncovered'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(uncovered, None, "a row with no overlapping embedding keeps resolving via its cluster");
+
+        let cluster: (String, String, f64) = sqlx::query_as(
+            "SELECT speaker_id, matched_by, match_score FROM meeting_speakers WHERE meeting_id = 'm1' AND cluster_label = 'SPEAKER_00'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cluster,
+            ("spk-greg".to_string(), "auto".to_string(), 0.86),
+            "the cluster binding must be untouched by the row-level pass"
+        );
+    }
+
+    /// A row is named only from its own channel's evidence: a system row must
+    /// not be named by a microphone-channel embedding, which is how the
+    /// stop-time assignment keeps the two voices apart. (Prototype *channel*
+    /// is a preference in the shared matcher, not a filter; what this pass
+    /// controls is which side's embeddings a row may be matched against.)
+    #[tokio::test]
+    async fn row_is_named_only_from_its_own_channel_evidence() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, audio_start_time, audio_end_time, source_device)
+             VALUES ('t1', 'm1', 'text', '2026-01-01T00:00:00Z', 'SPEAKER_00', 10.0, 12.0, 'System')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The overlapping embedding sits on the microphone side, so this
+        // system row has no evidence of its own.
+        let named = recognize_transcript_rows(&pool, "m1", &[(10.5, 11.5, axis(1))], &[], true)
+            .await
+            .unwrap();
+        assert_eq!(named, 0, "a system row must not be named from mic audio");
+        let auto_id: Option<String> =
+            sqlx::query_scalar("SELECT speaker_auto_id FROM transcripts WHERE id = 't1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(auto_id, None);
+
+        // The same embedding on the system side does name it.
+        let named = recognize_transcript_rows(&pool, "m1", &[], &[(10.5, 11.5, axis(1))], true)
+            .await
+            .unwrap();
+        assert_eq!(named, 1);
+    }
+
+    /// per-row-speaker-recognition 4.1: a re-match refreshes the row-level
+    /// names from the cached exemplars under the candidates that apply now,
+    /// drops the ones those candidates no longer support, and leaves every
+    /// user decision alone.
+    #[tokio::test]
+    async fn rematch_refresh_clears_unsupported_rows_and_spares_user_decisions() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+        enroll(&pool, "spk-bob", "Bob", "system", &axis(2)).await;
+
+        // Three rows of one cluster: one covered by Alex's voice, one the user
+        // overrode, and one belonging to a cluster the user bound.
+        for (id, start, end, cluster, override_id) in [
+            ("t-alex", 10.0, 12.0, "SPEAKER_00", None),
+            ("t-user", 20.0, 22.0, "SPEAKER_00", Some("spk-bob")),
+            ("t-bound", 30.0, 32.0, "SPEAKER_01", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, source_device, audio_start_time, audio_end_time, speaker_override_id)
+                 VALUES (?, 'm1', 'text', '2026-01-01T00:00:00Z', ?, 'System', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(cluster)
+            .bind(start)
+            .bind(end)
+            .bind(override_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO meeting_speakers (meeting_id, cluster_label, speaker_id, channel, matched_by, match_score) VALUES ('m1', 'SPEAKER_01', 'spk-bob', 'system', 'user', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The meeting's cached exemplars: Alex's voice over the first row, and
+        // an unknown voice over the third.
+        for (id, start, end, emb) in [
+            ("cache-1", 10.5, 11.5, axis(1)),
+            ("cache-2", 30.5, 31.5, axis(7)),
+        ] {
+            sqlx::query(
+                "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at)
+                 VALUES (?, ?, 'titanet_large', 'system', 1.0, 'm1', 'SPEAKER_00', ?, ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(embedding_to_bytes(&emb))
+            .bind(start)
+            .bind(end)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let (cleared, recomputed) = refresh_transcript_row_matches(&pool, "m1")
+            .await
+            .expect("refresh runs");
+        assert_eq!(cleared, 0, "nothing to clear on the first refresh");
+        assert_eq!(recomputed, 1, "only the row covered by a known voice is named");
+        let named: Option<String> =
+            sqlx::query_scalar("SELECT speaker_auto_id FROM transcripts WHERE id = 't-alex'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(named.as_deref(), Some("spk-alex"));
+
+        // Alex leaves the expected-speaker allowlist, so his prototypes are no
+        // longer candidates: the refresh must drop the name it gave that row.
+        sqlx::query("INSERT INTO meeting_expected_speakers (meeting_id, speaker_id) VALUES ('m1', 'spk-bob')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (cleared, recomputed) = refresh_transcript_row_matches(&pool, "m1")
+            .await
+            .expect("refresh runs again");
+        assert_eq!(cleared, 1, "the stale row-level name is cleared");
+        assert_eq!(recomputed, 0, "and nothing supports a new one");
+        let named: Option<String> =
+            sqlx::query_scalar("SELECT speaker_auto_id FROM transcripts WHERE id = 't-alex'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(named, None, "the row resolves through its cluster again");
+
+        // The user's decisions are untouched throughout.
+        let override_id: Option<String> =
+            sqlx::query_scalar("SELECT speaker_override_id FROM transcripts WHERE id = 't-user'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(override_id.as_deref(), Some("spk-bob"));
+        let bound: (String, String) = sqlx::query_as(
+            "SELECT speaker_id, matched_by FROM meeting_speakers WHERE meeting_id = 'm1' AND cluster_label = 'SPEAKER_01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bound, ("spk-bob".to_string(), "user".to_string()));
+    }
+
+    /// Manual verification harness for per-row-speaker-recognition 5.1: run
+    /// the shipped refresh against a real meeting and print what a user would
+    /// see before and after. Gated on `MEETILY_VERIFY_DB` (a *copy* of a
+    /// database — this writes to it) plus `MEETILY_VERIFY_MEETING`, so it
+    /// skips everywhere else. Asserts only what must hold on any data; the
+    /// meeting-specific numbers are recorded in the change's tasks file.
+    #[tokio::test]
+    async fn verify_row_matches_on_a_real_meeting() {
+        let (Ok(db), Ok(meeting_id)) = (
+            std::env::var("MEETILY_VERIFY_DB"),
+            std::env::var("MEETILY_VERIFY_MEETING"),
+        ) else {
+            eprintln!("skipping: set MEETILY_VERIFY_DB (a copy!) and MEETILY_VERIFY_MEETING");
+            return;
+        };
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{db}"))
+            .await
+            .expect("open the database copy");
+        // The copy comes from a database the app has not migrated yet, so
+        // bring it to the current schema exactly as the app would on start.
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrate the database copy");
+
+        // The real projection, not a copy of it, so this measures what a
+        // surface would actually render.
+        let display = |pool: SqlitePool, meeting_id: String| async move {
+            sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&format!(
+                "SELECT id, speaker_label, speaker_matched_by FROM ({})                  WHERE meeting_id = ? ORDER BY audio_start_time",
+                crate::database::repositories::meeting::TRANSCRIPT_DISPLAY_SELECT
+            ))
+            .bind(meeting_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+
+        let before = display(pool.clone(), meeting_id.clone()).await;
+        let overrides_before: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, speaker_override_id FROM transcripts WHERE meeting_id = ? ORDER BY id",
+        )
+        .bind(&meeting_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let (cleared, named) = refresh_transcript_row_matches(&pool, &meeting_id)
+            .await
+            .expect("refresh runs on the real meeting");
+        let after = display(pool.clone(), meeting_id.clone()).await;
+
+        let rows = before.len();
+        let changed: Vec<(&str, &str, &str)> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(b, a)| b.1 != a.1)
+            .map(|(b, a)| {
+                (
+                    b.0.as_str(),
+                    b.1.as_deref().unwrap_or("<none>"),
+                    a.1.as_deref().unwrap_or("<none>"),
+                )
+            })
+            .collect();
+        let mut moves: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (_, from, to) in &changed {
+            *moves.entry(format!("{from} -> {to}")).or_default() += 1;
+        }
+        let mut moves: Vec<_> = moves.into_iter().collect();
+        moves.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        eprintln!("rows: {rows}, cleared: {cleared}, named from their own audio: {named}");
+        eprintln!("rows whose displayed name changed: {}", changed.len());
+        for (mv, n) in &moves {
+            eprintln!("  {mv}: {n} row(s)");
+        }
+
+        // Invariants that must hold on any data.
+        let overrides_after: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, speaker_override_id FROM transcripts WHERE meeting_id = ? ORDER BY id",
+        )
+        .bind(&meeting_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            overrides_before, overrides_after,
+            "a refresh must never touch a user override"
+        );
+        assert!(named <= rows, "cannot name more rows than the meeting has");
+        for (b, a) in before.iter().zip(after.iter()) {
+            if b.2.as_deref() == Some("user") {
+                assert_eq!(b.1, a.1, "a user-provenance row changed name");
+            }
+        }
+
+        // 5.2: a user's decisions outrank the row-level names on this very
+        // data. Override the first row whose name the refresh changed, and
+        // confirm its cluster as correct, then re-run the refresh.
+        if let Some((row_id, _, _)) = changed.first().map(|(id, f, t)| (id.to_string(), f, t)) {
+            let cluster: String =
+                sqlx::query_scalar("SELECT speaker FROM transcripts WHERE id = ?")
+                    .bind(&row_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let user_speaker: String =
+                sqlx::query_scalar("SELECT id FROM speakers ORDER BY name LIMIT 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            sqlx::query("UPDATE transcripts SET speaker_override_id = ? WHERE id = ?")
+                .bind(&user_speaker)
+                .bind(&row_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE meeting_speakers SET matched_by = 'user' WHERE meeting_id = ? AND cluster_label = ?")
+                .bind(&meeting_id)
+                .bind(&cluster)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let (_, _) = refresh_transcript_row_matches(&pool, &meeting_id)
+                .await
+                .expect("refresh runs after the user decided");
+            let with_user = display(pool.clone(), meeting_id.clone()).await;
+
+            let user_name: String = sqlx::query_scalar("SELECT name FROM speakers WHERE id = ?")
+                .bind(&user_speaker)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let overridden = with_user.iter().find(|(id, _, _)| id == &row_id).unwrap();
+            assert_eq!(
+                (overridden.1.as_deref(), overridden.2.as_deref()),
+                (Some(user_name.as_str()), Some("user")),
+                "the overridden row must show the user's name"
+            );
+
+            let cluster_rows: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM transcripts WHERE meeting_id = ? AND speaker = ?",
+            )
+            .bind(&meeting_id)
+            .bind(&cluster)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let confirmed_name: Option<String> = sqlx::query_scalar(
+                "SELECT s.name FROM meeting_speakers ms JOIN speakers s ON s.id = ms.speaker_id
+                 WHERE ms.meeting_id = ? AND ms.cluster_label = ?",
+            )
+            .bind(&meeting_id)
+            .bind(&cluster)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let mut checked = 0usize;
+            for (id, name, provenance) in &with_user {
+                if !cluster_rows.contains(id) || id == &row_id {
+                    continue;
+                }
+                assert_eq!(
+                    (name.as_deref(), provenance.as_deref()),
+                    (confirmed_name.as_deref(), Some("user")),
+                    "row {id} of the confirmed cluster must show the confirmed name"
+                );
+                checked += 1;
+            }
+            eprintln!(
+                "user decisions: 1 overridden row + {checked} row(s) of the confirmed cluster {cluster} all show the user's names"
+            );
+        }
+
+    }
+
+    /// per-row-speaker-recognition 2.3: the offline pass persists clusters
+    /// and nothing else. The batch orchestrator calls only this function, so a
+    /// meeting diarized offline must come out with no row-level match at all.
+    #[tokio::test]
+    async fn the_batch_persistence_path_records_no_row_level_match() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        enroll(&pool, "spk-alex", "Alex", "mic", &axis(1)).await;
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, audio_start_time, audio_end_time, source_device)
+             VALUES ('t1', 'm1', 'text', '2026-01-01T00:00:00Z', 'SPEAKER_00', 10.0, 12.0, 'Microphone')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // What the offline orchestrator hands over: clustered embeddings only.
+        let mic = vec![ClusteredEmbedding {
+            speaker: 0,
+            embedding: axis(1),
+            duration_secs: 2.0,
+            start_secs: Some(10.5),
+            end_secs: Some(11.5),
+        }];
+        persist_and_recognize_session(&pool, "m1", &mic, &[], false)
+            .await
+            .expect("offline persistence runs");
+
+        // The cluster is recognized, as before this change ...
+        let bound: Option<String> = sqlx::query_scalar(
+            "SELECT speaker_id FROM meeting_speakers WHERE meeting_id = 'm1' AND cluster_label = 'SPEAKER_00'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(bound.as_deref(), Some("spk-alex"));
+        // ... and no row carries a row-level match.
+        let rows_with_match: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM transcripts WHERE meeting_id = 'm1' AND speaker_auto_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows_with_match, 0);
+    }
 
     /// Four buffered chunks against three turns. The last two chunks are what
     /// separates the two labelings: position 2 maps the 40 s chunk onto turn 2,

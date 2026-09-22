@@ -1503,6 +1503,47 @@ impl SpeakerRepository {
         Ok(rows.rows_affected() > 0)
     }
 
+    /// Record the row-level automatic speaker match on one transcript
+    /// (per-row-speaker-recognition). Writes ONLY that row's two recognition
+    /// columns: the cluster label, the cluster's own binding, any user
+    /// override and the manual `speaker_label` are all left alone, because
+    /// this level sits below a user decision and above the cluster binding at
+    /// display time. Returns false when the transcript does not exist.
+    pub async fn set_transcript_auto_match(
+        pool: &SqlitePool,
+        transcript_id: &str,
+        speaker_id: &str,
+        score: f64,
+    ) -> Result<bool, SqlxError> {
+        let rows = sqlx::query(
+            "UPDATE transcripts SET speaker_auto_id = ?, speaker_auto_score = ? WHERE id = ?",
+        )
+        .bind(speaker_id)
+        .bind(score)
+        .bind(transcript_id)
+        .execute(pool)
+        .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
+    /// Drop every row-level automatic match of a meeting, so its rows resolve
+    /// through their cluster again. Used before a re-match recomputes them:
+    /// clearing first is what stops a stale row-level name from outranking a
+    /// freshly refreshed cluster binding. User overrides are untouched.
+    pub async fn clear_meeting_auto_matches(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<u64, SqlxError> {
+        let rows = sqlx::query(
+            "UPDATE transcripts SET speaker_auto_id = NULL, speaker_auto_score = NULL
+             WHERE meeting_id = ? AND speaker_auto_id IS NOT NULL",
+        )
+        .bind(meeting_id)
+        .execute(pool)
+        .await?;
+        Ok(rows.rows_affected())
+    }
+
     /// Read the transcript's meeting id + cluster label, needed by the
     /// "apply to all blocks of this speaker" route to reuse the cluster-wide
     /// assignment path. Returns None when the transcript does not exist.
@@ -1531,6 +1572,58 @@ impl SpeakerRepository {
         )
         .bind(transcript_id)
         .fetch_optional(pool)
+        .await
+    }
+
+    /// A meeting's own cached cluster embeddings that carry a time window, as
+    /// `(start_secs, end_secs, embedding, channel)`. These are the unassigned
+    /// cache rows (`speaker_id IS NULL`) written when the session was
+    /// persisted, which is what lets a later re-match recompute the row-level
+    /// matches without reading audio (per-row-speaker-recognition, design D1).
+    /// Enhanced family only, in line with every other matching path.
+    pub async fn list_meeting_cached_embeddings(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Vec<(f32, f32, Vec<f32>, String)>, SqlxError> {
+        let rows: Vec<(f64, f64, Vec<u8>, Option<String>)> = sqlx::query_as(
+            "SELECT audio_start_time, audio_end_time, embedding, channel
+             FROM speaker_embeddings
+             WHERE meeting_id = ? AND speaker_id IS NULL AND model = ?
+               AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
+             ORDER BY audio_start_time",
+        )
+        .bind(meeting_id)
+        .bind(crate::audio::embedder::ENHANCED_MODEL_TAG)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(start, end, blob, channel)| {
+                (
+                    start as f32,
+                    end as f32,
+                    bytes_to_embedding(&blob),
+                    channel.unwrap_or_else(|| "mic".to_string()),
+                )
+            })
+            .collect())
+    }
+
+    /// Every transcript row of a meeting with its time window and source
+    /// device, ordered by start time, for the row-level recognition pass
+    /// (per-row-speaker-recognition). Returns (id, start, end, source_device);
+    /// a row with no time window is returned too, and the caller skips it
+    /// because there is nothing to overlap against.
+    pub async fn list_transcript_windows(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Vec<(String, Option<f64>, Option<f64>, Option<String>)>, SqlxError> {
+        sqlx::query_as::<_, (String, Option<f64>, Option<f64>, Option<String>)>(
+            "SELECT id, audio_start_time, audio_end_time, source_device FROM transcripts
+             WHERE meeting_id = ? ORDER BY audio_start_time, id",
+        )
+        .bind(meeting_id)
+        .fetch_all(pool)
         .await
     }
 
@@ -2037,6 +2130,89 @@ mod tests {
 
         let stats = SpeakerRepository::storage_stats(&pool).await.unwrap();
         assert_eq!(stats.prototype_count, 0);
+    }
+
+    /// per-row-speaker-recognition 1.2: the row-level match is its own
+    /// channel. Writing and clearing it must leave every other speaker column
+    /// of that row exactly as it was, because those columns carry the user's
+    /// decisions and the cluster's identity.
+    #[tokio::test]
+    async fn row_level_match_write_and_clear_touch_nothing_else() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        insert_transcript_window(&pool, "t1", "m1", Some("SPEAKER_00"), 0.0, 2.0, "System").await;
+        sqlx::query("UPDATE transcripts SET speaker_label = 'manual', speaker_override_id = 'spk-user' WHERE id = 't1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let before: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT speaker, speaker_label, speaker_override_id FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            SpeakerRepository::set_transcript_auto_match(&pool, "t1", "spk-auto", 0.74)
+                .await
+                .unwrap()
+        );
+        let (auto_id, auto_score): (Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT speaker_auto_id, speaker_auto_score FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(auto_id.as_deref(), Some("spk-auto"));
+        assert_eq!(auto_score, Some(0.74));
+
+        let after_write: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT speaker, speaker_label, speaker_override_id FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after_write, "writing the row match changed another column");
+
+        // A row with no match is not reported as cleared, and clearing a
+        // meeting leaves the other columns alone too.
+        assert_eq!(
+            SpeakerRepository::clear_meeting_auto_matches(&pool, "m1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            SpeakerRepository::clear_meeting_auto_matches(&pool, "m1")
+                .await
+                .unwrap(),
+            0,
+            "clearing twice must report nothing left to clear"
+        );
+        let (auto_id, auto_score): (Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT speaker_auto_id, speaker_auto_score FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(auto_id, None);
+        assert_eq!(auto_score, None);
+
+        let after_clear: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT speaker, speaker_label, speaker_override_id FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after_clear, "clearing the row match changed another column");
+
+        // A transcript that does not exist is reported, not silently ignored.
+        assert!(
+            !SpeakerRepository::set_transcript_auto_match(&pool, "nope", "spk-auto", 0.9)
+                .await
+                .unwrap()
+        );
     }
 
     async fn insert_transcript_window(
