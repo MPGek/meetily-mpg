@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: End-of-meeting speaker refinement
-At recording stop, before final speaker labels are written, the system SHALL re-derive the session's speaker timeline by clustering the session's buffered per-channel speech embeddings with the same clustering behavior and the same resolved parameters the offline path uses, rather than accepting the incremental speaker identities produced while recording. The refinement SHALL run per channel, SHALL keep microphone and system embeddings separate, and SHALL produce the same channel-scoped label scheme as before. When a channel has too few buffered embeddings to cluster, or the refinement fails, the system SHALL fall back to the incremental identities and record that it did so, rather than failing the stop.
+At recording stop, before final speaker labels are written, the system SHALL re-derive the session's speaker timeline by clustering the session's buffered per-channel speech embeddings with the same clustering behavior the offline path uses, the resolved clusterer kind and speaker-count ceiling, and a merge threshold calibrated for per-chunk embeddings (a threshold the user stored takes precedence), rather than accepting the incremental speaker identities produced while recording. The refinement SHALL run per channel, SHALL keep microphone and system embeddings separate, and SHALL produce the same channel-scoped label scheme as before. When a channel has too few buffered embeddings to cluster, or the refinement fails, the system SHALL fall back to the incremental identities and record that it did so, rather than failing the stop.
 
 #### Scenario: Two voices merged live are separated at stop
 - **WHEN** a session's incremental identities assigned one label to speech that the refinement clusters into two
@@ -12,6 +12,10 @@ At recording stop, before final speaker labels are written, the system SHALL re-
 #### Scenario: Refinement obeys the resolved parameters
 - **WHEN** the refinement runs with a stored clusterer kind, merge threshold, and speaker-count ceiling
 - **THEN** it SHALL use those resolved values and SHALL NOT exceed the effective ceiling for a channel
+
+#### Scenario: Refinement has its own default merge threshold
+- **WHEN** the refinement runs and the user has stored no merge threshold
+- **THEN** it SHALL use the merge threshold calibrated for per-chunk embeddings and SHALL NOT use the offline default, which was calibrated for dense fixed-length windows
 
 #### Scenario: Channels stay isolated
 - **WHEN** the refinement runs on a session that captured both microphone and system audio
@@ -26,7 +30,7 @@ A speaker label displayed during recording SHALL be treated as provisional, and 
 
 #### Scenario: Provisional label promoted unchanged
 - **WHEN** the refinement agrees with the label already displayed for a block
-- **THEN** the block SHALL be marked final with the same speaker, and no revision that changes its displayed name SHALL be emitted
+- **THEN** the block's displayed speaker SHALL stand as final (a block still undecided at stop is confirmed with a final revision carrying the same speaker; a block already resolved is left as displayed), and no revision that changes its displayed name SHALL be emitted
 
 #### Scenario: Changed cluster produces a final revision
 - **WHEN** the refinement assigns a different speaker to a block than the one displayed live

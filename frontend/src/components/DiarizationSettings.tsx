@@ -97,6 +97,14 @@ export function DiarizationSettings() {
   const [clusterThreshold, setClusterThreshold] = useState<number>(() =>
     loadClusteringSettings().clusterThreshold ?? 0.6
   );
+  // Unset means the backend default, which is on.
+  const [finalRecluster, setFinalRecluster] = useState<boolean>(() =>
+    loadClusteringSettings().finalReclusterEnabled ?? true
+  );
+  // Unset means the backend default, which is off.
+  const [finalRelabelAll, setFinalRelabelAll] = useState<boolean>(() =>
+    loadClusteringSettings().finalRelabelAll ?? false
+  );
 
   const mountedRef = useRef(false);
 
@@ -274,6 +282,51 @@ export function DiarizationSettings() {
             className="w-32"
           />
         </div>
+      </div>
+
+      {/* Live speaker refinement at stop (05b D1) */}
+      <div className="flex items-center justify-between">
+        <div>
+          <Label className="text-sm font-medium text-gray-900">
+            Refine speakers when recording stops
+          </Label>
+          <p className="text-xs text-gray-500">
+            Re-groups the meeting&apos;s voices once the recording ends, so speakers that were
+            merged while listening can still be told apart. Fast mode only; turning it off keeps
+            the labels exactly as they appeared live.
+          </p>
+        </div>
+        <Switch
+          checked={finalRecluster}
+          disabled={!enabled || diarizationMode !== "fast"}
+          onCheckedChange={(checked) => {
+            setFinalRecluster(checked);
+            saveClusteringSettings({ finalReclusterEnabled: checked });
+            syncClusteringSettingsToBackend();
+          }}
+        />
+      </div>
+
+      {/* Wholesale final relabel (05b D2), opt-in */}
+      <div className="flex items-center justify-between">
+        <div>
+          <Label className="text-sm font-medium text-gray-900">
+            Redraw every line after refining
+          </Label>
+          <p className="text-xs text-gray-500">
+            By default only the lines whose speaker actually changed are updated when the
+            recording stops. Turn this on to have every line redrawn instead.
+          </p>
+        </div>
+        <Switch
+          checked={finalRelabelAll}
+          disabled={!enabled || diarizationMode !== "fast" || !finalRecluster}
+          onCheckedChange={(checked) => {
+            setFinalRelabelAll(checked);
+            saveClusteringSettings({ finalRelabelAll: checked });
+            syncClusteringSettingsToBackend();
+          }}
+        />
       </div>
 
       {/* Enhanced model set - read-only, bundled at build time */}

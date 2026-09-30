@@ -80,6 +80,30 @@ pub(crate) struct TurnOverride {
 // applies them to the meeting's transcripts after the meeting row exists.
 pub(crate) static ONLINE_TURN_OVERRIDES: Mutex<Vec<TurnOverride>> = Mutex::new(Vec::new());
 
+/// The per-turn overrides recorded so far, as display-side protected windows
+/// (05b 3.3). Read-only: `finalize_online_session` remains the one place that
+/// consumes and clears them.
+pub(crate) fn live_turn_override_windows(
+    saw_system_audio: bool,
+) -> Vec<super::streaming::reconcile::ProtectedWindow> {
+    ONLINE_TURN_OVERRIDES
+        .lock_or_recover()
+        .iter()
+        .map(|o| super::streaming::reconcile::ProtectedWindow {
+            // Same channel rule the binding path uses: `MIC_SPEAKER_` is
+            // always the microphone, and a bare `SPEAKER_` is the system
+            // channel only in a session that captured one.
+            source_device: if !o.cluster_label.starts_with("MIC_SPEAKER_") && saw_system_audio {
+                "System".to_string()
+            } else {
+                "Microphone".to_string()
+            },
+            start: o.start_secs,
+            end: o.end_secs,
+        })
+        .collect()
+}
+
 /// What a live session needs to start. Fixed for the whole session: a
 /// mid-recording settings change must not split it (05 D4).
 pub struct LiveSessionConfig {
@@ -263,7 +287,8 @@ impl DiarizationEngine {
     /// `None` when no session was active or the processor never became
     /// available; every failure mode is logged, never surfaced as an error,
     /// exactly as at the call site this came from.
-    pub async fn finalize_session(
+    pub async fn finalize_session<R: Runtime>(
+        app: &tauri::AppHandle<R>,
         transcripts: Option<Vec<TranscriptSegment>>,
         meeting_folder: Option<PathBuf>,
     ) -> Option<Vec<SpeakerAssignment>> {
@@ -323,12 +348,16 @@ impl DiarizationEngine {
                 })
                 .await
                 {
-                    Ok(Ok((assignments, cluster_embeddings, live_bindings))) => {
+                    Ok(Ok((assignments, cluster_embeddings, live_bindings, display_pass))) => {
                         info!(
                             "✅ Online diarization finalized: {} speaker assignments, {} live bindings",
                             assignments.len(),
                             live_bindings.len()
                         );
+                        // Promote the live rendering to its final revision
+                        // (05b D2) before the cascade closes: display-only,
+                        // and a no-op when nothing was displayed.
+                        super::streaming::reconcile::finalize_session(app, &display_pass);
                         // Store cluster embeddings + live bindings for the
                         // frontend-initiated finalize_online_session call, which
                         // persists them once the meeting row exists.
@@ -791,6 +820,12 @@ impl DiarizationEngine {
                 .write()
                 .map_err(|_| "Live prototype store is locked".to_string())?
                 .bind(&cluster_label, &speaker.id, &speaker.name);
+            drop(store_guard);
+            // The turns already published carry the label this cluster had
+            // when they were emitted, so rows the user can already see would
+            // otherwise keep the old name until this speaker talks again
+            // (05b 3.4). Display-only; persistence still runs at stop.
+            super::streaming::reconcile::rebind_cluster(&cluster_label, &speaker.name);
         }
 
         // The actual DB persistence (meeting_speakers + enrollment / transcript
@@ -846,12 +881,16 @@ impl DiarizationEngine {
         cluster_ceiling: Option<usize>,
         gap_merge_secs: Option<f32>,
         clusterer: Option<super::ClustererKindSetting>,
+        final_recluster: Option<bool>,
+        final_relabel_all: Option<bool>,
     ) {
         super::config::set_clustering_overrides(
             cluster_threshold,
             cluster_ceiling,
             gap_merge_secs,
             clusterer,
+            final_recluster,
+            final_relabel_all,
         );
     }
 }

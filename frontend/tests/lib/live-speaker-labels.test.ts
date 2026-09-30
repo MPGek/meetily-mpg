@@ -133,6 +133,7 @@ const liveBlocks = (partial: Partial<LiveTranscriptBlocks>): LiveTranscriptBlock
   source_device: "Microphone",
   revision: 1,
   blocks: [],
+  final: false,
   ...partial,
 });
 

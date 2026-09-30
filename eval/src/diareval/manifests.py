@@ -26,12 +26,18 @@ OFFLINE_GATE_METRICS = {"der", "fa", "miss", "conf"}
 #: Metrics a subset gate may bound for the online (live-path) run: the DER
 #: components of its own hypothesis, its distance from the offline run, and
 #: the streaming-only metrics (add-online-diarization-eval task 6.2).
+#:
+#: The deltas carry no `online_` prefix: they only exist inside an
+#: `online_gate` block, which already says which mode they belong to.
 ONLINE_GATE_METRICS = {
     "der",
     "fa",
     "miss",
     "conf",
     "der_delta",
+    "conf_delta",
+    "live_final_flip",
+    "live_uncovered",
     "lag_median",
     "lag_p90",
     "flip_rate",
@@ -43,7 +49,7 @@ ONLINE_GATE_METRICS = {
 
 #: Recorded on every online run and deliberately not gateable: it measures the
 #: machine, not the pipeline (D7).
-NEVER_GATED_METRICS = {"real_time_factor", "rtf"}
+NEVER_GATED_METRICS = {"real_time_factor", "rtf", "finalize_secs_per_audio_hour"}
 
 
 class ManifestError(Exception):

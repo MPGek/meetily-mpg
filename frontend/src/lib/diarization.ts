@@ -58,6 +58,8 @@ export const DIARIZATION_CLUSTERING_KEYS = {
   clusterCeiling: "diarizationClusterCeiling",
   gapMergeSecs: "diarizationGapMergeSecs",
   clusterer: "diarizationClusterer",
+  finalRecluster: "diarizationFinalReclusterEnabled",
+  finalRelabelAll: "diarizationFinalRelabelAll",
 } as const;
 
 export interface DiarizationClusteringSettings {
@@ -65,6 +67,18 @@ export interface DiarizationClusteringSettings {
   clusterCeiling: number | null;
   gapMergeSecs: number | null;
   clusterer: DiarizationClusterer | null;
+  /**
+   * Re-cluster a Fast-mode session's buffered embeddings when the recording
+   * stops, so speakers the incremental pass merged can still be separated.
+   * `null` means unset, which leaves the backend default (on) in charge.
+   */
+  finalReclusterEnabled: boolean | null;
+  /**
+   * Have the stop-time pass re-emit every transcript block instead of only the
+   * ones whose speaker changed. `null` means unset, leaving the backend
+   * default (off) in charge.
+   */
+  finalRelabelAll: boolean | null;
 }
 
 function loadNumberOrNull(key: string): number | null {
@@ -73,6 +87,13 @@ function loadNumberOrNull(key: string): number | null {
   if (raw === null) return null;
   const value = parseFloat(raw);
   return Number.isFinite(value) ? value : null;
+}
+
+function loadBooleanOrNull(key: string): boolean | null {
+  if (typeof window === "undefined") return null;
+  const raw = localStorage.getItem(key);
+  if (raw === null) return null;
+  return raw === "true";
 }
 
 function loadClustererOrNull(key: string): DiarizationClusterer | null {
@@ -87,16 +108,31 @@ export function loadClusteringSettings(): DiarizationClusteringSettings {
     clusterCeiling: loadNumberOrNull(DIARIZATION_CLUSTERING_KEYS.clusterCeiling),
     gapMergeSecs: loadNumberOrNull(DIARIZATION_CLUSTERING_KEYS.gapMergeSecs),
     clusterer: loadClustererOrNull(DIARIZATION_CLUSTERING_KEYS.clusterer),
+    finalReclusterEnabled: loadBooleanOrNull(DIARIZATION_CLUSTERING_KEYS.finalRecluster),
+    finalRelabelAll: loadBooleanOrNull(DIARIZATION_CLUSTERING_KEYS.finalRelabelAll),
   };
 }
 
 export function saveClusteringSettings(
-  settings: Partial<Omit<DiarizationClusteringSettings, "clusterer">> & {
+  settings: Partial<
+    Omit<
+      DiarizationClusteringSettings,
+      "clusterer" | "finalReclusterEnabled" | "finalRelabelAll"
+    >
+  > & {
     clusterer?: DiarizationClusterer | null;
+    finalReclusterEnabled?: boolean | null;
+    finalRelabelAll?: boolean | null;
   }
 ): void {
   if (typeof window === "undefined") return;
-  const numericEntries: [keyof Omit<DiarizationClusteringSettings, "clusterer">, string][] = [
+  const numericEntries: [
+    keyof Omit<
+      DiarizationClusteringSettings,
+      "clusterer" | "finalReclusterEnabled" | "finalRelabelAll"
+    >,
+    string,
+  ][] = [
     ["clusterThreshold", DIARIZATION_CLUSTERING_KEYS.clusterThreshold],
     ["clusterCeiling", DIARIZATION_CLUSTERING_KEYS.clusterCeiling],
     ["gapMergeSecs", DIARIZATION_CLUSTERING_KEYS.gapMergeSecs],
@@ -111,6 +147,26 @@ export function saveClusteringSettings(
     if (settings.clusterer === null) localStorage.removeItem(DIARIZATION_CLUSTERING_KEYS.clusterer);
     else localStorage.setItem(DIARIZATION_CLUSTERING_KEYS.clusterer, settings.clusterer);
   }
+  if (settings.finalReclusterEnabled !== undefined) {
+    if (settings.finalReclusterEnabled === null) {
+      localStorage.removeItem(DIARIZATION_CLUSTERING_KEYS.finalRecluster);
+    } else {
+      localStorage.setItem(
+        DIARIZATION_CLUSTERING_KEYS.finalRecluster,
+        String(settings.finalReclusterEnabled)
+      );
+    }
+  }
+  if (settings.finalRelabelAll !== undefined) {
+    if (settings.finalRelabelAll === null) {
+      localStorage.removeItem(DIARIZATION_CLUSTERING_KEYS.finalRelabelAll);
+    } else {
+      localStorage.setItem(
+        DIARIZATION_CLUSTERING_KEYS.finalRelabelAll,
+        String(settings.finalRelabelAll)
+      );
+    }
+  }
 }
 
 /** Push the persisted clustering overrides to the Rust backend (best-effort). */
@@ -124,6 +180,8 @@ export async function syncClusteringSettingsToBackend(
       clusterCeiling: settings.clusterCeiling,
       gapMergeSecs: settings.gapMergeSecs,
       clusterer: settings.clusterer,
+      finalReclusterEnabled: settings.finalReclusterEnabled,
+      finalRelabelAll: settings.finalRelabelAll,
     });
   } catch (err) {
     console.error("[diarization] Failed to sync clustering settings to backend:", err);

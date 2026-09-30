@@ -20,7 +20,7 @@ use super::super::{
 };
 use super::chunking::run_chunked_polyvoice_diarization;
 use super::guard::{DiarizationGuard, DIARIZATION_CANCELLED};
-use super::pcm::{spawn_ffmpeg_pcm, PcmStream, StreamWindows};
+use super::pcm::{spawn_ffmpeg_pcm, PcmStream, PcmWindows, StreamWindows};
 use crate::audio::audio_file::find_audio_file;
 use super::super::persist::offline_split::split_rows_by_speaker;
 use crate::database::repositories::meeting::MeetingsRepository;
@@ -349,7 +349,7 @@ fn diarize_decoded_channels(
 /// embeddings globally.
 fn run_channel_diarization_stream(
     diarizer: &PolyvoiceDiarizer,
-    mut pcm: PcmStream,
+    pcm: PcmStream,
     config: &DiarizationConfig,
 ) -> Result<
     (
@@ -363,38 +363,22 @@ fn run_channel_diarization_stream(
     let overlap_samples = (config.chunk_overlap_secs * DIARIZATION_SAMPLE_RATE as f32) as usize;
 
     let mut core = V2Core::new(diarizer, config);
-    let mut windows = StreamWindows::new(chunk_samples, overlap_samples);
+    let mut source = PcmWindows::new(pcm, StreamWindows::new(chunk_samples, overlap_samples));
 
-    loop {
-        if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-            pcm.kill();
-            return Err("Diarization cancelled".to_string());
-        }
-
-        let (window_start_seconds, window) = match windows.next_from(&mut pcm.stdout) {
-            Ok(Some(w)) => w,
-            Ok(None) => break,
-            Err(e) => {
-                pcm.kill();
-                return Err(e);
-            }
-        };
-
-        if window.is_empty() {
-            continue;
-        }
-        if let Err(e) = core.process_chunk(window_start_seconds, &window) {
-            pcm.kill();
-            return Err(e);
-        }
+    // The core owns the read loop and its cancellation checks; whatever ends it
+    // early (a cancel, a failed read, a failed window), the pipe is abandoned
+    // here so ffmpeg does not outlive the run.
+    if let Err(e) = core.process_source(&mut source) {
+        source.kill();
+        return Err(e);
     }
 
     if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
-        pcm.kill();
+        source.kill();
         return Err("Diarization cancelled".to_string());
     }
 
-    pcm.finish()?;
+    source.finish()?;
     core.finish()
 }
 

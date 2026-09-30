@@ -259,6 +259,8 @@ pub async fn set_diarization_clustering_settings(
     cluster_ceiling: Option<usize>,
     gap_merge_secs: Option<f32>,
     clusterer: Option<String>,
+    final_recluster_enabled: Option<bool>,
+    final_relabel_all: Option<bool>,
 ) -> Result<(), String> {
     let kind = match clusterer.as_deref() {
         None => None,
@@ -268,6 +270,13 @@ pub async fn set_diarization_clustering_settings(
             )
         })?),
     };
-    set_clustering_overrides(cluster_threshold, cluster_ceiling, gap_merge_secs, kind);
+    set_clustering_overrides(
+        cluster_threshold,
+        cluster_ceiling,
+        gap_merge_secs,
+        kind,
+        final_recluster_enabled,
+        final_relabel_all,
+    );
     Ok(())
 }

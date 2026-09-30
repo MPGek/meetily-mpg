@@ -193,7 +193,7 @@ async fn replay_reproduces_stop_time_cluster_distribution_without_any_channels()
         );
 
         match processor.finalize(&transcripts) {
-            Ok((assignments, clusters, _bindings)) => {
+            Ok((assignments, clusters, _bindings, _display_pass)) => {
                 println!(
                     "{}: finalize -> {} assignments, mic clusters {}, sys clusters {}",
                     label,

@@ -5,6 +5,8 @@ pub mod engine;
 pub mod guard;
 pub mod processor;
 pub mod reconcile;
+#[cfg(test)]
+pub(crate) mod source;
 pub mod units;
 
 pub use guard::*;

@@ -6,6 +6,7 @@ pub(crate) mod fixtures;
 pub mod cluster;
 pub mod factory;
 pub mod segment;
+pub mod source;
 pub mod timeline;
 pub mod turns;
 pub mod units;

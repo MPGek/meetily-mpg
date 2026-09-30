@@ -70,3 +70,58 @@ def test_an_unmeasurable_metric_is_reported_rather_than_passed():
     online = {**ONLINE, "streaming": {**ONLINE["streaming"], "flip_rate": None}}
     measured = subset._online_measurements(online, OFFLINE)
     assert measured.get("flip_rate") is None
+
+
+# --- CLI mode plumbing -----------------------------------------------------
+
+
+def test_the_run_and_score_subcommands_forward_the_mode(monkeypatch):
+    """`--mode online` has to reach the runner and the scorer.
+
+    Without this the flag parses, the offline harness runs, and the result
+    lands in the offline run directory under an online-sounding run id - a
+    silent mode mix-up rather than an error.
+    """
+    from diareval import runner, scoring
+    from diareval.cli import build_parser
+    from diareval.commands import run as run_cmd, score as score_cmd
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        runner,
+        "run_dataset",
+        lambda dataset, run_id, workers, force, harness_args=None, mode="offline", chunking=None: seen.update(
+            run_mode=mode, run_chunking=chunking
+        ),
+    )
+    monkeypatch.setattr(
+        scoring,
+        "score_dataset",
+        lambda dataset, run_id, mode="offline": seen.update(score_mode=mode),
+    )
+
+    parser = build_parser()
+    run_cmd(
+        parser.parse_args(
+            [
+                "run",
+                "--dataset",
+                "voxconverse",
+                "--mode",
+                "online",
+                "--chunking",
+                "production",
+                "--run-id",
+                "base-online",
+            ]
+        )
+    )
+    score_cmd(
+        parser.parse_args(
+            ["score", "--dataset", "voxconverse", "--mode", "online", "--run-id", "base-online"]
+        )
+    )
+
+    assert seen["run_mode"] == "online"
+    assert seen["run_chunking"] == "production"
+    assert seen["score_mode"] == "online"

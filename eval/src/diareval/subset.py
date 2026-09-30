@@ -145,10 +145,14 @@ def _online_measurements(online: dict, offline: dict) -> dict:
 
     `der_delta` is the online run's distance from the offline run over the
     same files: the number that says whether the live path is losing quality
-    against the calibrated baseline.
+    against the calibrated baseline. `conf_delta` is the same distance on the
+    confusion component alone, for a dataset whose reference inflates Miss so
+    much that its total DER says more about the reference than the pipeline
+    (ru-synthetic; design D7).
     """
     measured = {key: online.get(key) for key in ("der", "fa", "miss", "conf")}
     measured["der_delta"] = online["der"] - offline["der"]
+    measured["conf_delta"] = online["conf"] - offline["conf"]
     measured.update(
         {
             key: value
@@ -159,4 +163,5 @@ def _online_measurements(online: dict, offline: dict) -> dict:
     # Recorded for information only: the manifest loader rejects a bound on
     # it, and nothing here consults it.
     measured.pop("real_time_factor", None)
+    measured.pop("finalize_secs_per_audio_hour", None)
     return measured

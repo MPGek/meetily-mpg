@@ -54,6 +54,8 @@ def run(args: argparse.Namespace) -> int:
         args.workers,
         args.force,
         harness_args=args.harness_arg,
+        mode=args.mode,
+        chunking=args.chunking,
     )
     return 0
 
@@ -61,14 +63,14 @@ def run(args: argparse.Namespace) -> int:
 def score(args: argparse.Namespace) -> int:
     from ..scoring import score_dataset
 
-    score_dataset(args.dataset, args.run_id)
+    score_dataset(args.dataset, args.run_id, mode=args.mode)
     return 0
 
 
 def report(args: argparse.Namespace) -> int:
     from ..reporting import write_report
 
-    write_report(args.datasets, args.run_id)
+    write_report(args.datasets, args.run_id, offline_run_id=args.offline_run_id)
     return 0
 
 

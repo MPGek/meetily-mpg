@@ -24,6 +24,36 @@ pub const DEFAULT_CLUSTER_CEILING: usize = 128;
 /// Built-in default same-speaker gap-merge window (sweep-selected, 2026-09-04).
 pub const DEFAULT_GAP_MERGE_SECS: f32 = 0.3;
 
+/// Built-in default for the stop-time refinement pass (05b D1): on. The pass
+/// re-clusters a finished live session's buffered embeddings so incrementally
+/// merged identities can be separated before anything is persisted; the
+/// fallback to the incremental identities is unconditional, so leaving it on
+/// cannot fail a stop.
+pub const DEFAULT_FINAL_RECLUSTER: bool = true;
+
+/// Built-in default merge threshold for the stop-time refinement (05b D1).
+///
+/// Its own constant because the offline threshold does not carry over: that one
+/// (`TITANET_CLUSTER_THRESHOLD`) was tuned on dense 5 s windows, while the
+/// refinement clusters one embedding per merged speech chunk of up to 25 s. At
+/// the offline value the pass under-clusters (measured: 3.8 speakers per
+/// recording against 7.8 in the reference on long recordings). A threshold the
+/// user stored still wins; this applies only when none is stored. Compiled-in
+/// and harness-sweepable (`online-eval --final-recluster-threshold`), not a
+/// persisted setting, like the binarization constants.
+///
+/// Sweep-selected (2026-09-30) on every 4th recording of `voxconverse-dev`, the
+/// tuning set: online DER 29.99 / 28.64 / 25.15 / 22.88 / 24.09 at
+/// 0.60 / 0.65 / 0.70 / 0.75 / 0.80, so the optimum is bracketed rather than
+/// at an edge of the grid. Confirmed on the held-out sets before it shipped.
+pub const DEFAULT_FINAL_RECLUSTER_THRESHOLD: f32 = 0.75;
+
+/// Built-in default for the wholesale final relabel (05b D2): off. The final
+/// pass revises the blocks whose speaker actually changed; re-emitting every
+/// block reads as a bug to someone watching the transcript, even when every
+/// label improved, so it is opt-in.
+pub const DEFAULT_FINAL_RELABEL_ALL: bool = false;
+
 /// Pipeline's clustering-backend maximum speaker count (`u8` local labels).
 pub(crate) const MAX_CLUSTERERS: usize = 255;
 
@@ -110,6 +140,16 @@ pub struct DiarizationConfig {
     pub binarization: Option<polyvoice::segmentation::BinarizationConfig>,
     /// Minimum output turn duration.
     pub min_speech_secs: f32,
+    /// Re-cluster a live session's buffered embeddings when the recording
+    /// stops (05b D1). Read by the streaming path only; the batch pass always
+    /// clusters, so it ignores this.
+    pub final_recluster: bool,
+    /// Have the stop-time display pass re-emit every live block instead of
+    /// only the ones whose speaker changed (05b D2). Display-only.
+    pub final_relabel_all: bool,
+    /// AHC merge criterion for the stop-time refinement only (05b D1); see
+    /// `DEFAULT_FINAL_RECLUSTER_THRESHOLD` for why it is not `cluster_threshold`.
+    pub final_recluster_threshold: f32,
 }
 
 impl Default for DiarizationConfig {
@@ -124,6 +164,9 @@ impl Default for DiarizationConfig {
             embed_window_secs: DEFAULT_EMBED_WINDOW_SECS,
             binarization: Some(DEFAULT_BINARIZATION),
             min_speech_secs: DEFAULT_MIN_SPEECH_SECS,
+            final_recluster: DEFAULT_FINAL_RECLUSTER,
+            final_relabel_all: DEFAULT_FINAL_RELABEL_ALL,
+            final_recluster_threshold: DEFAULT_FINAL_RECLUSTER_THRESHOLD,
         }
     }
 }
@@ -151,6 +194,12 @@ impl DiarizationConfig {
             cluster_ceiling: stored_cluster_ceiling().unwrap_or(DEFAULT_CLUSTER_CEILING),
             gap_merge_secs: stored_gap_merge_secs().unwrap_or(DEFAULT_GAP_MERGE_SECS),
             clusterer: stored_clusterer_kind().unwrap_or(ClustererKindSetting::Ahc),
+            final_recluster: stored_final_recluster().unwrap_or(DEFAULT_FINAL_RECLUSTER),
+            final_relabel_all: stored_final_relabel_all().unwrap_or(DEFAULT_FINAL_RELABEL_ALL),
+            // A threshold the user stored applies to the refinement too; the
+            // dedicated default only fills the gap when none is stored.
+            final_recluster_threshold: stored_cluster_threshold()
+                .unwrap_or(DEFAULT_FINAL_RECLUSTER_THRESHOLD),
             ..Self::default()
         }
     }
@@ -168,6 +217,8 @@ static CLUSTER_THRESHOLD_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, 
 static CLUSTER_CEILING_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else value
 static GAP_MERGE_SECS_OVERRIDE: AtomicU64 = AtomicU64::new(0); // 0 = unset, else f32 bits + 1
 static CLUSTERER_KIND_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 = unset
+static FINAL_RECLUSTER_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 = unset, 1 = off, 2 = on
+static FINAL_RELABEL_ALL_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 = unset, 1 = off, 2 = on
 
 fn store_f32_option(cell: &AtomicU64, value: Option<f32>) {
     match value {
@@ -218,6 +269,34 @@ pub(crate) fn stored_clusterer_kind() -> Option<ClustererKindSetting> {
     }
 }
 
+pub(crate) fn stored_final_recluster() -> Option<bool> {
+    tri_state(&FINAL_RECLUSTER_OVERRIDE)
+}
+
+pub(crate) fn stored_final_relabel_all() -> Option<bool> {
+    tri_state(&FINAL_RELABEL_ALL_OVERRIDE)
+}
+
+/// 0 = unset (the built-in default applies), 1 = off, 2 = on.
+fn tri_state(cell: &std::sync::atomic::AtomicU8) -> Option<bool> {
+    match cell.load(Ordering::SeqCst) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+fn store_tri_state(cell: &std::sync::atomic::AtomicU8, value: Option<bool>) {
+    cell.store(
+        match value {
+            Some(true) => 2,
+            Some(false) => 1,
+            None => 0,
+        },
+        Ordering::SeqCst,
+    );
+}
+
 /// Update the persisted clustering overrides (None clears a key back to the
 /// built-in default).
 pub fn set_clustering_overrides(
@@ -225,6 +304,8 @@ pub fn set_clustering_overrides(
     cluster_ceiling: Option<usize>,
     gap_merge_secs: Option<f32>,
     clusterer: Option<ClustererKindSetting>,
+    final_recluster: Option<bool>,
+    final_relabel_all: Option<bool>,
 ) {
     store_f32_option(&CLUSTER_THRESHOLD_OVERRIDE, cluster_threshold);
     CLUSTER_CEILING_OVERRIDE.store(
@@ -234,12 +315,16 @@ pub fn set_clustering_overrides(
     store_f32_option(&GAP_MERGE_SECS_OVERRIDE, gap_merge_secs);
     CLUSTERER_KIND_OVERRIDE
         .store(clusterer.map(kind_code).unwrap_or(0), Ordering::SeqCst);
+    store_tri_state(&FINAL_RECLUSTER_OVERRIDE, final_recluster);
+    store_tri_state(&FINAL_RELABEL_ALL_OVERRIDE, final_relabel_all);
     log::info!(
-        "Diarization clustering settings updated: threshold={:?}, ceiling={:?}, gap_merge={:?}, clusterer={:?}",
+        "Diarization clustering settings updated: threshold={:?}, ceiling={:?}, gap_merge={:?}, clusterer={:?}, final_recluster={:?}, final_relabel_all={:?}",
         stored_cluster_threshold(),
         stored_cluster_ceiling(),
         stored_gap_merge_secs(),
         stored_clusterer_kind(),
+        stored_final_recluster(),
+        stored_final_relabel_all(),
     );
 }
 
@@ -292,29 +377,58 @@ mod tests {
             stored_cluster_ceiling(),
             stored_gap_merge_secs(),
             stored_clusterer_kind(),
+            stored_final_recluster(),
+            stored_final_relabel_all(),
         );
         // Unset -> built-in defaults.
-        set_clustering_overrides(None, None, None, None);
+        set_clustering_overrides(None, None, None, None, None, None);
         let cfg = DiarizationConfig::resolved();
         assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
         assert_eq!(cfg.cluster_ceiling, DEFAULT_CLUSTER_CEILING);
         assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
         assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        assert!(
+            cfg.final_recluster,
+            "the stop-time refinement is on by default"
+        );
+        assert!(
+            !cfg.final_relabel_all,
+            "the wholesale final relabel is opt-in"
+        );
+        assert_eq!(
+            cfg.final_recluster_threshold, DEFAULT_FINAL_RECLUSTER_THRESHOLD,
+            "with no stored threshold the refinement uses its own default"
+        );
         // Stored override wins per key.
-        set_clustering_overrides(Some(0.35), Some(12), Some(0.3), Some(ClustererKindSetting::Ahc));
+        set_clustering_overrides(
+            Some(0.35),
+            Some(12),
+            Some(0.3),
+            Some(ClustererKindSetting::Ahc),
+            Some(false),
+            Some(true),
+        );
         let cfg = DiarizationConfig::resolved();
         assert_eq!(cfg.cluster_threshold, 0.35);
         assert_eq!(cfg.cluster_ceiling, 12);
         assert_eq!(cfg.gap_merge_secs, 0.3);
         assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
+        assert!(!cfg.final_recluster, "an explicit off is honoured");
+        assert_eq!(
+            cfg.final_recluster_threshold, 0.35,
+            "a threshold the user stored applies to the refinement as well"
+        );
+        assert!(cfg.final_relabel_all, "an explicit on is honoured");
         // Partial override: only the ceiling is stored, others fall back.
-        set_clustering_overrides(None, Some(7), None, None);
+        set_clustering_overrides(None, Some(7), None, None, None, None);
         let cfg = DiarizationConfig::resolved();
         assert_eq!(cfg.cluster_threshold, crate::audio::embedder::TITANET_CLUSTER_THRESHOLD);
         assert_eq!(cfg.cluster_ceiling, 7);
         assert_eq!(cfg.gap_merge_secs, DEFAULT_GAP_MERGE_SECS);
         assert_eq!(cfg.clusterer, ClustererKindSetting::Ahc);
-        set_clustering_overrides(saved.0, saved.1, saved.2, saved.3);
+        assert_eq!(cfg.final_recluster, DEFAULT_FINAL_RECLUSTER);
+        assert_eq!(cfg.final_relabel_all, DEFAULT_FINAL_RELABEL_ALL);
+        set_clustering_overrides(saved.0, saved.1, saved.2, saved.3, saved.4, saved.5);
     }
 
     #[test]

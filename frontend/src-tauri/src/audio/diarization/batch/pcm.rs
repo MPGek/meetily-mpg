@@ -2,6 +2,7 @@
 //! f32le on stdout, plus the overlapping in-memory window reader the v2 core
 //! consumes.
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -9,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::super::core::source::{AudioSource, Window};
 use super::super::DIARIZATION_SAMPLE_RATE;
 
 // ===== ffmpeg streaming decode =====
@@ -211,6 +213,38 @@ pub(crate) fn spawn_ffmpeg_pcm(
         stderr_stop,
         stderr_handle: Some(stderr_handle),
     })
+}
+
+/// The batch driver's source for a saved recording: overlapping windows read
+/// from the ffmpeg PCM pipe. It owns the pipe so a run can still kill or finish
+/// the process after the core is done with the audio.
+pub(crate) struct PcmWindows {
+    pcm: PcmStream,
+    windows: StreamWindows,
+}
+
+impl PcmWindows {
+    pub(crate) fn new(pcm: PcmStream, windows: StreamWindows) -> Self {
+        Self { pcm, windows }
+    }
+
+    pub(crate) fn kill(&mut self) {
+        self.pcm.kill();
+    }
+
+    /// Wait for ffmpeg to exit and report a failed decode.
+    pub(crate) fn finish(self) -> Result<(), String> {
+        self.pcm.finish()
+    }
+}
+
+impl AudioSource for PcmWindows {
+    fn next_window(&mut self) -> Result<Option<Window<'_>>, String> {
+        Ok(self
+            .windows
+            .next_from(&mut self.pcm.stdout)?
+            .map(|(start, window)| (start as f64, Cow::Owned(window))))
+    }
 }
 
 /// Yields overlapping in-memory windows of 16 kHz f32 PCM read from a stream.

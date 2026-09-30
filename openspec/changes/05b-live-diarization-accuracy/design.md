@@ -33,11 +33,13 @@ See `proposal.md` for motivation. Verified current state (2026-09-18, branch `fe
 
 ### D1: Deferred re-clustering at stop, behind a setting, with an unconditional fallback
 
-At stop, Fast mode clusters `mic_emb`/`sys_emb` through the `Clustering` factory from 05 (resolved kind, merge threshold, ceiling) and rebuilds the channel timeline by attributing each buffered chunk window to its refined cluster, then merging adjacent same-speaker windows with the resolved gap-merge window — the same `core/turns.rs` behavior the batch path uses. The streaming pipeline's own ids become a fallback, used when a channel has fewer than two buffered embeddings, when clustering errors, or when the setting is off.
+At stop, Fast mode clusters `mic_emb`/`sys_emb` through the `Clustering` factory from 05 (resolved kind and ceiling, and a merge threshold of its own: the user's stored threshold when there is one, otherwise `DEFAULT_FINAL_RECLUSTER_THRESHOLD`) and rebuilds the channel timeline by attributing each buffered chunk window to its refined cluster, then merging adjacent same-speaker windows with the resolved gap-merge window — the same `core/turns.rs` behavior the batch path uses. The streaming pipeline's own ids become a fallback, used when a channel has fewer than two buffered embeddings, when clustering errors, or when the setting is off.
 
 - Why cluster the chunk embeddings rather than the pipeline's centroids: the chunk embeddings are the only per-channel set that spans the whole session and is produced by the same embedder the batch path uses (`online_diarization.rs:1112`), so the refined result is comparable with an offline run of the same audio.
 - Alternative considered: run segmentation-3.0 over the recorded audio at stop. Rejected for this change — it is the full offline pass under another name, and D3 gets that benefit more cheaply when it is wanted.
 - The setting exists so the pass can be turned off if the eval numbers say it is not worth its cost.
+- Why the merge threshold is not the offline one (measured 2026-09-30, full `voxconverse`): at the offline 0.60 the pass under-clusters, landing on 3.8 speakers per recording against 7.8 in the reference for long recordings (the live pipeline over-splits to 19.2). 0.60 was tuned on dense 5 s windows; the refinement clusters one embedding per merged speech chunk of up to 25 s, which blends voices and looks more alike. The value is calibrated on the `voxconverse-dev` tuning set and validated on the held-out sets, and is a compiled-in, harness-sweepable constant rather than a new user setting.
+- Measured effect of the pass at 0.60 (full sets, against the pre-change live path): `voxconverse` online DER 41.54 to 33.93, label runs per reference speaker 50.95 to 4.70, stop-time cost 0.37 s per audio hour; `ru-synthetic` Conf 21.73 to 14.13.
 
 ### D2: Promotion semantics — provisional by default, revise only what changed
 
@@ -46,7 +48,16 @@ Every live block carries a provisional state. At stop the refined timeline is re
 - Why not relabel everything: the live view is a reading surface; a wholesale rewrite at stop looks like a bug to the user even when every label improved. Restricting the revision to changed blocks keeps the visible churn proportional to the actual correction.
 - This is recorded as an assumption to confirm (A2).
 
-### D3: Cache-reusing offline pass, in memory, with a coverage test
+### D3 (not built): Cache-reusing offline pass, in memory, with a coverage test
+
+**Dropped on 2026-09-30, after measurement, by decision of the owner. Nothing below was implemented.** What was measured, on the full held-out sets, with the offline result taken as the reference:
+
+- The result the cache can supply is the stop-time refinement's, not an offline result. The session buffers one embedding per merged speech chunk; the offline pass clusters dense windows that only exist after segmentation-3.0 has run, and `assemble_channel_turns` needs those windows and their local speaker indices. A reuse path therefore cannot "skip segmentation and still cluster the same units".
+- The two results differ substantially even where both are good: the refined online result disagrees with the offline result on 32.36 % of the offline speech on `voxconverse` (232 files, 41.1 h) while scoring about the same against the ground truth (DER 26.69 against 26.95), i.e. they make different errors. The verification this decision replaces asked for the same labels as a forced full run; that is unattainable.
+- The consequence would be a button whose answer depends on whether an in-memory cache is still alive: the same "analyse speakers" action returning one result right after a recording and another after a restart.
+- The saving is small: the full offline pass costs about 0.016 of the recording's duration on this machine (roughly a minute for an hour-long meeting).
+
+The offline path therefore stays deterministic and fully calibrated, and the refinement is what improves the labels saved at stop. The original design follows for the record.
 
 The engine keeps the finished session's per-channel embeddings and refined turns under the meeting id after `persist_session`, in a single-entry cache that is dropped when the next recording starts. Offline diarization of that meeting id reuses the cache when **all** of:
 
@@ -60,6 +71,8 @@ Otherwise the full pipeline runs. The decision and its inputs are logged, so any
 - Alternative considered: reuse the persisted exemplar cache. Rejected: 32 exemplars per cluster are a recognition cache, not a timeline; clustering from them cannot produce segment boundaries.
 
 ### D4: `AudioSource` unifies the two drivers
+
+**Built narrower than written, by decision of the owner on 2026-09-30.** The trait, the batch adapters and a test-only `streaming::VadChunks` exist, and a test asserts that the shared core gives the same result from a batch source and from a live source over the same windows. The live Fast-mode pipeline is **not** moved onto the core: the core segments and embeds windows but clusters once, in `finish()`, so it has no incremental labels to show during a recording, and switching Fast mode onto it would mean designing an incremental assignment over dense units and a new CPU/latency budget - a change of its own. Two differences from the sketch below: `next_window` returns a `Result`, because an I/O failure must end a run rather than read as the end of the audio, and there are two batch adapters (`PcmWindows` over the ffmpeg pipe, `MemoryWindows` for samples already in memory) because the eval harness runs the latter. The original design follows for the record.
 
 ```rust
 pub trait AudioSource {
@@ -112,13 +125,14 @@ Recorded in the manifests as `subset_gate` entries and enforced by `uv run --pro
 - `voxconverse-dev` is the tuning set (its manifest says never to select published results on it) and has no `subset: true`; it is used for the tuning and ablation runs in the tasks, not as a gate.
 - Real-time factor is recorded in the report and never gated, as the streaming-metrics capability requires; the assignment's "RTF unchanged" is therefore an observation to record in task 6.3, not a bound.
 - Bounds are first measured, then recorded with the documented margin, as the existing gate table in `eval/README.md:113-127` does.
+- **Revised 2026-09-30, after the first full-set measurement.** The table above states targets, not bounds that any configuration met. Measured, the live path alone is +14.59 (`voxconverse` DER delta) and +11.92 (`ru-synthetic` Conf delta) against the offline path, and the refinement at the offline threshold reaches +6.98 and +4.31; `live_final_flip` is 44.51 % and 28.32 %, because the live labels are themselves heavily fragmented (about 54 label runs per reference speaker), so the disagreement with a good final view is dominated by the live view's quality, which this change does not set out to fix. The gates are therefore **recorded as regression bounds at the measured post-calibration value plus a documented margin**, and the numbers in the table stay as targets, stated in the manifests' comments. `live_final_flip` in particular is gated as "no worse than measured", not "at most 5 %".
 
 ## Risks / Trade-offs
 
 - **Unifying boundary conventions can make live DER worse before it makes it better** (polyvoice streaming turns vs segmentation-3.0 hysteresis) → D4 ships after D1 and behind the same gates; if the gate fails on D4, the `AudioSource` change is reverted independently of the refinement pass.
 - **The refinement pass costs time at stop**, exactly when the user is waiting for the meeting to save → Measured as its own figure in task 2.4 and bounded by the buffered-embedding count, not by recording length in audio samples; the fallback path is unconditional, so a slow or failing pass never blocks the stop.
 - **A wholesale relabel at stop looks like a bug** → D2 makes the narrow revision the default and the wholesale one opt-in (assumption A2).
-- **The in-memory reuse cache holds a session's embeddings longer than today** → Single entry, dropped when the next recording starts; the per-chunk set for a long meeting is the same allocation that already lived through the session, so peak memory is unchanged and only its lifetime grows.
+- ~~**The in-memory reuse cache holds a session's embeddings longer than today**~~ (moot, D3 was not built) → Single entry, dropped when the next recording starts; the per-chunk set for a long meeting is the same allocation that already lived through the session, so peak memory is unchanged and only its lifetime grows.
 - **The new metric depends on an artifact `add-online-diarization-eval` produces** → This change is explicitly ordered after it; the metric fails loudly on a missing sidecar rather than reporting zero (delta scenario), so a mis-ordered run cannot produce a falsely good number.
 - **Gate bounds set on 5-file subsets are noisy** → The bounds are relative (online minus offline on the same files) rather than absolute, which cancels most dataset-specific noise, and the first measurement records the margin explicitly.
 
@@ -127,7 +141,7 @@ Recorded in the manifests as `subset_gate` entries and enforced by `uv run --pro
 1. Deferred re-clustering behind a setting, default on, with the fallback path (D1). Measured before anything else changes.
 2. Promotion semantics and the correction-driven reconcile pass (D2, D5) — display behavior only.
 3. `AudioSource` unification (D4), with the parity test extended to the streaming source.
-4. Cache-reusing offline pass (D3) and deletion of whatever the unification superseded.
+4. ~~Cache-reusing offline pass (D3)~~ dropped, see D3; deletion of whatever the unification superseded.
 
 Each step is gated by the eval run in its task group; a step that fails its gate is reverted on its own without unwinding the others.
 

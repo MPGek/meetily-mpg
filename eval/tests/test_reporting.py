@@ -107,3 +107,24 @@ def test_ablation_run_is_labelled_in_the_report(patched):
 
     text = reporting.write_report(["fixture-ds"], "latest").read_text(encoding="utf-8")
     assert "fixture-ds (ablation)" in text
+
+
+def test_online_run_is_reported_beside_an_offline_run_of_another_id(patched):
+    """The baseline pair is named per mode, so its report has to pair them.
+
+    `base-online` scored against a missing `base-online` offline run would
+    either fail or report the online run with nothing to compare to; the
+    offline id has to be nameable.
+    """
+    out = patched / "out"
+    _write_score(out, "fixture-ds", "base-offline", "offline", OFFLINE_SCORE)
+    _write_score(out, "fixture-ds", "base-online", "online", ONLINE_SCORE)
+
+    with pytest.raises(SystemExit, match="no score.json"):
+        reporting.write_report(["fixture-ds"], "base-online")
+
+    text = reporting.write_report(
+        ["fixture-ds"], "base-online", offline_run_id="base-offline"
+    ).read_text(encoding="utf-8")
+    assert "| fixture-ds | 2 | 0.50 | 14.80 |" in text
+    assert "| 22.40 | +7.60 |" in text

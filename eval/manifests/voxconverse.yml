@@ -19,22 +19,36 @@ subset_files:
 subset_gate:
   der: 12.0
   conf: 7.0
-# Online (live Fast path) gate ranges, first measured 2026-09-21 on the same 5
-# subset files with the production-faithful chunking (an ablation policy may
-# never feed a gate). Measured: DER 31.26 (FA 3.37 / Miss 14.91 / Conf 12.98),
-# so der_delta +22.86 against the offline 8.40; lag median 0.385 s / p90
-# 0.564 s; flip rate 0.030; runs per reference speaker 2.50 live and 2.50
-# final; 3.77 cluster switches per speaker-minute; 4 of 21 reference turns
-# uncovered. Bounds leave ~5-7 pp on the DER pair and roughly 2-3x headroom on
-# the streaming metrics, which move with chunk boundaries. Real-time factor
-# (measured 0.021) is recorded per run and is deliberately not gateable.
+# Online (live Fast path) gate ranges, REGRESSION bounds: re-measured 2026-09-30
+# on the same 5 subset files with production-faithful chunking (an ablation policy
+# may never feed a gate), after the stop-time refinement (05b) shipped at its
+# calibrated merge threshold, 0.75. Measured: DER 24.75 (FA 4.28 / Miss 1.02 /
+# Conf 19.45), der_delta +16.35 against the offline 8.40; lag median 0.385 s / p90
+# 0.564 s (unchanged by the refinement); flip rate 0.030; 2.50 label runs per
+# reference speaker live and 1.00 final; 3.77 cluster switches per speaker-minute;
+# live_final_flip 33.5 %. Bounds leave ~5-7 pp on the DER pair and the flip, and
+# roughly 2-3x headroom on the streaming metrics, which move with chunk
+# boundaries. Real-time factor (0.038) and the stop-time cost (3.5 s per audio
+# hour) are recorded per run and are deliberately not gateable.
+#
+# This subset is a SMOKE test, not the quality record: it holds about three
+# minutes of speech, and each file yields only 2-3 buffered chunks, too few for the
+# refinement to cluster (it collapses each file to one speaker, hence 1.00 final
+# runs per speaker). The quality record is the full set (232 files, 40.22 h),
+# offline DER 26.95: online DER 41.54 before the refinement, 33.93 with it at the
+# offline merge threshold 0.60, 26.69 at 0.75 - der_delta -0.26 against the
+# design's <= +3.0 target - with live_final_flip 38.45 % against the 5.0 % target
+# (the live labels are themselves heavily fragmented: 50.95 label runs per
+# reference speaker before the refinement, 6.62 after). 5.0 % and +3.0 stay the
+# stated targets; the bounds below only stop the numbers getting worse.
 online_gate:
-  der: 38.0
-  der_delta: 28.0
+  der: 31.0
+  der_delta: 22.0
   lag_p90: 1.5
   flip_rate: 0.10
   final_runs_per_speaker: 4.0
   switch_rate_per_speaker_minute: 8.0
+  live_final_flip: 40.0
 normalize:
   audio_archive: voxconverse_test_wav.zip
   audio_glob: voxconverse_test_wav/*.wav

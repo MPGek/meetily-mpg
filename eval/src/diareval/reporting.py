@@ -26,18 +26,32 @@ def _git_rev() -> str:
         return "unknown"
 
 
-def write_report(datasets: list[str] | None, run_id: str = "latest") -> Path:
+def write_report(
+    datasets: list[str] | None,
+    run_id: str = "latest",
+    offline_run_id: str | None = None,
+) -> Path:
+    """Write the Markdown comparison report.
+
+    The offline table reads `<ds>/<offline_run_id>` and the online section
+    reads `<ds>/online/<run_id>`. The two ids are the same by default, which is
+    how a comparison run under one id is laid out. `offline_run_id` exists for
+    the baseline pair, whose runs are named for their mode (`base-offline`,
+    `base-online`): without it the online run would be reported against a
+    missing offline run instead of the one it was measured beside.
+    """
+    offline_run_id = offline_run_id or run_id
     if datasets is None:
         datasets = [
             p.parent.name
-            for p in OUT_DIR.glob(f"*/{run_id}/score.json")
+            for p in OUT_DIR.glob(f"*/{offline_run_id}/score.json")
         ]
     if not datasets:
         raise SystemExit("no scored datasets found under eval/out")
 
     rows = []
     for ds in datasets:
-        score_path = OUT_DIR / ds / run_id / "score.json"
+        score_path = OUT_DIR / ds / offline_run_id / "score.json"
         if not score_path.is_file():
             raise SystemExit(f"{ds}: no score.json — run `score --dataset {ds}` first")
         import json
@@ -111,30 +125,45 @@ def _online_section(datasets: list[str], run_id: str, offline: dict) -> list[str
         "Only the datasets measured in online mode appear below; a dataset absent",
         "here was not run through the live path, which is not a missing comparison.",
         "",
-        "| Dataset | Files | Online DER % | Δ vs offline | Lag median s | Lag p90 s "
+        "| Dataset | Files | Online DER % | Δ vs offline | Δ Conf | Live-vs-final flip % "
+        "| Live uncovered % | Lag median s | Lag p90 s "
         "| Uncovered turns | Flip rate | Runs/speaker live | Runs/speaker final "
-        "| Switches /spk-min | RTF (not gated) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Switches /spk-min | RTF (not gated) | Stop-time s / audio h (not gated) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: | ---: |",
     ]
     for row in online_rows:
         metrics = row.get("streaming") or {}
         base = offline.get(row["dataset"])
         delta = f"{row['der'] - base['der']:+.2f}" if base else "offline run missing"
+        conf_delta = f"{row['conf'] - base['conf']:+.2f}" if base else "offline run missing"
         faithful = "" if metrics.get("production_faithful", True) else " (ablation)"
         lines.append(
             f"| {row['dataset']}{faithful} | {row['files']} | {row['der']:.2f} | {delta} | "
+            f"{conf_delta} | {fmt(metrics.get('live_final_flip'), 2)} | "
+            f"{fmt(metrics.get('live_uncovered'), 2)} | "
             f"{fmt(metrics.get('lag_median'))} | {fmt(metrics.get('lag_p90'))} | "
             f"{metrics.get('uncovered_turns', 'n/a')} | {fmt(metrics.get('flip_rate'))} | "
             f"{fmt(metrics.get('live_runs_per_speaker'))} | "
             f"{fmt(metrics.get('final_runs_per_speaker'))} | "
             f"{fmt(metrics.get('switch_rate_per_speaker_minute'))} | "
-            f"{fmt(metrics.get('real_time_factor'))} |"
+            f"{fmt(metrics.get('real_time_factor'))} | "
+            f"{fmt(metrics.get('finalize_secs_per_audio_hour'), 2)} |"
         )
     lines += [
         "",
         "Lag is audio time from a reference turn's start to the first emission that",
         "covered it; an uncovered turn is counted, never scored as zero. Real-time",
-        "factor is recorded for information and is never part of a gate.",
+        "factor is recorded for information and is never part of a gate. Stop-time",
+        "cost is the refinement pass alone, per hour of audio: it is paid while the",
+        "user waits for the meeting to save, and is reported, not gated, because it",
+        "measures this machine.",
+        "",
+        "Live-vs-final flip is the share of finalized speech whose live label differs",
+        "from the saved one after both are mapped into reference label space, so a",
+        "pure cluster renaming is not counted (design D6). Live uncovered is the share",
+        "of that speech no emission ever labelled, reported separately and never",
+        "folded into the flip.",
         "",
     ]
     return lines

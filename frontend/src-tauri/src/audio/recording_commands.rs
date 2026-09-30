@@ -841,6 +841,7 @@ pub async fn stop_recording<R: Runtime>(
         .as_ref()
         .and_then(|m| m.get_meeting_folder());
     let speaker_assignments = DiarizationEngine::finalize_session(
+        &app,
         transcripts_for_diarization,
         meeting_folder_for_diarization,
     )

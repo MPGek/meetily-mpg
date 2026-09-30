@@ -114,7 +114,7 @@ async fn full_stop_flow_fast_1322() {
     println!("error state: {}", processor.is_in_error_state());
 
     match processor.finalize(&transcripts) {
-        Ok((assignments, clusters, bindings)) => {
+        Ok((assignments, clusters, bindings, _display_pass)) => {
             println!(
                 "finalize OK: {} assignments, mic={}, sys={}, bindings={}",
                 assignments.len(),

@@ -2,6 +2,7 @@
 //! per-segment speaker turns, splits at overlap spans, applies the min-speech
 //! filter and bridges same-speaker gaps.
 
+use super::cluster::SpeakerSegment;
 use super::segment::ChunkRecord;
 use super::super::{
     ClusteredEmbedding, DiarizationConfig, DiarizationSegment, SpeakerTurn, TimeRange,
@@ -284,6 +285,45 @@ fn gap_fill_turns(turns: Vec<SpeakerTurn>, max_gap_secs: f32) -> Vec<SpeakerTurn
                 text: None,
                 stable: true,
             })
+        })
+        .collect()
+}
+
+/// Bridge same-speaker gaps in a channel timeline assembled outside the batch
+/// turn stage (05b D1): the stop-time refinement labels one segment per
+/// buffered embedding window, which tiles a single speaker's speech into as
+/// many segments as it had windows. Runs through the same `merge_segments`
+/// call `gap_fill_turns` uses, so a live session's refined timeline bridges
+/// gaps exactly as the batch path does.
+pub(crate) fn merge_same_speaker_segments(
+    mut segments: Vec<SpeakerSegment>,
+    max_gap_secs: f32,
+) -> Vec<SpeakerSegment> {
+    if segments.len() < 2 {
+        return segments;
+    }
+    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    if max_gap_secs <= 0.0 {
+        return segments;
+    }
+    let turns: Vec<SpeakerTurn> = segments
+        .iter()
+        .map(|seg| SpeakerTurn {
+            speaker: polyvoice::types::SpeakerId(seg.speaker as u32),
+            time: TimeRange {
+                start: seg.start as f64,
+                end: seg.end as f64,
+            },
+            text: None,
+            stable: true,
+        })
+        .collect();
+    gap_fill_turns(turns, max_gap_secs)
+        .into_iter()
+        .map(|turn| SpeakerSegment {
+            start: turn.time.start as f32,
+            end: turn.time.end as f32,
+            speaker: turn.speaker.0 as usize,
         })
         .collect()
 }

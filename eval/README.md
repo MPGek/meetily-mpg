@@ -60,6 +60,11 @@ uv run --project eval score --dataset voxconverse --mode online
 
 # The report shows both modes with the online-minus-offline delta
 uv run --project eval report
+
+# A baseline pair is named per mode (base-offline / base-online), so the report
+# is told which offline run to put beside the online one
+uv run --project eval report --datasets voxconverse ru-synthetic `
+  --run-id base-online --offline-run-id base-offline
 ```
 
 Rules that keep the numbers meaningful:
@@ -85,7 +90,79 @@ Rules that keep the numbers meaningful:
 Online gate bounds are declared per dataset as `online_gate:` in the
 manifests, alongside the offline `subset_gate:`, and `subset` evaluates both.
 
-Fast regression gate (≤10 recordings, ru-synthetic + voxconverse, end-to-end):
+### The stop-time pass, and what the online numbers mean (05b)
+
+`online-eval` stops a replay the way the app stops a recording: it calls the
+processor's `finalize`, and the finalized RTTM is the timeline that call
+publishes. With the stop-time refinement on (the app's default) that is the
+session's buffered chunk embeddings re-clustered; with it off it is the
+identities the session showed live. Two flags exist for measuring exactly that
+difference; neither is a persisted setting:
+
+```powershell
+# The A/B arm: the identities shown live, no refinement
+./target/release/online-eval <wav> --out-dir <dir> --no-final-recluster
+
+# A sweep arm: the refinement at another merge threshold (default: the app's)
+./target/release/online-eval <wav> --out-dir <dir> --final-recluster-threshold 0.70
+```
+
+The run header records `final_recluster` and `final_recluster_threshold`, so a
+result can always be attributed. Reported beside the DER:
+
+- **`live_final_flip`** - the share of the finalized speech whose label differs
+  from the one shown live. `L(t)` is the label of the latest *stable* emission
+  covering `t` (a provisional emission never reaches a user, so it is not
+  counted), `F(t)` the finalized label; both are mapped into reference-label
+  space through their own optimal mapping, so a pure cluster renaming is not a
+  disagreement, and it is scored over the finalized speech inside the
+  annotated regions, duration-weighted across recordings.
+- **`live_uncovered`** - the share of that speech no live emission ever
+  labelled. Reported separately and never folded into the flip.
+- **Stop-time cost** (`finalize_secs_per_audio_hour`) - the refinement pass on
+  its own, from `<uri>.timing.json`. It is paid exactly when the user waits for
+  the meeting to save. Like the real-time factor it measures the machine, is
+  reported and is never gated.
+
+**Tuning discipline.** `voxconverse-dev` is the tuning set and never a gate: a
+parameter of the stop-time pass is chosen on a sample of it, then validated on
+the held-out `voxconverse` and `ru-synthetic` full sets before it ships. The
+refinement's merge threshold (0.75) was selected that way; the two held-out
+sets disagree about it (see the manifests), which is recorded rather than
+tuned away.
+
+**Reading the gate table.** The 5-file regression subsets are a *smoke* test,
+not the quality record: about three minutes of speech, and each `voxconverse`
+file yields only 2-3 buffered chunks, too few for the refinement to cluster (it
+collapses each to one speaker). The gate bounds therefore stop the numbers
+getting worse; the design's targets are stated beside them, and the quality
+record is the full sets.
+
+Online gate (`online_gate:` in the manifests; measured 2026-09-30 on the
+production-faithful subset runs, refinement on at 0.75):
+
+| Dataset (5 files) | Gated metric | Measured | Gate max | Design target |
+| --- | --- | ---: | ---: | ---: |
+| voxconverse | DER | 24.75 | 31.0 | - |
+| voxconverse | `der_delta` (online - offline) | +16.35 | 22.0 | <= +3.0 |
+| voxconverse | `live_final_flip` | 33.5 % | 40.0 | 5.0 % |
+| ru-synthetic | DER (artifact-inflated) | 54.76 | 60.0 | - |
+| ru-synthetic | `conf_delta` (online - offline) | +11.02 | 16.0 | <= +3.0 |
+| ru-synthetic | `live_final_flip` | 20.4 % | 26.0 | 5.0 % |
+| both | lag p90 / flip rate / final runs per speaker / switches per speaker-minute | see manifests | see manifests | - |
+
+The quality record, full sets, online DER (Conf for `ru-synthetic`) before the
+stop-time pass, with it at the offline merge threshold 0.60, and as shipped at
+0.75:
+
+| Dataset | Offline | Before | 0.60 | 0.75 (shipped) |
+| --- | ---: | ---: | ---: | ---: |
+| voxconverse, 232 files, 40.22 h - DER | 26.95 | 41.54 | 33.93 | **26.69** |
+| voxconverse - `live_final_flip` | - | 0.00 % | 44.51 % | 38.45 % |
+| ru-synthetic, 2000 files, 26.16 h - Conf | 9.82 | 21.73 | **14.13** | 20.65 |
+| ru-synthetic - `live_final_flip` | - | 0.00 % | 28.32 % | 36.39 % |
+
+Fast regression gate (<=10 recordings, ru-synthetic + voxconverse, end-to-end):
 
 ```powershell
 uv run --project eval subset

@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="Write the Markdown comparison report")
     report.add_argument("--datasets", nargs="+", default=None, help="Datasets to include (default: all scored)")
     report.add_argument("--run-id", default="latest", help="Run directory name under eval/out")
+    report.add_argument(
+        "--offline-run-id",
+        default=None,
+        help="Offline run to report beside the online run (default: same as --run-id); "
+        "for a baseline pair whose runs are named per mode, e.g. base-offline / base-online",
+    )
     report.set_defaults(func=_dispatch("report"))
 
     subset = sub.add_parser("subset", help="Run the fast regression subset end-to-end")

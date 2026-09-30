@@ -107,6 +107,44 @@ def load_sidecar(run_dir: Path, uri: str) -> Sidecar:
     return Sidecar(uri=uri, header=header, emissions=emissions)
 
 
+def live_timeline(sidecar: Sidecar) -> list[tuple[float, float, str]]:
+    """The label a user actually saw at each instant, as disjoint spans.
+
+    Design D6's `L(t)`: the label of the emission with the highest emission
+    index covering `t`, so a later emission wins the region it revises. Built
+    from the *stable* emissions only, because those are the ones the app
+    receives and displays — a provisional emission never reaches a user, so
+    including it would measure a label nobody saw.
+
+    Returns spans sorted by start, with adjacent same-label spans joined.
+    """
+    spans: list[tuple[float, float, str]] = []
+    for emission in sorted(sidecar.stable, key=lambda e: e.index):
+        start, end = emission.start, emission.end
+        if end <= start:
+            continue
+        kept: list[tuple[float, float, str]] = []
+        for a, b, label in spans:
+            if b <= start or a >= end:
+                kept.append((a, b, label))
+                continue
+            if a < start:
+                kept.append((a, start, label))
+            if b > end:
+                kept.append((end, b, label))
+        kept.append((start, end, emission.speaker))
+        kept.sort(key=lambda s: s[0])
+        spans = kept
+
+    joined: list[tuple[float, float, str]] = []
+    for start, end, label in spans:
+        if joined and joined[-1][2] == label and abs(start - joined[-1][1]) < 1e-9:
+            joined[-1] = (joined[-1][0], end, label)
+        else:
+            joined.append((start, end, label))
+    return joined
+
+
 def read_rtf(run_dir: Path, uri: str) -> float | None:
     """The harness's recorded real-time factor, or None when absent.
 
@@ -118,6 +156,24 @@ def read_rtf(run_dir: Path, uri: str) -> float | None:
         return None
     try:
         return float(json.loads(path.read_text(encoding="utf-8"))["real_time_factor"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def read_stop_cost(run_dir: Path, uri: str) -> tuple[float, float] | None:
+    """`(finalize_secs, audio_secs)` from the harness's timing file, or None.
+
+    The stop-time refinement is paid exactly when the user is waiting for the
+    meeting to save, so it is reported on its own and never folded into the
+    real-time factor. A run recorded before the harness measured it simply has
+    no figure, which is "not measured", not zero.
+    """
+    path = run_dir / f"{uri}.timing.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return float(payload["finalize_secs"]), float(payload["audio_secs"])
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 

@@ -13,7 +13,14 @@ from pyannote.metrics.diarization import DiarizationErrorRate
 from .manifests import load_manifest
 from .paths import DATA_DIR, OUT_DIR
 from .runner import DEFAULT_MODE, check_mode, read_run_mode, run_dir
-from .streaming import emission_lag, flip_and_fragmentation, load_sidecar, read_rtf
+from .streaming import (
+    emission_lag,
+    flip_and_fragmentation,
+    live_timeline,
+    load_sidecar,
+    read_rtf,
+    read_stop_cost,
+)
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -147,6 +154,15 @@ def score_dataset(
         f"over {result['files']} files / {result['scored_hours']:.2f} h"
         + (f" | baseline {baseline:.1f}%" if baseline is not None else "")
     )
+    if "streaming" in result:
+        flip = result["streaming"]["live_final_flip"]
+        uncovered = result["streaming"]["live_uncovered"]
+        print(
+            "  live-vs-final: flip "
+            + (f"{flip:.2f}%" if flip is not None else "n/a")
+            + ", uncovered "
+            + (f"{uncovered:.2f}%" if uncovered is not None else "n/a")
+        )
     return result
 
 
@@ -164,6 +180,12 @@ def _streaming_metrics(hyp_dir: Path, refs: dict, hyps: dict, uem: dict) -> dict
     turns = 0
     rtfs: list[float] = []
     ablation_files: list[str] = []
+    stop_secs = 0.0
+    stop_audio_secs = 0.0
+    flip_secs = 0.0
+    judged_secs = 0.0
+    uncovered_secs = 0.0
+    agreement_secs = 0.0
 
     for uri, ref in refs.items():
         sidecar = load_sidecar(hyp_dir, uri)
@@ -193,9 +215,21 @@ def _streaming_metrics(hyp_dir: Path, refs: dict, hyps: dict, uem: dict) -> dict
             weighted[key] = weighted.get(key, 0.0) + value * secs
             weights[key] = weights.get(key, 0.0) + secs
 
+        # Summing the durations rather than averaging the ratios makes the
+        # aggregate exactly duration-weighted (D6).
+        agreement = live_final_agreement(sidecar, hyps[uri], ref, region)
+        flip_secs += agreement["flip_secs"]
+        judged_secs += agreement["judged_secs"]
+        uncovered_secs += agreement["uncovered_secs"]
+        agreement_secs += agreement["scored_secs"]
+
         rtf = read_rtf(hyp_dir, uri)
         if rtf is not None:
             rtfs.append(rtf)
+        stop_cost = read_stop_cost(hyp_dir, uri)
+        if stop_cost is not None:
+            stop_secs += stop_cost[0]
+            stop_audio_secs += stop_cost[1]
 
     # Every metric key is always present: a metric with no sample reports
     # None ("not measurable on this run"), never a missing field a report or a
@@ -209,18 +243,104 @@ def _streaming_metrics(hyp_dir: Path, refs: dict, hyps: dict, uem: dict) -> dict
             "final_runs_per_speaker",
         )
     }
+    metrics["live_final_flip"] = (
+        (flip_secs / judged_secs) * 100.0 if judged_secs > 0 else None
+    )
+    metrics["live_uncovered"] = (
+        (uncovered_secs / agreement_secs) * 100.0 if agreement_secs > 0 else None
+    )
     metrics["reference_turns"] = turns
     metrics["uncovered_turns"] = uncovered
     metrics["lag_median"] = statistics.median(lag_samples) if lag_samples else None
     metrics["lag_p90"] = _percentile(lag_samples, 90.0) if lag_samples else None
     # Recorded, never gated: this measures the machine, not the pipeline.
     metrics["real_time_factor"] = (sum(rtfs) / len(rtfs)) if rtfs else None
+    # The stop-time pass on its own, per hour of audio so runs of different
+    # length compare. None for a run recorded before it was measured.
+    metrics["finalize_secs_per_audio_hour"] = (
+        (stop_secs / stop_audio_secs) * 3600.0 if stop_audio_secs > 0 else None
+    )
     if ablation_files:
         metrics["ablation_files"] = len(ablation_files)
         metrics["production_faithful"] = False
     else:
         metrics["production_faithful"] = True
     return metrics
+
+
+def _mapped(label, mapping: dict) -> tuple[str, object]:
+    """A label in a space where live and final labels are comparable.
+
+    Namespaced so a mapped reference name can never collide with a raw
+    cluster id: a label the optimal mapping does not cover keeps its own id,
+    because the same unmapped id on both sides did not change for the user
+    even though neither side has a reference counterpart.
+    """
+    if label in mapping:
+        return ("ref", mapping[label])
+    return ("raw", label)
+
+
+def live_final_agreement(
+    sidecar,
+    finalized: Annotation,
+    reference: Annotation,
+    uem: Timeline | None = None,
+) -> dict:
+    """How much of the finalized speech carries a different label than was shown live.
+
+    Design D6. `L(t)` is the label of the latest emission covering `t` (see
+    `streaming.live_timeline`) and `F(t)` the finalized label. Both are mapped
+    into the reference label space through their own optimal mapping — the one
+    DER uses — because a re-clustering at stop may renumber clusters, and a raw
+    id comparison would then report a flip for every instant. Scored over
+    `support(F)` intersected with the annotated region, so silence and
+    unannotated audio never enter the denominator.
+
+    Durations are returned alongside the two ratios so an aggregate over
+    recordings can be duration-weighted exactly.
+    """
+    metric = DiarizationErrorRate(collar=0.0, skip_overlap=False)
+    map_final = metric.optimal_mapping(reference, finalized, uem=uem)
+
+    live_spans = live_timeline(sidecar)
+    live = Annotation(uri=sidecar.uri)
+    for index, (start, end, label) in enumerate(live_spans):
+        live[Segment(start, end), index] = label
+    map_live = metric.optimal_mapping(reference, live, uem=uem) if live_spans else {}
+
+    scored = finalized.get_timeline().support()
+    if uem is not None:
+        scored = scored.crop(uem, mode="intersection")
+
+    agree = 0.0
+    disagree = 0.0
+    uncovered = 0.0
+    for segment, _track, final_label in finalized.itertracks(yield_label=True):
+        final_key = _mapped(final_label, map_final)
+        for piece in scored.crop(segment, mode="intersection"):
+            covered = 0.0
+            for start, end, live_label in live_spans:
+                overlap = min(end, piece.end) - max(start, piece.start)
+                if overlap <= 0:
+                    continue
+                covered += overlap
+                if _mapped(live_label, map_live) == final_key:
+                    agree += overlap
+                else:
+                    disagree += overlap
+            uncovered += max(0.0, piece.duration - covered)
+
+    judged = agree + disagree
+    total = judged + uncovered
+    return {
+        "live_final_flip": (disagree / judged) if judged > 0 else None,
+        "live_uncovered": (uncovered / total) if total > 0 else None,
+        "flip_secs": disagree,
+        "judged_secs": judged,
+        "uncovered_secs": uncovered,
+        "scored_secs": total,
+    }
 
 
 def score(args) -> int:

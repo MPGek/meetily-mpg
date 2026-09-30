@@ -9,6 +9,7 @@ use std::time::Instant;
 use super::super::batch::guard::DIARIZATION_CANCELLED;
 use super::super::config::MIN_EMBED_SECS;
 use super::super::DIARIZATION_SAMPLE_RATE;
+use super::source::AudioSource;
 use super::units::{count_unique_speakers, StageTimings};
 use super::super::{
     ClusteredEmbedding, DiarizationConfig, DiarizationSegment, PolyvoiceDiarizer,
@@ -141,6 +142,26 @@ impl<'a> V2Core<'a> {
             chunks: Vec::new(),
             had_raw_segments: false,
             timings: StageTimings::default(),
+        }
+    }
+
+    /// Run the core over every window a source yields, in order. Cancellation
+    /// is checked before each read, so a cancelled run stops without pulling
+    /// more audio from a pipe it is about to abandon.
+    pub(crate) fn process_source(&mut self, source: &mut impl AudioSource) -> Result<(), String> {
+        loop {
+            if DIARIZATION_CANCELLED.load(Ordering::SeqCst) {
+                return Err("Diarization cancelled".to_string());
+            }
+            let Some((start_secs, window)) = source.next_window()? else {
+                return Ok(());
+            };
+            if window.is_empty() {
+                continue;
+            }
+            // Sources keep their starts as f64; the core has always taken f32,
+            // and an f32 start widened and narrowed again is unchanged.
+            self.process_chunk(start_secs as f32, &window)?;
         }
     }
 

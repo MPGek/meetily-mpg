@@ -154,6 +154,13 @@ export interface LiveTranscriptBlocks {
   source_device: string;
   revision: number;
   blocks: LiveTranscriptBlock[];
+  /**
+   * Promotion state (05b D2): revisions published while recording are
+   * provisional, the one the stop-time pass publishes is final. A block the
+   * final pass leaves alone keeps its last provisional revision, which is the
+   * rendering the final pass would have produced.
+   */
+  final: boolean;
 }
 
 // Speaker diarization types

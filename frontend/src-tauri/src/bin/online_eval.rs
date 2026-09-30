@@ -64,6 +64,16 @@ struct Args {
     /// Recording URI field in RTTM lines (default: input file stem)
     #[arg(long)]
     uri: Option<String>,
+    /// Skip the stop-time speaker refinement (05b D1), so the finalized
+    /// hypothesis is the identities the session showed live. The app runs the
+    /// refinement by default, so this is the A/B arm, not the default.
+    #[arg(long)]
+    no_final_recluster: bool,
+    /// AHC merge threshold for the stop-time refinement (default: the app's
+    /// built-in refinement threshold). For sweeps; ignored with
+    /// `--no-final-recluster`.
+    #[arg(long)]
+    final_recluster_threshold: Option<f32>,
 }
 
 fn main() -> ExitCode {
@@ -269,13 +279,20 @@ impl Emission {
     }
 }
 
-/// The finalized timeline: the stable emissions resolved so a later emission
-/// wins the region it covers (D6 — "the last label per region", which is what
-/// a saved transcript would show). Adjacent same-speaker spans are joined.
-fn finalized_timeline(emissions: &[Emission]) -> Vec<(f64, f64, String)> {
+/// The finalized timeline: the spans resolved so a later span wins the region
+/// it covers (D6 — "the last label per region", which is what a saved
+/// transcript would show). Adjacent same-speaker spans are joined.
+///
+/// The spans are what the stop-time `finalize` published for the channel: the
+/// refined timeline when the refinement ran, the incremental turns when it did
+/// not. Deriving this from the emission stream instead would leave the
+/// refinement invisible to the measurement, and `live_final_flip` at zero for
+/// ever.
+fn finalized_timeline(
+    spans: impl IntoIterator<Item = (f64, f64, String)>,
+) -> Vec<(f64, f64, String)> {
     let mut out: Vec<(f64, f64, String)> = Vec::new();
-    for emission in emissions.iter().filter(|e| e.stable) {
-        let (start, end) = (emission.start, emission.end);
+    for (start, end, speaker) in spans {
         if end <= start {
             continue;
         }
@@ -292,7 +309,7 @@ fn finalized_timeline(emissions: &[Emission]) -> Vec<(f64, f64, String)> {
                 kept.push((end, b, label));
             }
         }
-        kept.push((start, end, emission.speaker.clone()));
+        kept.push((start, end, speaker));
         kept.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
         out = kept;
     }
@@ -364,6 +381,19 @@ fn run(args: Args) -> Result<(), String> {
         Some(dir) => dir.clone(),
         None => app_lib::audio::diarization::resolve_models_dir_standalone(None)?,
     };
+    // The app resolves its parameters from the process-wide settings; the
+    // harness has no settings store, so it states its configuration itself
+    // (the built-in defaults plus the flags it was given) and records the
+    // refinement's parameters in the header.
+    let final_recluster = !args.no_final_recluster;
+    let config = app_lib::audio::diarization::DiarizationConfig {
+        final_recluster,
+        final_recluster_threshold: args
+            .final_recluster_threshold
+            .unwrap_or(app_lib::audio::diarization::DEFAULT_FINAL_RECLUSTER_THRESHOLD),
+        ..app_lib::audio::diarization::DiarizationConfig::default()
+    };
+    let final_recluster_threshold = config.final_recluster_threshold;
     let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<EmittedTurn>();
     let mut processor = OnlineDiarizationProcessor::new(
         DiarizationMode::Fast,
@@ -374,12 +404,24 @@ fn run(args: Args) -> Result<(), String> {
         None,
     )?;
     processor.attach_emission_sink(sink_tx);
+    processor.set_session_config(config);
 
     let started = Instant::now();
     for chunk in &chunks {
         processor.process_chunk(chunk.clone());
     }
     let elapsed = started.elapsed().as_secs_f64();
+
+    // Stop the way the app does. The finalized hypothesis is what the stop-time
+    // pass produces, and the cost of producing it is measured on its own: it is
+    // paid exactly when the user is waiting for the meeting to save (05b D1).
+    // A failure here is a failure of the recording, not something to paper over
+    // with the live labels.
+    let finalize_started = Instant::now();
+    let (_assignments, _clusters, _bindings, display_pass) = processor
+        .finalize(&[])
+        .map_err(|e| format!("stop-time finalize failed for {uri}: {e}"))?;
+    let finalize_secs = finalize_started.elapsed().as_secs_f64();
     drop(processor);
 
     let mut emissions: Vec<Emission> = Vec::new();
@@ -387,7 +429,14 @@ fn run(args: Args) -> Result<(), String> {
         emissions.push(Emission::from(emissions.len(), &emitted));
     }
 
-    let timeline = finalized_timeline(&emissions);
+    // One canonical channel is fed as the microphone (see above).
+    let timeline = finalized_timeline(
+        display_pass
+            .channels
+            .iter()
+            .filter(|channel| channel.source_device == "Microphone")
+            .flat_map(|channel| channel.spans.iter().cloned()),
+    );
     let header = serde_json::json!({
         "record": "header",
         "uri": uri,
@@ -400,6 +449,8 @@ fn run(args: Args) -> Result<(), String> {
         "chunks": chunks.len(),
         "emissions": emissions.len(),
         "finalized_segments": timeline.len(),
+        "final_recluster": final_recluster,
+        "final_recluster_threshold": final_recluster_threshold,
     });
 
     let out_dir = args.out_dir.clone();
@@ -421,11 +472,17 @@ fn run(args: Args) -> Result<(), String> {
     // sidecar and the RTTM must be reproducible run to run (task 2.6), while
     // the real-time factor is a property of this machine (D7 — recorded,
     // never gated).
-    write_timing(&artifact(".timing.json"), &uri, duration_secs, elapsed)?;
+    write_timing(
+        &artifact(".timing.json"),
+        &uri,
+        duration_secs,
+        elapsed,
+        finalize_secs,
+    )?;
 
     println!(
         "online-eval: uri={uri} mode=fast chunking={} production_faithful={} model_family={} \
-         sample_rate={} duration={:.3}s chunks={} emissions={} finalized={} rtf={:.3}",
+         sample_rate={} duration={:.3}s chunks={} emissions={} finalized={} final_recluster={} rtf={:.3}",
         policy.label(),
         policy.production_faithful(),
         app_lib::audio::embedder::ENHANCED_MODEL_TAG,
@@ -434,6 +491,7 @@ fn run(args: Args) -> Result<(), String> {
         chunks.len(),
         emissions.len(),
         timeline.len(),
+        final_recluster,
         if duration_secs > 0.0 {
             elapsed / duration_secs
         } else {
@@ -495,6 +553,7 @@ fn write_timing(
     uri: &str,
     duration_secs: f64,
     elapsed_secs: f64,
+    finalize_secs: f64,
 ) -> Result<(), String> {
     let rtf = if duration_secs > 0.0 {
         elapsed_secs / duration_secs
@@ -507,6 +566,9 @@ fn write_timing(
         "audio_secs": duration_secs,
         "wall_secs": elapsed_secs,
         "real_time_factor": rtf,
+        // The stop-time pass on its own, kept out of `real_time_factor` so that
+        // figure stays comparable with runs recorded before the pass existed.
+        "finalize_secs": finalize_secs,
     });
     std::fs::write(path, format!("{payload}\n"))
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
@@ -697,27 +759,14 @@ mod tests {
     }
 
     /// D6: the finalized timeline keeps the *last* label for a region, so a
-    /// revision that relabels an earlier span wins it.
+    /// span that relabels an earlier one wins it.
     #[test]
     fn finalized_timeline_resolves_revisions_last_wins() {
-        let emission = |index: usize, start: f64, end: f64, speaker: &str, stable: bool| Emission {
-            index,
-            start,
-            end,
-            speaker: speaker.to_string(),
-            stable,
-            display_name: None,
-            matched_by: None,
-            match_score: None,
-        };
-        let emissions = vec![
-            emission(0, 0.0, 2.0, "SPEAKER_00", true),
-            // a provisional emission must not reach the finalized timeline
-            emission(1, 2.0, 3.0, "SPEAKER_09", false),
-            // a later stable emission relabels the tail of the first
-            emission(2, 1.5, 2.5, "SPEAKER_01", true),
-        ];
-        let timeline = finalized_timeline(&emissions);
+        let timeline = finalized_timeline(vec![
+            (0.0, 2.0, "SPEAKER_00".to_string()),
+            // a later span relabels the tail of the first
+            (1.5, 2.5, "SPEAKER_01".to_string()),
+        ]);
         assert_eq!(
             timeline,
             vec![
@@ -729,20 +778,10 @@ mod tests {
 
     #[test]
     fn finalized_timeline_joins_adjacent_same_speaker_spans() {
-        let mk = |index: usize, start: f64, end: f64, speaker: &str| Emission {
-            index,
-            start,
-            end,
-            speaker: speaker.to_string(),
-            stable: true,
-            display_name: None,
-            matched_by: None,
-            match_score: None,
-        };
-        let timeline = finalized_timeline(&[
-            mk(0, 0.0, 1.0, "SPEAKER_00"),
-            mk(1, 1.0, 2.0, "SPEAKER_00"),
-            mk(2, 2.0, 3.0, "SPEAKER_01"),
+        let timeline = finalized_timeline(vec![
+            (0.0, 1.0, "SPEAKER_00".to_string()),
+            (1.0, 2.0, "SPEAKER_00".to_string()),
+            (2.0, 3.0, "SPEAKER_01".to_string()),
         ]);
         assert_eq!(
             timeline,
@@ -751,5 +790,16 @@ mod tests {
                 (2.0, 3.0, "SPEAKER_01".to_string()),
             ]
         );
+    }
+
+    /// A zero-length span carries no speech, so it must not reach the RTTM as
+    /// a line of its own (the refinement labels one span per buffered window).
+    #[test]
+    fn finalized_timeline_drops_empty_spans() {
+        let timeline = finalized_timeline(vec![
+            (1.0, 1.0, "SPEAKER_00".to_string()),
+            (1.0, 2.0, "SPEAKER_01".to_string()),
+        ]);
+        assert_eq!(timeline, vec![(1.0, 2.0, "SPEAKER_01".to_string())]);
     }
 }

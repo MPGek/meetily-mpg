@@ -15,6 +15,7 @@ use crate::audio::recording_state::{AudioChunk, DeviceType};
 
 use super::super::core::cluster::{EmbeddingBuffer, SpeakerSegment};
 use super::super::core::timeline::{find_best_speaker, split_tokens_by_speaker};
+use super::super::core::turns::merge_same_speaker_segments;
 use super::super::persist::clusters::{clustered_embeddings, EmbeddingLabeling};
 use super::super::identity::prototypes::PrototypeStore;
 use super::super::telemetry::{
@@ -22,8 +23,19 @@ use super::super::telemetry::{
 };
 use super::super::core::factory::create_streaming_embedder;
 use super::engine::{create_fast_channel, Engine};
+use super::reconcile::{FinalChannel, FinalDisplayPass};
 use super::guard::OnlineDiarizationGuard;
 use super::units::{OnlineClusterEmbeddings, SpeakerAssignment, SpeakerTurn};
+
+/// What a stop hands back: the transcript assignments, the per-channel
+/// clustered embeddings for the registry, the user's live cluster bindings, and
+/// the refined timeline the display-side final pass promotes live blocks against.
+pub type FinalizeOutput = (
+    Vec<SpeakerAssignment>,
+    OnlineClusterEmbeddings,
+    HashMap<String, String>,
+    FinalDisplayPass,
+);
 
 /// Receives VAD-filtered 16 kHz speech chunks and produces speaker
 /// assignments at recording stop. No-op while in the error state.
@@ -75,6 +87,176 @@ pub struct OnlineDiarizationProcessor {
     /// configurations.
     config: crate::audio::diarization::DiarizationConfig,
     _guard: OnlineDiarizationGuard,
+}
+
+/// Stop-time refinement of one channel (05b D1): re-cluster the session's
+/// buffered chunk embeddings so voices the incremental pass merged under one
+/// id can still be told apart before anything is persisted. The chunk
+/// embeddings are the only per-channel set that spans the whole session and
+/// comes from the same embedder the batch path uses, so the refined result is
+/// comparable with an offline run of the same audio.
+///
+/// Returns one labelled segment per buffered window, or the reason the
+/// channel keeps the streaming pipeline's incremental identities. That
+/// fallback is unconditional: the setting being off, fewer than the two
+/// embeddings clustering needs, a clusterer that will not build, and a
+/// clustering error all leave the channel exactly as the live session left
+/// it. Nothing here can fail a stop. The reason is both logged and returned,
+/// so a caller (and a test) sees exactly what the log line says.
+fn refine_channel(
+    channel: &str,
+    buffer: &EmbeddingBuffer,
+    config: &crate::audio::diarization::DiarizationConfig,
+    ceiling: usize,
+) -> Result<Vec<SpeakerSegment>, String> {
+    use crate::audio::diarization::Clustering as _;
+
+    if !config.final_recluster {
+        return Err(skipped(channel, "turned off in settings".to_string()));
+    }
+    if buffer.entries.len() < 2 {
+        return Err(skipped(
+            channel,
+            format!(
+                "{} buffered embedding(s), fewer than the two clustering needs",
+                buffer.entries.len()
+            ),
+        ));
+    }
+
+    let embeddings: Vec<Vec<f32>> = buffer.entries.iter().map(|e| e.2.clone()).collect();
+    // The refinement's own merge threshold, everything else as resolved.
+    let refine_config = crate::audio::diarization::DiarizationConfig {
+        cluster_threshold: config.final_recluster_threshold,
+        ..*config
+    };
+    let clusterer = match crate::audio::diarization::clusterer_for_buffer(&refine_config, ceiling) {
+        Ok(c) => c,
+        Err(e) => return Err(failed(channel, e)),
+    };
+    let labels = match clusterer.cluster(&embeddings) {
+        Ok(labels) if labels.len() == buffer.entries.len() => labels,
+        Ok(labels) => {
+            return Err(failed(
+                channel,
+                format!(
+                    "clustering returned {} labels for {} windows",
+                    labels.len(),
+                    buffer.entries.len()
+                ),
+            ))
+        }
+        Err(e) => return Err(failed(channel, e)),
+    };
+
+    let refined: Vec<SpeakerSegment> = buffer
+        .entries
+        .iter()
+        .zip(&labels)
+        .map(|((start, end, _), label)| SpeakerSegment {
+            start: *start,
+            end: *end,
+            speaker: *label,
+        })
+        .collect();
+    let distinct = labels
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    info!(
+        "Stop-time speaker refinement on the {} channel: {} windows -> {} speaker(s) (clusterer {}, threshold {:.3}, ceiling {})",
+        channel,
+        refined.len(),
+        distinct,
+        refine_config.clusterer.as_str(),
+        refine_config.cluster_threshold,
+        ceiling
+    );
+    Ok(refined)
+}
+
+/// An expected skip: logged at info, because nothing went wrong.
+fn skipped(channel: &str, reason: String) -> String {
+    let message = format!(
+        "Stop-time speaker refinement skipped on the {} channel: {}; keeping the identities shown live",
+        channel, reason
+    );
+    info!("{}", message);
+    message
+}
+
+/// A refinement that could not run: logged at warn, still not an error for
+/// the stop, which completes on the incremental identities.
+fn failed(channel: &str, reason: String) -> String {
+    let message = format!(
+        "Stop-time speaker refinement failed on the {} channel ({}); keeping the identities shown live",
+        channel, reason
+    );
+    warn!("{}", message);
+    message
+}
+
+/// Re-number a refined channel into the label space the live session
+/// published (05b D2/3.3).
+///
+/// Everything a user did during the recording is keyed by the *live* cluster
+/// label - a rename through `PrototypeStore::bind`, a per-turn override, the
+/// name already on screen - so refined clusters must not arrive under fresh
+/// numbers. Each refined cluster takes the name of the live cluster it covers
+/// most, greedily and one-to-one; a refined cluster that matches no live
+/// cluster (the split the refinement just discovered) gets an id no live
+/// cluster used. Two consequences that matter: a user's correction lands on
+/// the people it was made for, and the display pass sees a changed label only
+/// where the grouping really changed instead of everywhere.
+///
+/// Returns the number of refined clusters that kept a live name.
+fn anchor_to_live_labels(refined: &mut [SpeakerSegment], live: &[SpeakerSegment]) -> usize {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if refined.is_empty() || live.is_empty() {
+        return 0;
+    }
+    let mut overlap: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for r in refined.iter() {
+        for l in live.iter() {
+            let shared = (r.end.min(l.end) - r.start.max(l.start)) as f64;
+            if shared > 0.0 {
+                *overlap.entry((r.speaker, l.speaker)).or_insert(0.0) += shared;
+            }
+        }
+    }
+
+    // Greedy one-to-one by shared duration. Ties break on the ids, so the
+    // outcome does not depend on map iteration order.
+    let mut pairs: Vec<((usize, usize), f64)> = overlap.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut refined_to_live: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut taken_live: BTreeSet<usize> = BTreeSet::new();
+    for ((refined_id, live_id), _shared) in pairs {
+        if refined_to_live.contains_key(&refined_id) || taken_live.contains(&live_id) {
+            continue;
+        }
+        refined_to_live.insert(refined_id, live_id);
+        taken_live.insert(live_id);
+    }
+
+    // Refined clusters with no live counterpart get ids no live cluster used.
+    let mut next = live.iter().map(|l| l.speaker).max().unwrap_or(0) + 1;
+    let refined_ids: BTreeSet<usize> = refined.iter().map(|r| r.speaker).collect();
+    for id in refined_ids {
+        if refined_to_live.contains_key(&id) {
+            continue;
+        }
+        refined_to_live.insert(id, next);
+        next += 1;
+    }
+
+    for segment in refined.iter_mut() {
+        if let Some(anchored) = refined_to_live.get(&segment.speaker) {
+            segment.speaker = *anchored;
+        }
+    }
+    taken_live.len()
 }
 
 const MIN_SEGMENT_SAMPLES: usize = 3200; // 200 ms at 16 kHz (spec minimum)
@@ -211,6 +393,15 @@ impl OnlineDiarizationProcessor {
     /// ones included (developer harness only; the recording path never calls
     /// this). Kept separate from construction so the production path cannot
     /// acquire one by accident.
+    /// Replace the parameters resolved at construction. Evaluation hook: the
+    /// harness states its configuration explicitly instead of reading the
+    /// process-wide settings, so a run measures the defaults plus exactly the
+    /// flags it was given. The app never calls this; a session keeps the
+    /// configuration it resolved at its start (05 D4).
+    pub fn set_session_config(&mut self, config: crate::audio::diarization::DiarizationConfig) {
+        self.config = config;
+    }
+
     pub fn attach_emission_sink(&mut self, sink: UnboundedSender<EmittedTurn>) {
         self.emission_sink = Some(sink);
     }
@@ -532,19 +723,11 @@ impl OnlineDiarizationProcessor {
 
     /// Computes speaker assignments for the in-memory transcript segments and
     /// per-channel clustered embeddings for the speaker registry. Returns
-    /// `(assignments, cluster_embeddings, live_user_bindings)`. An empty
-    /// assignment list on "no speech detected" is not an error.
-    pub fn finalize(
-        &mut self,
-        transcripts: &[TranscriptSegment],
-    ) -> Result<
-        (
-            Vec<SpeakerAssignment>,
-            OnlineClusterEmbeddings,
-            HashMap<String, String>,
-        ),
-        String,
-    > {
+    /// `(assignments, cluster_embeddings, live_user_bindings, display_pass)`,
+    /// the last being the refined per-channel timeline the display-side final
+    /// pass promotes live blocks against (05b D2). An empty assignment list on
+    /// "no speech detected" is not an error.
+    pub fn finalize(&mut self, transcripts: &[TranscriptSegment]) -> Result<FinalizeOutput, String> {
         let Some(engine) = self.engine.take() else {
             return Err("Online diarization unavailable (error state)".to_string());
         };
@@ -611,13 +794,85 @@ impl OnlineDiarizationProcessor {
                         .collect();
                     mic_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
                     sys_segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-                    // Fast mode: buffer entries have no cluster id; group them by
-                    // time-overlap with the stable turns (which carry pipeline
-                    // speaker ids), using the same find_best_speaker logic.
-                    let mic_clustered =
-                        clustered_embeddings(&mic_emb.entries, EmbeddingLabeling::ByOverlap(&mic_segments));
-                    let sys_clustered =
-                        clustered_embeddings(&sys_emb.entries, EmbeddingLabeling::ByOverlap(&sys_segments));
+
+                    // Stop-time refinement (05b D1), per channel and never
+                    // across channels: the two buffers are clustered
+                    // separately, so a refined cluster only ever covers the
+                    // windows of the channel it came from. A channel that
+                    // falls back keeps the incremental timeline it published
+                    // live, independently of the other channel's outcome.
+                    let mut mic_refined =
+                        refine_channel("microphone", &mic_emb, &self.config, ceiling);
+                    let mut sys_refined = refine_channel("system", &sys_emb, &self.config, ceiling);
+                    // Keep the live label space (05b 3.3): a rename or a
+                    // per-turn override made during the recording is keyed by
+                    // the live cluster label.
+                    for (units, live, channel) in [
+                        (&mut mic_refined, &mic_segments, "microphone"),
+                        (&mut sys_refined, &sys_segments, "system"),
+                    ] {
+                        if let Ok(units) = units.as_mut() {
+                            let kept = anchor_to_live_labels(units, live);
+                            info!(
+                                "Stop-time refinement on the {} channel kept {} live speaker name(s); {} cluster(s) after refinement",
+                                channel,
+                                kept,
+                                units
+                                    .iter()
+                                    .map(|u| u.speaker)
+                                    .collect::<std::collections::BTreeSet<_>>()
+                                    .len()
+                            );
+                        }
+                    }
+                    let (mic_segments, mic_clustered) = match mic_refined {
+                        Ok(units) => {
+                            // Persistence and enrollment read the refined label
+                            // of each window directly; the timeline the
+                            // transcript is attributed against is the same
+                            // labels with the resolved gap-merge applied, so a
+                            // speaker's consecutive windows become one turn as
+                            // they do on the batch path.
+                            let clustered = clustered_embeddings(
+                                &mic_emb.entries,
+                                EmbeddingLabeling::ByPosition(&units),
+                            );
+                            (
+                                merge_same_speaker_segments(units, self.config.gap_merge_secs),
+                                clustered,
+                            )
+                        }
+                        Err(_) => {
+                            // Fast mode fallback: buffer entries have no cluster
+                            // id, so group them by time-overlap with the stable
+                            // turns (which carry pipeline speaker ids), using the
+                            // same find_best_speaker logic.
+                            let clustered = clustered_embeddings(
+                                &mic_emb.entries,
+                                EmbeddingLabeling::ByOverlap(&mic_segments),
+                            );
+                            (mic_segments, clustered)
+                        }
+                    };
+                    let (sys_segments, sys_clustered) = match sys_refined {
+                        Ok(units) => {
+                            let clustered = clustered_embeddings(
+                                &sys_emb.entries,
+                                EmbeddingLabeling::ByPosition(&units),
+                            );
+                            (
+                                merge_same_speaker_segments(units, self.config.gap_merge_secs),
+                                clustered,
+                            )
+                        }
+                        Err(_) => {
+                            let clustered = clustered_embeddings(
+                                &sys_emb.entries,
+                                EmbeddingLabeling::ByOverlap(&sys_segments),
+                            );
+                            (sys_segments, clustered)
+                        }
+                    };
                     (
                         mic_segments,
                         sys_segments,
@@ -628,6 +883,27 @@ impl OnlineDiarizationProcessor {
                     )
                 }
             };
+
+        // The refined timeline for the display-side final pass, in the label
+        // namespace the live turns used: the microphone channel carries this
+        // session's mic prefix, the system channel always `SPEAKER`.
+        let display_pass = FinalDisplayPass {
+            channels: vec![
+                FinalChannel {
+                    source_device: "Microphone".to_string(),
+                    spans: labelled_spans(&mic_segments, &mic_prefix),
+                },
+                FinalChannel {
+                    source_device: "System".to_string(),
+                    spans: labelled_spans(&sys_segments, "SPEAKER"),
+                },
+            ],
+            relabel_all: self.config.final_relabel_all,
+            // Per-turn overrides the user recorded during the recording. Read,
+            // never consumed: `finalize_online_session` still applies them to
+            // the persisted transcripts.
+            protected: super::super::engine::live_turn_override_windows(self.saw_system_audio),
+        };
 
         let clusters = OnlineClusterEmbeddings {
             mic: mic_clustered,
@@ -665,7 +941,7 @@ impl OnlineDiarizationProcessor {
 
         if mic_segments.is_empty() && sys_segments.is_empty() {
             info!("Online diarization: no speech segments detected, skipping transcript updates");
-            return Ok((Vec::new(), clusters, live_bindings));
+            return Ok((Vec::new(), clusters, live_bindings, display_pass));
         }
 
         // N-way token expansion: if a transcript carries token timestamps spanning
@@ -733,8 +1009,23 @@ impl OnlineDiarizationProcessor {
             skipped_no_match,
             live_bindings.len()
         );
-        Ok((assignments, clusters, live_bindings))
+        Ok((assignments, clusters, live_bindings, display_pass))
     }
+}
+
+/// `(start, end, label)` spans for one channel, named exactly as the
+/// assignment path names them.
+fn labelled_spans(segments: &[SpeakerSegment], prefix: &str) -> Vec<(f64, f64, String)> {
+    segments
+        .iter()
+        .map(|seg| {
+            (
+                seg.start as f64,
+                seg.end as f64,
+                format!("{}_{:02}", prefix, seg.speaker),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -767,7 +1058,14 @@ mod tests {
         let saved = DiarizationConfig::resolved();
 
         // Start the session under a known, non-default threshold.
-        set_clustering_overrides(Some(0.42), Some(9), None, Some(ClustererKindSetting::Ahc));
+        set_clustering_overrides(
+            Some(0.42),
+            Some(9),
+            None,
+            Some(ClustererKindSetting::Ahc),
+            Some(false),
+            None,
+        );
         let processor = match OnlineDiarizationProcessor::new(
             DiarizationMode::Efficient,
             0,
@@ -779,23 +1077,39 @@ mod tests {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("skipping: processor init unavailable ({e})");
-                set_clustering_overrides(None, None, None, None);
+                set_clustering_overrides(None, None, None, None, None, None);
                 return;
             }
         };
         assert_eq!(processor.config.cluster_threshold, 0.42);
         assert_eq!(processor.config.cluster_ceiling, 9);
+        assert!(
+            !processor.config.final_recluster,
+            "the stop-time refinement switch is resolved at session start too (05b 2.1)"
+        );
 
         // A settings change after the session started must not reach it.
-        set_clustering_overrides(Some(0.81), Some(3), None, Some(ClustererKindSetting::Nmesc));
+        set_clustering_overrides(
+            Some(0.81),
+            Some(3),
+            None,
+            Some(ClustererKindSetting::Nmesc),
+            Some(true),
+            None,
+        );
         assert_eq!(
             processor.config.cluster_threshold, 0.42,
             "session config is a snapshot taken at construction"
         );
         assert_eq!(processor.config.cluster_ceiling, 9);
         assert_eq!(processor.config.clusterer, ClustererKindSetting::Ahc);
+        assert!(
+            !processor.config.final_recluster,
+            "turning the refinement on mid-recording must not reach a running session"
+        );
         // ... while a newly resolved config does see it.
         assert_eq!(DiarizationConfig::resolved().cluster_threshold, 0.81);
+        assert!(DiarizationConfig::resolved().final_recluster);
 
         drop(processor);
         set_clustering_overrides(
@@ -803,8 +1117,437 @@ mod tests {
             Some(saved.cluster_ceiling),
             Some(saved.gap_merge_secs),
             Some(saved.clusterer),
+            Some(saved.final_recluster),
+            Some(saved.final_relabel_all),
         );
-        set_clustering_overrides(None, None, None, None);
+        set_clustering_overrides(None, None, None, None, None, None);
+    }
+
+    // ===== Stop-time refinement (05b D1, tasks 2.2/2.3) =====
+
+    /// A deterministic stand-in for one voice: a 192-d unit direction (the
+    /// TitaNet-Large dimensionality) with a fixed per-window perturbation, so
+    /// two windows of the same voice are near-parallel and two windows of
+    /// different voices are near-orthogonal. Real audio is not needed to
+    /// exercise the clustering seam, and a synthetic vector keeps the expected
+    /// grouping known exactly.
+    fn voice_window(voice: usize, window: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 192];
+        v[voice] = 1.0;
+        // A small, deterministic wobble in a dimension no voice occupies.
+        v[64 + window] = 0.02;
+        v
+    }
+
+    fn buffer_of(windows: &[(f32, f32, usize, usize)]) -> EmbeddingBuffer {
+        let mut buffer = EmbeddingBuffer::default();
+        for (start, end, voice, window) in windows {
+            buffer.push(*start, *end, voice_window(*voice, *window));
+        }
+        buffer
+    }
+
+    fn refine_config(final_recluster: bool) -> crate::audio::diarization::DiarizationConfig {
+        crate::audio::diarization::DiarizationConfig {
+            final_recluster,
+            ..crate::audio::diarization::DiarizationConfig::default()
+        }
+    }
+
+    /// The regression this change exists for: the incremental pass published
+    /// one identity for two voices, and the stop-time pass has to take them
+    /// apart from the same buffered embeddings.
+    #[test]
+    fn refinement_separates_two_voices_the_incremental_pass_merged() {
+        // Six windows, two voices, alternating in time - exactly the shape
+        // that makes an incremental clusterer merge them.
+        let buffer = buffer_of(&[
+            (0.0, 1.0, 0, 0),
+            (1.0, 2.0, 1, 1),
+            (2.0, 3.0, 0, 2),
+            (3.0, 4.0, 1, 3),
+            (4.0, 5.0, 0, 4),
+            (5.0, 6.0, 1, 5),
+        ]);
+        let config = refine_config(true);
+
+        let refined = refine_channel("microphone", &buffer, &config, 128)
+            .expect("two well-separated voices must cluster");
+        assert_eq!(refined.len(), 6, "one labelled segment per buffered window");
+
+        let labels: Vec<usize> = refined.iter().map(|seg| seg.speaker).collect();
+        let distinct: std::collections::BTreeSet<usize> = labels.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "the refined pass finds the two voices the live ids merged into one, got {:?}",
+            labels
+        );
+        // Windows of one voice share a label, and the two voices differ.
+        assert_eq!(labels[0], labels[2]);
+        assert_eq!(labels[0], labels[4]);
+        assert_eq!(labels[1], labels[3]);
+        assert_eq!(labels[1], labels[5]);
+        assert_ne!(labels[0], labels[1]);
+        // Times are carried through untouched: the pass relabels windows, it
+        // does not move them.
+        assert_eq!(
+            refined.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(),
+            vec![
+                (0.0, 1.0),
+                (1.0, 2.0),
+                (2.0, 3.0),
+                (3.0, 4.0),
+                (4.0, 5.0),
+                (5.0, 6.0)
+            ]
+        );
+    }
+
+    /// The timeline the transcript is attributed against is the refined labels
+    /// with the resolved gap-merge applied, so one speaker's consecutive
+    /// windows become one turn instead of one turn per window.
+    #[test]
+    fn the_refined_timeline_merges_a_speakers_consecutive_windows() {
+        let buffer = buffer_of(&[
+            (0.0, 1.0, 0, 0),
+            (1.0, 2.0, 0, 1),
+            (2.0, 3.0, 0, 2),
+            (4.0, 5.0, 1, 3),
+            (5.0, 6.0, 1, 4),
+        ]);
+        let config = refine_config(true);
+        let refined = refine_channel("microphone", &buffer, &config, 128).expect("clusters");
+
+        let timeline = merge_same_speaker_segments(refined, config.gap_merge_secs);
+        assert_eq!(
+            timeline.len(),
+            2,
+            "three windows of one voice and two of another become two turns, got {:?}",
+            timeline
+                .iter()
+                .map(|s| (s.start, s.end, s.speaker))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!((timeline[0].start, timeline[0].end), (0.0, 3.0));
+        assert_eq!((timeline[1].start, timeline[1].end), (4.0, 6.0));
+        assert_ne!(timeline[0].speaker, timeline[1].speaker);
+    }
+
+    /// Each channel is clustered from its own buffer, so a refined cluster can
+    /// only ever cover windows of the channel it came from - even when both
+    /// channels carry speech over the same wall-clock span, and even when one
+    /// channel falls back while the other refines.
+    #[test]
+    fn a_refined_cluster_never_spans_both_channels() {
+        let config = refine_config(true);
+        // Both channels speak over 0-6 s. The microphone has two voices, the
+        // system channel one - a different voice again.
+        let mic = buffer_of(&[
+            (0.0, 1.0, 0, 0),
+            (1.0, 2.0, 1, 1),
+            (2.0, 3.0, 0, 2),
+            (3.0, 4.0, 1, 3),
+        ]);
+        let sys = buffer_of(&[(0.0, 2.0, 2, 0), (2.0, 4.0, 2, 1), (4.0, 6.0, 2, 2)]);
+
+        let mic_refined = refine_channel("microphone", &mic, &config, 128).expect("mic clusters");
+        let sys_refined = refine_channel("system", &sys, &config, 128).expect("sys clusters");
+
+        // Every refined segment came from its own channel's windows.
+        let mic_windows: Vec<(f32, f32)> = mic.entries.iter().map(|e| (e.0, e.1)).collect();
+        let sys_windows: Vec<(f32, f32)> = sys.entries.iter().map(|e| (e.0, e.1)).collect();
+        assert_eq!(
+            mic_refined
+                .iter()
+                .map(|s| (s.start, s.end))
+                .collect::<Vec<_>>(),
+            mic_windows
+        );
+        assert_eq!(
+            sys_refined
+                .iter()
+                .map(|s| (s.start, s.end))
+                .collect::<Vec<_>>(),
+            sys_windows
+        );
+        // The system channel's single voice stays one cluster while the
+        // microphone's two stay two: neither result could have been produced
+        // from the other channel's embeddings.
+        assert_eq!(
+            sys_refined
+                .iter()
+                .map(|s| s.speaker)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        assert_eq!(
+            mic_refined
+                .iter()
+                .map(|s| s.speaker)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        // One channel falling back leaves the other channel's refinement
+        // exactly as it was.
+        let empty = EmbeddingBuffer::default();
+        assert!(refine_channel("system", &empty, &config, 128).is_err());
+        let mic_again = refine_channel("microphone", &mic, &config, 128).expect("mic clusters");
+        assert_eq!(
+            mic_again.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            mic_refined.iter().map(|s| s.speaker).collect::<Vec<_>>()
+        );
+    }
+
+    /// Spec scenario "Refinement obeys the resolved parameters": the refinement
+    /// never yields more speakers than the effective ceiling, however many the
+    /// audio would support.
+    #[test]
+    fn the_refinement_never_exceeds_the_effective_ceiling() {
+        let distinct = |segments: &[SpeakerSegment]| {
+            segments
+                .iter()
+                .map(|s| s.speaker)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        // Three well-separated voices, two windows each.
+        let buffer = buffer_of(&[
+            (0.0, 1.0, 0, 0),
+            (1.0, 2.0, 1, 1),
+            (2.0, 3.0, 2, 2),
+            (3.0, 4.0, 0, 3),
+            (4.0, 5.0, 1, 4),
+            (5.0, 6.0, 2, 5),
+        ]);
+        let config = refine_config(true);
+
+        let free = refine_channel("microphone", &buffer, &config, 128).expect("clusters");
+        assert_eq!(distinct(&free), 3, "the audio supports three speakers");
+
+        let capped = refine_channel("microphone", &buffer, &config, 2).expect("clusters");
+        assert!(
+            distinct(&capped) <= 2,
+            "a ceiling of two must hold, got {} speakers",
+            distinct(&capped)
+        );
+    }
+
+    /// Spec scenario "Refinement has its own default merge threshold": the pass
+    /// reads `final_recluster_threshold`, not the offline `cluster_threshold`.
+    /// Each arm sets the two to opposite extremes, so wiring the wrong one
+    /// through gives the opposite answer.
+    #[test]
+    fn the_refinement_uses_its_own_merge_threshold_not_the_offline_one() {
+        let distinct = |segments: &[SpeakerSegment]| {
+            segments
+                .iter()
+                .map(|s| s.speaker)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        let buffer = buffer_of(&[
+            (0.0, 1.0, 0, 0),
+            (1.0, 2.0, 1, 1),
+            (2.0, 3.0, 0, 2),
+            (3.0, 4.0, 1, 3),
+        ]);
+
+        // Offline threshold would merge everything; the refinement's separates.
+        let separates = crate::audio::diarization::DiarizationConfig {
+            cluster_threshold: -0.5,
+            final_recluster_threshold: 0.5,
+            ..refine_config(true)
+        };
+        let refined = refine_channel("microphone", &buffer, &separates, 128).expect("clusters");
+        assert_eq!(distinct(&refined), 2, "the refinement's own threshold decides");
+
+        // Offline threshold would separate; the refinement's merges everything.
+        let merges = crate::audio::diarization::DiarizationConfig {
+            cluster_threshold: 0.99,
+            final_recluster_threshold: -0.5,
+            ..refine_config(true)
+        };
+        let refined = refine_channel("microphone", &buffer, &merges, 128).expect("clusters");
+        assert_eq!(distinct(&refined), 1, "the offline threshold must not leak in");
+    }
+
+    /// Task 2.3: every fallback path completes the stop on the incremental
+    /// identities and says why, in the same words it logs.
+    #[test]
+    fn every_refinement_fallback_keeps_the_live_identities_and_says_why() {
+        let buffer = buffer_of(&[(0.0, 1.0, 0, 0), (1.0, 2.0, 1, 1), (2.0, 3.0, 0, 2)]);
+
+        // 1. The setting is off.
+        let reason = refine_channel("microphone", &buffer, &refine_config(false), 128)
+            .expect_err("a disabled pass must not refine");
+        assert!(
+            reason.contains("turned off in settings")
+                && reason.contains("keeping the identities shown live"),
+            "unexpected reason: {reason}"
+        );
+
+        // 2. Fewer than two buffered embeddings on the channel.
+        let one = buffer_of(&[(0.0, 1.0, 0, 0)]);
+        let reason = refine_channel("system", &one, &refine_config(true), 128)
+            .expect_err("one embedding cannot be clustered");
+        assert!(
+            reason.contains("1 buffered embedding(s), fewer than the two clustering needs"),
+            "unexpected reason: {reason}"
+        );
+        let none = EmbeddingBuffer::default();
+        assert!(refine_channel("system", &none, &refine_config(true), 128).is_err());
+
+        // 3. A clusterer that cannot be built for this model family: `vbx`
+        // is dimension-locked to 256-d embeddings and the bundled family is
+        // 192-d, so construction errors instead of silently switching kinds.
+        let vbx = crate::audio::diarization::DiarizationConfig {
+            clusterer: crate::audio::diarization::ClustererKindSetting::Vbx,
+            final_recluster: true,
+            ..crate::audio::diarization::DiarizationConfig::default()
+        };
+        let reason = refine_channel("microphone", &buffer, &vbx, 128)
+            .expect_err("vbx must not build for the 192-d family");
+        assert!(
+            reason.contains("failed on the microphone channel")
+                && reason.contains("keeping the identities shown live"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    /// The live label space survives the refinement (05b 3.3). Everything the
+    /// user did during the recording is keyed by the live cluster label, so a
+    /// refined cluster that is mostly one live cluster has to keep its name.
+    #[test]
+    fn anchoring_keeps_the_live_name_and_numbers_only_the_new_split() {
+        // Live: one cluster (id 3) covered 0-6 s - it merged two voices.
+        let live = vec![SpeakerSegment {
+            start: 0.0,
+            end: 6.0,
+            speaker: 3,
+        }];
+        // Refined: two clusters, ids 0 and 1 from the clusterer's own numbering.
+        let mut refined = vec![
+            SpeakerSegment { start: 0.0, end: 1.0, speaker: 0 },
+            SpeakerSegment { start: 1.0, end: 2.0, speaker: 1 },
+            SpeakerSegment { start: 2.0, end: 3.0, speaker: 0 },
+            SpeakerSegment { start: 3.0, end: 4.0, speaker: 1 },
+            SpeakerSegment { start: 4.0, end: 6.0, speaker: 0 },
+        ];
+        let kept = anchor_to_live_labels(&mut refined, &live);
+        assert_eq!(kept, 1, "one refined cluster inherits the live cluster");
+        // Cluster 0 covers 4 s of live id 3 and cluster 1 covers 2 s, so 0
+        // takes the name and 1 becomes an id no live cluster used.
+        let labels: Vec<usize> = refined.iter().map(|s| s.speaker).collect();
+        assert_eq!(labels, vec![3, 4, 3, 4, 3]);
+    }
+
+    /// With no live labels to anchor to (a session that published no stable
+    /// turn), the refined numbering stands as it is.
+    #[test]
+    fn anchoring_is_a_no_op_without_live_labels() {
+        let mut refined = vec![
+            SpeakerSegment { start: 0.0, end: 1.0, speaker: 0 },
+            SpeakerSegment { start: 1.0, end: 2.0, speaker: 1 },
+        ];
+        let before: Vec<usize> = refined.iter().map(|s| s.speaker).collect();
+        assert_eq!(anchor_to_live_labels(&mut refined, &[]), 0);
+        assert_eq!(refined.iter().map(|s| s.speaker).collect::<Vec<_>>(), before);
+    }
+
+    /// Two live clusters that survive the refinement each keep their own name,
+    /// rather than both collapsing onto the biggest one.
+    #[test]
+    fn anchoring_is_one_to_one() {
+        let live = vec![
+            SpeakerSegment { start: 0.0, end: 4.0, speaker: 0 },
+            SpeakerSegment { start: 4.0, end: 8.0, speaker: 1 },
+        ];
+        let mut refined = vec![
+            SpeakerSegment { start: 0.0, end: 4.0, speaker: 7 },
+            SpeakerSegment { start: 4.0, end: 8.0, speaker: 9 },
+        ];
+        assert_eq!(anchor_to_live_labels(&mut refined, &live), 2);
+        assert_eq!(
+            refined.iter().map(|s| s.speaker).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    /// Task 4.2: the shared core serves the batch drivers and the live driver
+    /// alike. Given the same windows of the same audio, the in-memory batch
+    /// source and the live VAD-chunk source must produce the same result, so
+    /// nothing in the core depends on which driver it is running for. The
+    /// windows are cut at fixed boundaries and handed to both sources
+    /// unchanged; what a real recording's VAD would cut is a different
+    /// question, and not one this seam answers.
+    #[test]
+    fn the_core_gives_the_same_result_from_a_batch_source_and_a_live_source() {
+        use super::super::source::VadChunks;
+        use crate::audio::diarization::batch::chunking::MemoryWindows;
+        use crate::audio::diarization::core::segment::V2Core;
+        use crate::audio::diarization::{create_polyvoice_diarizer, DiarizationConfig};
+        use crate::audio::recording_state::DeviceType;
+
+        let Ok(models_dir) = crate::audio::diarization::resolve_models_dir_standalone(None) else {
+            eprintln!("skipping: enhanced diarization models not installed");
+            return;
+        };
+        let Some(blocks) = speech_chunks(30.0) else {
+            eprintln!("skipping: no eval speech fixture available");
+            return;
+        };
+        // 30 s of speech re-cut into three 10 s windows.
+        let samples: Vec<f32> = blocks.iter().flat_map(|c| c.data.iter().copied()).collect();
+        let rate = blocks[0].sample_rate;
+        assert_eq!(rate, 16_000, "the fixture is 16 kHz, like the live path");
+        let per_window = 10 * rate as usize;
+        let windows: Vec<(f32, Vec<f32>)> = samples
+            .chunks(per_window)
+            .enumerate()
+            .map(|(i, w)| ((i * 10) as f32, w.to_vec()))
+            .collect();
+        assert!(windows.len() >= 3, "need several windows to exercise the loop");
+
+        let config = DiarizationConfig::default();
+        let diarizer = create_polyvoice_diarizer(&models_dir, None, &config).expect("diarizer");
+
+        let run = |source: &mut dyn FnMut(&mut V2Core<'_>) -> Result<(), String>| {
+            let mut core = V2Core::new(&diarizer, &config);
+            source(&mut core).expect("core run");
+            core.finish().expect("finish")
+        };
+        let (batch_segments, batch_embeddings, _) =
+            run(&mut |core| core.process_source(&mut MemoryWindows::new(windows.clone(), rate)));
+        let mut live = VadChunks::new(windows.iter().enumerate().map(|(i, (start, data))| AudioChunk {
+            data: data.clone(),
+            sample_rate: rate,
+            timestamp: *start as f64,
+            chunk_id: i as u64,
+            device_type: DeviceType::Microphone,
+            channels: 1,
+        }));
+        let (live_segments, live_embeddings, _) = run(&mut |core| core.process_source(&mut live));
+
+        assert!(
+            !batch_segments.is_empty() && !batch_embeddings.is_empty(),
+            "the fixture must yield speech, or this comparison proves nothing"
+        );
+        let spans = |segments: &[crate::audio::diarization::DiarizationSegment]| {
+            segments
+                .iter()
+                .map(|s| (s.start, s.end, s.speaker))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans(&batch_segments), spans(&live_segments));
+        assert_eq!(batch_embeddings.len(), live_embeddings.len());
+        for (a, b) in batch_embeddings.iter().zip(&live_embeddings) {
+            assert_eq!(a.speaker, b.speaker);
+            assert_eq!((a.start_secs, a.end_secs), (b.start_secs, b.end_secs));
+            assert_eq!(a.embedding, b.embedding, "embedding units differ between sources");
+        }
     }
 
     /// A fixture with real speech, in 0.6 s chunks on one channel. Returns

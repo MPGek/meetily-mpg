@@ -108,7 +108,7 @@ async fn run_mode(
     println!("  live turns emitted: {}", turns.len());
 
     match processor.finalize(transcripts) {
-        Ok((assignments, clusters, bindings)) => {
+        Ok((assignments, clusters, bindings, _display_pass)) => {
             println!(
                 "  finalize OK: {} assignments, mic clusters {}, sys clusters {}, bindings {}",
                 assignments.len(),
@@ -317,7 +317,7 @@ async fn run_mode_short(
     }
     println!("  final error state: {}", processor.is_in_error_state());
     match processor.finalize(transcripts) {
-        Ok((assignments, clusters, _)) => println!(
+        Ok((assignments, clusters, _, _)) => println!(
             "  finalize OK: {} assignments, mic clusters {}, sys clusters {}",
             assignments.len(),
             clusters.mic.len(),
@@ -399,7 +399,7 @@ async fn run_mode_16k(
     }
     println!("  live turns emitted: {}", turns.len());
     match processor.finalize(transcripts) {
-        Ok((assignments, clusters, _)) => {
+        Ok((assignments, clusters, _, _)) => {
             println!(
                 "  finalize OK: {} assignments, mic clusters {}, sys clusters {}",
                 assignments.len(),
@@ -480,7 +480,7 @@ async fn run_mode_long(
     }
     println!("  live turns emitted: {}", turns.len());
     match processor.finalize(transcripts) {
-        Ok((assignments, clusters, _)) => {
+        Ok((assignments, clusters, _, _)) => {
             println!(
                 "  finalize OK: {} assignments, mic clusters {}, sys clusters {}",
                 assignments.len(),
@@ -551,7 +551,7 @@ async fn run_mode_ms(
         processor.is_in_error_state()
     );
     match processor.finalize(transcripts) {
-        Ok((assignments, clusters, _)) => {
+        Ok((assignments, clusters, _, _)) => {
             println!(
                 "  finalize OK: {} assignments, mic clusters {}, sys clusters {}",
                 assignments.len(),

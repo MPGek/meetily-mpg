@@ -1,14 +1,58 @@
 //! Chunked batch diarization: split a long channel into overlapping chunks and
 //! run the core over each, keeping peak memory at one chunk.
 
+use std::borrow::Cow;
+
 use log::info;
 
 use super::super::core::segment::V2Core;
+use super::super::core::source::{AudioSource, Window};
 use super::super::core::units::StageTimings;
 use super::super::{
     ClusteredEmbedding, DiarizationConfig, DiarizationSegment, PolyvoiceDiarizer,
     DIARIZATION_SAMPLE_RATE,
 };
+
+/// The batch driver's source for samples already in memory: the recording cut
+/// into overlapping chunks, each resampled to the diarization rate when the
+/// recording is at another one. Owns its windows so the core can take them one
+/// at a time and peak memory stays at one chunk plus what is still queued.
+pub(crate) struct MemoryWindows {
+    chunks: std::vec::IntoIter<(f32, Vec<f32>)>,
+    next_index: usize,
+    sample_rate: u32,
+}
+
+impl MemoryWindows {
+    pub(crate) fn new(chunks: Vec<(f32, Vec<f32>)>, sample_rate: u32) -> Self {
+        Self {
+            chunks: chunks.into_iter(),
+            next_index: 0,
+            sample_rate,
+        }
+    }
+}
+
+impl AudioSource for MemoryWindows {
+    fn next_window(&mut self) -> Result<Option<Window<'_>>, String> {
+        let Some((start_secs, samples)) = self.chunks.next() else {
+            return Ok(None);
+        };
+        let index = self.next_index;
+        self.next_index += 1;
+        let window = if self.sample_rate != DIARIZATION_SAMPLE_RATE {
+            crate::audio::audio_processing::resample(
+                &samples,
+                self.sample_rate,
+                DIARIZATION_SAMPLE_RATE,
+            )
+            .map_err(|e| format!("Resampling failed for chunk {}: {}", index, e))?
+        } else {
+            samples
+        };
+        Ok(Some((start_secs as f64, Cow::Owned(window))))
+    }
+}
 
 pub(crate) fn run_chunked_polyvoice_diarization(
     diarizer: &PolyvoiceDiarizer,
@@ -39,20 +83,7 @@ pub(crate) fn run_chunked_polyvoice_diarization(
     );
 
     let mut core = V2Core::new(diarizer, config);
-    for (chunk_idx, (chunk_start_seconds, chunk_samples)) in chunks.iter().enumerate() {
-        let diar_samples: std::borrow::Cow<'_, [f32]> = if sample_rate != DIARIZATION_SAMPLE_RATE {
-            crate::audio::audio_processing::resample(
-                chunk_samples,
-                sample_rate,
-                DIARIZATION_SAMPLE_RATE,
-            )
-            .map_err(|e| format!("Resampling failed for chunk {}: {}", chunk_idx, e))?
-            .into()
-        } else {
-            std::borrow::Cow::Borrowed(chunk_samples)
-        };
-        core.process_chunk(*chunk_start_seconds, &diar_samples)?;
-    }
+    core.process_source(&mut MemoryWindows::new(chunks, sample_rate))?;
     core.finish()
 }
 
