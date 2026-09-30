@@ -7,7 +7,7 @@ use super::super::identity::matching::{
 use super::super::core::cluster::SpeakerSegment;
 use super::super::core::timeline::find_best_speaker;
 use super::super::ClusteredEmbedding;
-use log::info;
+use log::{info, warn};
 
 use crate::database::repositories::speaker::{Exemplar, SpeakerRepository};
 use sqlx::SqlitePool;
@@ -335,6 +335,42 @@ pub(crate) async fn refresh_transcript_row_matches(
     )
     .await?;
     Ok((cleared, recomputed))
+}
+
+/// Name a freshly diarized meeting's rows from its persisted embeddings
+/// (offline-per-row-recognition).
+///
+/// The offline pass names a cluster from one match of its centroid, which fails
+/// twice over: a cluster that holds two people is named after whichever of them
+/// the mean is nearer, and a mean vector scores lower than the vectors it
+/// averages, so a cluster of a recognizable person can stay under the threshold
+/// and anonymous. This runs the row-level refresh the re-match operation runs,
+/// so a row gets the candidate its own audio matches, and the offline pass and
+/// a later re-match agree.
+///
+/// The embeddings it reads are the meeting's persisted ones: the offline run's
+/// exemplars and, for a meeting recorded with live diarization, the live
+/// session's chunk embeddings that are still stored. The latter are what the
+/// registry's voiceprints are made of, and on the user's own assignments they
+/// name rows far better than the cluster centroid does (see the change's
+/// design). The refresh clears the meeting's earlier row-level matches first, so
+/// a name a live session or an earlier run left cannot outrank this run's result.
+///
+/// Best-effort: an error is logged and swallowed. Row names improve on the
+/// cluster names, they are not a precondition of the diarization, and by this
+/// point its rows have already been rewritten, so failing the run here would
+/// leave the user worse off than the cluster bindings do.
+pub(crate) async fn name_rows_after_offline_pass(pool: &SqlitePool, meeting_id: &str) {
+    match refresh_transcript_row_matches(pool, meeting_id).await {
+        Ok((_cleared, named)) => info!(
+            "Row-level recognition after the offline pass named {} row(s) of {} from their own embeddings",
+            named, meeting_id
+        ),
+        Err(e) => warn!(
+            "Row-level recognition after the offline pass failed for {}; its rows keep resolving through their clusters: {}",
+            meeting_id, e
+        ),
+    }
 }
 
 /// Maximum exemplar cache rows persisted per cluster (top by duration).
@@ -753,15 +789,25 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
+            // The changed row's cluster may be one recognition never bound (the
+            // row was anonymous before the refresh named it); then there is no
+            // confirmed cluster name to check, only the per-row override above.
             let confirmed_name: Option<String> = sqlx::query_scalar(
                 "SELECT s.name FROM meeting_speakers ms JOIN speakers s ON s.id = ms.speaker_id
                  WHERE ms.meeting_id = ? AND ms.cluster_label = ?",
             )
             .bind(&meeting_id)
             .bind(&cluster)
-            .fetch_one(&pool)
+            .fetch_optional(&pool)
             .await
-            .unwrap();
+            .unwrap()
+            .flatten();
+            if confirmed_name.is_none() {
+                eprintln!(
+                    "user decisions: the changed row's cluster {cluster} is unbound, so only the overridden row was checked"
+                );
+                return;
+            }
             let mut checked = 0usize;
             for (id, name, provenance) in &with_user {
                 if !cluster_rows.contains(id) || id == &row_id {
@@ -781,11 +827,228 @@ mod tests {
 
     }
 
-    /// per-row-speaker-recognition 2.3: the offline pass persists clusters
-    /// and nothing else. The batch orchestrator calls only this function, so a
-    /// meeting diarized offline must come out with no row-level match at all.
+    // ===== offline-per-row-recognition =====
+
+    async fn seed_meeting(pool: &SqlitePool) {
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn seed_row(pool: &SqlitePool, id: &str, start: f64, end: f64, cluster: &str) {
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, speaker, audio_start_time, audio_end_time, source_device)
+             VALUES (?, 'm1', 'text', '2026-01-01T00:00:00Z', ?, ?, ?, 'System')",
+        )
+        .bind(id)
+        .bind(cluster)
+        .bind(start)
+        .bind(end)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// One segment embedding as an offline run hands it to the persistence step.
+    fn seg(speaker: i32, embedding: Vec<f32>, secs: f32, window: (f32, f32)) -> ClusteredEmbedding {
+        ClusteredEmbedding {
+            speaker,
+            embedding,
+            duration_secs: secs,
+            start_secs: Some(window.0),
+            end_secs: Some(window.1),
+        }
+    }
+
+    /// What a surface would render for a row: the real display projection.
+    async fn shown(pool: &SqlitePool, id: &str) -> Option<String> {
+        sqlx::query_scalar(&format!(
+            "SELECT speaker_label FROM ({}) WHERE id = ?",
+            crate::database::repositories::meeting::TRANSCRIPT_DISPLAY_SELECT
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cluster_speaker(pool: &SqlitePool, label: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT speaker_id FROM meeting_speakers WHERE meeting_id = 'm1' AND cluster_label = ?",
+        )
+        .bind(label)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
+    }
+
+    /// The reported failure: one cluster holds two people and its centroid is
+    /// nearer one of them, so the other person's rows were named after him.
     #[tokio::test]
-    async fn the_batch_persistence_path_records_no_row_level_match() {
+    async fn offline_pass_names_a_row_its_merged_cluster_would_have_misnamed() {
+        let pool = setup_pool().await;
+        seed_meeting(&pool).await;
+        enroll(&pool, "spk-vasiliy", "Vasiliy", "system", &axis(0)).await;
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+        seed_row(&pool, "t-alex", 10.0, 12.0, "SPEAKER_00").await;
+        seed_row(&pool, "t-vasiliy", 40.0, 42.0, "SPEAKER_00").await;
+
+        // Vasiliy's speech outweighs Alex's inside the one cluster.
+        let sys = vec![
+            seg(0, axis(1), 2.0, (10.5, 11.5)),
+            seg(0, axis(0), 3.0, (40.2, 40.9)),
+            seg(0, axis(0), 3.0, (41.0, 41.8)),
+        ];
+        persist_and_recognize_session(&pool, "m1", &[], &sys, true).await.unwrap();
+        assert_eq!(
+            cluster_speaker(&pool, "SPEAKER_00").await.as_deref(),
+            Some("spk-vasiliy"),
+            "the merged cluster is named after the nearer person, as reported"
+        );
+        assert_eq!(shown(&pool, "t-alex").await.as_deref(), Some("Vasiliy"), "before the step: the wrong name");
+
+        name_rows_after_offline_pass(&pool, "m1").await;
+
+        assert_eq!(shown(&pool, "t-alex").await.as_deref(), Some("Alex"));
+        assert_eq!(shown(&pool, "t-vasiliy").await.as_deref(), Some("Vasiliy"));
+        assert_eq!(
+            cluster_speaker(&pool, "SPEAKER_00").await.as_deref(),
+            Some("spk-vasiliy"),
+            "the cluster binding itself is left alone"
+        );
+    }
+
+    /// The other half of the report: a cluster's mean vector scores under the
+    /// threshold, so the cluster stays anonymous although a row of it is clearly
+    /// somebody's voice.
+    #[tokio::test]
+    async fn offline_pass_names_a_row_whose_cluster_centroid_is_under_the_threshold() {
+        let pool = setup_pool().await;
+        seed_meeting(&pool).await;
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+        for (id, start) in [("t1", 10.0), ("t2", 20.0), ("t3", 30.0)] {
+            seed_row(&pool, id, start, start + 2.0, "SPEAKER_00").await;
+        }
+        // Three orthogonal voices in one cluster: the centroid is 0.58 from each.
+        let sys = vec![
+            seg(0, axis(1), 2.0, (10.5, 11.5)),
+            seg(0, axis(2), 2.0, (20.5, 21.5)),
+            seg(0, axis(3), 2.0, (30.5, 31.5)),
+        ];
+        persist_and_recognize_session(&pool, "m1", &[], &sys, true).await.unwrap();
+        assert_eq!(cluster_speaker(&pool, "SPEAKER_00").await, None, "the centroid alone names nobody");
+
+        name_rows_after_offline_pass(&pool, "m1").await;
+
+        assert_eq!(shown(&pool, "t1").await.as_deref(), Some("Alex"));
+        assert_ne!(shown(&pool, "t2").await.as_deref(), Some("Alex"), "a row with no match stays anonymous");
+        assert_eq!(cluster_speaker(&pool, "SPEAKER_00").await, None, "and the cluster stays unbound");
+    }
+
+    /// A name a previous run recorded must not survive a run that no longer
+    /// supports it: it would sit above the new result and could never change.
+    #[tokio::test]
+    async fn an_offline_pass_replaces_the_row_names_an_earlier_run_left() {
+        let pool = setup_pool().await;
+        seed_meeting(&pool).await;
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+        seed_row(&pool, "t1", 10.0, 12.0, "SPEAKER_00").await;
+        seed_row(&pool, "t2", 20.0, 22.0, "SPEAKER_00").await;
+        // Left by a live session: t2 was named Alex, but nothing now supports it.
+        SpeakerRepository::set_transcript_auto_match(&pool, "t2", "spk-alex", 0.9).await.unwrap();
+
+        let sys = vec![seg(0, axis(1), 2.0, (10.5, 11.5))];
+        persist_and_recognize_session(&pool, "m1", &[], &sys, true).await.unwrap();
+        name_rows_after_offline_pass(&pool, "m1").await;
+
+        let matches: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, speaker_auto_id FROM transcripts WHERE meeting_id = 'm1' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                ("t1".to_string(), Some("spk-alex".to_string())),
+                ("t2".to_string(), None),
+            ],
+            "t1 is named by the new run, and the stale name on t2 is gone"
+        );
+    }
+
+    /// The user decisions are protected by the display order, not by this step
+    /// touching them: a per-block override and a user-bound cluster both still
+    /// win over what the row audio says.
+    #[tokio::test]
+    async fn the_offline_row_step_leaves_user_decisions_alone() {
+        let pool = setup_pool().await;
+        seed_meeting(&pool).await;
+        enroll(&pool, "spk-alex", "Alex", "system", &axis(1)).await;
+        enroll(&pool, "spk-bob", "Bob", "system", &axis(2)).await;
+        enroll(&pool, "spk-carol", "Carol", "system", &axis(3)).await;
+        seed_row(&pool, "t-override", 10.0, 12.0, "SPEAKER_00").await;
+        seed_row(&pool, "t-bound", 20.0, 22.0, "SPEAKER_01").await;
+        sqlx::query("UPDATE transcripts SET speaker_override_id = 'spk-bob' WHERE id = 't-override'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO meeting_speakers (meeting_id, cluster_label, speaker_id, channel, matched_by, match_score) VALUES ('m1', 'SPEAKER_01', 'spk-carol', 'system', 'user', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Both rows own audio says Alex.
+        let sys = vec![
+            seg(0, axis(1), 2.0, (10.5, 11.5)),
+            seg(1, axis(1), 2.0, (20.5, 21.5)),
+        ];
+        persist_and_recognize_session(&pool, "m1", &[], &sys, true).await.unwrap();
+        name_rows_after_offline_pass(&pool, "m1").await;
+
+        assert_eq!(shown(&pool, "t-override").await.as_deref(), Some("Bob"), "the override wins");
+        assert_eq!(shown(&pool, "t-bound").await.as_deref(), Some("Carol"), "the user-bound cluster wins");
+        let override_id: Option<String> =
+            sqlx::query_scalar("SELECT speaker_override_id FROM transcripts WHERE id = 't-override'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(override_id.as_deref(), Some("spk-bob"));
+        let bound: (String, String) = sqlx::query_as(
+            "SELECT speaker_id, matched_by FROM meeting_speakers WHERE meeting_id = 'm1' AND cluster_label = 'SPEAKER_01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bound, ("spk-carol".to_string(), "user".to_string()));
+    }
+
+    /// The step cannot fail a diarization. With no tables at all the refresh
+    /// itself errors, and the function the orchestrator calls still returns.
+    #[tokio::test]
+    async fn a_failing_row_step_never_fails_the_diarization() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        assert!(
+            refresh_transcript_row_matches(&pool, "m1").await.is_err(),
+            "the refresh does report the failure"
+        );
+        // Returns nothing: there is no error left to propagate.
+        name_rows_after_offline_pass(&pool, "m1").await;
+    }
+
+    /// The cluster-persistence step persists clusters and cluster bindings and
+    /// nothing else: on its own it records no row-level match. (Since
+    /// offline-per-row-recognition the offline orchestrator follows it with
+    /// `name_rows_after_offline_pass`, which is what names rows; the online stop
+    /// path follows it with `recognize_transcript_rows`.)
+    #[tokio::test]
+    async fn cluster_persistence_records_no_row_level_match_on_its_own() {
         let pool = setup_pool().await;
         sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
             .execute(&pool)

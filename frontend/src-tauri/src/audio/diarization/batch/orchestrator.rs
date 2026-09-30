@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 use super::super::core::factory::create_polyvoice_diarizer_for_app;
 use super::super::core::timeline::compute_speaker_matches;
 use super::super::core::units::{count_unique_speakers, StageTimings};
-use super::super::persist::clusters::persist_and_recognize_session;
+use super::super::persist::clusters::{name_rows_after_offline_pass, persist_and_recognize_session};
 use super::super::telemetry::{emit_progress, MemorySampler};
 use super::super::core::segment::V2Core;
 use super::super::{
@@ -478,6 +478,13 @@ pub(crate) async fn run_offline_diarization<R: Runtime>(
                 is_stereo,
             )
             .await?;
+
+            // Name each row from the embeddings that overlap it, so a cluster
+            // that merged two people, or whose centroid fell under the
+            // threshold, does not decide the names of rows whose own audio
+            // matches somebody (offline-per-row-recognition). Best-effort: it
+            // logs and carries on, and the rows resolve through their clusters.
+            name_rows_after_offline_pass(pool, &meeting_id).await;
 
             MeetingsRepository::update_diarization_status(pool, &meeting_id, "complete")
                 .await
