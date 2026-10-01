@@ -27,3 +27,8 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 0
+
+# Vendored tao with an atomic event-loop runner refcount (fixes 0xC000001D crashes in
+# tauri_runtime_wry::Context::clone). See vendor/tao/MEETILY_PATCH.md before upgrading tao/tauri.
+[patch.crates-io]
+tao = { path = "vendor/tao" }
