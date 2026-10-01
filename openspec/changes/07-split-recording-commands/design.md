@@ -46,6 +46,16 @@ pub use crate::audio::recording::stop::stop_recording;
 
 ### D2: The diarization engine facade — minimal interface `07` assumes from `05`
 
+> **Update (2026-10-01, at apply time):** `05` landed as the unified engine and already provides the facade and the thin commands, so D2 needed no work in `07`. The actual surface is `audio/diarization/engine.rs::DiarizationEngine` (a unit struct with associated functions; the session statics are engine-private):
+>
+> ```rust
+> DiarizationEngine::persist_session(pool: &SqlitePool, meeting_id: String) -> Result<serde_json::Value, String>; // async
+> DiarizationEngine::telemetry_snapshot() -> Result<OnlineDiarizationStatus, String>;                          // async
+> DiarizationEngine::assign_live_speaker(pool: &SqlitePool, a: LiveSpeakerAssignment) -> Result<AssignedSpeaker, String>; // async
+> ```
+>
+> `persist_session` returns the same JSON body `finalize_online_session` returned before; `LiveSpeakerAssignment` carries the raw command arguments and the engine resolves scope and the registry find-or-create. The Open Questions below are resolved by that design. The original assumption is kept below for history.
+
 `07` needs exactly three operations from whatever concrete type/module `05` produces under `audio/diarization/`. This change treats the facade as an opaque handle obtained however `05` decides (a `tauri::State`, a field on `AppState`, or a free function — see Open Questions) and calls:
 
 ```rust
