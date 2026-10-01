@@ -180,6 +180,7 @@ pub enum DiarChannelState {
 
 /// Resolve one channel's display state from its counters and session context.
 /// Kept pure so every state is testable without an engine or audio.
+#[allow(clippy::too_many_arguments)] // 8 params; pure resolver over independent counters, kept flat for testability
 pub(crate) fn resolve_channel_state(
     available: bool,
     mode: DiarizationMode,

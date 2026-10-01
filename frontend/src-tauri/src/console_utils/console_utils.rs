@@ -2,8 +2,6 @@
 use env_logger;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-#[cfg(target_os = "windows")]
-use std::ptr;
 
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
@@ -25,7 +23,7 @@ pub fn show_console() -> Result<String, String> {
     #[cfg(target_os = "windows")]
     unsafe {
         let console_window = GetConsoleWindow();
-        if console_window == ptr::null_mut() {
+        if console_window.is_null() {
             // If no console exists, allocate one
             if AllocConsole() == 0 {
                 return Err("Failed to allocate console".to_string());
@@ -72,7 +70,7 @@ pub fn hide_console() -> Result<String, String> {
     #[cfg(target_os = "windows")]
     unsafe {
         let console_window = GetConsoleWindow();
-        if console_window != ptr::null_mut() {
+        if !console_window.is_null() {
             ShowWindow(console_window, SW_HIDE);
             Ok("Console hidden".to_string())
         } else {
@@ -113,7 +111,7 @@ pub fn toggle_console() -> Result<String, String> {
     #[cfg(target_os = "windows")]
     unsafe {
         let console_window = GetConsoleWindow();
-        if console_window == ptr::null_mut() {
+        if console_window.is_null() {
             show_console()
         } else {
             // Check if window is visible (this is a simplified approach)

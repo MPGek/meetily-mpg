@@ -100,7 +100,7 @@ fn report(label: &str, assignments: &[app_lib::audio::online_diarization::Speake
         *counts.entry(a.speaker.clone()).or_default() += 1;
     }
     let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|e| std::cmp::Reverse(e.1));
     let total = assignments.len().max(1);
     println!("=== {} : cluster distribution (top 10) ===", label);
     for (name, n) in ranked.iter().take(10) {

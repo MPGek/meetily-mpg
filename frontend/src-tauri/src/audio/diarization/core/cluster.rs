@@ -41,12 +41,13 @@ pub(crate) fn build_clusterer(
             );
             Ok(Box::new(polyvoice::clusterer::NmeScClusterer::new(ceiling)))
         }
-        ClustererKindSetting::Vbx => Err(format!(
+        ClustererKindSetting::Vbx => Err(
             "The 'vbx' clusterer is unavailable for the enhanced diarization model set: \
              VBx requires 256-dimensional embeddings (the vendored PLDA parameters are \
               dimension-locked), while the bundled TitaNet-Large family embeds 192-d. \
               Select 'ahc' (default) or 'nmesc' instead."
-        )),
+                .to_string(),
+        ),
     }
 }
 

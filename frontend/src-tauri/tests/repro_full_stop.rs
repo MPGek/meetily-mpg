@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use app_lib::audio::decoder::decode_audio_file;
 use app_lib::audio::online_diarization::{
-    DiarizationMode, OnlineClusterEmbeddings, OnlineDiarizationProcessor, PrototypeStore,
+    DiarizationMode, OnlineDiarizationProcessor, PrototypeStore,
 };
 use app_lib::audio::recording_saver::TranscriptSegment;
 use app_lib::audio::recording_state::{AudioChunk, DeviceType};

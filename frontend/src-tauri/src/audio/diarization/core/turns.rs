@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn gap_fill_zero_window_is_noop() {
         // 0 disables: assemble_channel_turns skips gap_fill_turns entirely.
-        let input = vec![turn(0.0, 1.0, 0), turn(1.05, 2.0, 0), turn(2.02, 3.0, 0)];
+        let input = [turn(0.0, 1.0, 0), turn(1.05, 2.0, 0), turn(2.02, 3.0, 0)];
         let expected: Vec<(f32, f32, i32)> =
             input.iter().map(turn_span).collect();
         let config = DiarizationConfig {

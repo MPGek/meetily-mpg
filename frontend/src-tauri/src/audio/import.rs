@@ -948,7 +948,7 @@ pub async fn select_and_validate_audio_command<R: Runtime>(
             .file()
             .add_filter(
                 "Audio Files",
-                &AUDIO_EXTENSIONS.iter().map(|s| *s).collect::<Vec<_>>(),
+                AUDIO_EXTENSIONS,
             )
             .blocking_pick_file()
     })

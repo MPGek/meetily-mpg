@@ -2,7 +2,7 @@ use crate::parakeet_engine::model::ParakeetModel;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
@@ -12,16 +12,13 @@ use tokio::time::timeout;
 
 /// Quantization type for Parakeet models
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
 pub enum QuantizationType {
     FP32, // Full precision
+    #[default]
     Int8, // 8-bit integer quantization (faster)
 }
 
-impl Default for QuantizationType {
-    fn default() -> Self {
-        QuantizationType::Int8 // Default to int8 for best performance
-    }
-}
 
 /// Model status for Parakeet models
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +141,7 @@ impl ParakeetEngine {
             } else {
                 // Production mode
                 dirs::data_dir()
-                    .or_else(|| dirs::home_dir())
+                    .or_else(dirs::home_dir)
                     .ok_or_else(|| anyhow!("Could not find system data directory"))?
                     .join("Meetily")
                     .join("models")
@@ -281,7 +278,7 @@ impl ParakeetEngine {
     }
 
     /// Validate model directory by checking if all required files exist AND have valid sizes
-    async fn validate_model_directory(&self, model_dir: &PathBuf) -> Result<()> {
+    async fn validate_model_directory(&self, model_dir: &Path) -> Result<()> {
         // Check if vocab.txt exists and is readable
         let vocab_path = model_dir.join("vocab.txt");
         if !vocab_path.exists() {
@@ -358,7 +355,7 @@ impl ParakeetEngine {
         match self.validate_model_directory(model_dir).await {
             Ok(_) => {
                 log::info!("Model directory is valid, no cleanup needed");
-                return Ok(());
+                Ok(())
             }
             Err(validation_error) => {
                 log::warn!(

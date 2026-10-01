@@ -1203,6 +1203,7 @@ impl SpeakerRepository {
     /// List voiceprints grouped by speaker (prototypes) and by meeting (unconfirmed caches).
     /// - When `speaker_id_filter` is Some, only that speaker's prototypes are returned.
     /// - When `unconfirmed_only` is true, the `speakers` branch is omitted.
+    ///
     /// Meeting titles are resolved via LEFT JOIN with "deleted meeting" fallback when
     /// a prototype retains a meeting_id whose meeting was deleted.
     /// Supports lazy/paginated loading by speaker via `limit`/`offset` (applied to speakers).
@@ -2229,7 +2230,7 @@ mod tests {
         // Enrolled prototypes should be the 8 longest-duration (indices 4..12).
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -2267,7 +2268,7 @@ mod tests {
         assert_eq!(
             SpeakerRepository::load_prototypes(
                 &pool,
-                Some(&[alice.id.clone()]),
+                Some(std::slice::from_ref(&alice.id)),
                 SPEAKER_EMBEDDING_MODEL
             )
             .await
@@ -2330,7 +2331,7 @@ mod tests {
 
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[bob.id.clone()]),
+            Some(std::slice::from_ref(&bob.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -3014,7 +3015,7 @@ mod tests {
 
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -3061,7 +3062,7 @@ mod tests {
 
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -3110,7 +3111,7 @@ mod tests {
 
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -3974,7 +3975,7 @@ mod tests {
         // Must be excluded from recognition
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -3995,7 +3996,7 @@ mod tests {
             .unwrap();
         let protos2 = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -4065,7 +4066,7 @@ mod tests {
             "SPEAKER_00",
             "mic",
             &emb(&[0.1; 4]),
-            &vec![Exemplar {
+            &[Exemplar {
                 embedding: emb(&[0.1; 4]),
                 duration_secs: 1.0,
                 start_secs: Some(1.0),
@@ -4081,7 +4082,7 @@ mod tests {
             "SPEAKER_01",
             "mic",
             &emb(&[0.2; 4]),
-            &vec![Exemplar {
+            &[Exemplar {
                 embedding: emb(&[0.2; 4]),
                 duration_secs: 1.0,
                 start_secs: Some(3.0),
@@ -4477,7 +4478,7 @@ mod tests {
         // Verify Bob now has prototypes
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[bob.id.clone()]),
+            Some(std::slice::from_ref(&bob.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -4616,7 +4617,7 @@ mod tests {
         // Verify Bob now has prototypes
         let protos = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[bob.id.clone()]),
+            Some(std::slice::from_ref(&bob.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -4665,7 +4666,7 @@ mod tests {
         // Verify Alice has prototypes
         let protos_before = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await
@@ -4697,7 +4698,7 @@ mod tests {
         // Step 4: Verify Alice's prototypes survived the cache refresh
         let protos_after = SpeakerRepository::load_prototypes(
             &pool,
-            Some(&[alice.id.clone()]),
+            Some(std::slice::from_ref(&alice.id)),
             SPEAKER_EMBEDDING_MODEL,
         )
         .await

@@ -28,10 +28,6 @@ macro_rules! perf_trace {
     ($($arg:tt)*) => {};
 }
 
-// Make these macros available to other modules
-pub(crate) use perf_debug;
-pub(crate) use perf_trace;
-
 // Re-export async logging macros for external use (removed due to macro conflicts)
 
 // Declare audio module
@@ -468,7 +464,7 @@ pub fn run() {
             });
 
             // Set models directory to use app_data_dir (unified storage location)
-            whisper_engine::commands::set_models_directory(&_app.handle());
+            whisper_engine::commands::set_models_directory(_app.handle());
 
             // Initialize Whisper engine on startup
             tauri::async_runtime::spawn(async {
@@ -478,10 +474,10 @@ pub fn run() {
             });
 
             // Set Parakeet models directory
-            parakeet_engine::commands::set_models_directory(&_app.handle());
+            parakeet_engine::commands::set_models_directory(_app.handle());
 
             // Set alignment models directory (word-level-diarization-alignment)
-            audio::word_alignment::commands::set_models_directory(&_app.handle());
+            audio::word_alignment::commands::set_models_directory(_app.handle());
 
             // Initialize Parakeet engine on startup
             tauri::async_runtime::spawn(async {
@@ -518,7 +514,7 @@ pub fn run() {
 
             // Initialize database (handles first launch detection and conditional setup)
             tauri::async_runtime::block_on(async {
-                database::setup::initialize_database_on_startup(&_app.handle()).await
+                database::setup::initialize_database_on_startup(_app.handle()).await
             })
             .expect("Failed to initialize database");
 

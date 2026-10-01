@@ -683,7 +683,7 @@ impl ContinuousVadProcessor {
                     }
 
                     // Calculate end sample with post-speech padding
-                    let end_with_pad = (self.processed_samples + self.post_speech_pad_samples)
+                    let _end_with_pad = (self.processed_samples + self.post_speech_pad_samples)
                         .min(self.processed_samples + chunk.len() + self.post_speech_pad_samples);
                     let end_sample_for_segment =
                         self.processed_samples.saturating_sub(self.silent_samples)
@@ -839,7 +839,7 @@ where
         let mut processed = 0;
         let mut last_progress = 0u32;
         let mut chunk_count = 0;
-        let total_chunks = (total_samples + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let total_chunks = total_samples.div_ceil(CHUNK_SIZE);
 
         for chunk in samples_mono_16k.chunks(CHUNK_SIZE) {
             chunk_count += 1;
@@ -932,7 +932,7 @@ mod tests {
         let silence = vec![0.0f32; 512];
         let prob = session.forward(&silence).expect("Forward failed");
         assert!(
-            prob >= 0.0 && prob <= 1.0,
+            (0.0..=1.0).contains(&prob),
             "Probability should be in [0,1], got {}",
             prob
         );
@@ -974,7 +974,7 @@ mod tests {
 
         // prob2 should be different from processing zeros alone, because
         // the context from chunk1 conditions the model
-        assert!(prob2 >= 0.0 && prob2 <= 1.0);
+        assert!((0.0..=1.0).contains(&prob2));
         // Log for debugging
         println!("Context test: prob1={:.6}, prob2={:.6}", prob1, prob2);
     }
@@ -1194,7 +1194,7 @@ mod tests {
             println!("VAD did not detect speech — state preservation still validated (no panic)");
         } else {
             assert!(
-                all_segments.len() >= 1,
+                !all_segments.is_empty(),
                 "Expected at least 1 speech segment"
             );
         }

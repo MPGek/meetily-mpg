@@ -619,7 +619,7 @@ impl ParakeetModel {
 
         // Create waveforms array [batch_size, samples_len]
         let waveforms = Array2::from_shape_vec((batch_size, samples_len), samples)
-            .map_err(|e| ParakeetError::Shape(e))?
+            .map_err(ParakeetError::Shape)?
             .into_dyn();
 
         // Create waveforms_lens array [batch_size] with the actual length

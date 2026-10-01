@@ -711,6 +711,7 @@ fn remap_segment_times_to_real(anchors: &[(f64, f64)], segments: &mut [SpeechSeg
 }
 
 impl AudioPipeline {
+    #[allow(clippy::too_many_arguments)] // 10 params; a params struct would change every call site; no owning change yet
     pub fn new(
         receiver: mpsc::Receiver<AudioChunk>,
         transcription_sender: mpsc::Sender<AudioChunk>,
@@ -1301,6 +1302,7 @@ impl AudioPipelineManager {
     }
 
     /// Start the audio pipeline with device information for adaptive buffering
+    #[allow(clippy::too_many_arguments)] // 11 params; a params struct would change every call site; no owning change yet
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,

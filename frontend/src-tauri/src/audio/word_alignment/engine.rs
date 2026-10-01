@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn pool_size_matches_diarization_formula() {
         let cores = std::thread::available_parallelism().unwrap().get();
-        let expected = (((cores as f64) * 0.75).ceil() as usize).min(8).max(1);
+        let expected = (((cores as f64) * 0.75).ceil() as usize).clamp(1, 8);
         assert_eq!(fixed_pool_size(), expected);
     }
 
@@ -366,7 +366,7 @@ mod tests {
             .collect();
         let post = engine.log_posteriors(&samples).expect("posteriors");
         let (frames, vocab) = (post.nrows(), post.ncols());
-        assert!(frames >= 40 && frames <= 60, "frames={frames} (expect ~50 for 1s)");
+        assert!((40..=60).contains(&frames), "frames={frames} (expect ~50 for 1s)");
         assert!(vocab > 100, "vocab={vocab}");
         // Log-probs: each row sums (in linear space) to ~1.
         for t in (0..frames).step_by(frames / 5).take(5) {

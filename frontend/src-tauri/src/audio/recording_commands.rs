@@ -1586,17 +1586,6 @@ pub async fn get_recording_telemetry() -> Result<RecordingTelemetry, String> {
     })
 }
 
-/// Assign a live speaker during Fast-mode recording.
-///
-/// Two scopes (design D10):
-/// - `scope` unset or "cluster": update the in-memory prototype store binding
-///   so subsequent chunks of the cluster are recognized and labeled for the
-///   remainder of the session; persisted at stop-time finalize.
-/// - `scope == "block"` together with `start_time`/`end_time`: relabel only
-///   the turn(s) overlapping that time range via a per-turn override (no
-///   cluster binding, no prototype merge); applied to the matched transcript
-///   at stop-time finalize.
-
 /// Finalize an online diarization session after the meeting row has been
 /// created by the frontend. The work lives in the engine; this is the command
 /// surface (05 task 5.4).
@@ -1611,6 +1600,15 @@ pub async fn finalize_online_session(
 /// Assign a speaker to a live cluster (or to a single turn with
 /// `scope == "block"`) while a recording runs. The work lives in the engine;
 /// this is the command surface (05 task 5.5).
+///
+/// Two scopes (design D10):
+/// - `scope` unset or "cluster": update the in-memory prototype store binding
+///   so subsequent chunks of the cluster are recognized and labeled for the
+///   remainder of the session; persisted at stop-time finalize.
+/// - `scope == "block"` together with `start_time`/`end_time`: relabel only
+///   the turn(s) overlapping that time range via a per-turn override (no
+///   cluster binding, no prototype merge); applied to the matched transcript
+///   at stop-time finalize.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn assign_live_speaker(

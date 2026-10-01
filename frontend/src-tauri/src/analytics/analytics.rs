@@ -421,6 +421,7 @@ impl AnalyticsClient {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)] // 13 params mirror the track_meeting_ended command's arguments one-to-one
     pub async fn track_meeting_ended(
         &self,
         transcription_provider: &str,

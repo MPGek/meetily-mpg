@@ -257,7 +257,7 @@ async fn run_mode_short(
     };
     let (left, right) = decoded.extract_channels();
     let mic = left.unwrap_or_default();
-    let sys = right.unwrap_or_default();
+    let _sys = right.unwrap_or_default();
     // Mix of 0.15s (too short for embedder?) and normal chunks.
     let mut chunks = Vec::new();
     let chunk_len_short = (16000.0 * 0.15) as usize;

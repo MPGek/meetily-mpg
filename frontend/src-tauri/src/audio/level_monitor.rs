@@ -31,6 +31,12 @@ pub struct AudioLevelMonitor {
     streams: Arc<Mutex<Vec<cpal::Stream>>>,
 }
 
+impl Default for AudioLevelMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioLevelMonitor {
     pub fn new() -> Self {
         Self {

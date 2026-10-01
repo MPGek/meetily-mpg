@@ -26,17 +26,21 @@ pub enum NotificationType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum NotificationPriority {
     Low,
+    #[default]
     Normal,
     High,
     Critical,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum NotificationTimeout {
     Never,
     Seconds(u64),
+    #[default]
     Default,
 }
 
@@ -103,17 +107,7 @@ impl Notification {
     }
 }
 
-impl Default for NotificationPriority {
-    fn default() -> Self {
-        NotificationPriority::Normal
-    }
-}
 
-impl Default for NotificationTimeout {
-    fn default() -> Self {
-        NotificationTimeout::Default
-    }
-}
 
 // Helper functions for creating common notifications
 impl Notification {

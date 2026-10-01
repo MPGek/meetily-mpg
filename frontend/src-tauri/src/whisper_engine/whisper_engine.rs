@@ -128,7 +128,7 @@ impl WhisperEngine {
                 // Production mode fallback (shouldn't reach here, caller should provide path)
                 log::warn!("WhisperEngine: No models directory provided, using fallback path");
                 dirs::data_dir()
-                    .or_else(|| dirs::home_dir())
+                    .or_else(dirs::home_dir)
                     .ok_or_else(|| anyhow!("Could not find system data directory"))?
                     .join("Meetily")
                     .join("models")
@@ -210,8 +210,7 @@ impl WhisperEngine {
                                              filename);
                                     ModelStatus::Corrupted {
                                         file_size: file_size_bytes,
-                                        expected_min_size: (expected_min_size_mb * 1024 * 1024)
-                                            as u64,
+                                        expected_min_size: expected_min_size_mb * 1024 * 1024,
                                     }
                                 }
                             }
@@ -233,8 +232,7 @@ impl WhisperEngine {
                                                  filename, file_size_mb, size_mb);
                                         ModelStatus::Corrupted {
                                             file_size: file_size_bytes,
-                                            expected_min_size: (expected_min_size_mb * 1024 * 1024)
-                                                as u64,
+                                            expected_min_size: expected_min_size_mb * 1024 * 1024,
                                         }
                                     }
                                 }
@@ -243,7 +241,7 @@ impl WhisperEngine {
                                          filename, file_size_mb, size_mb);
                                 ModelStatus::Corrupted {
                                     file_size: file_size_bytes,
-                                    expected_min_size: (expected_min_size_mb * 1024 * 1024) as u64,
+                                    expected_min_size: expected_min_size_mb * 1024 * 1024,
                                 }
                             }
                         } else {
@@ -259,7 +257,7 @@ impl WhisperEngine {
             let model_info = ModelInfo {
                 name: name.to_string(),
                 path: model_path,
-                size_mb: size_mb as u32,
+                size_mb,
                 accuracy: accuracy.to_string(),
                 speed: speed.to_string(),
                 status,
@@ -532,13 +530,13 @@ impl WhisperEngine {
 
         let mut word_counts = HashMap::new();
         for word in &words {
-            *word_counts.entry(word.to_lowercase()).or_insert(0) += 1;
+            *word_counts.entry(word.to_lowercase()).or_insert(0usize) += 1;
         }
 
         let total_words = words.len() as f32;
         let repeated_words: usize = word_counts
             .values()
-            .map(|&count| if count > 1 { count - 1 } else { 0 })
+            .map(|&count| count.saturating_sub(1))
             .sum();
 
         repeated_words as f32 / total_words
@@ -644,7 +642,7 @@ impl WhisperEngine {
         // whisper-rs v0.16.0: full_n_segments() returns i32 directly, not Result
         // get_segment() returns Option<WhisperSegment> instead of old full_get_segment_text returning Result<String>
         let num_seg_count = num_segments;
-        for i in 0..num_seg_count as i32 {
+        for i in 0..num_seg_count {
             if let Some(segment) = state.get_segment(i) {
                 let segment_text = segment.to_str_lossy().unwrap_or_default().to_string();
                 let seg_start = segment.start_timestamp() as f64 / 100.0;
@@ -799,7 +797,7 @@ impl WhisperEngine {
                 let s = seg.start_timestamp() as f64 / 100.0;
                 let e = seg.end_timestamp() as f64 / 100.0;
                 let dur = (e - s).max(0.01);
-                let conf = if txt.len() > 0 {
+                let conf = if !txt.is_empty() {
                     (txt.len() as f32 / 100.0).min(0.9) + 0.1
                 } else {
                     0.1
@@ -1372,7 +1370,7 @@ impl WhisperEngine {
 
             // Report progress every 1% or every 2 seconds for better UI responsiveness
             let time_since_last_report = last_report_time.elapsed().as_secs();
-            if progress >= last_progress_report + 1
+            if progress > last_progress_report
                 || progress == 100
                 || time_since_last_report >= 2
             {

@@ -1,8 +1,11 @@
 use sqlx::SqlitePool;
 
+#[ignore = "manual DB inspection tool; run explicitly with cargo test --test db_inspect -- --ignored"]
 #[tokio::test]
 async fn inspect_meeting_0818_1322() {
-    let pool = SqlitePool::connect("sqlite://C:/Users/vasiliy.kotov/AppData/Roaming/com.meetily.ai/meeting_minutes.sqlite?mode=ro")
+    let db_url = std::env::var("MEETILY_DB_INSPECT_PATH")
+        .expect("set MEETILY_DB_INSPECT_PATH to a sqlite:// URL to inspect a local DB");
+    let pool = SqlitePool::connect(&db_url)
         .await
         .expect("open db");
 

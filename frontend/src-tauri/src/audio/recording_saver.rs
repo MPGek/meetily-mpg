@@ -344,7 +344,7 @@ impl RecordingSaver {
     /// rewrites; struct fields win on overlap. Shares the metadata write
     /// lock with `summary::metadata` so concurrent field writers never
     /// interleave a torn replace.
-    fn write_metadata(&self, folder: &PathBuf, metadata: &MeetingMetadata) -> Result<()> {
+    fn write_metadata(&self, folder: &Path, metadata: &MeetingMetadata) -> Result<()> {
         let _guard = crate::summary::metadata::METADATA_WRITE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -371,7 +371,7 @@ impl RecordingSaver {
     }
 
     /// Write transcripts.json to disk (atomic write with temp file and validation)
-    fn write_transcripts_json(&self, folder: &PathBuf) -> Result<()> {
+    fn write_transcripts_json(&self, folder: &Path) -> Result<()> {
         // Clone segments to avoid holding lock during I/O
         let segments_clone = if let Ok(segments) = self.transcript_segments.lock() {
             segments.clone()

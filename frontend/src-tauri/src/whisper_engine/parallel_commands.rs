@@ -13,6 +13,12 @@ pub struct ParallelProcessorState {
     pub system_monitor: Arc<SystemMonitor>,
 }
 
+impl Default for ParallelProcessorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParallelProcessorState {
     pub fn new() -> Self {
         Self {
@@ -67,7 +73,7 @@ pub async fn start_parallel_processing(
 ) -> Result<String, String> {
     let chunks: Vec<AudioChunk> = audio_chunks
         .into_iter()
-        .map(|v| serde_json::from_value(v))
+        .map(serde_json::from_value)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to parse audio chunks: {}", e))?;
 

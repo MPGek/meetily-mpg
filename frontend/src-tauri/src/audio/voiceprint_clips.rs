@@ -84,7 +84,7 @@ pub fn cut_voiceprint_clip(
         "-to",
         &format!("{:.3}", end),
         "-i",
-        &audio_path.to_string_lossy().to_string(),
+        audio_path.to_string_lossy().as_ref(),
         "-vn",
         "-af",
         pan,
@@ -102,7 +102,7 @@ pub fn cut_voiceprint_clip(
         "voip",
         "-f",
         "ogg",
-        &out_path.to_string_lossy().to_string(),
+        out_path.to_string_lossy().as_ref(),
     ]);
     #[cfg(target_os = "windows")]
     {

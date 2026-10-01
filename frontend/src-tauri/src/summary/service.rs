@@ -247,9 +247,7 @@ impl SummaryService {
             }
         };
 
-        let Some(folder_path) = meeting.folder_path.filter(|p| !p.trim().is_empty()) else {
-            return None;
-        };
+        let folder_path = meeting.folder_path.filter(|p| !p.trim().is_empty())?;
 
         match read_detected_summary_language_from_metadata(Path::new(&folder_path)) {
             Ok(language) => language,
@@ -297,6 +295,7 @@ impl SummaryService {
     /// * `model_name` - Specific model (e.g., "gpt-4", "llama3.2:latest")
     /// * `custom_prompt` - Optional user-provided context
     /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
+    #[allow(clippy::too_many_arguments)] // 9 params; a params struct would change every call site; no owning change yet
     pub async fn process_transcript_background<R: tauri::Runtime>(
         _app: AppHandle<R>,
         pool: SqlitePool,
@@ -337,13 +336,13 @@ impl SummaryService {
             match SettingsRepository::get_api_key(&pool, &model_provider).await {
                 Ok(Some(key)) if !key.is_empty() => key,
                 Ok(None) | Ok(Some(_)) => {
-                    let err_msg = format!("API key not found for {}", &model_provider);
+                    let err_msg = format!("API key not found for {}", model_provider);
                     Self::update_process_failed(&pool, &meeting_id, &err_msg).await;
                     return;
                 }
                 Err(e) => {
                     let err_msg =
-                        format!("Failed to retrieve API key for {}: {}", &model_provider, e);
+                        format!("Failed to retrieve API key for {}: {}", model_provider, e);
                     Self::update_process_failed(&pool, &meeting_id, &err_msg).await;
                     return;
                 }

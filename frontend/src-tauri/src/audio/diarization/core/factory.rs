@@ -10,7 +10,7 @@ use super::super::{ChannelClusters, DiarizationConfig, PolyvoiceDiarizer};
 use super::cluster::{clusterer_for_batch, effective_cluster_ceiling};
 
 pub(crate) fn create_polyvoice_diarizer(
-    models_dir: &PathBuf,
+    models_dir: &Path,
     max_speakers: Option<i32>,
     config: &DiarizationConfig,
 ) -> Result<PolyvoiceDiarizer, String> {

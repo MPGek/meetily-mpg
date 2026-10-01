@@ -140,7 +140,7 @@ pub fn best_match_with_threshold(
         }
     }
 
-    best.and_then(|m| if m.score > threshold { Some(m) } else { None })
+    best.filter(|m| m.score > threshold)
 }
 
 /// Convenience wrapper using the enhanced TitaNet recognition threshold.

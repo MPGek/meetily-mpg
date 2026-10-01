@@ -323,6 +323,7 @@ pub fn extract_meeting_name_from_markdown(markdown: &str) -> Option<String> {
 /// Tuple of (final_summary_markdown, english_summary_markdown, number_of_chunks_processed)
 /// where english_summary_markdown is the canonical AI-generated English summary
 /// (equals final_summary_markdown when target language is English)
+#[allow(clippy::too_many_arguments)] // 20 params; a real smell, but a params struct would change every call site; no owning change yet
 pub async fn generate_meeting_summary(
     client: &Client,
     provider: &LLMProvider,

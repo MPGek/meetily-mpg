@@ -3,6 +3,8 @@ pub mod commands;
 pub mod parallel_commands;
 pub mod parallel_processor;
 pub mod system_monitor;
+// Named after its parent directory by convention; renaming would touch every call site.
+#[allow(clippy::module_inception)]
 pub mod whisper_engine;
 // pub mod stderr_suppressor;
 

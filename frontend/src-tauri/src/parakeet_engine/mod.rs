@@ -19,6 +19,8 @@
 
 pub mod commands;
 pub mod model;
+// Named after its parent directory by convention; renaming would touch every call site.
+#[allow(clippy::module_inception)]
 pub mod parakeet_engine;
 
 pub use commands::*;

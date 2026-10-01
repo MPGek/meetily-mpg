@@ -110,6 +110,7 @@ impl LLMProvider {
 ///
 /// # Returns
 /// The generated summary text or an error message
+#[allow(clippy::too_many_arguments)] // 14 params; a params struct would change every call site; no owning change yet
 pub async fn generate_summary(
     client: &Client,
     provider: &LLMProvider,
@@ -341,7 +342,7 @@ pub async fn generate_summary(
 
         let content = chat_response
             .content
-            .get(0)
+            .first()
             .ok_or("No content in LLM response")?
             .text
             .trim()
@@ -357,7 +358,7 @@ pub async fn generate_summary(
 
         let content = chat_response
             .choices
-            .get(0)
+            .first()
             .ok_or("No content in LLM response")?
             .message
             .content

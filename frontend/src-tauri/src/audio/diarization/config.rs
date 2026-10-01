@@ -12,7 +12,7 @@ pub(crate) fn fixed_pool_size() -> usize {
         .map(|n| n.get())
         .unwrap_or(1);
     let seventy_five_percent = ((cores as f64) * 0.75).ceil() as usize;
-    seventy_five_percent.min(8).max(1)
+    seventy_five_percent.clamp(1, 8)
 }
 
 /// Built-in default speaker-count ceiling: sweep-selected (extended grid,
@@ -436,7 +436,7 @@ mod tests {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let expected = (((cores as f64) * 0.75).ceil() as usize).min(8).max(1);
+        let expected = (((cores as f64) * 0.75).ceil() as usize).clamp(1, 8);
         assert_eq!(fixed_pool_size(), expected);
         assert!(fixed_pool_size() >= 1);
         assert!(fixed_pool_size() <= 8);

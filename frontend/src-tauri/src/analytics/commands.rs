@@ -158,7 +158,7 @@ pub async fn track_feature_used(feature_name: String) -> Result<(), String> {
 #[command]
 pub async fn is_analytics_enabled() -> bool {
     let guard = ANALYTICS_CLIENT.lock().unwrap();
-    guard.as_ref().map_or(false, |client| client.is_enabled())
+    guard.as_ref().is_some_and(|client| client.is_enabled())
 }
 
 // Enhanced analytics commands
@@ -321,6 +321,7 @@ pub async fn track_custom_prompt_used(prompt_length: usize) -> Result<(), String
     }
 }
 
+#[allow(clippy::too_many_arguments)] // 12 params; Tauri command: each param is a separate IPC argument from the frontend
 #[command]
 pub async fn track_meeting_ended(
     transcription_provider: String,

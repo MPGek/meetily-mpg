@@ -434,7 +434,7 @@ impl OnlineDiarizationProcessor {
         let _guard = ConsumedGuard(
             self.stats
                 .as_ref()
-                .map(|s| std::sync::Arc::downgrade(s)),
+                .map(std::sync::Arc::downgrade),
         );
 
         if chunk.data.len() < MIN_SEGMENT_SAMPLES {
