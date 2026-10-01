@@ -411,7 +411,7 @@ pub async fn reconfirm_voiceprint(
     id: String,
     speaker_id: String,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Option<f32>, String> {
     let pool = state.db_manager.pool();
     SpeakerRepository::reconfirm_voiceprint(pool, &id, &speaker_id)
         .await

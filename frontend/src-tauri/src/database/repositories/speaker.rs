@@ -24,6 +24,19 @@ pub const ENROLLMENT_BEST_K: usize = 8;
 /// pruned (design open question: start at 64).
 pub const PER_PERSON_PROTOTYPE_CAP: usize = 64;
 
+/// Rows examined per enrollment: the best-K by duration plus spares that fill
+/// a slot when the coherence guard drops a row ahead of the cut.
+const ENROLLMENT_POOL: usize = ENROLLMENT_BEST_K * 2;
+
+/// What an enrollment did: prototypes now held, and candidates the coherence
+/// guard left in the cache because they did not fit the rest
+/// (voiceprint-enrollment-quality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrollOutcome {
+    pub enrolled: usize,
+    pub dropped: usize,
+}
+
 /// Voiceprint storage statistics (change requirement: storage visibility).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SpeakerStorageStats {
@@ -83,6 +96,13 @@ pub struct VoiceprintRow {
     #[sqlx(default)]
     pub is_verified: i64,
     pub created_at: crate::database::models::DateTimeUtc,
+    /// Computed on read for enrolled prototypes (never stored): the
+    /// prototype looks foreign to its owner (guard-prototype-enrollment).
+    #[sqlx(default)]
+    pub suspect: bool,
+    /// Cosine to the mean of the owner's other prototypes, when assessed.
+    #[sqlx(default)]
+    pub own_similarity: Option<f32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -92,6 +112,7 @@ pub struct SpeakerVoiceprints {
     pub is_me: bool,
     pub prototype_count: usize,
     pub unverified_count: usize,
+    pub suspect_count: usize,
     pub prototypes: Vec<VoiceprintRow>,
 }
 
@@ -607,31 +628,68 @@ impl SpeakerRepository {
         cluster_label: &str,
         speaker_id: &str,
     ) -> Result<usize, SqlxError> {
+        Ok(Self::enroll_cluster_outcome(pool, meeting_id, cluster_label, speaker_id)
+            .await?
+            .enrolled)
+    }
+
+    /// [`Self::enroll_cluster`] that also reports how many candidates the
+    /// coherence guard left in the cache.
+    pub async fn enroll_cluster_outcome(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+        speaker_id: &str,
+    ) -> Result<EnrollOutcome, SqlxError> {
         let mut tx = pool.begin().await?;
 
-        // Reparent the best-K exemplars (longest duration first) to the speaker.
-        // Provenance (meeting_id, cluster_label, timecodes) is retained.
-        // SQLite supports UPDATE ... ORDER BY ... LIMIT.
-        let k = ENROLLMENT_BEST_K as i64;
-        sqlx::query(
-            "UPDATE speaker_embeddings SET speaker_id = ?
-             WHERE id IN (
-                 SELECT id FROM speaker_embeddings
-                 WHERE meeting_id = ? AND cluster_label = ?
-                 ORDER BY duration_secs DESC LIMIT ?
-             )",
+        // Examine the longest rows (best-K plus spares), keep the first K that
+        // cohere with the others. Provenance (meeting_id, cluster_label,
+        // timecodes) is retained by reparenting.
+        let pool_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, embedding FROM speaker_embeddings
+             WHERE meeting_id = ? AND cluster_label = ?
+             ORDER BY duration_secs DESC LIMIT ?",
         )
-        .bind(speaker_id)
         .bind(meeting_id)
         .bind(cluster_label)
-        .bind(k)
-        .execute(&mut *tx)
+        .bind(ENROLLMENT_POOL as i64)
+        .fetch_all(&mut *tx)
         .await?;
+        let (picked, dropped) = Self::pick_coherent_rows(&pool_rows);
+        for i in picked {
+            sqlx::query("UPDATE speaker_embeddings SET speaker_id = ? WHERE id = ?")
+                .bind(speaker_id)
+                .bind(&pool_rows[i].0)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         let enrolled = Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
 
         tx.commit().await?;
-        Ok(enrolled)
+        Self::log_dropped(dropped, meeting_id, cluster_label, speaker_id);
+        Ok(EnrollOutcome { enrolled, dropped })
+    }
+
+    /// Pick up to K coherent rows from a duration-ordered `(id, embedding)`
+    /// pool. Returns the picked pool indexes and the dropped count.
+    fn pick_coherent_rows(pool_rows: &[(String, Vec<u8>)]) -> (Vec<usize>, usize) {
+        let vectors: Vec<Vec<f32>> = pool_rows.iter().map(|(_, b)| bytes_to_embedding(b)).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
+        super::enrollment_guard::pick_coherent(&refs, ENROLLMENT_BEST_K)
+    }
+
+    fn log_dropped(dropped: usize, meeting_id: &str, cluster_label: &str, speaker_id: &str) {
+        if dropped > 0 {
+            tracing::info!(
+                meeting_id = %meeting_id,
+                cluster_label = %cluster_label,
+                speaker_id = %speaker_id,
+                dropped,
+                "enrollment left incoherent candidates in the cache"
+            );
+        }
     }
 
     /// Re-bind a cluster to a speaker with cluster-wide scope: first demote the
@@ -672,9 +730,31 @@ impl SpeakerRepository {
         window: (f64, f64),
         speaker_id: &str,
     ) -> Result<usize, SqlxError> {
+        Ok(Self::enroll_block_window_outcome(
+            pool,
+            meeting_id,
+            cluster_label,
+            channel,
+            window,
+            speaker_id,
+        )
+        .await?
+        .enrolled)
+    }
+
+    /// [`Self::enroll_block_window`] that also reports how many candidates
+    /// the coherence guard left in the cache.
+    pub async fn enroll_block_window_outcome(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cluster_label: &str,
+        channel: &str,
+        window: (f64, f64),
+        speaker_id: &str,
+    ) -> Result<EnrollOutcome, SqlxError> {
         let (start, end) = window;
         if end <= start {
-            return Ok(0);
+            return Ok(EnrollOutcome { enrolled: 0, dropped: 0 });
         }
 
         let mut tx = pool.begin().await?;
@@ -691,32 +771,38 @@ impl SpeakerRepository {
         )
         .await?;
 
-        // Reparent the best-K unassigned cache rows overlapping the block.
-        sqlx::query(
-            "UPDATE speaker_embeddings SET speaker_id = ?
-             WHERE id IN (
-                 SELECT id FROM speaker_embeddings
-                 WHERE meeting_id = ? AND cluster_label = ? AND channel = ?
-                   AND speaker_id IS NULL
-                   AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
-                   AND audio_start_time < ? AND audio_end_time > ?
-                 ORDER BY duration_secs DESC LIMIT ?
-             )",
+        // Examine the longest unassigned cache rows overlapping the block
+        // (best-K plus spares) and reparent the first K that cohere.
+        let pool_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, embedding FROM speaker_embeddings
+             WHERE meeting_id = ? AND cluster_label = ? AND channel = ?
+               AND speaker_id IS NULL
+               AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
+               AND audio_start_time < ? AND audio_end_time > ?
+             ORDER BY duration_secs DESC LIMIT ?",
         )
-        .bind(speaker_id)
         .bind(meeting_id)
         .bind(cluster_label)
         .bind(channel)
         .bind(end)
         .bind(start)
-        .bind(ENROLLMENT_BEST_K as i64)
-        .execute(&mut *tx)
+        .bind(ENROLLMENT_POOL as i64)
+        .fetch_all(&mut *tx)
         .await?;
+        let (picked, dropped) = Self::pick_coherent_rows(&pool_rows);
+        for i in picked {
+            sqlx::query("UPDATE speaker_embeddings SET speaker_id = ? WHERE id = ?")
+                .bind(speaker_id)
+                .bind(&pool_rows[i].0)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         let enrolled = Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
 
         tx.commit().await?;
-        Ok(enrolled)
+        Self::log_dropped(dropped, meeting_id, cluster_label, speaker_id);
+        Ok(EnrollOutcome { enrolled, dropped })
     }
 
     /// Demote prototype rows a previous binding left on a cluster back to
@@ -819,9 +905,33 @@ impl SpeakerRepository {
         meeting_id: &str,
         cluster_label: &str,
     ) -> Result<usize, SqlxError> {
+        Ok(Self::enroll_embeddings_from_buffer_outcome(
+            pool,
+            speaker_id,
+            channel,
+            embeddings,
+            window,
+            meeting_id,
+            cluster_label,
+        )
+        .await?
+        .enrolled)
+    }
+
+    /// [`Self::enroll_embeddings_from_buffer`] that also reports how many
+    /// candidates the coherence guard dropped.
+    pub async fn enroll_embeddings_from_buffer_outcome(
+        pool: &SqlitePool,
+        speaker_id: &str,
+        channel: &str,
+        embeddings: &[(f32, f32, Vec<f32>)],
+        window: (f32, f32),
+        meeting_id: &str,
+        cluster_label: &str,
+    ) -> Result<EnrollOutcome, SqlxError> {
         let (win_start, win_end) = window;
         if win_end <= win_start {
-            return Ok(0);
+            return Ok(EnrollOutcome { enrolled: 0, dropped: 0 });
         }
         let mut candidates: Vec<(f64, Vec<f32>, f32, f32)> = embeddings
             .iter()
@@ -829,7 +939,16 @@ impl SpeakerRepository {
             .map(|(s, e, emb)| ((e - s) as f64, emb.clone(), *s, *e))
             .collect();
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
-        candidates.truncate(ENROLLMENT_BEST_K as usize);
+        // Best-K plus spares, then the first K that cohere with the others.
+        candidates.truncate(ENROLLMENT_POOL);
+        let (picked, dropped) = {
+            let refs: Vec<&[f32]> = candidates.iter().map(|c| c.1.as_slice()).collect();
+            super::enrollment_guard::pick_coherent(&refs, ENROLLMENT_BEST_K)
+        };
+        let candidates: Vec<(f64, Vec<f32>, f32, f32)> = picked
+            .into_iter()
+            .map(|i| candidates[i].clone())
+            .collect();
         // Skip chunks this speaker already holds (another override over the
         // same chunk, or a repeated confirm), before any clip is cut.
         let mut fresh = Vec::with_capacity(candidates.len());
@@ -854,7 +973,7 @@ impl SpeakerRepository {
         }
         let candidates = fresh;
         if candidates.is_empty() {
-            return Ok(0);
+            return Ok(EnrollOutcome { enrolled: 0, dropped });
         }
 
         // Best-effort voice clips for the enrolled candidates, cut before the
@@ -907,7 +1026,8 @@ impl SpeakerRepository {
         }
         Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
         tx.commit().await?;
-        Ok(inserted)
+        Self::log_dropped(dropped, meeting_id, cluster_label, speaker_id);
+        Ok(EnrollOutcome { enrolled: inserted, dropped })
     }
 
     // ===== Prototype queries (recognition) =====
@@ -1130,8 +1250,27 @@ impl SpeakerRepository {
                 .await?
             };
 
+            // Suspect flags are computed from every owner's prototypes (the
+            // nearer-to-another-speaker rule needs the others), then applied
+            // to the speakers listed here. Enhanced family only, like
+            // recognition.
+            let assessed = {
+                let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+                    "SELECT id, speaker_id, embedding FROM speaker_embeddings
+                     WHERE speaker_id IS NOT NULL AND model = ?",
+                )
+                .bind(crate::audio::embedder::ENHANCED_MODEL_TAG)
+                .fetch_all(pool)
+                .await?;
+                let items: Vec<(String, String, Vec<f32>)> = rows
+                    .into_iter()
+                    .map(|(id, owner, e)| (id, owner, bytes_to_embedding(&e)))
+                    .collect();
+                super::enrollment_guard::assess_prototypes(&items)
+            };
+
             for sp in speakers {
-                let rows: Vec<VoiceprintRow> = sqlx::query_as::<_, VoiceprintRow>(
+                let mut rows: Vec<VoiceprintRow> = sqlx::query_as::<_, VoiceprintRow>(
                     "SELECT se.id, se.model, se.channel, se.duration_secs, se.speaker_id, se.meeting_id, se.cluster_label, se.audio_start_time, se.audio_end_time, COALESCE(m.title, CASE WHEN se.meeting_id IS NOT NULL THEN 'deleted meeting' ELSE NULL END) as meeting_title, (se.audio_blob IS NOT NULL) as has_audio, se.is_verified, se.created_at
                      FROM speaker_embeddings se LEFT JOIN meetings m ON m.id = se.meeting_id
                      WHERE se.speaker_id = ?
@@ -1140,14 +1279,22 @@ impl SpeakerRepository {
                 .bind(&sp.id)
                 .fetch_all(pool)
                 .await?;
+                for r in rows.iter_mut() {
+                    if let Some(a) = assessed.get(&r.id) {
+                        r.suspect = a.suspect;
+                        r.own_similarity = Some(a.own_similarity);
+                    }
+                }
                 let count = rows.len();
                 let unverified = rows.iter().filter(|r| r.is_verified == 0).count();
+                let suspect = rows.iter().filter(|r| r.suspect).count();
                 speakers_out.push(SpeakerVoiceprints {
                     speaker_id: sp.id,
                     speaker_name: sp.name,
                     is_me: sp.is_me,
                     prototype_count: count,
                     unverified_count: unverified,
+                    suspect_count: suspect,
                     prototypes: rows,
                 });
             }
@@ -1287,12 +1434,44 @@ impl SpeakerRepository {
     /// Reconfirm a cache (or demoted) voiceprint as a speaker's prototype.
     /// Enforces per-person cap (reuse enforce_prototype_cap), no provenance change.
     /// The row becomes unverified for its new owner until explicitly verified.
+    /// Never refused for low similarity - the user has decided (design D4) -
+    /// but the row's cosine to the mean of the target's existing prototypes is
+    /// returned (None when the target holds fewer than two) so the UI can warn.
     pub async fn reconfirm_voiceprint(
         pool: &SqlitePool,
         id: &str,
         speaker_id: &str,
-    ) -> Result<(), SqlxError> {
+    ) -> Result<Option<f32>, SqlxError> {
         let mut tx = pool.begin().await?;
+        let row_emb: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT embedding FROM speaker_embeddings WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let target_embs: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT embedding FROM speaker_embeddings WHERE speaker_id = ? AND id <> ?",
+        )
+        .bind(speaker_id)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let similarity = row_emb.and_then(|(row,)| {
+            if target_embs.len() < 2 {
+                return None;
+            }
+            let row = bytes_to_embedding(&row);
+            let dim = row.len();
+            let mut mean = vec![0.0f32; dim];
+            for (b,) in &target_embs {
+                let e = crate::audio::diarization::identity::matching::l2_normalize(
+                    &bytes_to_embedding(b),
+                );
+                for (m, x) in mean.iter_mut().zip(&e) {
+                    *m += x;
+                }
+            }
+            Some(crate::audio::diarization::identity::matching::cosine_similarity(&row, &mean))
+        });
         let rows =
             sqlx::query("UPDATE speaker_embeddings SET speaker_id = ?, is_verified = 0, verified_at = NULL WHERE id = ?")
                 .bind(speaker_id)
@@ -1305,7 +1484,7 @@ impl SpeakerRepository {
         }
         Self::enforce_prototype_cap(&mut tx, speaker_id).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(similarity)
     }
 
     /// Mark a single voiceprint as user-verified (voice is correct).
@@ -2112,7 +2291,7 @@ mod tests {
 
         let exemplars: Vec<Exemplar> = (0..5)
             .map(|i| Exemplar {
-                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                embedding: emb(&[1.0 + i as f32, 0.0, 0.0, 0.0]),
                 duration_secs: (i + 1) as f64,
                 start_secs: Some(i as f32 * 10.0),
                 end_secs: Some(i as f32 * 10.0 + (i + 1) as f32),
@@ -3754,7 +3933,7 @@ mod tests {
             .unwrap();
         let exemplars: Vec<Exemplar> = (0..3)
             .map(|i| Exemplar {
-                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                embedding: emb(&[1.0 + i as f32, 0.0, 0.0, 0.0]),
                 duration_secs: i as f64 + 1.0,
                 start_secs: Some(i as f32 * 10.0),
                 end_secs: Some(i as f32 * 10.0 + 1.0),
@@ -4459,7 +4638,7 @@ mod tests {
         // Step 1: Write initial cache with 5 exemplars
         let initial_exemplars: Vec<Exemplar> = (0..5)
             .map(|i| Exemplar {
-                embedding: emb(&[i as f32, 0.0, 0.0, 0.0]),
+                embedding: emb(&[0.5 + i as f32, 0.0, 0.0, 0.0]),
                 duration_secs: (i + 1) as f64,
                 start_secs: Some(i as f32 * 10.0),
                 end_secs: Some(i as f32 * 10.0 + (i + 1) as f32),
@@ -4944,7 +5123,7 @@ mod tests {
         // m1: a fully enrolled cluster (prototypes keep m1 provenance).
         let enrolled_exemplars: Vec<Exemplar> = (0..4)
             .map(|i| Exemplar {
-                embedding: emb(&[i as f32, 1.0, 0.0, 0.0]),
+                embedding: emb(&[10.0 + i as f32, 1.0, 0.0, 0.0]),
                 duration_secs: 5.0 + i as f64,
                 start_secs: Some(i as f32),
                 end_secs: Some(i as f32 + 5.0),
@@ -4971,7 +5150,7 @@ mod tests {
         // m2: a cluster still sitting as caches only.
         let pending_exemplars: Vec<Exemplar> = (0..3)
             .map(|i| Exemplar {
-                embedding: emb(&[i as f32, 2.0, 0.0, 0.0]),
+                embedding: emb(&[10.0 + i as f32, 2.0, 0.0, 0.0]),
                 duration_secs: 4.0 + i as f64,
                 start_secs: Some(i as f32),
                 end_secs: Some(i as f32 + 4.0),
@@ -5089,4 +5268,369 @@ mod tests {
             assert_eq!(r.meeting_id.as_deref(), Some("m1"));
         }
     }
+
+    // ===== Coherence guard on enrollment (guard-prototype-enrollment) =====
+
+    /// A cluster cache of `coherent` collinear exemplars (durations 1..=n,
+    /// windows 10s apart) plus the given `(embedding, duration)` outliers.
+    async fn cache_with_outliers(
+        pool: &SqlitePool,
+        coherent: usize,
+        outliers: &[([f32; 4], f64)],
+    ) {
+        let mut ex: Vec<Exemplar> = (0..coherent)
+            .map(|i| Exemplar {
+                embedding: emb(&[10.0 + i as f32, 1.0, 0.0, 0.0]),
+                duration_secs: (i + 1) as f64,
+                start_secs: Some(10.0 * i as f32),
+                end_secs: Some(10.0 * i as f32 + (i + 1) as f32),
+            })
+            .collect();
+        for (k, (v, d)) in outliers.iter().enumerate() {
+            ex.push(Exemplar {
+                embedding: emb(v),
+                duration_secs: *d,
+                start_secs: Some(500.0 + 10.0 * k as f32),
+                end_secs: Some(500.0 + 10.0 * k as f32 + *d as f32),
+            });
+        }
+        SpeakerRepository::write_cluster_cache(
+            pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[1.0, 0.0, 0.0, 0.0]),
+            &ex,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enroll_cluster_leaves_outliers_in_the_cache_and_fills_from_the_next_longest() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        // Two foreign-sounding rows that are the LONGEST of the cluster, so
+        // without the guard both would be among the best-K.
+        cache_with_outliers(
+            &pool,
+            10,
+            &[([0.0, 0.0, 1.0, 0.0], 50.0), ([0.0, 0.0, 0.0, 1.0], 40.0)],
+        )
+        .await;
+
+        let out = SpeakerRepository::enroll_cluster_outcome(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+        assert_eq!(out, EnrollOutcome { enrolled: ENROLLMENT_BEST_K, dropped: 2 });
+
+        // The outliers are still unassigned cache rows.
+        let outliers_in_cache: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL AND duration_secs >= 40.0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outliers_in_cache.0, 2);
+        // The slots went to the next-longest coherent rows (durations 10..=3).
+        let shortest: (f64,) = sqlx::query_as(
+            "SELECT MIN(duration_secs) FROM speaker_embeddings WHERE speaker_id = ?",
+        )
+        .bind(&alice.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(shortest.0, 3.0);
+    }
+
+    #[tokio::test]
+    async fn enroll_cluster_without_outliers_drops_nothing() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        cache_with_outliers(&pool, 10, &[]).await;
+        let out = SpeakerRepository::enroll_cluster_outcome(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+        assert_eq!(out, EnrollOutcome { enrolled: ENROLLMENT_BEST_K, dropped: 0 });
+    }
+
+    #[tokio::test]
+    async fn enroll_block_window_drops_an_outlier_but_enrolls_a_two_row_block_whole() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        // Window 490..600 covers only the two outliers' windows (500+).
+        cache_with_outliers(
+            &pool,
+            6,
+            &[([10.0, 1.0, 0.0, 0.0], 20.0), ([0.0, 0.0, 1.0, 0.0], 30.0)],
+        )
+        .await;
+        let two = SpeakerRepository::enroll_block_window_outcome(
+            &pool,
+            "m1",
+            "SPEAKER_00",
+            "mic",
+            (490.0, 600.0),
+            &alice.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            two,
+            EnrollOutcome { enrolled: 2, dropped: 0 },
+            "two rows are too few to judge against each other"
+        );
+
+        // A wider window with coherent rows plus one foreign row (the
+        // longest): the foreign row is left in the cache.
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+        insert_meeting(&pool, "m2").await;
+        let ex: Vec<Exemplar> = (0..6)
+            .map(|i| Exemplar {
+                embedding: emb(&[10.0 + i as f32, 1.0, 0.0, 0.0]),
+                duration_secs: (i + 1) as f64,
+                start_secs: Some(10.0 + i as f32),
+                end_secs: Some(11.0 + i as f32),
+            })
+            .chain(std::iter::once(Exemplar {
+                embedding: emb(&[0.0, 0.0, 0.0, 1.0]),
+                duration_secs: 30.0,
+                start_secs: Some(12.0),
+                end_secs: Some(14.0),
+            }))
+            .collect();
+        SpeakerRepository::write_cluster_cache(
+            &pool,
+            "m2",
+            "SPEAKER_00",
+            "mic",
+            &emb(&[1.0, 0.0, 0.0, 0.0]),
+            &ex,
+            SPEAKER_EMBEDDING_MODEL,
+        )
+        .await
+        .unwrap();
+        let wide = SpeakerRepository::enroll_block_window_outcome(
+            &pool,
+            "m2",
+            "SPEAKER_00",
+            "mic",
+            (9.0, 20.0),
+            &bob.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wide, EnrollOutcome { enrolled: 6, dropped: 1 });
+        let left: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE meeting_id = 'm2' AND speaker_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(left.0, 1, "only the outlier stays unassigned");
+    }
+
+    #[tokio::test]
+    async fn enroll_embeddings_from_buffer_skips_an_outlier_chunk_and_still_skips_held_ones() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "meeting-1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let mut buffer: Vec<(f32, f32, Vec<f32>)> = (0..5)
+            .map(|i| {
+                (
+                    i as f32,
+                    i as f32 + 1.0 + 0.1 * i as f32,
+                    emb(&[10.0 + i as f32, 1.0, 0.0, 0.0]),
+                )
+            })
+            .collect();
+        buffer.push((0.0, 9.0, emb(&[0.0, 0.0, 1.0, 0.0]))); // longest, foreign
+
+        let first = SpeakerRepository::enroll_embeddings_from_buffer_outcome(
+            &pool, &alice.id, "mic", &buffer, (0.0, 10.0), "meeting-1", "MIC_SPEAKER_00",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, EnrollOutcome { enrolled: 5, dropped: 1 });
+        let stored: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+                .bind(&alice.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, 5);
+
+        let second = SpeakerRepository::enroll_embeddings_from_buffer_outcome(
+            &pool, &alice.id, "mic", &buffer, (0.0, 10.0), "meeting-1", "MIC_SPEAKER_00",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.enrolled, 0, "chunks already held are not enrolled twice");
+    }
+
+
+    #[tokio::test]
+    async fn reconfirm_accepts_a_low_similarity_row_and_reports_the_similarity() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        // Alice holds four coherent prototypes; a foreign-sounding cache row
+        // (the longest, so it is never part of the cluster enrollment below).
+        cache_with_outliers(&pool, 4, &[([0.0, 0.0, 1.0, 0.0], 50.0)]).await;
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+        let outlier_id: (String,) = sqlx::query_as(
+            "SELECT id FROM speaker_embeddings WHERE speaker_id IS NULL AND duration_secs >= 50.0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let similarity = SpeakerRepository::reconfirm_voiceprint(&pool, &outlier_id.0, &alice.id)
+            .await
+            .unwrap()
+            .expect("target holds enough prototypes to compare");
+        assert!(similarity < super::super::enrollment_guard::COHERENCE_THRESHOLD, "got {similarity}");
+
+        let owner: (Option<String>,) =
+            sqlx::query_as("SELECT speaker_id FROM speaker_embeddings WHERE id = ?")
+                .bind(&outlier_id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(owner.0.as_deref(), Some(alice.id.as_str()), "the user's decision stands");
+    }
+
+    #[tokio::test]
+    async fn reconfirm_into_a_speaker_with_few_prototypes_reports_no_similarity() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        cache_with_outliers(&pool, 0, &[([1.0, 0.0, 0.0, 0.0], 5.0)]).await;
+        let id: (String,) =
+            sqlx::query_as("SELECT id FROM speaker_embeddings WHERE speaker_id IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let similarity = SpeakerRepository::reconfirm_voiceprint(&pool, &id.0, &alice.id)
+            .await
+            .unwrap();
+        assert_eq!(similarity, None);
+    }
+
+
+    #[tokio::test]
+    async fn list_voiceprints_flags_a_foreign_prototype_without_writing_anything() {
+        let enhanced = crate::audio::embedder::ENHANCED_MODEL_TAG;
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        insert_meeting(&pool, "m2").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        let mk = |base: [f32; 4], n: usize| -> Vec<Exemplar> {
+            (0..n)
+                .map(|i| Exemplar {
+                    embedding: emb(&[
+                        base[0] * (10.0 + i as f32),
+                        base[1] * (10.0 + i as f32),
+                        base[2] * (10.0 + i as f32),
+                        base[3] * (10.0 + i as f32),
+                    ]),
+                    duration_secs: (i + 1) as f64,
+                    start_secs: Some(10.0 * i as f32),
+                    end_secs: Some(10.0 * i as f32 + 1.0),
+                })
+                .collect()
+        };
+        let mut alice_ex = mk([1.0, 0.1, 0.0, 0.0], 5);
+        // A row that sounds like Bob, filed under Alice by hand.
+        alice_ex.push(Exemplar {
+            embedding: emb(&[0.0, 0.1, 12.0, 0.0]),
+            duration_secs: 50.0,
+            start_secs: Some(500.0),
+            end_secs: Some(501.0),
+        });
+        for (meeting, ex) in [("m1", &alice_ex), ("m2", &mk([0.0, 0.1, 1.0, 0.0], 5))] {
+            SpeakerRepository::write_cluster_cache(
+                &pool,
+                meeting,
+                "SPEAKER_00",
+                "mic",
+                &emb(&[1.0, 0.0, 0.0, 0.0]),
+                ex,
+                enhanced,
+            )
+            .await
+            .unwrap();
+        }
+        SpeakerRepository::enroll_cluster(&pool, "m1", "SPEAKER_00", &alice.id)
+            .await
+            .unwrap();
+        SpeakerRepository::enroll_cluster(&pool, "m2", "SPEAKER_00", &bob.id)
+            .await
+            .unwrap();
+        let odd: (String,) = sqlx::query_as(
+            "SELECT id FROM speaker_embeddings WHERE speaker_id IS NULL AND duration_secs >= 50.0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        SpeakerRepository::reconfirm_voiceprint(&pool, &odd.0, &alice.id)
+            .await
+            .unwrap();
+
+        let snapshot = |pool: SqlitePool| async move {
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT id, speaker_id, is_verified FROM speaker_embeddings ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let before = snapshot(pool.clone()).await;
+        let browser = SpeakerRepository::list_voiceprints(&pool, None, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(before, snapshot(pool.clone()).await, "listing writes nothing");
+
+        let a = browser.speakers.iter().find(|s| s.speaker_id == alice.id).unwrap();
+        let b = browser.speakers.iter().find(|s| s.speaker_id == bob.id).unwrap();
+        assert_eq!(a.suspect_count, 1);
+        assert_eq!(b.suspect_count, 0);
+        assert!(a.prototypes.iter().find(|r| r.id == odd.0).unwrap().suspect);
+        assert!(a.prototypes.iter().filter(|r| r.id != odd.0).all(|r| !r.suspect));
+        assert!(
+            browser
+                .unconfirmed
+                .iter()
+                .flat_map(|m| &m.caches)
+                .all(|r| !r.suspect && r.own_similarity.is_none()),
+            "cache rows are never assessed"
+        );
+    }
+
 }

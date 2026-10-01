@@ -1,3 +1,4 @@
+pub mod enrollment_guard;
 pub mod meeting;
 pub mod setting;
 pub mod speaker;

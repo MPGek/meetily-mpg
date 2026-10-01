@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAudioPlayer } from '@/hooks/useAudioPlayer';
+import { suspectBadge, visibleRows, hasSuspect } from '@/lib/voiceprint-suspect';
 import { ChevronDown, ChevronRight, ChevronsDown, ChevronsUp, Play, Pause, AlertCircle, Trash2 } from 'lucide-react';
 
 type VoiceprintRow = {
@@ -19,6 +20,8 @@ type VoiceprintRow = {
   has_audio: boolean;
   is_verified: number;
   created_at: string;
+  suspect?: boolean;
+  own_similarity?: number | null;
 };
 
 type SpeakerVoiceprints = {
@@ -27,6 +30,7 @@ type SpeakerVoiceprints = {
   is_me: boolean;
   prototype_count: number;
   unverified_count: number;
+  suspect_count?: number;
   prototypes: VoiceprintRow[];
 };
 
@@ -480,6 +484,7 @@ export default function VoiceprintBrowser() {
 
   // ——— Verification (voiceprint-verification) ———
   const [hideVerified, setHideVerified] = useState(false);
+  const [suspectOnly, setSuspectOnly] = useState(false);
 
   const handleVerifyRow = async (row: VoiceprintRow) => {
     try {
@@ -509,7 +514,7 @@ export default function VoiceprintBrowser() {
   };
 
   const visiblePrototypes = (sp: SpeakerVoiceprints) =>
-    hideVerified ? sp.prototypes.filter((r) => r.is_verified === 0) : sp.prototypes;
+    visibleRows(sp.prototypes, { hideVerified, suspectOnly });
   const visibleCaches = (mg: MeetingVoiceprints) =>
     hideVerified ? mg.caches.filter((r) => r.is_verified === 0) : mg.caches;
 
@@ -697,6 +702,15 @@ export default function VoiceprintBrowser() {
               />
               Hide verified
             </label>
+            <label className="text-xs px-2 py-1 bg-gray-100 rounded flex items-center gap-1 cursor-pointer" title="Show only prototypes that look foreign to their speaker">
+              <input
+                type="checkbox"
+                checked={suspectOnly}
+                onChange={(e) => setSuspectOnly(e.target.checked)}
+                aria-label="Show only suspect voiceprints"
+              />
+              Suspect only
+            </label>
             <button
               onClick={expandAll}
               disabled={isAllExpanded || allIds.length === 0}
@@ -720,7 +734,7 @@ export default function VoiceprintBrowser() {
         {data.speakers.length === 0 ? (
           <div className="text-sm text-gray-500">No confirmed voiceprints</div>
         ) : (
-          data.speakers.map((sp) => {
+          data.speakers.filter((sp) => !suspectOnly || hasSuspect(sp.prototypes)).map((sp) => {
             const key = `speaker:${sp.speaker_id}`;
             const isExpanded = expanded.has(key);
             const rows = visiblePrototypes(sp);
@@ -746,6 +760,11 @@ export default function VoiceprintBrowser() {
                     {sp.unverified_count > 0 && (
                       <span className="text-xs px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded" title="Unverified voiceprints">
                         {sp.unverified_count} new
+                      </span>
+                    )}
+                    {(sp.suspect_count ?? 0) > 0 && (
+                      <span className="text-xs px-1.5 py-0.5 bg-red-100 text-red-700 rounded" title="Prototypes that look foreign to this speaker">
+                        {sp.suspect_count} suspect
                       </span>
                     )}
                     {!isExpanded && <span className="text-xs text-gray-400">(collapsed)</span>}
@@ -792,6 +811,14 @@ export default function VoiceprintBrowser() {
                             </td>
                             <td>{row.audio_start_time != null && row.audio_end_time != null ? `${row.audio_start_time.toFixed(1)}–${row.audio_end_time.toFixed(1)}s` : '—'}</td>
                             <td className="flex gap-1 py-1 flex-wrap items-center">
+                              {suspectBadge(row) && (
+                                <span
+                                  className={`px-1.5 py-0.5 text-xs rounded ${suspectBadge(row) === 'suspect' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}`}
+                                  title={`Sounds unlike this speaker's other voiceprints${row.own_similarity != null ? ` (similarity ${row.own_similarity.toFixed(2)})` : ''}`}
+                                >
+                                  {suspectBadge(row) === 'suspect' ? 'suspect' : 'suspect · checked'}
+                                </span>
+                              )}
                               <button disabled={disabledPlay} onClick={() => handlePlay(row)} className={`px-2 py-0.5 rounded text-xs flex items-center gap-1 ${disabledPlay ? 'bg-gray-100 text-gray-400' : isFailedRow ? 'bg-red-600 text-white' : isPlayingRow ? 'bg-blue-700 text-white' : 'bg-blue-500 text-white'}`}>
                                 {isFailedRow ? <AlertCircle className="h-3 w-3" /> : isPlayingRow ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
                                 Play clip
