@@ -404,7 +404,7 @@ Offline diarization SHALL persist, for each produced cluster, its centroid embed
 - **THEN** the cache refresh SHALL replace only the unassigned exemplar rows for each cluster and SHALL NOT delete any enrolled prototypes, so that voiceprints enrolled during the recording session or via manual assignment survive re-diarization
 
 ### Requirement: Post-clustering automatic recognition
-After clustering and cache persistence, offline diarization SHALL match each cluster centroid against candidate prototypes per the speaker-identity-registry recognition rules (expected-speaker allowlist, or all registry speakers when no allowlist; model-tagged embeddings only; τ=0.7) and auto-assign confident matches.
+After clustering and cache persistence, offline diarization SHALL match each cluster centroid against candidate prototypes per the speaker-identity-registry recognition rules (expected-speaker allowlist, or all registry speakers when no allowlist; model-tagged embeddings only; τ=0.7) and auto-assign confident matches. It SHALL then additionally name each transcript row from the embeddings that overlap that row, per the speaker-identity-registry per-row recognition rules, so that a cluster holding the speech of more than one person, or whose centroid falls below the threshold, does not decide the name of a row whose own audio matches a candidate. A failure of the row-level step SHALL NOT fail the diarization or change its reported status; the rows then resolve through their cluster bindings as they did before the step existed.
 
 #### Scenario: Recognized speaker labeled without user action
 - **WHEN** offline diarization completes and a cluster centroid matches an expected speaker's prototype above threshold
@@ -413,6 +413,18 @@ After clustering and cache persistence, offline diarization SHALL match each clu
 #### Scenario: No candidates leaves clusters anonymous
 - **WHEN** the registry is empty or no candidate exceeds the threshold
 - **THEN** diarization results SHALL be unchanged from current behavior (cluster labels only)
+
+#### Scenario: A merged cluster does not rename a row whose own audio matches someone else
+- **WHEN** offline diarization puts two recognizable people into one cluster and the cluster's centroid matches only one of them
+- **THEN** the rows of the other person SHALL display that person's name, not the cluster's
+
+#### Scenario: Row-level failure does not fail the diarization
+- **WHEN** the row-level step fails after the clusters have been persisted and recognized
+- **THEN** the diarization SHALL still complete with its normal status and result, the failure SHALL be logged, and the rows SHALL resolve through their cluster bindings
+
+#### Scenario: The diarization output itself is unchanged
+- **WHEN** offline diarization records row-level matches
+- **THEN** its clusters, turns, transcript speaker labels, centroids, exemplar caches and cluster bindings SHALL be exactly what they would be without the row-level step
 
 ### Requirement: Enhanced diarization models default when installed
 When the enhanced model set is installed, offline diarization SHALL use it by default for new and re-run diarization; the legacy polyvoice set SHALL remain bundled and serve as the automatic fallback. Diarization SHALL never require the user to have the enhanced models installed.
@@ -470,4 +482,3 @@ Offline diarization's post-clustering recognition and cache persistence SHALL re
 
 - **WHEN** offline diarization completes successfully after this fix
 - **THEN** each persisted centroid in `meeting_speakers` SHALL be 192-dimensional, `model='titanet_large'`, and cosine-similarity against enrolled TitaNet prototypes SHALL be meaningful (not a layout-corrupted vector)
-
