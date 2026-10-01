@@ -158,9 +158,9 @@ export function useImportAudio({
         setStatus('idle');
         return null;
       }
-    } catch (err: any) {
+    } catch (err) {
       setStatus('error');
-      const errorMsg = typeof err === 'string' ? err : (err?.message || String(err) || 'Failed to validate file');
+      const errorMsg = typeof err === 'string' ? err : ((err instanceof Error && err.message) || String(err) || 'Failed to validate file');
       setError(errorMsg);
       onErrorRef.current?.(errorMsg);
       return null;
@@ -177,9 +177,9 @@ export function useImportAudio({
       setFileInfo(result);
       setStatus('idle');
       return result;
-    } catch (err: any) {
+    } catch (err) {
       setStatus('error');
-      const errorMsg = typeof err === 'string' ? err : (err?.message || String(err) || 'Failed to validate file');
+      const errorMsg = typeof err === 'string' ? err : ((err instanceof Error && err.message) || String(err) || 'Failed to validate file');
       setError(errorMsg);
       onErrorRef.current?.(errorMsg);
       return null;
@@ -218,9 +218,9 @@ export function useImportAudio({
           model: model || null,
           provider: provider || null,
         });
-      } catch (err: any) {
+      } catch (err) {
         setStatus('error');
-        const errorMsg = typeof err === 'string' ? err : (err?.message || String(err) || 'Failed to start import');
+        const errorMsg = typeof err === 'string' ? err : ((err instanceof Error && err.message) || String(err) || 'Failed to start import');
         setError(errorMsg);
 
         await Analytics.trackError('import_audio_failed', errorMsg);
@@ -238,7 +238,7 @@ export function useImportAudio({
       await cancelImportCommand();
       setStatus('idle');
       setProgress(null);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Failed to cancel import:', err);
     }
   }, []);

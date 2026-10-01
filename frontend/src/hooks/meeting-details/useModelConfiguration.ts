@@ -7,6 +7,7 @@ import {
   getModelConfig,
   listenModelConfigUpdated,
   saveModelConfig,
+  type CustomOpenAIConfig,
 } from '@/lib/ipc/settings';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
@@ -31,7 +32,8 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
       setIsLoading(true);
       try {
         console.log('🔄 Fetching model configuration from database...');
-        const data = await getModelConfig() as any;
+        // `customOpenAIDisplayName`/`displayName` are not sent by Rust (always null here); kept as-is.
+        const data: (ModelConfig & { customOpenAIDisplayName?: string | null }) | null = await getModelConfig();
         if (data && data.provider !== null) {
           console.log('✅ Loaded model config from database:', {
             provider: data.provider,
@@ -55,7 +57,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
           // Fetch custom OpenAI config if provider is custom-openai
           if (data.provider === 'custom-openai') {
             try {
-              const customConfig = await getCustomOpenaiConfig() as any;
+              const customConfig: (CustomOpenAIConfig & { displayName?: string }) | null = await getCustomOpenaiConfig();
               if (customConfig) {
                 data.customOpenAIDisplayName = customConfig.displayName || null;
                 data.customOpenAIEndpoint = customConfig.endpoint || null;

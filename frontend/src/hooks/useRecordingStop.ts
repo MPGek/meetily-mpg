@@ -18,6 +18,10 @@ import {
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
+interface WindowWithTauriHooks extends Window {
+  handleRecordingStop?: (callApi?: boolean) => void;
+}
+
 interface UseRecordingStopReturn {
   handleRecordingStop: (callApi: boolean) => Promise<void>;
   isStopping: boolean;
@@ -533,13 +537,13 @@ export function useRecordingStop(
   });
 
   useEffect(() => {
-    (window as any).handleRecordingStop = (callApi: boolean = true) => {
+    (window as WindowWithTauriHooks).handleRecordingStop = (callApi: boolean = true) => {
       handleRecordingStopRef.current(callApi);
     };
 
     // Cleanup on unmount
     return () => {
-      delete (window as any).handleRecordingStop;
+      delete (window as WindowWithTauriHooks).handleRecordingStop;
     };
   }, []);
 

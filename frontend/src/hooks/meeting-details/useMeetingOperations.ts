@@ -1,9 +1,10 @@
 import { useCallback } from 'react';
 import { openMeetingFolder } from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
+import type { MeetingMetadata } from '@/types';
 
 interface UseMeetingOperationsProps {
-  meeting: any;
+  meeting: MeetingMetadata;
 }
 
 export function useMeetingOperations({

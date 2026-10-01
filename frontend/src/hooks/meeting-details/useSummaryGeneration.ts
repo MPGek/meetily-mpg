@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Transcript, Summary } from '@/types';
+import { Transcript, Summary, MeetingMetadata } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { builtinAiGetModelInfo, builtinAiIsModelReady, getOllamaModels } from '@/lib/ipc/models';
@@ -9,6 +9,7 @@ import { getMeetingTranscripts } from '@/lib/ipc/transcript';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { isOllamaNotInstalledError } from '@/lib/utils';
+import { formatLegacySummaryData, isLegacySummaryEmpty } from '@/lib/summary-formatting';
 import {
   detectAndCacheSummaryLanguage,
   readMeetingSummaryLanguage,
@@ -53,7 +54,7 @@ async function resolveSummaryLanguage(
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
 interface UseSummaryGenerationProps {
-  meeting: any;
+  meeting: MeetingMetadata;
   transcripts: Transcript[];
   modelConfig: ModelConfig;
   isModelConfigLoading: boolean;
@@ -175,7 +176,7 @@ export function useSummaryGeneration({
           try {
             const existingSummary = await getSummary({
               meetingId: meeting.id
-            }) as any;
+            });
 
             if (existingSummary?.data) {
               console.log('Restored previous summary after cancellation');
@@ -203,7 +204,7 @@ export function useSummaryGeneration({
             try {
               const existingSummary = await getSummary({
                 meetingId: meeting.id
-              }) as any;
+              });
 
               if (existingSummary?.data) {
                 console.log('Restored previous summary after regeneration failure');
@@ -275,7 +276,7 @@ export function useSummaryGeneration({
           // Check if backend returned markdown format (new flow)
           if (pollingResult.data.markdown) {
             console.log('Received markdown format from backend');
-            setAiSummary({ markdown: pollingResult.data.markdown } as any);
+            setAiSummary({ markdown: pollingResult.data.markdown } as Summary);
             setSummaryStatus('completed');
 
             // Show success toast
@@ -298,7 +299,7 @@ export function useSummaryGeneration({
 
           // Legacy format handling
           const summarySections = Object.entries(pollingResult.data).filter(([key]) => key !== 'MeetingName');
-          const allEmpty = summarySections.every(([, section]) => !(section as any).blocks || (section as any).blocks.length === 0);
+          const allEmpty = isLegacySummaryEmpty(summarySections);
 
           if (allEmpty) {
             console.error('Summary completed but all sections empty');
@@ -320,35 +321,8 @@ export function useSummaryGeneration({
           const { MeetingName, ...summaryData } = pollingResult.data;
 
           // Format legacy summary data
-          const formattedSummary: Summary = {};
           const sectionKeys = pollingResult.data._section_order || Object.keys(summaryData);
-
-          for (const key of sectionKeys) {
-            try {
-              const section = summaryData[key];
-              if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
-                const typedSection = section as { title?: string; blocks?: any[] };
-
-                if (Array.isArray(typedSection.blocks)) {
-                  formattedSummary[key] = {
-                    title: typedSection.title || key,
-                    blocks: typedSection.blocks.map((block: any) => ({
-                      ...block,
-                      color: 'default',
-                      content: block?.content?.trim() || ''
-                    }))
-                  };
-                } else {
-                  formattedSummary[key] = {
-                    title: typedSection.title || key,
-                    blocks: []
-                  };
-                }
-              }
-            } catch (error) {
-              console.warn(`Error processing section ${key}:`, error);
-            }
-          }
+          const formattedSummary = formatLegacySummaryData(sectionKeys, summaryData);
 
           setAiSummary(formattedSummary);
           setSummaryStatus('completed');

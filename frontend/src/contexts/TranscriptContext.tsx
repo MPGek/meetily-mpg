@@ -9,6 +9,7 @@ import { recordingService, type SpeakerTurn } from '@/services/recordingService'
 import { indexedDBService } from '@/services/indexedDBService';
 import { getMeetingFolderPath } from '@/lib/ipc/meetings';
 import { loadDiarizationSettings } from '@/lib/diarization';
+import { dedupeAndInsertTranscript, formatTranscriptForClipboard } from '@/lib/transcript-formatting';
 import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveLiveBlocks, type LiveWindowOverride } from '@/lib/live-speaker-labels';
 
 interface TranscriptContextType {
@@ -678,18 +679,11 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     setTranscripts(prev => {
       console.log('📊 Current transcripts count before update:', prev.length);
 
-      // Check if this transcript already exists
-      const exists = prev.some(
-        t => t.text === update.text && t.timestamp === update.timestamp
-      );
-      if (exists) {
+      const sorted = dedupeAndInsertTranscript(prev, newTranscript);
+      if (sorted === prev) {
         console.log('🚫 Duplicate transcript detected, skipping:', update.text.substring(0, 30) + '...');
         return prev;
       }
-
-      // Add new transcript and sort by sequence_id to maintain order
-      const updated = [...prev, newTranscript];
-      const sorted = updated.sort((a, b) => (a.sequence_id || 0) - (b.sequence_id || 0));
 
       console.log('✅ Added new transcript. New count:', sorted.length);
       console.log('📝 Latest transcript:', {
@@ -704,18 +698,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Copy transcript to clipboard with recording-relative timestamps
   const copyTranscript = useCallback(() => {
-    // Format timestamps as recording-relative [MM:SS] instead of wall-clock time
-    const formatTime = (seconds: number | undefined): string => {
-      if (seconds === undefined) return '[--:--]';
-      const totalSecs = Math.floor(seconds);
-      const mins = Math.floor(totalSecs / 60);
-      const secs = totalSecs % 60;
-      return `[${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
-    };
-
-    const fullTranscript = transcripts
-      .map(t => `${formatTime(t.audio_start_time)} ${t.text}`)
-      .join('\n');
+    const fullTranscript = formatTranscriptForClipboard(transcripts);
     navigator.clipboard.writeText(fullTranscript);
 
     toast.success("Transcript copied to clipboard");

@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { Summary } from '@/types';
+import { Summary, SummaryDataResponse, BlockNoteBlock, MeetingMetadata, Transcript } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { saveMeetingTitle } from '@/lib/ipc/meetings';
@@ -7,7 +7,7 @@ import { saveMeetingSummary } from '@/lib/ipc/summary';
 import { toast } from 'sonner';
 
 interface UseMeetingDataProps {
-  meeting: any;
+  meeting: MeetingMetadata & { transcripts: Transcript[] };
   summaryData: Summary | null;
   onMeetingUpdated?: () => Promise<void>;
 }
@@ -74,7 +74,7 @@ export function useMeetingData({ meeting, summaryData }: UseMeetingDataProps) {
     }
   }, [meeting.id, meetingTitle, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
-  const handleSaveSummary = useCallback(async (summary: Summary | { markdown?: string; summary_json?: any[] }) => {
+  const handleSaveSummary = useCallback(async (summary: Summary | { markdown?: string; summary_json?: BlockNoteBlock[] }) => {
     console.log('📄 handleSaveSummary called with:', {
       hasMarkdown: 'markdown' in summary,
       hasSummaryJson: 'summary_json' in summary,
@@ -82,7 +82,7 @@ export function useMeetingData({ meeting, summaryData }: UseMeetingDataProps) {
     });
 
     try {
-      let formattedSummary: any;
+      let formattedSummary: SummaryDataResponse;
 
       // Check if it's the new BlockNote format
       if ('markdown' in summary || 'summary_json' in summary) {

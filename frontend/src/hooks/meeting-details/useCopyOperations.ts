@@ -1,12 +1,12 @@
 import { useCallback, RefObject } from 'react';
-import { Transcript, Summary } from '@/types';
+import { Transcript, Summary, MeetingMetadata } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { getMeetingTranscripts } from '@/lib/ipc/transcript';
 
 interface UseCopyOperationsProps {
-  meeting: any;
+  meeting: MeetingMetadata;
   transcripts: Transcript[];
   meetingTitle: string;
   aiSummary: Summary | null;
@@ -120,7 +120,7 @@ export function useCopyOperations({
       // Fallback: Check if aiSummary has markdown property
       if (!summaryMarkdown && aiSummary && 'markdown' in aiSummary) {
         console.log('📝 Using markdown from aiSummary');
-        summaryMarkdown = (aiSummary as any).markdown || '';
+        summaryMarkdown = (aiSummary as { markdown?: string }).markdown || '';
         console.log('📝 Markdown from aiSummary, length:', summaryMarkdown.length);
       }
 
@@ -136,7 +136,7 @@ export function useCopyOperations({
             if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
               const sectionTitle = `## ${section.title}\n\n`;
               const sectionContent = section.blocks
-                .map((block: any) => `- ${block.content}`)
+                .map((block) => `- ${block.content}`)
                 .join('\n');
               return sectionTitle + sectionContent;
             }
