@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo, useMemo } from "react";
+import { useRef, useReducer, startTransition, useEffect, useState, memo, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
@@ -400,7 +400,7 @@ function SpeakerLabel({
                             className="w-full text-xs text-left text-blue-600 hover:underline"
                             onClick={() => handleCreateNew(query)}
                         >
-                            Create "{query.trim()}"
+                            Create &quot;{query.trim()}&quot;
                         </button>
                     </div>
                 )}

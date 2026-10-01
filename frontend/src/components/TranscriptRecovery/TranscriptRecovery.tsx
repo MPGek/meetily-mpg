@@ -58,6 +58,7 @@ export function TranscriptRecovery({
     if (isOpen && recoverableMeetings.length > 0 && !selectedMeetingId) {
       handleMeetingSelect(recoverableMeetings[0].meetingId);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- handleMeetingSelect is recreated every render, and selectedMeetingId is set by this effect; adding either would re-select in a loop
   }, [isOpen, recoverableMeetings]);
 
   const handleMeetingSelect = async (meetingId: string) => {

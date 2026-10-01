@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import { Transcript, Summary } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
-import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
@@ -64,7 +64,6 @@ interface UseSummaryGenerationProps {
 
 export function useSummaryGeneration({
   meeting,
-  transcripts,
   modelConfig,
   isModelConfigLoading,
   selectedTemplate,
@@ -315,6 +314,7 @@ export function useSummaryGeneration({
           }
 
           // Remove MeetingName from data before formatting
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
           const { MeetingName, ...summaryData } = pollingResult.data;
 
           // Format legacy summary data
@@ -387,6 +387,7 @@ export function useSummaryGeneration({
         errorMessage
       );
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- onOpenModelSettings is an unmemoized prop; adding it would recreate this callback on every parent render
   }, [
     meeting.id,
     meeting.created_at,
@@ -614,6 +615,7 @@ export function useSummaryGeneration({
       ...summaryPayload,
       customPrompt,
     });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- onOpenModelSettings is an unmemoized prop; adding it would recreate this callback on every parent render
   }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary, modelConfig, isModelConfigLoading, selectedTemplate]);
 
   // Public API: Regenerate summary from the current saved transcript

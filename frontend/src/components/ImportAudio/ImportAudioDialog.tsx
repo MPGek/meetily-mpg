@@ -114,7 +114,6 @@ export function ImportAudioDialog({
     progress,
     error,
     isProcessing,
-    isBusy,
     selectFile,
     validateFile,
     startImport,
@@ -369,7 +368,7 @@ export function ImportAudioDialog({
                             <span className="text-sm font-medium">Language</span>
                           </div>
                           <p className="text-xs text-muted-foreground">
-                            Language selection isn't supported for Parakeet. It always uses automatic detection.
+                            Language selection isn&apos;t supported for Parakeet. It always uses automatic detection.
                           </p>
                         </div>
                       )}

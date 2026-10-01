@@ -33,7 +33,7 @@ export function ModelManager({
   const [error, setError] = useState<string | null>(null);
   const [initialized, setInitialized] = useState(false);
   const [downloadingModels, setDownloadingModels] = useState<Set<string>>(new Set());
-  const [hasUserSelection, setHasUserSelection] = useState(false);
+  const [, setHasUserSelection] = useState(false);
 
   // Refs for stable callbacks
   const onModelSelectRef = useRef(onModelSelect);
@@ -240,6 +240,7 @@ export function ModelManager({
       if (unlistenComplete) unlistenComplete();
       if (unlistenError) unlistenError();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event listeners; downloadModel and models change every render and the listeners use refs for current values
   }, []); // Empty dependency array - listeners use refs for stable callbacks
 
   const saveModelSelection = async (modelName: string) => {
@@ -510,7 +511,6 @@ function ModelCard({
   onDownload,
   onCancel,
   onDelete,
-  isDownloading,
   displayName
 }: ModelCardProps) {
   const [isHovered, setIsHovered] = useState(false);

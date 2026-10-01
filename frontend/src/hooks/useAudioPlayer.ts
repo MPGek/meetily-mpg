@@ -91,6 +91,7 @@ export const useAudioPlayer = (audioPath: string | null) => {
   // Release playback resources on unmount
   useEffect(() => {
     return () => {
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- releases whichever element the ref holds at unmount, which is the one to free
       const el = audioRef.current;
       if (el) {
         el.pause();

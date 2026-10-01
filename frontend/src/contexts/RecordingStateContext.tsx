@@ -78,7 +78,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       status,
       statusMessage: message,
     }));
-  }, [state.status, state.isRecording, state.isPaused]);
+  }, [state.status]);
 
   /**
    * Sync recording state with backend
@@ -214,6 +214,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       unsubscribers.forEach(unsub => unsub());
       stopPolling();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event listeners and polling; startPolling is recreated every render and would restart polling
   }, []);
 
   /**

@@ -11,6 +11,7 @@ interface OnboardingFlowProps {
   onComplete: () => void;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- onComplete stays in the props contract; completion is driven by OnboardingContext
 export function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
   const { currentStep } = useOnboarding();
   const [isMac, setIsMac] = React.useState(false);

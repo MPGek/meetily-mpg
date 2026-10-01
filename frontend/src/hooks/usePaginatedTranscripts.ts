@@ -55,7 +55,6 @@ function convertTranscriptsToSegments(transcripts: Transcript[]): TranscriptSegm
 
 export function usePaginatedTranscripts({
     meetingId,
-    initialTimestamp,
 }: UsePaginatedTranscriptsProps): UsePaginatedTranscriptsReturn {
     const [metadata, setMetadata] = useState<MeetingMetadata | null>(null);
     const [transcripts, setTranscripts] = useState<Transcript[]>([]);

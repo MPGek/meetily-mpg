@@ -16,7 +16,7 @@ const HOMEBREW_PATHS = [
   '/usr/local/var/meetily/meeting_minutes.db',      // Intel Macs
 ];
 
-export function HomebrewDatabaseDetector({ onImportSuccess, onDecline }: HomebrewDatabaseDetectorProps) {
+export function HomebrewDatabaseDetector({ onDecline }: HomebrewDatabaseDetectorProps) {
   const [isChecking, setIsChecking] = useState(true);
   const [isImporting, setIsImporting] = useState(false);
   const [homebrewDbExists, setHomebrewDbExists] = useState(false);

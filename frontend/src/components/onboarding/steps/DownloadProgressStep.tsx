@@ -156,7 +156,7 @@ export function DownloadProgressStep() {
       try {
         const { platform } = await import('@tauri-apps/plugin-os');
         setIsMac(platform() === 'macos');
-      } catch (e) {
+      } catch {
         setIsMac(navigator.userAgent.includes('Mac'));
       }
     };
@@ -182,6 +182,7 @@ export function DownloadProgressStep() {
         setParakeetState((prev) => ({ ...prev, status: 'error', error: String(error) }));
       }
     });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only download kickoff; startBackgroundDownloads is recreated every render and parakeetDownloaded must not restart it
   }, []);
 
   // Start the selected summary model only after the backend recommendation is known.
@@ -191,6 +192,7 @@ export function DownloadProgressStep() {
     summaryDownloadStartedRef.current = true;
 
     startSummaryDownload();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- startSummaryDownload is recreated every render; the start is guarded by summaryDownloadStartedRef and keyed on the selected model
   }, [selectedSummaryModel]);
 
   // Listen to Parakeet download progress
@@ -248,7 +250,7 @@ export function DownloadProgressStep() {
       unlistenComplete.then((fn) => fn());
       unlistenError.then((fn) => fn());
     };
-  }, []);
+  }, [setParakeetDownloaded]);
 
   // Listen to Summary Model download progress (always downloading for builtin-ai)
   useEffect(() => {
@@ -286,7 +288,7 @@ export function DownloadProgressStep() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [selectedSummaryModel]);
+  }, [selectedSummaryModel, setSummaryModelDownloaded]);
 
   useEffect(() => {
     const modelForSize = selectedSummaryModel || recommendedSummaryModel;

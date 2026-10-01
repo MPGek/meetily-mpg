@@ -71,6 +71,7 @@ export function BuiltInModelManager({
 
   useEffect(() => {
     fetchModels();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only fetch; fetchModels is recreated every render and would refetch in a loop
   }, []);
 
   // Listen for download progress events
@@ -118,10 +119,12 @@ export function BuiltInModelManager({
           });
           // Clean up progress state
           setDownloadProgress((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
           setDownloadProgressInfo((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
@@ -139,10 +142,12 @@ export function BuiltInModelManager({
           });
           // Clean up progress state
           setDownloadProgress((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
           setDownloadProgressInfo((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
@@ -159,10 +164,12 @@ export function BuiltInModelManager({
           });
           // Clean up progress state
           setDownloadProgress((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
           setDownloadProgressInfo((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
@@ -196,6 +203,7 @@ export function BuiltInModelManager({
         unlisten();
       }
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event subscription; fetchModels is recreated every render and would re-subscribe on every render
   }, []);
 
   const downloadModel = async (modelName: string) => {

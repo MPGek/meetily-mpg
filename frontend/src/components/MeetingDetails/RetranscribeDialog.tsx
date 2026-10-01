@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu } from 'lucide-react';
+import { RefreshCw, Globe, Loader2, AlertCircle, X, Cpu } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -124,6 +124,7 @@ export function RetranscribeDialog({
       // Fetch available models using centralized hook
       fetchModels();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- resetSelection is recreated every render; adding it would reset the selection on every render while open
   }, [open, selectedLanguage, transcriptModelConfig, fetchModels]);
 
   // Listen for retranscription events
@@ -338,7 +339,7 @@ export function RetranscribeDialog({
                   <span className="text-sm font-medium">Language</span>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Language selection isn't supported for Parakeet. It always uses automatic detection.
+                  Language selection isn&apos;t supported for Parakeet. It always uses automatic detection.
                 </p>
               </div>
             )

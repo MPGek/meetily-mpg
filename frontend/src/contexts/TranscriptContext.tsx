@@ -353,7 +353,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
                   await indexedDBService.saveMeetingMetadata(metadata);
                 }
               }
-            } catch (error) {
+            } catch {
               // Non-fatal - will be set on stop if recording completes normally
             }
           } catch (error) {
@@ -423,7 +423,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
     let transcriptCounter = 0;
-    let transcriptBuffer = new Map<number, Transcript>();
+    const transcriptBuffer = new Map<number, Transcript>();
     let lastProcessedSequence = 0;
     let processingTimer: NodeJS.Timeout | undefined;
 
@@ -648,6 +648,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     };
 
     syncFromBackend();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- reload sync keyed on recording state; adding transcripts.length would re-fetch history from the backend whenever transcripts are cleared mid-recording
   }, [recordingState.isRecording]); // Run when recording state changes
 
   // Manual transcript update handler (for RecordingControls component)

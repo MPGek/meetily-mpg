@@ -105,7 +105,7 @@ function cleanStopWords(text: string): string {
 }
 
 export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isRecording = false, isPaused = false, isProcessing = false, isStopping = false, enableStreaming = false }) => {
-  const [speechDetected, setSpeechDetected] = useState(false);
+  const [, setSpeechDetected] = useState(false);
 
   // Debug: Log the props to understand what's happening
   console.log('TranscriptView render:', {

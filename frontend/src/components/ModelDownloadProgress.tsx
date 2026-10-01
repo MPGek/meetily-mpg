@@ -1,6 +1,5 @@
 import React from 'react';
 import { ModelStatus } from '../lib/whisper';
-import { Button } from './ui/button';
 
 interface ModelDownloadProgressProps {
   status: ModelStatus;
@@ -8,7 +7,7 @@ interface ModelDownloadProgressProps {
   onCancel?: () => void;
 }
 
-export function ModelDownloadProgress({ status, modelName, onCancel }: ModelDownloadProgressProps) {
+export function ModelDownloadProgress({ status, modelName }: ModelDownloadProgressProps) {
   if (typeof status !== 'object' || !('Downloading' in status)) {
     return null;
   }

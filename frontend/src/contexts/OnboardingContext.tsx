@@ -151,6 +151,7 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
     loadOnboardingStatus();
     checkDatabaseStatus();
     initializeDatabaseInBackground();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only load and DB init; both functions are recreated every render and would re-run initialization
   }, []);
 
   // Initialize database silently in background (moved from SetupOverviewStep)
@@ -230,6 +231,7 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
     return () => {
       if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- debounced auto-save keyed on the saved fields; saveOnboardingStatus is recreated every render and would reschedule the save on every render
   }, [currentStep, parakeetDownloaded, summaryModelDownloaded, completed]);
 
   // Listen to Parakeet download progress
@@ -415,7 +417,7 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
     // Determine the correct step based on verified status
     // New simplified flow: Step 1: Welcome, Step 2: Setup Overview, Step 3: Download Progress, Step 4: Permissions (macOS)
     let currentStep = savedStatus.current_step;
-    let completed = savedStatus.completed;
+    const completed = savedStatus.completed;
 
     // Clamp step to new max (4)
     if (currentStep > 4) {

@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from 'react';
-import { useSidebar } from './Sidebar/SidebarProvider';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { useOllamaDownload } from '@/contexts/OllamaDownloadContext';
@@ -16,7 +15,6 @@ import {
 } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Switch } from '@/components/ui/switch';
 import { Lock, Unlock, Eye, EyeOff, RefreshCw, CheckCircle2, XCircle, ChevronDown, ChevronUp, Download, ExternalLink, Check, ChevronsUpDown } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import {
@@ -129,9 +127,8 @@ export function ModelSettingsModal({
   const [showApiKey, setShowApiKey] = useState<boolean>(false);
   const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(!!modelConfig.apiKey?.trim());
   const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
-  const { serverAddress } = useSidebar();
   const [openRouterModels, setOpenRouterModels] = useState<OpenRouterModel[]>([]);
-  const [openRouterError, setOpenRouterError] = useState<string>('');
+  const [, setOpenRouterError] = useState<string>('');
   const [isLoadingOpenRouter, setIsLoadingOpenRouter] = useState<boolean>(false);
   const [ollamaEndpoint, setOllamaEndpoint] = useState<string>(modelConfig.ollamaEndpoint || '');
   const [isLoadingOllama, setIsLoadingOllama] = useState<boolean>(false);
@@ -140,7 +137,7 @@ export function ModelSettingsModal({
   const [hasAutoFetched, setHasAutoFetched] = useState<boolean>(false);
   const hasSyncedFromParent = useRef<boolean>(false);
   const hasLoadedInitialConfig = useRef<boolean>(false);
-  const [autoGenerateEnabled, setAutoGenerateEnabled] = useState<boolean>(true); // Default to true
+  const [, setAutoGenerateEnabled] = useState<boolean>(true); // Default to true
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isEndpointSectionCollapsed, setIsEndpointSectionCollapsed] = useState<boolean>(true); // Collapsed by default
   const [ollamaNotInstalled, setOllamaNotInstalled] = useState<boolean>(false); // Track if Ollama is not installed
@@ -202,18 +199,6 @@ export function ModelSettingsModal({
 
     return () => clearTimeout(timer);
   }, [ollamaEndpoint]);
-
-  const fetchApiKey = async (provider: string) => {
-    try {
-      const data = (await invoke('api_get_api_key', {
-        provider,
-      })) as string;
-      setApiKey(data || '');
-    } catch (err) {
-      console.error('Error fetching API key:', err);
-      setApiKey(null);
-    }
-  };
 
   // Auto-unlock when API key becomes empty, 
   useEffect(() => {
@@ -311,7 +296,7 @@ export function ModelSettingsModal({
     };
 
     fetchModelConfig();
-  }, [skipInitialFetch]);
+  }, [skipInitialFetch, setModelConfig]);
 
   // Fetch auto-generate setting on mount
   useEffect(() => {
@@ -340,6 +325,7 @@ export function ModelSettingsModal({
     if (modelConfig.provider) {
       hasSyncedFromParent.current = true; // Mark that we've received prop value
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- syncs from the parent value only; adding the local ollamaEndpoint would overwrite user edits as they type
   }, [modelConfig.ollamaEndpoint, modelConfig.provider]);
 
   // Sync custom OpenAI state from modelConfig (context or props)
@@ -410,6 +396,7 @@ export function ModelSettingsModal({
         setIsApiKeyLocked(!!correctKey?.trim());
       }
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- syncs the key only when provider/keys change; adding the local apiKey would overwrite user edits as they type
   }, [modelConfig.provider, providerApiKeys, requiresApiKey]);
 
   // Manual fetch function for Ollama models
@@ -483,6 +470,7 @@ export function ModelSettingsModal({
     return () => {
       mounted = false;
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- initial fetch keyed on provider only (see trailing comment); fetchOllamaModels is recreated every render and hasAutoFetched is set by this effect
   }, [modelConfig.provider]); // Only depend on provider, NOT endpoint
 
   const loadOpenRouterModels = async () => {
@@ -612,6 +600,7 @@ export function ModelSettingsModal({
     if (cachedModel && providerModels.includes(cachedModel)) {
       setModelConfig((prev: ModelConfig) => ({ ...prev, model: cachedModel }));
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- modelOptions is a new object every render and setModelConfig would re-run the restore on every render; keyed on the model lists instead
   }, [models, openRouterModels, builtinAiModels, openaiModels, claudeModels, groqModels, modelConfig.provider]);
 
   const handleSave = async () => {
@@ -746,24 +735,6 @@ export function ModelSettingsModal({
     }
   };
 
-  // Function to delete Ollama model
-  const deleteOllamaModel = async (modelName: string) => {
-    try {
-      const endpoint = ollamaEndpoint.trim() || null;
-      await invoke('delete_ollama_model', {
-        modelName,
-        endpoint
-      });
-
-      toast.success(`Model ${modelName} deleted`);
-      await fetchOllamaModels(true); // Refresh list
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Failed to delete model';
-      toast.error(errorMsg);
-      console.error('Error deleting model:', err);
-    }
-  };
-
   // Track previous downloading models to detect completions
   const previousDownloadingRef = useRef<Set<string>>(new Set());
 
@@ -784,6 +755,7 @@ export function ModelSettingsModal({
 
     // Update ref for next comparison
     previousDownloadingRef.current = new Set(current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- fetchOllamaModels is recreated every render; the refresh must fire only when downloadingModels changes
   }, [downloadingModels]);
 
   // Filter Ollama models based on search query
@@ -1183,7 +1155,7 @@ export function ModelSettingsModal({
                 {ollamaEndpointChanged && !error && (
                   <Alert className="mt-3 border-yellow-500 bg-yellow-50">
                     <AlertDescription className="text-yellow-800">
-                      Endpoint changed. Please click "Fetch Models" to load models from the new endpoint before saving.
+                      Endpoint changed. Please click &quot;Fetch Models&quot; to load models from the new endpoint before saving.
                     </AlertDescription>
                   </Alert>
                 )}
@@ -1240,7 +1212,7 @@ export function ModelSettingsModal({
                       Download Ollama
                     </Button>
                     <div className="text-sm text-muted-foreground text-center">
-                      After installing Ollama, restart this application and click "Fetch Models" to continue.
+                      After installing Ollama, restart this application and click &quot;Fetch Models&quot; to continue.
                     </div>
                   </div>
                 ) : (
@@ -1302,7 +1274,7 @@ export function ModelSettingsModal({
                 {filteredModels.length === 0 ? (
                   <Alert>
                     <AlertDescription>
-                      No models found matching "{searchQuery}". Try a different search term.
+                      No models found matching &quot;{searchQuery}&quot;. Try a different search term.
                     </AlertDescription>
                   </Alert>
                 ) : (

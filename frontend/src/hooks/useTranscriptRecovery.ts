@@ -130,7 +130,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         // Try to get from backend (might exist if only app crashed, not system)
         try {
           folderPath = await invoke<string>('get_meeting_folder_path');
-        } catch (error) {
+        } catch {
           folderPath = undefined;
         }
       }

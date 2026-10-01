@@ -224,6 +224,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
           console.error('[ConfigContext] Failed to sync language preference to Rust on startup:', err);
         });
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only sync to Rust; later language changes already call set_language_preference through the setter
   }, []); 
 
   // Sync word-alignment settings to Rust on mount so the live worker and
@@ -359,6 +360,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     return () => {
       cleanup?.();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event listener; updateProviderApiKey is recreated every render and would re-register the listener
   }, []);
 
   // Load device preferences on mount
@@ -381,6 +383,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Calculate model options based on available models
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- memoizing modelOptions would make the context value stable and change consumer re-render timing; left for the frontend component split (change 09)
   const modelOptions: Record<ModelConfig['provider'], string[]> = {
     ollama: models.map(model => model.name),
     claude: ['claude-3-5-sonnet-latest'],

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -193,6 +193,7 @@ export function ParakeetModelManager({
       if (unlistenComplete) unlistenComplete();
       if (unlistenError) unlistenError();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event listeners; downloadModel is recreated every render and the listeners use refs for current callbacks
   }, []); // Empty dependency array - listeners use refs for stable callbacks
 
   const saveModelSelection = async (modelName: string) => {
@@ -432,7 +433,6 @@ function ModelCard({
   onDownload,
   onCancel,
   onDelete,
-  isDownloading
 }: ModelCardProps) {
   const [isHovered, setIsHovered] = useState(false);
   const displayInfo = getModelDisplayInfo(model.name);

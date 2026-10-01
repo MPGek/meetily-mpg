@@ -235,7 +235,7 @@ function MeetingDetailsContent() {
         if (typeof summaryData === 'string') {
           try {
             parsedData = JSON.parse(summaryData);
-          } catch (e) {
+          } catch {
             parsedData = {};
           }
         }
@@ -257,6 +257,7 @@ function MeetingDetailsContent() {
         // Legacy format - apply formatting
         console.log('LEGACY FORMAT: Detected legacy format, applying section formatting');
 
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
         const { MeetingName, _section_order, ...restSummaryData } = parsedData;
 
         // Format the summary data with consistent styling - PRESERVE ORDER

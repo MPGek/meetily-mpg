@@ -145,11 +145,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       setCurrentMeeting({ id: 'intro-call', title: '+ New Call' });
     }
     setSidebarItems(baseItems);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- baseItems is a new array every render; adding it would reset sidebar items on every render
   }, [pathname]);
 
   // Update sidebar items when meetings change
   useEffect(() => {
     setSidebarItems(baseItems);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- baseItems is a new array every render; adding it would reset sidebar items on every render
   }, [meetings]);
 
   // Function to handle recording toggle from sidebar
