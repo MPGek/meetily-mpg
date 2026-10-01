@@ -76,3 +76,4 @@ target/
 frontend/src-tauri/binaries/
 graphify-out/
 .kilo/
+baseline-oldcore-timing.txt
