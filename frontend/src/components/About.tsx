@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { invoke } from '@tauri-apps/api/core';
+import { openExternalUrl } from '@/lib/ipc/settings';
 import { getVersion } from '@tauri-apps/api/app';
 import Image from 'next/image';
 import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch";
@@ -23,7 +23,7 @@ export function About() {
 
     const handleContactClick = async () => {
         try {
-            await invoke('open_external_url', { url: 'https://meetily.zackriya.com/#about' });
+            await openExternalUrl({ url: 'https://meetily.zackriya.com/#about' });
         } catch (error) {
             console.error('Failed to open link:', error);
         }

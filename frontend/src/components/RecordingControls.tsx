@@ -1,11 +1,17 @@
 'use client';
 
-import { invoke } from '@tauri-apps/api/core';
+import {
+  isRecording as isRecordingCommand,
+  listenSpeechDetected,
+  pauseRecording,
+  resumeRecording,
+  stopRecording,
+} from '@/lib/ipc/recording';
+import { listenTranscriptError, listenTranscriptionError } from '@/lib/ipc/transcript';
 import { appDataDir } from '@tauri-apps/api/path';
 import { useCallback, useEffect, useState } from 'react';
 import { Play, Pause, Square, Mic, AlertCircle, X } from 'lucide-react';
 import { SummaryResponse } from '@/types/summary';
-import { listen } from '@tauri-apps/api/event';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import Analytics from '@/lib/analytics';
@@ -75,7 +81,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   useEffect(() => {
     const checkTauri = async () => {
       try {
-        const result = await invoke('is_recording');
+        const result = await isRecordingCommand();
         console.log('Tauri is initialized and ready, is_recording result:', result);
       } catch (error) {
         console.error('Tauri initialization error:', error);
@@ -148,7 +154,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       const savePath = `${dataDir}/recording-${timestamp}.wav`;
       console.log('Saving recording to:', savePath);
       console.log('About to call stop_recording command');
-      const result = await invoke('stop_recording', {
+      const result = await stopRecording({
         args: {
           save_path: savePath
         }
@@ -210,7 +216,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     setIsPausing(true);
 
     try {
-      await invoke('pause_recording');
+      await pauseRecording();
       // isPaused state now managed by RecordingStateContext via events
       console.log('Recording paused successfully');
     } catch (error) {
@@ -228,7 +234,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     setIsResuming(true);
 
     try {
-      await invoke('resume_recording');
+      await resumeRecording();
       // isPaused state now managed by RecordingStateContext via events
       console.log('Recording resumed successfully');
     } catch (error) {
@@ -252,7 +258,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     const setupListeners = async () => {
       try {
         // Transcript error listener - handles both regular and actionable errors
-        const transcriptErrorUnsubscribe = await listen('transcript-error', (event) => {
+        const transcriptErrorUnsubscribe = await listenTranscriptError((event) => {
           console.log('transcript-error event received:', event);
           console.error('Transcription error received:', event.payload);
           const errorMessage = event.payload as string;
@@ -274,7 +280,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         });
 
         // Transcription error listener - handles structured error objects with actionable flag
-        const transcriptionErrorUnsubscribe = await listen('transcription-error', (event) => {
+        const transcriptionErrorUnsubscribe = await listenTranscriptionError((event) => {
           console.log('transcription-error event received:', event);
           console.error('Transcription error received:', event.payload);
 
@@ -311,7 +317,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         // No need for duplicate listeners here
 
         // Speech detected listener - for UX feedback when VAD detects speech
-        const speechDetectedUnsubscribe = await listen('speech-detected', (event) => {
+        const speechDetectedUnsubscribe = await listenSpeechDetected((event) => {
           console.log('speech-detected event received:', event);
           setSpeechDetected(true);
         });

@@ -1,6 +1,7 @@
 'use client';
 
 import { Transcript } from '@/types';
+import { listenSpeechDetected } from '@/lib/ipc/recording';
 import { useEffect, useRef, useState } from 'react';
 import { ConfidenceIndicator } from './ConfidenceIndicator';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
@@ -14,10 +15,6 @@ interface TranscriptViewProps {
   isProcessing?: boolean; // Is processing/finalizing transcription (hides "Listening..." indicator)
   isStopping?: boolean; // Is recording being stopped (provides immediate UI feedback)
   enableStreaming?: boolean; // Enable streaming effect for live transcription UX
-}
-
-interface SpeechDetectedEvent {
-  message: string;
 }
 
 // Helper function to format seconds as recording-relative time [MM:SS]
@@ -151,8 +148,7 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
     let unsubscribe: (() => void) | undefined;
 
     const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      unsubscribe = await listen<SpeechDetectedEvent>('speech-detected', () => {
+      unsubscribe = await listenSpeechDetected(() => {
         setSpeechDetected(true);
       });
     };

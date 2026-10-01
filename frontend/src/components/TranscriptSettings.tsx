@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { getTranscriptApiKey, type TranscriptModelProps } from '@/lib/ipc/settings';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
@@ -9,11 +9,7 @@ import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
 
 
-export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
-    model: string;
-    apiKey?: string | null;
-}
+export type { TranscriptModelProps } from '@/lib/ipc/settings';
 
 export interface TranscriptSettingsProps {
     transcriptModelConfig: TranscriptModelProps;
@@ -42,7 +38,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const fetchApiKey = async (provider: string) => {
         try {
 
-            const data = await invoke('api_get_transcript_api_key', { provider }) as string;
+            const data = await getTranscriptApiKey({ provider });
 
             setApiKey(data || '');
         } catch (err) {

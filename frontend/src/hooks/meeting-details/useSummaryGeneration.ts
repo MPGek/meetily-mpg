@@ -2,11 +2,13 @@ import { useState, useCallback } from 'react';
 import { Transcript, Summary } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
-import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import { builtinAiGetModelInfo, builtinAiIsModelReady, getOllamaModels } from '@/lib/ipc/models';
+import { openExternalUrl } from '@/lib/ipc/settings';
+import { cancelSummary, getSummary, processTranscript } from '@/lib/ipc/summary';
+import { getMeetingTranscripts } from '@/lib/ipc/transcript';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { isOllamaNotInstalledError } from '@/lib/utils';
-import { BuiltInModelInfo } from '@/lib/builtin-ai';
 import {
   detectAndCacheSummaryLanguage,
   readMeetingSummaryLanguage,
@@ -146,7 +148,7 @@ export function useSummaryGeneration({
       );
 
       // Process transcript and get process_id
-      const result = await invokeTauri('api_process_transcript', {
+      const result = await processTranscript({
         text: transcriptText,
         model: modelConfig.provider,
         modelName: modelConfig.model,
@@ -156,7 +158,7 @@ export function useSummaryGeneration({
         customPrompt: customPrompt,
         templateId: selectedTemplate,
         summaryLanguage,
-      }) as any;
+      });
 
       const process_id = result.process_id;
       console.log('Process ID:', process_id);
@@ -171,7 +173,7 @@ export function useSummaryGeneration({
 
           // Reload summary from database (backend has already restored from backup)
           try {
-            const existingSummary = await invokeTauri('api_get_summary', {
+            const existingSummary = await getSummary({
               meetingId: meeting.id
             }) as any;
 
@@ -199,7 +201,7 @@ export function useSummaryGeneration({
           // If this was a regeneration, try to restore previous summary from database
           if (isRegeneration) {
             try {
-              const existingSummary = await invokeTauri('api_get_summary', {
+              const existingSummary = await getSummary({
                 meetingId: meeting.id
               }) as any;
 
@@ -405,11 +407,11 @@ export function useSummaryGeneration({
       console.log('📊 Fetching all transcripts for meeting:', meetingId);
 
       // First, get total count by fetching first page
-      const firstPage = await invokeTauri('api_get_meeting_transcripts', {
+      const firstPage = await getMeetingTranscripts({
         meetingId,
         limit: 1,
         offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
+      });
 
       const totalCount = firstPage.total_count;
       console.log(`📊 Total transcripts in database: ${totalCount}`);
@@ -419,11 +421,11 @@ export function useSummaryGeneration({
       }
 
       // Fetch all transcripts in one call
-      const allData = await invokeTauri('api_get_meeting_transcripts', {
+      const allData = await getMeetingTranscripts({
         meetingId,
         limit: totalCount,
         offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
+      });
 
       console.log(`✅ Fetched ${allData.transcripts.length} transcripts from database`);
       return allData.transcripts;
@@ -485,7 +487,7 @@ export function useSummaryGeneration({
     if (modelConfig.provider === 'ollama') {
       try {
         const endpoint = modelConfig.ollamaEndpoint || null;
-        const models = await invokeTauri('get_ollama_models', { endpoint }) as any[];
+        const models = await getOllamaModels({ endpoint });
 
         if (!models || models.length === 0) {
           toast.error(
@@ -507,7 +509,7 @@ export function useSummaryGeneration({
               duration: 7000,
               action: {
                 label: 'Download',
-                onClick: () => invokeTauri('open_external_url', { url: 'https://ollama.com/download' })
+                onClick: () => openExternalUrl({ url: 'https://ollama.com/download' })
               }
             }
           );
@@ -539,14 +541,14 @@ export function useSummaryGeneration({
         }
 
         // Check model readiness with filesystem refresh
-        const isReady = await invokeTauri<boolean>('builtin_ai_is_model_ready', {
+        const isReady = await builtinAiIsModelReady({
           modelName: selectedModel,
           refresh: true,
         });
 
         if (!isReady) {
           // Get detailed model status
-          const modelInfo = await invokeTauri<BuiltInModelInfo | null>('builtin_ai_get_model_info', {
+          const modelInfo = await builtinAiGetModelInfo({
             modelName: selectedModel,
           });
 
@@ -640,7 +642,7 @@ export function useSummaryGeneration({
 
     try {
       // Call backend to cancel the summary generation
-      await invokeTauri('api_cancel_summary', {
+      await cancelSummary({
         meetingId: meeting.id
       });
       console.log('✓ Backend cancellation request sent for meeting:', meeting.id);

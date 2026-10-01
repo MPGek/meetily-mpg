@@ -9,7 +9,8 @@ import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import Analytics from '@/lib/analytics';
-import { invoke } from '@tauri-apps/api/core';
+import { getApiKey, getModelConfig, getTranscriptConfig, listenModelConfigUpdated } from '@/lib/ipc/settings';
+import { deleteMeeting, saveMeetingTitle } from '@/lib/ipc/meetings';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
@@ -116,14 +117,14 @@ const Sidebar: React.FC = () => {
       }
 
       try {
-        const data = await invoke('api_get_model_config') as any;
+        const data = await getModelConfig();
         if (data && data.provider !== null) {
           // Fetch API key if not included and provider requires it
           if (data.provider !== 'ollama' && !data.apiKey) {
             try {
-              const apiKeyData = await invoke('api_get_api_key', {
+              const apiKeyData = await getApiKey({
                 provider: data.provider
-              }) as string;
+              });
               data.apiKey = apiKeyData;
             } catch (err) {
               console.error('Failed to fetch API key:', err);
@@ -150,7 +151,7 @@ const Sidebar: React.FC = () => {
       }
 
       try {
-        const data = await invoke('api_get_transcript_config') as any;
+        const data = await getTranscriptConfig();
         if (data && data.provider !== null) {
           setTranscriptModelConfig(data);
         }
@@ -164,8 +165,7 @@ const Sidebar: React.FC = () => {
   // Listen for model config updates from other components
   useEffect(() => {
     const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
+      const unlisten = await listenModelConfigUpdated((event) => {
         console.log('Sidebar received model-config-updated event:', event.payload);
         setModelConfig(event.payload);
       });
@@ -275,8 +275,7 @@ const Sidebar: React.FC = () => {
     console.log('Deleting item:', itemId);
 
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
-      await invoke('api_delete_meeting', {
+      await deleteMeeting({
         meetingId: itemId,
       });
       console.log('Meeting deleted successfully');
@@ -334,7 +333,7 @@ const Sidebar: React.FC = () => {
     }
 
     try {
-      await invoke('api_save_meeting_title', {
+      await saveMeetingTitle({
         meetingId: meetingId,
         title: newTitle,
       });

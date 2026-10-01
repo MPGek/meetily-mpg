@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { hideConsole, showConsole, toggleConsole } from '@/lib/ipc/settings';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -11,7 +11,7 @@ export function ConsoleToggle() {
   const handleToggleConsole = async () => {
     setIsLoading(true);
     try {
-      const result = await invoke('toggle_console');
+      const result = await toggleConsole();
       console.log('Console toggle result:', result);
       setConsoleVisible(!consoleVisible);
     } catch (error) {
@@ -24,7 +24,7 @@ export function ConsoleToggle() {
   const handleShowConsole = async () => {
     setIsLoading(true);
     try {
-      const result = await invoke('show_console');
+      const result = await showConsole();
       console.log('Show console result:', result);
       setConsoleVisible(true);
     } catch (error) {
@@ -37,7 +37,7 @@ export function ConsoleToggle() {
   const handleHideConsole = async () => {
     setIsLoading(true);
     try {
-      const result = await invoke('hide_console');
+      const result = await hideConsole();
       console.log('Hide console result:', result);
       setConsoleVisible(false);
     } catch (error) {

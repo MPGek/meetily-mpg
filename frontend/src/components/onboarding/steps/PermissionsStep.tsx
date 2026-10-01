@@ -1,5 +1,9 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { openSystemSettings } from '@/lib/ipc/settings';
+import {
+  triggerMicrophonePermission,
+  triggerSystemAudioPermissionCommand,
+} from '@/lib/ipc/recording';
 import { Mic, Volume2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { OnboardingContainer } from '../OnboardingContainer';
@@ -30,7 +34,7 @@ export function PermissionsStep() {
     if (permissions.microphone === 'denied') {
       // Try to open system settings
       try {
-        await invoke('open_system_settings');
+        await openSystemSettings();
       } catch {
         alert('Please enable microphone access in System Preferences > Security & Privacy > Microphone');
       }
@@ -40,7 +44,7 @@ export function PermissionsStep() {
     setIsPending(true);
     try {
       console.log('[PermissionsStep] Triggering microphone permission...');
-      const granted = await invoke<boolean>('trigger_microphone_permission');
+      const granted = await triggerMicrophonePermission();
       console.log('[PermissionsStep] Microphone permission result:', granted);
 
       if (granted) {
@@ -62,7 +66,7 @@ export function PermissionsStep() {
     if (permissions.systemAudio === 'denied') {
       // Try to open system settings
       try {
-        await invoke('open_system_settings');
+        await openSystemSettings();
       } catch {
         alert('Please enable Audio Capture in System Settings → Privacy & Security → Audio Capture');
       }
@@ -74,7 +78,7 @@ export function PermissionsStep() {
       console.log('[PermissionsStep] Triggering Audio Capture permission...');
       // Backend creates Core Audio tap, captures audio, and verifies it's not silence
       // Returns true if permission granted and audio verified, false if denied (silence)
-      const granted = await invoke<boolean>('trigger_system_audio_permission_command');
+      const granted = await triggerSystemAudioPermissionCommand();
       console.log('[PermissionsStep] System audio permission result:', granted);
 
       if (granted) {

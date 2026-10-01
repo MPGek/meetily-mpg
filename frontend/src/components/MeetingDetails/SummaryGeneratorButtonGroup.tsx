@@ -18,11 +18,11 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Sparkles, Settings, Loader2, FileText, Check, Square } from 'lucide-react';
 import Analytics from '@/lib/analytics';
-import { invoke } from '@tauri-apps/api/core';
+import { builtinAiGetModelInfo, builtinAiIsModelReady, getOllamaModels } from '@/lib/ipc/models';
+import { openExternalUrl } from '@/lib/ipc/settings';
 import { toast } from 'sonner';
 import { useState, useEffect, ReactNode } from 'react';
 import { isOllamaNotInstalledError } from '@/lib/utils';
-import { BuiltInModelInfo } from '@/lib/builtin-ai';
 
 interface SummaryGeneratorButtonGroupProps {
   languageSlot?: ReactNode;
@@ -99,7 +99,7 @@ export function SummaryGeneratorButtonGroup({
       }
 
       // Check model readiness (with filesystem refresh)
-      const isReady = await invoke<boolean>('builtin_ai_is_model_ready', {
+      const isReady = await builtinAiIsModelReady({
         modelName: selectedModel,
         refresh: true,
       });
@@ -111,7 +111,7 @@ export function SummaryGeneratorButtonGroup({
       }
 
       // Model not ready - check detailed status
-      const modelInfo = await invoke<BuiltInModelInfo | null>('builtin_ai_get_model_info', {
+      const modelInfo = await builtinAiGetModelInfo({
         modelName: selectedModel,
       });
 
@@ -196,7 +196,7 @@ export function SummaryGeneratorButtonGroup({
     setIsCheckingModels(true);
     try {
       const endpoint = modelConfig.ollamaEndpoint || null;
-      const models = await invoke('get_ollama_models', { endpoint }) as any[];
+      const models = await getOllamaModels({ endpoint });
 
       if (!models || models.length === 0) {
         // No models available, show message and open settings
@@ -223,7 +223,7 @@ export function SummaryGeneratorButtonGroup({
             duration: 7000,
             action: {
               label: 'Download',
-              onClick: () => invoke('open_external_url', { url: 'https://ollama.com/download' })
+              onClick: () => openExternalUrl({ url: 'https://ollama.com/download' })
             }
           }
         );

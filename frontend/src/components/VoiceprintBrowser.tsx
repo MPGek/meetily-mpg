@@ -1,61 +1,34 @@
 'use client';
 
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  clearAllVoiceprints,
+  findOrCreateSpeaker,
+  getVoiceprintAudio,
+  listSpeakers,
+  listVoiceprints,
+  previewReplaceSpeaker,
+  purgeUnconfirmedCaches,
+  reconfirmVoiceprint,
+  rejectVoiceprint,
+  replaceSpeaker,
+  speakerStorageStats,
+  verifyMeetingCaches,
+  verifySpeaker,
+  verifyVoiceprint,
+  type MeetingVoiceprints,
+  type Speaker,
+  type SpeakerVoiceprints,
+  type StorageStats,
+  type VoiceprintBrowserData,
+  type VoiceprintRow,
+} from '@/lib/ipc/speakers';
+import { getMeetingAudioPath } from '@/lib/ipc/meetings';
 import { useAudioPlayer } from '@/hooks/useAudioPlayer';
 import { suspectBadge, visibleRows, hasSuspect } from '@/lib/voiceprint-suspect';
 import { ChevronDown, ChevronRight, ChevronsDown, ChevronsUp, Play, Pause, AlertCircle, Trash2 } from 'lucide-react';
 
-type VoiceprintRow = {
-  id: string;
-  model: string;
-  channel: string;
-  duration_secs: number;
-  speaker_id: string | null;
-  meeting_id: string | null;
-  cluster_label: string | null;
-  audio_start_time: number | null;
-  audio_end_time: number | null;
-  meeting_title: string | null;
-  has_audio: boolean;
-  is_verified: number;
-  created_at: string;
-  suspect?: boolean;
-  own_similarity?: number | null;
-};
-
-type SpeakerVoiceprints = {
-  speaker_id: string;
-  speaker_name: string;
-  is_me: boolean;
-  prototype_count: number;
-  unverified_count: number;
-  suspect_count?: number;
-  prototypes: VoiceprintRow[];
-};
-
-type MeetingVoiceprints = {
-  meeting_id: string;
-  meeting_title: string;
-  unverified_count: number;
-  caches: VoiceprintRow[];
-};
-
-type VoiceprintBrowserData = {
-  speakers: SpeakerVoiceprints[];
-  unconfirmed: MeetingVoiceprints[];
-};
-
-type StorageStats = {
-  registry_count: number;
-  prototype_count: number;
-  cache_count: number;
-  total_bytes: number;
-  audio_bytes: number;
-  clip_count: number;
-};
-
-type SpeakerLite = { id: string; name: string; is_me?: boolean };
+type SpeakerLite = Pick<Speaker, 'id' | 'name'> & Partial<Pick<Speaker, 'is_me'>>;
 
 // Human-readable size formatter, kept identical to the one used by the
 // Settings general-tab storage section (DiarizationSettings.tsx) so the two
@@ -356,11 +329,11 @@ export default function VoiceprintBrowser() {
 
   const load = useCallback(async () => {
     try {
-      const browser = await invoke<VoiceprintBrowserData>('list_voiceprints', { speakerId: null, unconfirmedOnly: false, limit: null, offset: null });
+      const browser = await listVoiceprints({ speakerId: null, unconfirmedOnly: false, limit: null, offset: null });
       setData(browser);
-      const s = await invoke<StorageStats>('speaker_storage_stats');
+      const s = await speakerStorageStats();
       setStats(s);
-      const list = await invoke<SpeakerLite[]>('list_speakers');
+      const list = await listSpeakers();
       setSpeakersList(list.map((x) => ({ id: x.id, name: x.name })));
       // Default state is collapsed: leave `expanded` as the empty set so all
       // speaker/meeting groups start collapsed. Expand-all / collapse-all and
@@ -434,7 +407,7 @@ export default function VoiceprintBrowser() {
     // Blob-first: stored clips play without the meeting file or timecodes.
     if (row.has_audio) {
       try {
-        const clipPath = await invoke<string | null>('get_voiceprint_audio', { id: row.id });
+        const clipPath = await getVoiceprintAudio({ id: row.id });
         if (clipPath) {
           setPlayingRowId(row.id);
           setPendingBlobPlay(true);
@@ -452,7 +425,7 @@ export default function VoiceprintBrowser() {
     }
     if (row.audio_start_time == null || row.audio_end_time == null || !row.meeting_id) return;
     try {
-      const path = await invoke<string>('get_meeting_audio_path', { meetingId: row.meeting_id });
+      const path = await getMeetingAudioPath({ meetingId: row.meeting_id });
       if (!path) {
         setError('No audio file for meeting');
         setFailedRowId(row.id);
@@ -472,7 +445,7 @@ export default function VoiceprintBrowser() {
     const confirmText = permanent ? 'Permanently delete this voiceprint?' : 'Demote this voiceprint to unconfirmed cache?';
     if (!window.confirm(confirmText)) return;
     try {
-      const res = await invoke<{ speaker_id: string | null; remaining_prototypes: number }>('reject_voiceprint', { id: row.id, permanent });
+      const res = await rejectVoiceprint({ id: row.id, permanent });
       if (res.speaker_id && res.remaining_prototypes === 0) {
         window.alert(`Speaker now has no voiceprints and will not be auto-assigned until reconfirmed.`);
       }
@@ -488,7 +461,7 @@ export default function VoiceprintBrowser() {
 
   const handleVerifyRow = async (row: VoiceprintRow) => {
     try {
-      await invoke('verify_voiceprint', { id: row.id });
+      await verifyVoiceprint({ id: row.id });
       await load();
     } catch (e) {
       setError(String(e));
@@ -497,7 +470,7 @@ export default function VoiceprintBrowser() {
 
   const handleVerifySpeaker = async (speakerId: string) => {
     try {
-      await invoke('verify_speaker', { speakerId });
+      await verifySpeaker({ speakerId });
       await load();
     } catch (e) {
       setError(String(e));
@@ -506,7 +479,7 @@ export default function VoiceprintBrowser() {
 
   const handleVerifyMeeting = async (meetingId: string) => {
     try {
-      await invoke('verify_meeting_caches', { meetingId });
+      await verifyMeetingCaches({ meetingId });
       await load();
     } catch (e) {
       setError(String(e));
@@ -535,7 +508,7 @@ export default function VoiceprintBrowser() {
   const handleReconfirmPick = async (speakerId: string) => {
     if (!picker || picker.mode !== 'reconfirm') return;
     try {
-      await invoke('reconfirm_voiceprint', { id: picker.rowId, speakerId });
+      await reconfirmVoiceprint({ id: picker.rowId, speakerId });
       await load();
     } catch (e) {
       setError(String(e));
@@ -545,9 +518,9 @@ export default function VoiceprintBrowser() {
   const handleReconfirmCreate = async (name: string) => {
     if (!picker || picker.mode !== 'reconfirm') return;
     try {
-      const sp = await invoke<SpeakerLite>('find_or_create_speaker', { name });
+      const sp = await findOrCreateSpeaker({ name });
       setSpeakersList((prev) => (prev.some((p) => p.id === sp.id) ? prev : [...prev, sp]));
-      await invoke('reconfirm_voiceprint', { id: picker.rowId, speakerId: sp.id });
+      await reconfirmVoiceprint({ id: picker.rowId, speakerId: sp.id });
       await load();
     } catch (e) {
       setError(String(e));
@@ -559,7 +532,7 @@ export default function VoiceprintBrowser() {
     // Fetch preview counts before confirming (shows affected meetings/clusters/transcripts)
     let preview: { affected_meetings: number; affected_clusters: number; affected_transcripts: number } | null = null;
     try {
-      preview = await invoke<{ affected_meetings: number; affected_clusters: number; affected_transcripts: number }>('preview_replace_speaker', { source: picker.sourceId });
+      preview = await previewReplaceSpeaker({ source: picker.sourceId });
     } catch {
       preview = null;
     }
@@ -579,7 +552,7 @@ export default function VoiceprintBrowser() {
 
   const handleReplaceCreate = async (name: string) => {
     try {
-      const sp = await invoke<SpeakerLite>('find_or_create_speaker', { name });
+      const sp = await findOrCreateSpeaker({ name });
       setSpeakersList((prev) => (prev.some((p) => p.id === sp.id) ? prev : [...prev, sp]));
       await handleReplacePick(sp.id, sp.name);
     } catch (e) {
@@ -594,7 +567,7 @@ export default function VoiceprintBrowser() {
   const executeReplace = async () => {
     if (!confirm) return;
     try {
-      const res = await invoke<{ affected_meetings: number; affected_clusters: number; affected_transcripts: number }>('replace_speaker', {
+      const res = await replaceSpeaker({
         source: confirm.sourceId,
         target: confirm.targetId,
       });
@@ -609,7 +582,7 @@ export default function VoiceprintBrowser() {
 
   const handleClearAllConfirm = async () => {
     try {
-      const res = await invoke<{ deleted_prototypes: number; deleted_caches: number; total_deleted: number }>('clear_all_voiceprints');
+      const res = await clearAllVoiceprints();
       setClearAllOpen(false);
       player.pause();
       setPlayingRowId(null);
@@ -624,7 +597,7 @@ export default function VoiceprintBrowser() {
 
   const handlePurgeCachesConfirm = async () => {
     try {
-      const res = await invoke<{ deleted_caches: number; deleted_embedding_bytes: number; deleted_clip_count: number; deleted_clip_bytes: number }>('purge_unconfirmed_caches');
+      const res = await purgeUnconfirmedCaches();
       setPurgeCachesOpen(false);
       player.pause();
       setPlayingRowId(null);

@@ -1,3 +1,28 @@
 {
-  "extends": ["next/core-web-vitals", "next/typescript"]
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "rules": {
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "@tauri-apps/api/core",
+            "importNames": ["invoke"],
+            "message": "Import from '@/lib/ipc/...' instead of calling invoke() directly."
+          },
+          {
+            "name": "@tauri-apps/api/event",
+            "importNames": ["listen", "once", "emit"],
+            "message": "Import from '@/lib/ipc/...' instead of calling listen() directly."
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["src/lib/ipc/**/*.ts", "src/app/layout.tsx"],
+      "rules": { "no-restricted-imports": "off" }
+    }
+  ]
 }

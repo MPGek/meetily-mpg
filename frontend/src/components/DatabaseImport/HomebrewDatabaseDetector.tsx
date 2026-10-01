@@ -1,7 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  checkHomebrewDatabase as checkHomebrewDatabaseCommand,
+  importAndInitializeDatabase,
+} from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 import { Database, AlertCircle, Loader2, CheckCircle2 } from 'lucide-react';
 
@@ -34,7 +37,7 @@ export function HomebrewDatabaseDetector({ onDecline }: HomebrewDatabaseDetector
 
       // Check all possible Homebrew locations
       for (const path of HOMEBREW_PATHS) {
-        const result = await invoke<{ exists: boolean; size: number } | null>('check_homebrew_database', {
+        const result = await checkHomebrewDatabaseCommand({
           path,
         });
 
@@ -57,7 +60,7 @@ export function HomebrewDatabaseDetector({ onDecline }: HomebrewDatabaseDetector
     try {
       setIsImporting(true);
 
-      await invoke('import_and_initialize_database', {
+      await importAndInitializeDatabase({
         legacyDbPath: detectedPath,
       });
 

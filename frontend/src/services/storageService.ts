@@ -5,24 +5,17 @@
  * Pure 1-to-1 wrapper - no error handling changes, exact same behavior as direct invoke calls.
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { saveTranscript, type SaveMeetingResponse } from '@/lib/ipc/transcript';
+import { getMeeting, getMeetings, type Meeting, type MeetingDetails } from '@/lib/ipc/meetings';
 import { Transcript } from '@/types';
+
+export type { SaveMeetingResponse } from '@/lib/ipc/transcript';
+export type { Meeting } from '@/lib/ipc/meetings';
 
 export interface SaveMeetingRequest {
   meetingTitle: string;
   transcripts: Transcript[];
   folderPath: string | null;
-}
-
-export interface SaveMeetingResponse {
-  meeting_id: string;
-  tag_warnings?: string[];
-}
-
-export interface Meeting {
-  id: string;
-  title: string;
-  [key: string]: any; // Allow additional properties from backend
 }
 
 /**
@@ -42,7 +35,7 @@ export class StorageService {
     transcripts: Transcript[],
     folderPath: string | null
   ): Promise<SaveMeetingResponse> {
-    return invoke<SaveMeetingResponse>('api_save_transcript', {
+    return saveTranscript({
       meetingTitle,
       transcripts,
       folderPath,
@@ -54,8 +47,8 @@ export class StorageService {
    * @param meetingId - ID of the meeting to fetch
    * @returns Promise with meeting details
    */
-  async getMeeting(meetingId: string): Promise<Meeting> {
-    return invoke<Meeting>('api_get_meeting', { meetingId });
+  async getMeeting(meetingId: string): Promise<MeetingDetails> {
+    return getMeeting({ meetingId });
   }
 
   /**
@@ -63,7 +56,7 @@ export class StorageService {
    * @returns Promise with array of meetings
    */
   async getMeetings(): Promise<Meeting[]> {
-    return invoke<Meeting[]>('api_get_meetings');
+    return getMeetings();
   }
 }
 

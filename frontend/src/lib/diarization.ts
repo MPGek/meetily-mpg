@@ -1,3 +1,5 @@
+import { setDiarizationClusteringSettings } from "@/lib/ipc/speakers";
+
 export const DIARIZATION_STORAGE_KEYS = {
   enabled: "diarizationEnabled",
   autoRun: "diarizationAutoRun",
@@ -174,8 +176,7 @@ export async function syncClusteringSettingsToBackend(
   settings: DiarizationClusteringSettings = loadClusteringSettings()
 ): Promise<void> {
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("set_diarization_clustering_settings", {
+    await setDiarizationClusteringSettings({
       clusterThreshold: settings.clusterThreshold,
       clusterCeiling: settings.clusterCeiling,
       gapMergeSecs: settings.gapMergeSecs,

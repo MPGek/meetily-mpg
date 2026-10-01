@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSegmentData } from "@/types";
+import { getMeetingMetadata } from "@/lib/ipc/meetings";
+import { getMeetingTranscripts } from "@/lib/ipc/transcript";
+import { Transcript, MeetingMetadata, TranscriptSegmentData } from "@/types";
 
 const DEFAULT_PAGE_SIZE = 100;
 
@@ -86,7 +87,7 @@ export function usePaginatedTranscripts({
         if (!meetingId) return null;
 
         try {
-            const data = await invoke<MeetingMetadata>('api_get_meeting_metadata', {
+            const data = await getMeetingMetadata({
                 meetingId,
             });
             setMetadata(data);
@@ -106,8 +107,7 @@ export function usePaginatedTranscripts({
         if (!meetingId) return [];
 
         try {
-            const response = await invoke<PaginatedTranscriptsResponse>(
-                'api_get_meeting_transcripts',
+            const response = await getMeetingTranscripts(
                 {
                     meetingId,
                     limit: DEFAULT_PAGE_SIZE,

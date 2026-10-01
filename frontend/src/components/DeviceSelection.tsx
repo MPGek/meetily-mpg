@@ -1,6 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import {
+  getAudioDevices,
+  listenAudioLevels,
+  stopAudioLevelMonitoring as stopAudioLevelMonitoringCommand,
+  type AudioDevice,
+  type AudioLevelData,
+} from '@/lib/ipc/recording';
 import { RefreshCw, Mic, Speaker } from 'lucide-react';
 import { AudioLevelMeter, CompactAudioLevelMeter } from './AudioLevelMeter';
 import { AudioBackendSelector } from './AudioBackendSelector';
@@ -8,27 +13,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Label } from '@/components/ui/label';
 import Analytics from '@/lib/analytics';
 
-export interface AudioDevice {
-  name: string;
-  device_type: 'Input' | 'Output';
-}
-
 export interface SelectedDevices {
   micDevice: string | null;
   systemDevice: string | null;
-}
-
-export interface AudioLevelData {
-  device_name: string;
-  device_type: string;
-  rms_level: number;
-  peak_level: number;
-  is_active: boolean;
-}
-
-export interface AudioLevelUpdate {
-  timestamp: number;
-  levels: AudioLevelData[];
 }
 
 interface DeviceSelectionProps {
@@ -54,7 +41,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   const fetchDevices = async () => {
     try {
       setError(null);
-      const result = await invoke<AudioDevice[]>('get_audio_devices');
+      const result = await getAudioDevices();
       setDevices(result);
       console.log('Fetched audio devices:', result);
     } catch (err) {
@@ -77,7 +64,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
 
     const setupAudioLevelListener = async () => {
       try {
-        unlisten = await listen<AudioLevelUpdate>('audio-levels', (event) => {
+        unlisten = await listenAudioLevels((event) => {
           const levelUpdate = event.payload;
           const newLevels = new Map<string, AudioLevelData>();
 
@@ -173,7 +160,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   // Stop audio level monitoring
   const stopAudioLevelMonitoring = async () => {
     try {
-      await invoke('stop_audio_level_monitoring');
+      await stopAudioLevelMonitoringCommand();
       setIsMonitoring(false);
       setAudioLevels(new Map());
       console.log('Stopped audio level monitoring');

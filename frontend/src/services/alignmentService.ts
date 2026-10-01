@@ -7,80 +7,68 @@
  * events, cancel cleans partials, delete removes.
  */
 
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import {
+  cancelAlignmentDownload,
+  checkAlignmentModels,
+  deleteAlignmentModel,
+  downloadAlignmentModel,
+  listAlignmentModels,
+  listenAlignmentModelDownloadCompleted,
+  listenAlignmentModelDownloadFailed,
+  listenAlignmentModelDownloadProgress,
+  type AlignmentDownloadProgressPayload,
+  type AlignmentModelInfo,
+  type AlignmentModelStatus,
+} from '@/lib/ipc/models';
+import type { UnlistenFn } from '@/lib/ipc/core';
 
-export type AlignmentModelStatus =
-  | { state: 'Available' }
-  | { state: 'Missing' }
-  | { state: 'Downloading'; detail: { progress: number } }
-  | { state: 'Corrupted'; detail: { file_size: number; expected_min_size: number } };
-
-export interface AlignmentModelInfo {
-  id: string;
-  name: string;
-  size_mb: number;
-  languages: string;
-  description: string;
-  path: string;
-  status: AlignmentModelStatus;
-}
-
-export interface AlignmentDownloadProgressPayload {
-  modelId: string;
-  progress: number;
-  downloaded_bytes: number;
-  total_bytes: number;
-  speed_mbps: number;
-}
+export type {
+  AlignmentDownloadProgressPayload,
+  AlignmentModelInfo,
+  AlignmentModelStatus,
+} from '@/lib/ipc/models';
 
 export class AlignmentService {
   /** List catalogued alignment models with their current status. */
   async listModels(): Promise<AlignmentModelInfo[]> {
-    return invoke<AlignmentModelInfo[]>('list_alignment_models');
+    return listAlignmentModels();
   }
 
   /** Readiness of every catalogued model, keyed by id. */
   async checkModels(): Promise<Record<string, AlignmentModelStatus>> {
-    return invoke<Record<string, AlignmentModelStatus>>('check_alignment_models');
+    return checkAlignmentModels();
   }
 
   /** Download a model. Resolves on completion; watch onDownloadProgress. */
   async downloadModel(modelId: string): Promise<void> {
-    return invoke('download_alignment_model', { modelId });
+    return downloadAlignmentModel({ modelId });
   }
 
   /** Cancel an in-flight download and remove partial files. */
   async cancelDownload(modelId: string): Promise<void> {
-    return invoke('cancel_alignment_download', { modelId });
+    return cancelAlignmentDownload({ modelId });
   }
 
   /** Delete a downloaded model. */
   async deleteModel(modelId: string): Promise<void> {
-    return invoke('delete_alignment_model', { modelId });
+    return deleteAlignmentModel({ modelId });
   }
 
   async onDownloadProgress(
     callback: (payload: AlignmentDownloadProgressPayload) => void
   ): Promise<UnlistenFn> {
-    return listen<AlignmentDownloadProgressPayload>(
-      'alignment-model-download-progress',
-      (event) => callback(event.payload)
-    );
+    return listenAlignmentModelDownloadProgress((event) => callback(event.payload));
   }
 
   async onDownloadCompleted(callback: (modelId: string) => void): Promise<UnlistenFn> {
-    return listen<{ modelId: string }>('alignment-model-download-completed', (event) =>
-      callback(event.payload.modelId)
-    );
+    return listenAlignmentModelDownloadCompleted((event) => callback(event.payload.modelId));
   }
 
   async onDownloadFailed(
     callback: (modelId: string, error: string) => void
   ): Promise<UnlistenFn> {
-    return listen<{ modelId: string; error: string }>(
-      'alignment-model-download-failed',
-      (event) => callback(event.payload.modelId, event.payload.error)
+    return listenAlignmentModelDownloadFailed((event) =>
+      callback(event.payload.modelId, event.payload.error)
     );
   }
 }

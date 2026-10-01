@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  createTag,
+  getRecordingPendingTags,
+  listTags,
+  setRecordingPendingTags,
+} from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 import type { MeetingTag, MeetingTagWithUsage } from '@/lib/meeting-tags';
 
@@ -38,7 +43,7 @@ export function usePendingRecordingTags(isRecording: boolean) {
   }, []);
 
   const resolveIds = useCallback(async (ids: string[]) => {
-    const all = await invoke<MeetingTagWithUsage[]>('list_tags');
+    const all = await listTags();
     const byId = new Map(all.map((t) => [t.id, t]));
     return ids.map((id) => byId.get(id)).filter((t): t is MeetingTagWithUsage => !!t);
   }, []);
@@ -47,7 +52,7 @@ export function usePendingRecordingTags(isRecording: boolean) {
   // clears an existing selection; when idle it just resets to empty.
   const load = useCallback(async () => {
     try {
-      const ids = await invoke<string[]>('get_recording_pending_tags');
+      const ids = await getRecordingPendingTags();
       if (ids.length === 0) {
         if (!isRecordingRef.current) setPending([]);
         return;
@@ -79,7 +84,7 @@ export function usePendingRecordingTags(isRecording: boolean) {
       for (const delay of CARRY_RETRY_DELAYS_MS) {
         if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
         try {
-          const canonical = await invoke<string[]>('set_recording_pending_tags', {
+          const canonical = await setRecordingPendingTags({
             tagIds: ids,
           });
           if (canonical.length === 0) {
@@ -110,7 +115,7 @@ export function usePendingRecordingTags(isRecording: boolean) {
       if (!isRecordingRef.current) return;
       syncChain.current = syncChain.current
         .catch(() => {})
-        .then(() => invoke<string[]>('set_recording_pending_tags', { tagIds: ids }))
+        .then(() => setRecordingPendingTags({ tagIds: ids }))
         .then((canonical) => {
           if (canonical.length === 0 && ids.length > 0) warnPersistFailure();
         })
@@ -144,7 +149,7 @@ export function usePendingRecordingTags(isRecording: boolean) {
 
   const create = useCallback(
     async (name: string): Promise<void> => {
-      const tag = await invoke<MeetingTag>('create_tag', { name, color: null });
+      const tag = await createTag({ name, color: null });
       const current = pendingRef.current;
       if (current.some((t) => t.id === tag.id)) return;
       applySelection([...current, tag]);

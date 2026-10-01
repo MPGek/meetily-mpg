@@ -6,7 +6,7 @@ import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { MeetingTagsBar } from '@/components/MeetingTags';
 import { AudioPlayer, AudioPlayerHandle, PlaybackState } from '@/components/AudioPlayer';
 import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { getMeetingAudioPath } from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 
 interface TranscriptPanelProps {
@@ -103,7 +103,7 @@ export function TranscriptPanel({
     setIsEnded(false);
     setPlayerTime(0);
     prevActiveSegmentRef.current = null;
-    invoke<string | null>('get_meeting_audio_path', { meetingId })
+    getMeetingAudioPath({ meetingId })
       .then((path) => {
         if (!cancelled) setAudioPath(path);
       })

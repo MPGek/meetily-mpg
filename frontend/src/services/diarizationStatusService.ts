@@ -8,180 +8,29 @@
  * an event per audio chunk.
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { getRecordingTelemetry, type RecordingTelemetry } from '@/lib/ipc/recording';
 
-export type DiarChannelName = 'microphone' | 'system';
-
-/** Display state resolved by the backend for one channel. */
-export type DiarChannelState =
-  | 'unavailable'
-  | 'inactive'
-  | 'deferred'
-  | 'accumulating'
-  | 'healthy'
-  | 'warning'
-  | 'error';
-
-export interface DiarLastTurn {
-  speaker: string;
-  display_name?: string;
-  /** `user` for a user binding, `auto` for a registry match, absent otherwise. */
-  matched_by?: string;
-  score?: number;
-}
-
-export interface DiarChannelStatus {
-  channel: DiarChannelName;
-  state: DiarChannelState;
-  chunks: number;
-  embed_ok: number;
-  embed_failed: number;
-  buffered: number;
-  /** Audio seconds covered by the buffered embeddings. */
-  buffered_secs: number;
-  turns: number;
-  ordered: boolean;
-  last_turn?: DiarLastTurn;
-}
-
-export type DiarizationMode = 'off' | 'efficient' | 'fast';
-
-export interface OnlineDiarizationStatus {
-  /** True while an online diarization session is running. */
-  active: boolean;
-  mode: DiarizationMode;
-  /** False when the session's engine was never constructed. */
-  available: boolean;
-  model_tag: string;
-  embedding_dim: number;
-  recognition_threshold: number;
-  /** Null when no prototype store is loaded for the session. */
-  prototypes: number | null;
-  bindings: number | null;
-  /** Blocks queued for the diarization engine but not yet consumed. */
-  pending_blocks: number;
-  blocks_sent: number;
-  blocks_processed: number;
-  blocks_in_flight: boolean;
-  mic: DiarChannelStatus;
-  sys: DiarChannelStatus;
-}
-
-/** A buffer's fill relative to the threshold that fires what it gates. */
-export interface BufferFill {
-  fill: number;
-  threshold: number;
-  /** `fill / threshold`; at or above 1 once the gated operation has fired. */
-  fraction: number;
-  fired: boolean;
-}
-
-/** Merged speech waiting to be sent for recognition. */
-export interface PendingState {
-  segments: number;
-  buffered_ms: number;
-  gap_trigger_ms: number;
-  cap_trigger_ms: number;
-}
-
-/** Level of the last processed chunk, with how old it is. */
-export interface AudioLevel {
-  /** Linear RMS amplitude. */
-  rms: number;
-  /** Peak absolute amplitude. */
-  peak: number;
-  /** Milliseconds since that chunk was measured. */
-  age_ms: number;
-}
-
-export interface ChannelPipelineFill {
-  vad_dispatch: BufferFill;
-  vad_frames: number;
-  vad_speaking: boolean;
-  pending: PendingState;
-  mix: BufferFill;
-  level: AudioLevel;
-}
-
-export interface PipelineStatus {
-  sample_rate: number;
-  mic: ChannelPipelineFill;
-  sys: ChannelPipelineFill;
-}
-
-export interface VadActivity {
-  identity: string;
-  loaded: boolean;
-  mic_frames: number;
-  mic_speaking: boolean;
-  sys_frames: number;
-  sys_speaking: boolean;
-  /** Speech is currently detected on any channel (indicator blink). */
-  speaking: boolean;
-}
-
-export interface AsrActivity {
-  engine: string | null;
-  model: string | null;
-  loaded: boolean;
-  queued: number;
-  completed: number;
-  pending: number;
-  /** True while the recogniser is consuming a segment. */
-  in_flight: boolean;
-  /** A segment was submitted but the recogniser is not yet consuming it. */
-  requested: boolean;
-  last_text: string | null;
-}
-
-export interface AlignmentActivity {
-  enabled: boolean;
-  model_id: string | null;
-  loaded: boolean;
-  queued_jobs: number;
-  queue_bytes: number;
-  dropped: number;
-  refined: number;
-  /** True while the aligner is refining a block. */
-  in_flight: boolean;
-  /** A block was submitted but the aligner is not yet consuming it. */
-  requested: boolean;
-}
-
-export interface DiarizationModelActivity {
-  mode: DiarizationMode;
-  model_tag: string;
-  embedding_dim: number;
-  recognition_threshold: number;
-  loaded: boolean;
-  prototypes: number | null;
-  bindings: number | null;
-  /** Blocks queued for the diarization engine but not yet consumed. */
-  pending_blocks: number;
-  blocks_sent: number;
-  blocks_completed: number;
-  /** True while the engine works on a dequeued block. */
-  in_flight: boolean;
-  /** Blocks were submitted but the engine is not yet consuming them. */
-  requested: boolean;
-}
-
-/** Every model kind the recording relies on, with readiness and activity. */
-export interface ModelsActivity {
-  vad: VadActivity;
-  asr: AsrActivity;
-  alignment: AlignmentActivity;
-  diarization: DiarizationModelActivity;
-}
-
-export interface RecordingTelemetry {
-  active: boolean;
-  diarization: OnlineDiarizationStatus;
-  pipeline: PipelineStatus;
-  models: ModelsActivity;
-}
+export type {
+  AlignmentActivity,
+  AsrActivity,
+  AudioLevel,
+  BufferFill,
+  ChannelPipelineFill,
+  DiarChannelName,
+  DiarChannelState,
+  DiarChannelStatus,
+  DiarizationMode,
+  DiarizationModelActivity,
+  DiarLastTurn,
+  ModelsActivity,
+  OnlineDiarizationStatus,
+  PendingState,
+  PipelineStatus,
+  RecordingTelemetry,
+  VadActivity,
+} from '@/lib/ipc/recording';
 
 /** Read the current snapshot. Resolves to the inactive shape when idle. */
 export async function fetchRecordingTelemetry(): Promise<RecordingTelemetry> {
-  return invoke<RecordingTelemetry>('get_recording_telemetry');
+  return getRecordingTelemetry();
 }

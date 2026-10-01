@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listenChunkDropWarning, listenRecordingAudioWarning } from '@/lib/ipc/recording';
+import { listenTranscriptionError } from '@/lib/ipc/transcript';
+import { listenModelDownloadComplete } from '@/lib/ipc/models';
 import { toast } from 'sonner';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 
@@ -105,7 +107,7 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
     const setupChunkDropListener = async () => {
       try {
         console.log('Setting up chunk-drop-warning listener...');
-        unlistenFn = await listen<string>('chunk-drop-warning', (event) => {
+        unlistenFn = await listenChunkDropWarning((event) => {
           console.log('Chunk drop warning received:', event.payload);
           showModal('chunkDropWarning', event.payload);
         });
@@ -136,11 +138,7 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
     const setupRecordingAudioWarningListener = async () => {
       try {
         console.log('Setting up recording-audio-warning listener...');
-        unlistenFn = await listen<{
-          saved_duration_seconds: number;
-          expected_duration_seconds: number;
-          failed_checkpoints: number;
-        }>('recording-audio-warning', (event) => {
+        unlistenFn = await listenRecordingAudioWarning((event) => {
           console.log('Recording audio warning received:', event.payload);
           const { saved_duration_seconds, expected_duration_seconds, failed_checkpoints } = event.payload;
 
@@ -178,7 +176,7 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
     const setupTranscriptionErrorListener = async () => {
       try {
         console.log('Setting up transcription-error listener...');
-        unlistenFn = await listen<{ error: string, userMessage: string, actionable: boolean }>('transcription-error', (event) => {
+        unlistenFn = await listenTranscriptionError((event) => {
           console.log('Transcription error received:', event.payload);
           const { userMessage, actionable } = event.payload;
 
@@ -215,7 +213,7 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
       const unlisteners: (() => void)[] = [];
 
       // Listen for Whisper model download complete
-      const unlistenWhisper = await listen<{ modelName: string }>('model-download-complete', (event) => {
+      const unlistenWhisper = await listenModelDownloadComplete((event) => {
         const { modelName } = event.payload;
         console.log('[useModalState] Whisper model download complete:', modelName);
 

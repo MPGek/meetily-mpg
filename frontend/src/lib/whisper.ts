@@ -1,23 +1,6 @@
 // Types for whisper-rs integration
-export interface ModelInfo {
-  name: string;
-  path: string;
-  size_mb: number;
-  accuracy: ModelAccuracy;
-  speed: ProcessingSpeed;
-  status: ModelStatus;
-  description?: string;
-}
-
-export type ModelAccuracy = 'High' | 'Good' | 'Decent';
-export type ProcessingSpeed = 'Slow' | 'Medium' | 'Fast' | 'Very Fast';
-
-export type ModelStatus =
-  | 'Available'
-  | 'Missing'
-  | { Downloading: number }
-  | { Error: string }
-  | { Corrupted: { file_size: number; expected_min_size: number } };
+import type { ModelInfo, ModelAccuracy, ProcessingSpeed, ModelStatus } from '@/lib/ipc/models';
+export type { ModelInfo, ModelAccuracy, ProcessingSpeed, ModelStatus } from '@/lib/ipc/models';
 
 export interface ModelDownloadProgress {
   modelName: string;
@@ -277,58 +260,72 @@ export function getRecommendedModel(systemSpecs?: { ram: number; cores: number }
 }
 
 // Tauri command wrappers for whisper-rs backend
-import { invoke } from '@tauri-apps/api/core';
+import {
+  whisperInit,
+  whisperGetAvailableModels,
+  whisperLoadModel,
+  whisperGetCurrentModel,
+  whisperIsModelLoaded,
+  whisperTranscribeAudio,
+  whisperGetModelsDirectory,
+  whisperDownloadModel,
+  whisperCancelDownload,
+  whisperDeleteCorruptedModel,
+  whisperHasAvailableModels,
+  whisperValidateModelReady,
+  openModelsFolder,
+} from '@/lib/ipc/models';
 
 export class WhisperAPI {
   static async init(): Promise<void> {
-    await invoke('whisper_init');
+    await whisperInit();
   }
 
   static async getAvailableModels(): Promise<ModelInfo[]> {
-    return await invoke('whisper_get_available_models');
+    return await whisperGetAvailableModels();
   }
 
   static async loadModel(modelName: string): Promise<void> {
-    await invoke('whisper_load_model', { modelName });
+    await whisperLoadModel({ modelName });
   }
 
   static async getCurrentModel(): Promise<string | null> {
-    return await invoke('whisper_get_current_model');
+    return await whisperGetCurrentModel();
   }
 
   static async isModelLoaded(): Promise<boolean> {
-    return await invoke('whisper_is_model_loaded');
+    return await whisperIsModelLoaded();
   }
 
   static async transcribeAudio(audioData: number[]): Promise<string> {
-    return await invoke('whisper_transcribe_audio', { audioData });
+    return await whisperTranscribeAudio({ audioData });
   }
 
   static async getModelsDirectory(): Promise<string> {
-    return await invoke('whisper_get_models_directory');
+    return await whisperGetModelsDirectory();
   }
 
   static async downloadModel(modelName: string): Promise<void> {
-    await invoke('whisper_download_model', { modelName });
+    await whisperDownloadModel({ modelName });
   }
 
   static async cancelDownload(modelName: string): Promise<void> {
-    await invoke('whisper_cancel_download', { modelName });
+    await whisperCancelDownload({ modelName });
   }
 
   static async deleteCorruptedModel(modelName: string): Promise<string> {
-    return await invoke('whisper_delete_corrupted_model', { modelName });
+    return await whisperDeleteCorruptedModel({ modelName });
   }
 
   static async hasAvailableModels(): Promise<boolean> {
-    return await invoke('whisper_has_available_models');
+    return await whisperHasAvailableModels();
   }
 
   static async validateModelReady(): Promise<string> {
-    return await invoke('whisper_validate_model_ready');
+    return await whisperValidateModelReady();
   }
 
   static async openModelsFolder(): Promise<void> {
-    await invoke('open_models_folder');
+    await openModelsFolder();
   }
 }

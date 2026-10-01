@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import * as analyticsIpc from '@/lib/ipc/analytics';
 
 export interface AnalyticsProperties {
   [key: string]: string;
@@ -43,7 +43,7 @@ export class Analytics {
 
   private static async doInit(): Promise<void> {
     try {
-      await invoke('init_analytics');
+      await analyticsIpc.initAnalytics();
       this.initialized = true;
       console.log('Analytics initialized successfully');
     } catch (error) {
@@ -56,7 +56,7 @@ export class Analytics {
 
   static async disable(): Promise<void> {
     try {
-      await invoke('disable_analytics');
+      await analyticsIpc.disableAnalytics();
       this.initialized = false;
       this.currentUserId = null;
       this.initializationPromise = null;
@@ -68,7 +68,7 @@ export class Analytics {
 
   static async isEnabled(): Promise<boolean> {
     try {
-      return await invoke('is_analytics_enabled');
+      return await analyticsIpc.isAnalyticsEnabled();
     } catch (error) {
       console.error('Failed to check analytics status:', error);
       return false;
@@ -82,7 +82,7 @@ export class Analytics {
     }
 
     try {
-      await invoke('track_event', { eventName, properties });
+      await analyticsIpc.trackEvent({ eventName, properties });
     } catch (error) {
       console.error(`Failed to track event ${eventName}:`, error);
     }
@@ -95,7 +95,7 @@ export class Analytics {
     }
 
     try {
-      await invoke('identify_user', { userId, properties });
+      await analyticsIpc.identifyUser({ userId, properties });
       this.currentUserId = userId;
     } catch (error) {
       console.error(`Failed to identify user ${userId}:`, error);
@@ -110,7 +110,7 @@ export class Analytics {
     }
 
     try {
-      const sessionId = await invoke('start_analytics_session', { userId });
+      const sessionId = await analyticsIpc.startAnalyticsSession({ userId });
       this.currentUserId = userId;
       
       return sessionId as string;
@@ -124,7 +124,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('end_analytics_session');
+      await analyticsIpc.endAnalyticsSession();
     } catch (error) {
       console.error('Failed to end analytics session:', error);
     }
@@ -134,7 +134,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_daily_active_user');
+      await analyticsIpc.trackDailyActiveUser();
     } catch (error) {
       console.error('Failed to track daily active user:', error);
     }
@@ -144,7 +144,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_user_first_launch');
+      await analyticsIpc.trackUserFirstLaunch();
     } catch (error) {
       console.error('Failed to track user first launch:', error);
     }
@@ -154,7 +154,7 @@ export class Analytics {
     if (!this.initialized) return false;
 
     try {
-      return await invoke('is_analytics_session_active');
+      return await analyticsIpc.isAnalyticsSessionActive();
     } catch (error) {
       console.error('Failed to check session status:', error);
       return false;
@@ -535,7 +535,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_meeting_started', { meetingId });
+      await analyticsIpc.trackMeetingStarted({ meetingId });
     } catch (error) {
       console.error('Failed to track meeting started:', error);
     }
@@ -545,7 +545,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_recording_started', { meetingId });
+      await analyticsIpc.trackRecordingStarted({ meetingId });
     } catch (error) {
       console.error('Failed to track recording started:', error);
     }
@@ -555,7 +555,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_recording_stopped', { meetingId, durationSeconds });
+      await analyticsIpc.trackRecordingStopped({ meetingId, durationSeconds });
     } catch (error) {
       console.error('Failed to track recording stopped:', error);
     }
@@ -565,7 +565,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_meeting_deleted', { meetingId });
+      await analyticsIpc.trackMeetingDeleted({ meetingId });
     } catch (error) {
       console.error('Failed to track meeting deleted:', error);
     }
@@ -575,7 +575,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_settings_changed', { settingType, newValue });
+      await analyticsIpc.trackSettingsChanged({ settingType, newValue });
     } catch (error) {
       console.error('Failed to track settings changed:', error);
     }
@@ -585,7 +585,7 @@ export class Analytics {
     if (!this.initialized) return;
 
     try {
-      await invoke('track_feature_used', { featureName });
+      await analyticsIpc.trackFeatureUsed({ featureName });
     } catch (error) {
       console.error('Failed to track feature used:', error);
     }
@@ -652,7 +652,7 @@ export class Analytics {
 
     try {
       console.log('Tracking backend connection event:', { success, error });
-      await invoke('track_event', {
+      await analyticsIpc.trackEvent({
         eventName: 'backend_connection',
         properties: {
           success: success.toString(),
@@ -675,7 +675,7 @@ export class Analytics {
 
     try {
       console.log('Tracking transcription error event:', { errorMessage });
-      await invoke('track_event', {
+      await analyticsIpc.trackEvent({
         eventName: 'transcription_error',
         properties: {
           error_message: errorMessage,
@@ -697,7 +697,7 @@ export class Analytics {
 
     try {
       console.log('Tracking transcription success event:', { duration });
-      await invoke('track_event', {
+      await analyticsIpc.trackEvent({
         eventName: 'transcription_success',
         properties: {
           duration: duration ? duration.toString() : '',
@@ -764,7 +764,7 @@ export class Analytics {
 
     try {
       console.log('Tracking summary generation completed event:', { modelProvider, modelName, success, durationSeconds, errorMessage });
-      await invoke('track_summary_generation_completed', {
+      await analyticsIpc.trackSummaryGenerationCompleted({
         modelProvider,
         modelName,
         success,
@@ -785,7 +785,7 @@ export class Analytics {
 
     try {
       console.log('Tracking summary regenerated event:', { modelProvider, modelName });
-      await invoke('track_summary_regenerated', {
+      await analyticsIpc.trackSummaryRegenerated({
         modelProvider,
         modelName
       });
@@ -803,7 +803,7 @@ export class Analytics {
 
     try {
       console.log('Tracking model changed event:', { oldProvider, oldModel, newProvider, newModel });
-      await invoke('track_model_changed', {
+      await analyticsIpc.trackModelChanged({
         oldProvider,
         oldModel,
         newProvider,
@@ -823,7 +823,7 @@ export class Analytics {
 
     try {
       console.log('Tracking custom prompt used event:', { promptLength });
-      await invoke('track_custom_prompt_used', {
+      await analyticsIpc.trackCustomPromptUsed({
         promptLength
       });
       console.log('Custom prompt used event tracked successfully');

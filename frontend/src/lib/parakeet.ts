@@ -1,25 +1,8 @@
 // Types for Parakeet (NVIDIA NeMo) integration
-export interface ParakeetModelInfo {
-  name: string;
-  path: string;
-  size_mb: number;
-  accuracy: ModelAccuracy;
-  speed: ProcessingSpeed;
-  status: ModelStatus;
-  description?: string;
-  quantization: QuantizationType;
-}
+import type { ParakeetModelInfo, QuantizationType, ModelAccuracy, ModelStatus } from '@/lib/ipc/models';
+export type { ParakeetModelInfo, QuantizationType, ModelAccuracy, ModelStatus } from '@/lib/ipc/models';
 
-export type QuantizationType = 'FP32' | 'Int8';
-export type ModelAccuracy = 'High' | 'Good' | 'Decent';
 export type ProcessingSpeed = 'Slow' | 'Medium' | 'Fast' | 'Very Fast' | 'Ultra Fast';
-
-export type ModelStatus =
-  | 'Available'
-  | 'Missing'
-  | { Downloading: number }
-  | { Error: string }
-  | { Corrupted: { file_size: number; expected_min_size: number } };
 
 export interface ParakeetEngineState {
   currentModel: string | null;
@@ -149,58 +132,72 @@ export function getRecommendedModel(systemSpecs?: { ram: number; cores: number }
 }
 
 // Tauri command wrappers for Parakeet backend
-import { invoke } from '@tauri-apps/api/core';
+import {
+  parakeetInit,
+  parakeetGetAvailableModels,
+  parakeetLoadModel,
+  parakeetGetCurrentModel,
+  parakeetIsModelLoaded,
+  parakeetTranscribeAudio,
+  parakeetGetModelsDirectory,
+  parakeetDownloadModel,
+  parakeetCancelDownload,
+  parakeetDeleteCorruptedModel,
+  parakeetHasAvailableModels,
+  parakeetValidateModelReady,
+  openParakeetModelsFolder,
+} from '@/lib/ipc/models';
 
 export class ParakeetAPI {
   static async init(): Promise<void> {
-    await invoke('parakeet_init');
+    await parakeetInit();
   }
 
   static async getAvailableModels(): Promise<ParakeetModelInfo[]> {
-    return await invoke('parakeet_get_available_models');
+    return await parakeetGetAvailableModels();
   }
 
   static async loadModel(modelName: string): Promise<void> {
-    await invoke('parakeet_load_model', { modelName });
+    await parakeetLoadModel({ modelName });
   }
 
   static async getCurrentModel(): Promise<string | null> {
-    return await invoke('parakeet_get_current_model');
+    return await parakeetGetCurrentModel();
   }
 
   static async isModelLoaded(): Promise<boolean> {
-    return await invoke('parakeet_is_model_loaded');
+    return await parakeetIsModelLoaded();
   }
 
   static async transcribeAudio(audioData: number[]): Promise<string> {
-    return await invoke('parakeet_transcribe_audio', { audioData });
+    return await parakeetTranscribeAudio({ audioData });
   }
 
   static async getModelsDirectory(): Promise<string> {
-    return await invoke('parakeet_get_models_directory');
+    return await parakeetGetModelsDirectory();
   }
 
   static async downloadModel(modelName: string): Promise<void> {
-    await invoke('parakeet_download_model', { modelName });
+    await parakeetDownloadModel({ modelName });
   }
 
   static async cancelDownload(modelName: string): Promise<void> {
-    await invoke('parakeet_cancel_download', { modelName });
+    await parakeetCancelDownload({ modelName });
   }
 
   static async deleteCorruptedModel(modelName: string): Promise<string> {
-    return await invoke('parakeet_delete_corrupted_model', { modelName });
+    return await parakeetDeleteCorruptedModel({ modelName });
   }
 
   static async hasAvailableModels(): Promise<boolean> {
-    return await invoke('parakeet_has_available_models');
+    return await parakeetHasAvailableModels();
   }
 
   static async validateModelReady(): Promise<string> {
-    return await invoke('parakeet_validate_model_ready');
+    return await parakeetValidateModelReady();
   }
 
   static async openModelsFolder(): Promise<void> {
-    await invoke('open_parakeet_models_folder');
+    await openParakeetModelsFolder();
   }
 }

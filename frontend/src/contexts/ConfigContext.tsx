@@ -4,18 +4,23 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import { SelectedDevices } from '@/components/DeviceSelection';
 import { configService, ModelConfig } from '@/services/configService';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  getApiKey,
+  getDatabaseDirectory,
+  getNotificationSettings,
+  listenModelConfigUpdated,
+  setLanguagePreference,
+  setNotificationSettings as setNotificationSettingsIpc,
+  type NotificationSettings,
+} from '@/lib/ipc/settings';
+import { getOllamaModels, whisperGetModelsDirectory, type OllamaModel } from '@/lib/ipc/models';
+import { getDefaultRecordingsFolderPath } from '@/lib/ipc/recording';
 import Analytics from '@/lib/analytics';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
 import { syncAlignmentSettingsToBackend } from '@/lib/alignment';
 import { syncClusteringSettingsToBackend } from '@/lib/diarization';
 
-export interface OllamaModel {
-  name: string;
-  id: string;
-  size: string;
-  modified: string;
-}
+export type { OllamaModel } from '@/lib/ipc/models';
 
 export interface StorageLocations {
   database: string;
@@ -23,26 +28,7 @@ export interface StorageLocations {
   recordings: string;
 }
 
-export interface NotificationSettings {
-  recording_notifications: boolean;
-  time_based_reminders: boolean;
-  meeting_reminders: boolean;
-  respect_do_not_disturb: boolean;
-  notification_sound: boolean;
-  system_permission_granted: boolean;
-  consent_given: boolean;
-  manual_dnd_mode: boolean;
-  notification_preferences: {
-    show_recording_started: boolean;
-    show_recording_stopped: boolean;
-    show_recording_paused: boolean;
-    show_recording_resumed: boolean;
-    show_transcription_complete: boolean;
-    show_meeting_reminders: boolean;
-    show_system_errors: boolean;
-    meeting_reminder_minutes: number[];
-  };
-}
+export type { NotificationSettings } from '@/lib/ipc/settings';
 
 interface ConfigContextType {
   // Model configuration
@@ -182,7 +168,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     const loadModels = async () => {
       try {
         const endpoint = modelConfig.ollamaEndpoint || null;
-        const modelList = await invoke<OllamaModel[]>('get_ollama_models', { endpoint });
+        const modelList = await getOllamaModels({ endpoint });
         setModels(modelList);
         setError('');
       } catch (err) {
@@ -216,7 +202,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   // Sync language preference to Rust on mount (fixes startup desync bug)
   useEffect(() => {
     if (selectedLanguage) {
-      invoke('set_language_preference', { language: selectedLanguage })
+      setLanguagePreference({ language: selectedLanguage })
         .then(() => {
           console.log('[ConfigContext] Synced language preference to Rust on startup:', selectedLanguage);
         })
@@ -318,7 +304,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
         const providers = ['claude', 'groq', 'openai', 'openrouter'];
         const keys = await Promise.all(
           providers.map(p =>
-            invoke<string>('api_get_api_key', { provider: p })
+            getApiKey({ provider: p })
               .catch(() => null) // Gracefully handle missing keys
           )
         );
@@ -341,8 +327,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   // Listen for model config updates from other components
   useEffect(() => {
     const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
+      const unlisten = await listenModelConfigUpdated((event) => {
         console.log('[ConfigContext] Received model-config-updated event:', event.payload);
         setModelConfig(event.payload);
 
@@ -450,7 +435,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       // Load notification settings from backend
       let settings: NotificationSettings | null = null;
       try {
-        settings = await invoke<NotificationSettings>('get_notification_settings');
+        settings = await getNotificationSettings();
         setNotificationSettings(settings);
       } catch (notifError) {
         console.error('[ConfigContext] Failed to load notification settings:', notifError);
@@ -460,9 +445,9 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
       // Load storage locations
       const [dbDir, modelsDir, recordingsDir] = await Promise.all([
-        invoke<string>('get_database_directory'),
-        invoke<string>('whisper_get_models_directory'),
-        invoke<string>('get_default_recordings_folder_path')
+        getDatabaseDirectory(),
+        whisperGetModelsDirectory(),
+        getDefaultRecordingsFolderPath()
       ]);
 
       setStorageLocations({
@@ -484,7 +469,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   // Update notification settings
   const updateNotificationSettings = useCallback(async (settings: NotificationSettings) => {
     try {
-      await invoke('set_notification_settings', { settings });
+      await setNotificationSettingsIpc({ settings });
       setNotificationSettings(settings);
     } catch (error) {
       console.error('[ConfigContext] Failed to update notification settings:', error);
@@ -499,7 +484,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       localStorage.setItem('primaryLanguage', lang);
     }
     // Sync with Rust in-memory state for live recording
-    invoke('set_language_preference', { language: lang }).catch(err =>
+    setLanguagePreference({ language: lang }).catch(err =>
       console.error('Failed to sync language preference to Rust:', err)
     );
   }, []);

@@ -3,7 +3,7 @@ import { Transcript, Summary } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
-import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import { getMeetingTranscripts } from '@/lib/ipc/transcript';
 
 interface UseCopyOperationsProps {
   meeting: any;
@@ -26,11 +26,11 @@ export function useCopyOperations({
       console.log('📊 Fetching all transcripts for copying:', meetingId);
 
       // First, get total count by fetching first page
-      const firstPage = await invokeTauri('api_get_meeting_transcripts', {
+      const firstPage = await getMeetingTranscripts({
         meetingId,
         limit: 1,
         offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
+      });
 
       const totalCount = firstPage.total_count;
       console.log(`📊 Total transcripts in database: ${totalCount}`);
@@ -40,11 +40,11 @@ export function useCopyOperations({
       }
 
       // Fetch all transcripts in one call
-      const allData = await invokeTauri('api_get_meeting_transcripts', {
+      const allData = await getMeetingTranscripts({
         meetingId,
         limit: totalCount,
         offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
+      });
 
       console.log(`✅ Fetched ${allData.transcripts.length} transcripts from database for copying`);
       return allData.transcripts;

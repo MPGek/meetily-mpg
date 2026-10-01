@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { convertFileSrc } from '@tauri-apps/api/core';
+import { prepareAudioForPlayback } from '@/lib/ipc/meetings';
 
 export const useAudioPlayer = (audioPath: string | null) => {
   const [isPlaying, setIsPlaying] = useState(false);
@@ -59,7 +60,7 @@ export const useAudioPlayer = (audioPath: string | null) => {
       }
       retriedRef.current = true;
       try {
-        const wavPath = await invoke<string>('prepare_audio_for_playback', {
+        const wavPath = await prepareAudioForPlayback({
           filePath: audioPath
         });
         console.log('Transcoded WAV ready at:', wavPath);

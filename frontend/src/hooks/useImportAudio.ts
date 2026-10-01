@@ -1,34 +1,22 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@/lib/ipc/core';
+import {
+  cancelImportCommand,
+  listenImportComplete,
+  listenImportError,
+  listenImportProgress,
+  selectAndValidateAudioCommand,
+  startImportAudioCommand,
+  validateAudioFileCommand,
+  type AudioFileInfo,
+  type ImportProgress,
+  type ImportResult,
+} from '@/lib/ipc/transcript';
 import Analytics from '@/lib/analytics';
 import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-preferences';
 import { toast } from 'sonner';
 
-export interface AudioFileInfo {
-  path: string;
-  filename: string;
-  duration_seconds: number;
-  size_bytes: number;
-  format: string;
-}
-
-export interface ImportProgress {
-  stage: string;
-  progress_percentage: number;
-  message: string;
-}
-
-export interface ImportResult {
-  meeting_id: string;
-  title: string;
-  segments_count: number;
-  duration_seconds: number;
-}
-
-export interface ImportError {
-  error: string;
-}
+export type { AudioFileInfo, ImportError, ImportProgress, ImportResult } from '@/lib/ipc/transcript';
 
 export type ImportStatus = 'idle' | 'validating' | 'processing' | 'complete' | 'error';
 
@@ -82,8 +70,7 @@ export function useImportAudio({
 
     const setupListeners = async () => {
       // Progress events
-      const unlistenProgress = await listen<ImportProgress>(
-        'import-progress',
+      const unlistenProgress = await listenImportProgress(
         (event) => {
           if (isCancelledRef.current) return;
           setProgress(event.payload);
@@ -97,8 +84,7 @@ export function useImportAudio({
       unlisteners.push(unlistenProgress);
 
       // Completion event
-      const unlistenComplete = await listen<ImportResult>(
-        'import-complete',
+      const unlistenComplete = await listenImportComplete(
         async (event) => {
           if (isCancelledRef.current) return;
 
@@ -129,8 +115,7 @@ export function useImportAudio({
       unlisteners.push(unlistenComplete);
 
       // Error event
-      const unlistenError = await listen<ImportError>(
-        'import-error',
+      const unlistenError = await listenImportError(
         async (event) => {
           if (isCancelledRef.current) return;
 
@@ -163,7 +148,7 @@ export function useImportAudio({
     setError(null);
 
     try {
-      const result = await invoke<AudioFileInfo | null>('select_and_validate_audio_command');
+      const result = await selectAndValidateAudioCommand();
       if (result) {
         setFileInfo(result);
         setStatus('idle');
@@ -188,7 +173,7 @@ export function useImportAudio({
     setError(null);
 
     try {
-      const result = await invoke<AudioFileInfo>('validate_audio_file_command', { path });
+      const result = await validateAudioFileCommand({ path });
       setFileInfo(result);
       setStatus('idle');
       return result;
@@ -226,7 +211,7 @@ export function useImportAudio({
           });
         }
 
-        await invoke('start_import_audio_command', {
+        await startImportAudioCommand({
           sourcePath,
           title,
           language: language || null,
@@ -250,7 +235,7 @@ export function useImportAudio({
   const cancelImport = useCallback(async () => {
     isCancelledRef.current = true;
     try {
-      await invoke('cancel_import_command');
+      await cancelImportCommand();
       setStatus('idle');
       setProgress(null);
     } catch (err: any) {

@@ -1,7 +1,12 @@
 'use client';
 
 import { useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  detectLegacyDatabase,
+  importAndInitializeDatabase,
+  initializeFreshDatabase,
+  selectLegacyDatabasePath,
+} from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { Loader2, FolderOpen, Database, CheckCircle2, XCircle } from 'lucide-react';
@@ -24,7 +29,7 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
       setImportState('selecting');
 
       // Open file picker
-      const selectedPath = await invoke<string | null>('select_legacy_database_path');
+      const selectedPath = await selectLegacyDatabasePath();
 
       if (!selectedPath) {
         setImportState('idle');
@@ -34,7 +39,7 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
       setImportState('detecting');
 
       // Detect database from selected path
-      const dbPath = await invoke<string | null>('detect_legacy_database', {
+      const dbPath = await detectLegacyDatabase({
         selectedPath,
       });
 
@@ -61,7 +66,7 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
     try {
       setImportState('importing');
 
-      await invoke('import_and_initialize_database', {
+      await importAndInitializeDatabase({
         legacyDbPath: detectedPath,
       });
 
@@ -85,7 +90,7 @@ export function LegacyDatabaseImport({ isOpen, onComplete }: LegacyDatabaseImpor
     try {
       setImportState('importing');
 
-      await invoke('initialize_fresh_database');
+      await initializeFreshDatabase();
 
       setImportState('success');
       toast.success('Database initialized successfully! Starting app...');

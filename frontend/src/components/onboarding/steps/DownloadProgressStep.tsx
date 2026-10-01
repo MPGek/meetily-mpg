@@ -1,6 +1,14 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import {
+  parakeetRetryDownload,
+  parakeetInit,
+  parakeetHasAvailableModels,
+  builtinAiDownloadModel,
+  listenParakeetModelDownloadProgress,
+  listenParakeetModelDownloadComplete,
+  listenParakeetModelDownloadError,
+  listenBuiltinAiDownloadProgress,
+} from '@/lib/ipc/models';
 import { Mic, Sparkles, Check, Loader2, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { OnboardingContainer } from '../OnboardingContainer';
@@ -81,7 +89,7 @@ export function DownloadProgressStep() {
     }));
 
     try {
-      await invoke('parakeet_retry_download', { modelName: PARAKEET_MODEL });
+      await parakeetRetryDownload({ modelName: PARAKEET_MODEL });
       // Progress events will update state
     } catch (error) {
       console.error('[DownloadProgressStep] Retry failed:', error);
@@ -130,7 +138,7 @@ export function DownloadProgressStep() {
       if (!modelName) {
         throw new Error('Summary model recommendation is not ready yet');
       }
-      await invoke('builtin_ai_download_model', { modelName });
+      await builtinAiDownloadModel({ modelName });
     } catch (error) {
       console.error('[DownloadProgressStep] Summary retry failed:', error);
       setSummaryState((prev) => ({
@@ -197,14 +205,7 @@ export function DownloadProgressStep() {
 
   // Listen to Parakeet download progress
   useEffect(() => {
-    const unlistenProgress = listen<{
-      modelName: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status?: string;
-    }>('parakeet-model-download-progress', (event) => {
+    const unlistenProgress = listenParakeetModelDownloadProgress((event) => {
       const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
       if (modelName === PARAKEET_MODEL) {
         setParakeetState((prev) => ({
@@ -222,8 +223,7 @@ export function DownloadProgressStep() {
       }
     });
 
-    const unlistenComplete = listen<{ modelName: string }>(
-      'parakeet-model-download-complete',
+    const unlistenComplete = listenParakeetModelDownloadComplete(
       (event) => {
         if (event.payload.modelName === PARAKEET_MODEL) {
           setParakeetState((prev) => ({ ...prev, status: 'completed', progress: 100 }));
@@ -232,8 +232,7 @@ export function DownloadProgressStep() {
       }
     );
 
-    const unlistenError = listen<{ modelName: string; error: string }>(
-      'parakeet-model-download-error',
+    const unlistenError = listenParakeetModelDownloadError(
       (event) => {
         if (event.payload.modelName === PARAKEET_MODEL) {
           setParakeetState((prev) => ({
@@ -254,15 +253,7 @@ export function DownloadProgressStep() {
 
   // Listen to Summary Model download progress (always downloading for builtin-ai)
   useEffect(() => {
-    const unlisten = listen<{
-      model: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status: string;
-      error?: string;
-    }>('builtin-ai-download-progress', (event) => {
+    const unlisten = listenBuiltinAiDownloadProgress((event) => {
       const { model, progress, downloaded_mb, total_mb, speed_mbps, status, error } = event.payload;
       if (selectedSummaryModel && model === selectedSummaryModel) {
         setSummaryState((prev) => ({
@@ -333,8 +324,8 @@ export function DownloadProgressStep() {
   const handleContinue = async () => {
     // Verify actual model availability (catches state drift)
     try {
-      await invoke('parakeet_init');
-      const actuallyAvailable = await invoke<boolean>('parakeet_has_available_models');
+      await parakeetInit();
+      const actuallyAvailable = await parakeetHasAvailableModels();
 
       if (actuallyAvailable && !parakeetDownloaded) {
         console.log('[DownloadProgressStep] Model available but state not updated');

@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { listen } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  listenModelDownloadProgress,
+  listenModelDownloadComplete,
+  listenModelDownloadError,
+} from '@/lib/ipc/models';
+import { saveTranscriptConfig } from '@/lib/ipc/settings';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import {
@@ -129,8 +133,7 @@ export function ModelManager({
       console.log('[ModelManager] Setting up event listeners...');
 
       // Download progress with throttling
-      unlistenProgress = await listen<{ modelName: string; progress: number }>(
-        'model-download-progress',
+      unlistenProgress = await listenModelDownloadProgress(
         (event) => {
           const { modelName, progress } = event.payload;
           const now = Date.now();
@@ -157,8 +160,7 @@ export function ModelManager({
       );
 
       // Download complete
-      unlistenComplete = await listen<{ modelName: string }>(
-        'model-download-complete',
+      unlistenComplete = await listenModelDownloadComplete(
         (event) => {
           const { modelName } = event.payload;
           const model = models.find(m => m.name === modelName);
@@ -197,8 +199,7 @@ export function ModelManager({
       );
 
       // Download error
-      unlistenError = await listen<{ modelName: string; error: string }>(
-        'model-download-error',
+      unlistenError = await listenModelDownloadError(
         (event) => {
           const { modelName, error } = event.payload;
           const displayName = getDisplayName(modelName);
@@ -245,7 +246,7 @@ export function ModelManager({
 
   const saveModelSelection = async (modelName: string) => {
     try {
-      await invoke('api_save_transcript_config', {
+      await saveTranscriptConfig({
         provider: 'localWhisper',
         model: modelName,
         apiKey: null

@@ -1,5 +1,25 @@
 import { useState, useEffect, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  getApiKey,
+  getAutoGenerateSetting,
+  getCustomOpenaiConfig,
+  getModelConfig,
+  openExternalUrl,
+  saveCustomOpenaiConfig,
+  testCustomOpenaiConnection,
+  type ModelConfig,
+} from '@/lib/ipc/settings';
+import {
+  builtinAiListModels,
+  getAnthropicModels,
+  getGroqModels,
+  getOllamaModels,
+  getOpenaiModels,
+  getOpenrouterModels,
+  pullOllamaModel,
+  type OllamaModel,
+  type OpenRouterModel,
+} from '@/lib/ipc/models';
 import { Button } from '@/components/ui/button';
 import { useOllamaDownload } from '@/contexts/OllamaDownloadContext';
 import { BuiltInModelManager } from '@/components/BuiltInModelManager';
@@ -28,49 +48,7 @@ import {
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
 
-export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
-  model: string;
-  whisperModel: string;
-  apiKey?: string | null;
-  ollamaEndpoint?: string | null;
-  // Custom OpenAI fields
-  customOpenAIEndpoint?: string | null;
-  customOpenAIModel?: string | null;
-  customOpenAIApiKey?: string | null;
-  maxTokens?: number | null;
-  temperature?: number | null;
-  topP?: number | null;
-}
-
-interface OllamaModel {
-  name: string;
-  id: string;
-  size: string;
-  modified: string;
-}
-
-interface OpenRouterModel {
-  id: string;
-  name: string;
-  context_length?: number;
-  prompt_price?: string;
-  completion_price?: string;
-}
-
-interface OpenAIModel {
-  id: string;
-}
-
-interface AnthropicModel {
-  id: string;
-  display_name?: string;
-}
-
-interface GroqModel {
-  id: string;
-  owned_by?: string;
-}
+export type { ModelConfig } from '@/lib/ipc/settings';
 
 // Fallback models for when API fetch fails or no API key provided
 const OPENAI_FALLBACK_MODELS = [
@@ -248,16 +226,16 @@ export function ModelSettingsModal({
       }
 
       try {
-        const data = (await invoke('api_get_model_config')) as any;
+        const data = await getModelConfig();
         if (data && data.provider !== null) {
           setModelConfig(data);
 
           // Fetch API key if not included in response and provider requires it
           if (data.provider !== 'ollama' && !data.apiKey) {
             try {
-              const apiKeyData = await invoke('api_get_api_key', {
+              const apiKeyData = await getApiKey({
                 provider: data.provider
-              }) as string;
+              });
               data.apiKey = apiKeyData;
               setApiKey(apiKeyData);
             } catch (err) {
@@ -275,7 +253,7 @@ export function ModelSettingsModal({
           // Fetch Custom OpenAI config if that's the active provider
           if (data.provider === 'custom-openai') {
             try {
-              const customConfig = (await invoke('api_get_custom_openai_config')) as any;
+              const customConfig = await getCustomOpenaiConfig();
               if (customConfig) {
                 setCustomOpenAIEndpoint(customConfig.endpoint || '');
                 setCustomOpenAIModel(customConfig.model || '');
@@ -302,7 +280,7 @@ export function ModelSettingsModal({
   useEffect(() => {
     const fetchAutoGenerateSetting = async () => {
       try {
-        const enabled = (await invoke('api_get_auto_generate_setting')) as boolean;
+        const enabled = await getAutoGenerateSetting();
         setAutoGenerateEnabled(enabled);
         console.log('Auto-generate setting loaded:', enabled);
       } catch (err) {
@@ -418,7 +396,7 @@ export function ModelSettingsModal({
 
     try {
       const endpoint = trimmedEndpoint || null;
-      const modelList = (await invoke('get_ollama_models', { endpoint })) as OllamaModel[];
+      const modelList = await getOllamaModels({ endpoint });
       setModels(modelList);
       setLastFetchedEndpoint(trimmedEndpoint); // Track successful fetch
 
@@ -479,7 +457,7 @@ export function ModelSettingsModal({
     try {
       setIsLoadingOpenRouter(true);
       setOpenRouterError('');
-      const data = (await invoke('get_openrouter_models')) as OpenRouterModel[];
+      const data = await getOpenrouterModels();
       setOpenRouterModels(data);
     } catch (err) {
       console.error('Error loading OpenRouter models:', err);
@@ -495,7 +473,7 @@ export function ModelSettingsModal({
     if (builtinAiModels.length > 0) return; // Already loaded
 
     try {
-      const data = (await invoke('builtin_ai_list_models')) as any[];
+      const data = await builtinAiListModels();
       setBuiltinAiModels(data);
 
       // Auto-select first available model if none selected
@@ -519,7 +497,7 @@ export function ModelSettingsModal({
     }
     setIsLoadingOpenAI(true);
     try {
-      const data = (await invoke('get_openai_models', { apiKey: key })) as OpenAIModel[];
+      const data = await getOpenaiModels({ apiKey: key });
       setOpenaiModels(data.map((m) => m.id));
     } catch (err) {
       console.error('Error loading OpenAI models:', err);
@@ -537,7 +515,7 @@ export function ModelSettingsModal({
     }
     setIsLoadingClaude(true);
     try {
-      const data = (await invoke('get_anthropic_models', { apiKey: key })) as AnthropicModel[];
+      const data = await getAnthropicModels({ apiKey: key });
       setClaudeModels(data.map((m) => m.id));
     } catch (err) {
       console.error('Error loading Claude models:', err);
@@ -555,7 +533,7 @@ export function ModelSettingsModal({
     }
     setIsLoadingGroq(true);
     try {
-      const data = (await invoke('get_groq_models', { apiKey: key })) as GroqModel[];
+      const data = await getGroqModels({ apiKey: key });
       setGroqModels(data.map((m) => m.id));
     } catch (err) {
       console.error('Error loading Groq models:', err);
@@ -607,7 +585,7 @@ export function ModelSettingsModal({
     // For custom-openai provider, save the custom config first
     if (modelConfig.provider === 'custom-openai') {
       try {
-        await invoke('api_save_custom_openai_config', {
+        await saveCustomOpenaiConfig({
           endpoint: customOpenAIEndpoint.trim(),
           apiKey: customOpenAIApiKey.trim() || null,
           model: customOpenAIModel.trim(),
@@ -666,7 +644,7 @@ export function ModelSettingsModal({
 
     setIsTestingConnection(true);
     try {
-      const result = await invoke<{ status: string; message: string }>('api_test_custom_openai_connection', {
+      const result = await testCustomOpenaiConnection({
         endpoint: customOpenAIEndpoint.trim(),
         apiKey: customOpenAIApiKey.trim() || null,
         model: customOpenAIModel.trim(),
@@ -704,7 +682,7 @@ export function ModelSettingsModal({
 
       // The download will be tracked by the global context via events
       // Progress toasts are shown automatically by OllamaDownloadContext
-      await invoke('pull_ollama_model', {
+      await pullOllamaModel({
         modelName: recommendedModel,
         endpoint
       });
@@ -725,7 +703,7 @@ export function ModelSettingsModal({
           duration: 7000,
           action: {
             label: 'Download',
-            onClick: () => invoke('open_external_url', { url: 'https://ollama.com/download' })
+            onClick: () => openExternalUrl({ url: 'https://ollama.com/download' })
           }
         });
         // Update the installation status flag
@@ -827,7 +805,7 @@ export function ModelSettingsModal({
 
                 // Load custom OpenAI config when selected
                 if (provider === 'custom-openai') {
-                  invoke<any>('api_get_custom_openai_config').then((config) => {
+                  getCustomOpenaiConfig().then((config) => {
                     if (config) {
                       setCustomOpenAIEndpoint(config.endpoint || '');
                       setCustomOpenAIModel(config.model || '');
@@ -1205,7 +1183,7 @@ export function ModelSettingsModal({
                     <Button
                       variant="default"
                       size="sm"
-                      onClick={() => invoke('open_external_url', { url: 'https://ollama.com/download' })}
+                      onClick={() => openExternalUrl({ url: 'https://ollama.com/download' })}
                       className="w-full bg-blue-600 hover:bg-blue-700"
                     >
                       <ExternalLink className="mr-2 h-4 w-4" />

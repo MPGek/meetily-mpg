@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { checkActiveTranscriptionModelReady } from '@/lib/ipc/transcript';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -52,9 +52,7 @@ export function useRecordingStart(
   // Check if the active transcription provider's model is ready
   const checkActiveModelReady = useCallback(async (): Promise<{ ready: boolean; downloading: boolean }> => {
     try {
-      const status = await invoke<{ ready: boolean; provider: string; downloading: boolean }>(
-        'check_active_transcription_model_ready'
-      );
+      const status = await checkActiveTranscriptionModelReady();
       return { ready: status.ready, downloading: status.downloading };
     } catch (error) {
       console.error('Failed to check transcription model status:', error);

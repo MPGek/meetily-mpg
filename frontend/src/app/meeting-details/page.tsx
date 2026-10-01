@@ -5,7 +5,9 @@ import { Transcript, Summary } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
-import { invoke } from "@tauri-apps/api/core";
+import { getOllamaModels } from "@/lib/ipc/models";
+import { getModelConfig, saveModelConfig } from "@/lib/ipc/settings";
+import { getSummary } from "@/lib/ipc/summary";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
@@ -64,7 +66,7 @@ function MeetingDetailsContent() {
   // Check if gemma3:1b model is available in Ollama
   const checkForGemmaModel = useCallback(async (): Promise<boolean> => {
     try {
-      const models = await invoke('get_ollama_models', { endpoint: null }) as any[];
+      const models = await getOllamaModels({ endpoint: null });
       const hasGemma = models.some((m: any) => m.name === 'gemma3:1b');
       console.log('🔍 Checked for gemma3:1b:', hasGemma);
       return hasGemma;
@@ -94,7 +96,7 @@ function MeetingDetailsContent() {
 
     try {
       // Check what's currently in database
-      const currentConfig = await invoke('api_get_model_config') as any;
+      const currentConfig = await getModelConfig();
 
       // If DB already has a model, use it (never override!)
       if (currentConfig && currentConfig.model) {
@@ -110,7 +112,7 @@ function MeetingDetailsContent() {
       if (hasGemma) {
         console.log('💾 DB empty, using gemma3:1b as initial default');
 
-        await invoke('api_save_model_config', {
+        await saveModelConfig({
           provider: 'ollama',
           model: '',
           whisperModel: 'large-v3',
@@ -214,7 +216,7 @@ function MeetingDetailsContent() {
 
     const fetchMeetingSummary = async () => {
       try {
-        const summary = await invoke('api_get_summary', {
+        const summary = await getSummary({
           meetingId: meetingId,
         }) as any;
 

@@ -5,53 +5,55 @@
  * Pure 1-to-1 wrapper - no error handling changes, exact same behavior as direct invoke/listen calls.
  */
 
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
-import type { LiveTranscriptBlocks } from '@/types';
+import {
+  getRecordingMeetingName,
+  getRecordingState,
+  isRecording,
+  listenChunkDropWarning,
+  listenRecordingPaused,
+  listenRecordingResumed,
+  listenRecordingStarted,
+  listenRecordingStopped,
+  listenSpeechDetected,
+  pauseRecording,
+  resumeRecording,
+  startRecording,
+  startRecordingWithDevicesAndMeeting,
+  stopRecording,
+  type RecordingState,
+  type RecordingStoppedPayload,
+} from '@/lib/ipc/recording';
+import {
+  applyBlockSpeakerToCluster,
+  assignBlockSpeaker,
+  assignLiveSpeaker,
+  assignSpeaker,
+  checkDiarizationModels,
+  clearAllVoiceprints,
+  confirmBlockSpeaker,
+  finalizeOnlineSession,
+  getDiarizationStatus,
+  getExpectedSpeakers,
+  listenDiarizationProgress,
+  listenLiveTranscriptBlocks,
+  listenOnlineSpeakerTurn,
+  listSpeakers,
+  purgeUnconfirmedCaches,
+  rematchMeetingSpeakers,
+  renameSpeaker,
+  setExpectedSpeakers,
+  speakerStorageStats,
+  startDiarization,
+  updateSpeakerLabelCommand,
+  type SpeakerTurn,
+} from '@/lib/ipc/speakers';
+import type { UnlistenFn } from '@/lib/ipc/core';
+import type { DiarizationProgress, DiarizationResult, LiveTranscriptBlocks } from '@/types';
 
-export interface RecordingState {
-  is_recording: boolean;
-  is_paused: boolean;
-  is_active: boolean;
-  recording_duration: number | null;
-  active_duration: number | null;
-}
-
-export interface SpeakerAssignment {
-  sequence_id: number;
-  speaker: string;
-}
-
-export interface SpeakerTurn {
-  start_time: number;
-  end_time: number;
-  speaker: string;
-  source_device: string;
-  display_name?: string;
-  matched_by?: string; // 'user' | 'auto'
-  match_score?: number; // cosine similarity 0..1 for auto matches
-}
-
-export interface RecordingStoppedPayload {
-  message: string;
-  folder_path?: string;
-  meeting_name?: string;
-  online_diarization_used?: boolean;
-  speaker_assignments?: SpeakerAssignment[];
-}
-
-export interface DiarizationProgressPayload {
-  meeting_id: string;
-  status: string;
-  progress: number;
-  message: string;
-}
-
-export interface DiarizationResultPayload {
-  meeting_id: string;
-  segments_labeled: number;
-  speakers_found: number;
-}
+export type { RecordingState, RecordingStoppedPayload, SpeakerAssignment } from '@/lib/ipc/recording';
+export type { SpeakerTurn } from '@/lib/ipc/speakers';
+export type DiarizationProgressPayload = DiarizationProgress;
+export type DiarizationResultPayload = DiarizationResult;
 
 /**
  * Recording Service
@@ -63,7 +65,7 @@ export class RecordingService {
    * @returns Promise<boolean>
    */
   async isRecording(): Promise<boolean> {
-    return invoke<boolean>('is_recording');
+    return isRecording();
   }
 
   /**
@@ -71,7 +73,7 @@ export class RecordingService {
    * @returns Promise with full recording state
    */
   async getRecordingState(): Promise<RecordingState> {
-    return invoke<RecordingState>('get_recording_state');
+    return getRecordingState();
   }
 
   /**
@@ -79,7 +81,7 @@ export class RecordingService {
    * @returns Promise<string | null>
    */
   async getRecordingMeetingName(): Promise<string | null> {
-    return invoke<string | null>('get_recording_meeting_name');
+    return getRecordingMeetingName();
   }
 
   /**
@@ -87,7 +89,7 @@ export class RecordingService {
    * @returns Promise<void>
    */
   async startRecording(): Promise<void> {
-    return invoke('start_recording');
+    return startRecording();
   }
 
   /**
@@ -108,7 +110,7 @@ export class RecordingService {
     maxSpeakers: number | null = null,
     expectedSpeakerIds: string[] | null = null
   ): Promise<void> {
-    return invoke('start_recording_with_devices_and_meeting', {
+    return startRecordingWithDevicesAndMeeting({
       micDeviceName: micDeviceName,
       systemDeviceName: systemDeviceName,
       meetingName: meetingName,
@@ -124,7 +126,7 @@ export class RecordingService {
    * @returns Promise<void>
    */
   async stopRecording(savePath: string): Promise<void> {
-    return invoke('stop_recording', {
+    return stopRecording({
       args: { save_path: savePath }
     });
   }
@@ -134,7 +136,7 @@ export class RecordingService {
    * @returns Promise<void>
    */
   async pauseRecording(): Promise<void> {
-    return invoke('pause_recording');
+    return pauseRecording();
   }
 
   /**
@@ -142,7 +144,7 @@ export class RecordingService {
    * @returns Promise<void>
    */
   async resumeRecording(): Promise<void> {
-    return invoke('resume_recording');
+    return resumeRecording();
   }
 
   // Event Listeners
@@ -153,7 +155,7 @@ export class RecordingService {
    * @returns Promise that resolves to unlisten function
    */
   async onRecordingStarted(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-started', callback);
+    return listenRecordingStarted(callback);
   }
 
   /**
@@ -162,7 +164,7 @@ export class RecordingService {
    * @returns Promise that resolves to unlisten function
    */
   async onRecordingStopped(callback: (payload: RecordingStoppedPayload) => void): Promise<UnlistenFn> {
-    return listen<RecordingStoppedPayload>('recording-stopped', (event) => {
+    return listenRecordingStopped((event) => {
       callback(event.payload);
     });
   }
@@ -173,7 +175,7 @@ export class RecordingService {
    * @returns Promise that resolves to unlisten function
    */
   async onRecordingPaused(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-paused', callback);
+    return listenRecordingPaused(callback);
   }
 
   /**
@@ -182,7 +184,7 @@ export class RecordingService {
    * @returns Promise that resolves to unlisten function
    */
   async onRecordingResumed(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-resumed', callback);
+    return listenRecordingResumed(callback);
   }
 
   /**
@@ -191,7 +193,7 @@ export class RecordingService {
    * @returns Promise that resolves to unlisten function
    */
   async onChunkDropWarning(callback: (warning: string) => void): Promise<UnlistenFn> {
-    return listen<string>('chunk-drop-warning', (event) => {
+    return listenChunkDropWarning((event) => {
       callback(event.payload);
     });
   }
@@ -202,7 +204,7 @@ export class RecordingService {
    * @returns Promise that resolves to unlisten function
    */
   async onSpeechDetected(callback: () => void): Promise<UnlistenFn> {
-    return listen('speech-detected', callback);
+    return listenSpeechDetected(callback);
   }
 
   // Diarization Methods
@@ -217,7 +219,7 @@ export class RecordingService {
     meetingId: string,
     maxSpeakers?: number
   ): Promise<DiarizationResultPayload> {
-    return invoke<DiarizationResultPayload>('start_diarization', {
+    return startDiarization({
       meetingId: meetingId,
       max_speakers: maxSpeakers ?? 0,
     });
@@ -233,7 +235,7 @@ export class RecordingService {
     diarization_status: string | null;
     speaker_names: string | null;
   }> {
-    return invoke('get_diarization_status', {
+    return getDiarizationStatus({
       meetingId: meetingId,
     });
   }
@@ -249,7 +251,7 @@ export class RecordingService {
     speaker: string,
     label: string
   ): Promise<boolean> {
-    return invoke<boolean>('update_speaker_label_command', {
+    return updateSpeakerLabelCommand({
       meetingId: meetingId,
       speaker: speaker,
       label: label,
@@ -264,7 +266,7 @@ export class RecordingService {
   async onDiarizationProgress(
     callback: (payload: DiarizationProgressPayload) => void
   ): Promise<UnlistenFn> {
-    return listen<DiarizationProgressPayload>('diarization-progress', (event) => {
+    return listenDiarizationProgress((event) => {
       callback(event.payload);
     });
   }
@@ -275,7 +277,7 @@ export class RecordingService {
    * @returns Unlisten function
    */
   async onSpeakerTurn(callback: (turn: SpeakerTurn) => void): Promise<UnlistenFn> {
-    return listen<SpeakerTurn>('online-speaker-turn', (event) => {
+    return listenOnlineSpeakerTurn((event) => {
       callback(event.payload);
     });
   }
@@ -290,7 +292,7 @@ export class RecordingService {
   async onLiveTranscriptBlocks(
     callback: (payload: LiveTranscriptBlocks) => void
   ): Promise<UnlistenFn> {
-    return listen<LiveTranscriptBlocks>('live-transcript-blocks', (event) => {
+    return listenLiveTranscriptBlocks((event) => {
       callback(event.payload);
     });
   }
@@ -301,7 +303,7 @@ export class RecordingService {
    * is no runtime download.
    */
   async checkDiarizationModels(): Promise<{ segmentation_ready: boolean; embedding_ready: boolean; ready: boolean }> {
-    return invoke('check_diarization_models');
+    return checkDiarizationModels();
   }
 
   // ===== Speaker Identity Registry =====
@@ -310,7 +312,7 @@ export class RecordingService {
    * List all registry speakers (for editor dropdowns).
    */
   async listSpeakers(): Promise<Array<{ id: string; name: string; is_me: boolean }>> {
-    return invoke('list_speakers');
+    return listSpeakers();
   }
 
   /**
@@ -323,7 +325,7 @@ export class RecordingService {
     speakerId?: string,
     newName?: string
   ): Promise<{ meeting_id: string; cluster_label: string; speaker_id: string; name: string }> {
-    return invoke('assign_speaker', {
+    return assignSpeaker({
       meetingId,
       clusterLabel,
       speakerId: speakerId ?? null,
@@ -336,7 +338,7 @@ export class RecordingService {
    * read-time join.
    */
   async renameSpeaker(speakerId: string, newName: string): Promise<boolean> {
-    return invoke('rename_speaker', { speakerId, newName });
+    return renameSpeaker({ speakerId, newName });
   }
 
   /**
@@ -344,7 +346,7 @@ export class RecordingService {
    * Empty list = recognition matches all registry speakers.
    */
   async setExpectedSpeakers(meetingId: string, speakerIds: string[]): Promise<void> {
-    return invoke('set_expected_speakers', {
+    return setExpectedSpeakers({
       request: { meeting_id: meetingId, speaker_ids: speakerIds },
     });
   }
@@ -353,7 +355,7 @@ export class RecordingService {
    * Read the expected-speaker ids for a meeting.
    */
   async getExpectedSpeakers(meetingId: string): Promise<string[]> {
-    return invoke('get_expected_speakers', { meetingId });
+    return getExpectedSpeakers({ meetingId });
   }
 
   /**
@@ -361,7 +363,7 @@ export class RecordingService {
    * User bindings are preserved.
    */
   async rematchMeetingSpeakers(meetingId: string): Promise<{ meeting_id: string; matched: number }> {
-    return invoke('rematch_meeting_speakers', { meetingId });
+    return rematchMeetingSpeakers({ meetingId });
   }
 
   /**
@@ -369,7 +371,7 @@ export class RecordingService {
    * Persists cluster caches, enrolls embeddings, persists expected speakers.
    */
   async finalizeOnlineSession(meetingId: string): Promise<{ meeting_id: string; live_bindings: number; enrolled: number }> {
-    return invoke('finalize_online_session', { meetingId });
+    return finalizeOnlineSession({ meetingId });
   }
 
   /**
@@ -381,7 +383,7 @@ export class RecordingService {
     cache_count: number;
     total_bytes: number;
   }> {
-    return invoke('speaker_storage_stats');
+    return speakerStorageStats();
   }
 
   /**
@@ -394,7 +396,7 @@ export class RecordingService {
     deleted_caches: number;
     total_deleted: number;
   }> {
-    return invoke('clear_all_voiceprints');
+    return clearAllVoiceprints();
   }
 
   /**
@@ -409,7 +411,7 @@ export class RecordingService {
     deleted_clip_count: number;
     deleted_clip_bytes: number;
   }> {
-    return invoke('purge_unconfirmed_caches');
+    return purgeUnconfirmedCaches();
   }
 
   /**
@@ -421,7 +423,7 @@ export class RecordingService {
     speakerId?: string,
     newName?: string
   ): Promise<{ transcript_id: string; speaker_id: string; name: string }> {
-    return invoke('assign_block_speaker', {
+    return assignBlockSpeaker({
       transcriptId,
       speakerId: speakerId ?? null,
       newName: newName ?? null,
@@ -437,7 +439,7 @@ export class RecordingService {
     speakerId?: string,
     newName?: string
   ): Promise<{ meeting_id: string; cluster_label: string; speaker_id: string; name: string }> {
-    return invoke('apply_block_speaker_to_cluster', {
+    return applyBlockSpeakerToCluster({
       transcriptId,
       speakerId: speakerId ?? null,
       newName: newName ?? null,
@@ -453,7 +455,7 @@ export class RecordingService {
     speakerId?: string,
     newName?: string
   ): Promise<{ cluster_label: string; speaker_id: string; name: string }> {
-    return invoke('assign_live_speaker', {
+    return assignLiveSpeaker({
       clusterLabel,
       speakerId: speakerId ?? null,
       newName: newName ?? null,
@@ -475,7 +477,7 @@ export class RecordingService {
     newName?: string,
     endTime?: number
   ): Promise<{ cluster_label: string; speaker_id: string; name: string }> {
-    return invoke('assign_live_speaker', {
+    return assignLiveSpeaker({
       clusterLabel,
       speakerId: speakerId ?? null,
       newName: newName ?? null,
@@ -496,7 +498,7 @@ export class RecordingService {
     transcriptId: string,
     scopeAll?: boolean
   ): Promise<number> {
-    return invoke('confirm_block_speaker', {
+    return confirmBlockSpeaker({
       transcriptId,
       scopeAll: scopeAll ?? false,
     });

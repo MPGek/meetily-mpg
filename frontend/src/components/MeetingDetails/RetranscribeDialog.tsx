@@ -16,8 +16,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../ui/select';
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@/lib/ipc/core';
+import {
+  cancelRetranscriptionCommand,
+  listenRetranscriptionComplete,
+  listenRetranscriptionError,
+  listenRetranscriptionProgress,
+  startRetranscriptionCommand,
+  type RetranscriptionProgress,
+} from '@/lib/ipc/transcript';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
@@ -31,25 +38,6 @@ interface RetranscribeDialogProps {
   meetingFolderPath: string | null;
   onComplete?: () => void;
   onProcessingChange?: (processing: boolean) => void;
-}
-
-interface RetranscriptionProgress {
-  meeting_id: string;
-  stage: string;
-  progress_percentage: number;
-  message: string;
-}
-
-interface RetranscriptionResult {
-  meeting_id: string;
-  segments_count: number;
-  duration_seconds: number;
-  language: string | null;
-}
-
-interface RetranscriptionError {
-  meeting_id: string;
-  error: string;
 }
 
 export function RetranscribeDialog({
@@ -136,8 +124,7 @@ export function RetranscribeDialog({
 
     const setupListeners = async () => {
       // Progress events
-      const unlistenProgress = await listen<RetranscriptionProgress>(
-        'retranscription-progress',
+      const unlistenProgress = await listenRetranscriptionProgress(
         (event) => {
           if (event.payload.meeting_id === meetingId) {
             setProgress(event.payload);
@@ -151,8 +138,7 @@ export function RetranscribeDialog({
       unlisteners.push(unlistenProgress);
 
       // Completion event
-      const unlistenComplete = await listen<RetranscriptionResult>(
-        'retranscription-complete',
+      const unlistenComplete = await listenRetranscriptionComplete(
         async (event) => {
           if (event.payload.meeting_id === meetingId) {
             await Analytics.track('enhance_transcript_completed', {
@@ -178,8 +164,7 @@ export function RetranscribeDialog({
       unlisteners.push(unlistenComplete);
 
       // Error event
-      const unlistenError = await listen<RetranscriptionError>(
-        'retranscription-error',
+      const unlistenError = await listenRetranscriptionError(
         async (event) => {
           if (event.payload.meeting_id === meetingId) {
             await Analytics.trackError('enhance_transcript_failed', event.payload.error);
@@ -223,7 +208,7 @@ export function RetranscribeDialog({
         model_name: selectedModelDetails?.name || ''
       });
 
-      await invoke('start_retranscription_command', {
+      await startRetranscriptionCommand({
         meetingId,
         meetingFolderPath,
         language: languageToSend,
@@ -242,7 +227,7 @@ export function RetranscribeDialog({
   const handleCancel = async () => {
     if (isProcessing) {
       try {
-        await invoke('cancel_retranscription_command');
+        await cancelRetranscriptionCommand();
         setIsProcessing(false);
         setProgress(null);
         toast.info('Retranscription cancelled');

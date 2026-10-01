@@ -7,6 +7,7 @@ import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
 import { recordingService, type SpeakerTurn } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
+import { getMeetingFolderPath } from '@/lib/ipc/meetings';
 import { loadDiarizationSettings } from '@/lib/diarization';
 import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveLiveBlocks, type LiveWindowOverride } from '@/lib/live-speaker-labels';
 
@@ -344,8 +345,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             // Fetch folder path from backend and update metadata
             // This ensures folder path is persisted even if app crashes
             try {
-              const { invoke } = await import('@tauri-apps/api/core');
-              const folderPath = await invoke<string>('get_meeting_folder_path');
+              const folderPath = await getMeetingFolderPath();
               if (folderPath) {
                 const metadata = await indexedDBService.getMeetingMetadata(meetingId);
                 if (metadata) {
@@ -616,7 +616,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           console.log(`[Reload Sync] Retrieved ${history.length} transcript segments from backend`);
 
           // Convert backend format to frontend Transcript format
-          const formattedTranscripts: Transcript[] = history.map((segment: any) => ({
+          const formattedTranscripts: Transcript[] = history.map((segment) => ({
             id: segment.id,
             text: segment.text,
             timestamp: segment.display_time, // Use display_time for UI

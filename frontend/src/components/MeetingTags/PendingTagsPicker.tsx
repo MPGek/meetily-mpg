@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { Check, Plus, Tag as TagIcon, X } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { listTags } from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import {
@@ -41,7 +41,7 @@ export const PendingTagsPicker: React.FC<PendingTagsPickerProps> = ({
   useEffect(() => {
     if (!open) return;
     setQuery('');
-    invoke<MeetingTagWithUsage[]>('list_tags')
+    listTags()
       .then(setAllTags)
       .catch((e) => console.error('Failed to list tags:', e));
   }, [open ]);

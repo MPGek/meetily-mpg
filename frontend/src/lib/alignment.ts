@@ -7,7 +7,7 @@
  * worker, stop-time repair, and offline repair all read the same values.
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { setWordAlignmentSettings } from '@/lib/ipc/settings';
 
 export const ALIGNMENT_STORAGE_KEYS = {
   enabled: 'wordAlignmentEnabled',
@@ -46,7 +46,7 @@ export async function syncAlignmentSettingsToBackend(
   settings: WordAlignmentSettings = loadAlignmentSettings()
 ): Promise<void> {
   try {
-    await invoke('set_word_alignment_settings', {
+    await setWordAlignmentSettings({
       enabled: settings.enabled,
       modelId: settings.modelId,
     });

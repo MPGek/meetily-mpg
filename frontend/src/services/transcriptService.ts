@@ -5,25 +5,26 @@
  * Pure 1-to-1 wrapper - no error handling changes, exact same behavior as direct invoke/listen calls.
  */
 
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
-import { TranscriptUpdate, Transcript } from '@/types';
+import {
+  getTranscriptHistory,
+  getTranscriptionStatus,
+  listenTranscriptError,
+  listenTranscriptionComplete,
+  listenTranscriptionError,
+  listenTranscriptUpdate,
+  type TranscriptHistorySegment,
+  type TranscriptionErrorPayload,
+  type TranscriptionStatus,
+} from '@/lib/ipc/transcript';
+import {
+  listenModelDownloadComplete,
+  listenParakeetModelDownloadComplete,
+} from '@/lib/ipc/models';
+import type { UnlistenFn } from '@/lib/ipc/core';
+import { TranscriptUpdate } from '@/types';
 
-export interface TranscriptionStatus {
-  chunks_in_queue: number;
-  is_processing: boolean;
-  last_activity_ms: number;
-}
-
-export interface TranscriptionErrorPayload {
-  error: string;
-  userMessage: string;
-  actionable: boolean;
-}
-
-export interface ModelDownloadCompletePayload {
-  modelName: string;
-}
+export type { TranscriptionErrorPayload, TranscriptionStatus } from '@/lib/ipc/transcript';
+export type { ModelDownloadCompletePayload } from '@/lib/ipc/models';
 
 /**
  * Transcript Service
@@ -32,10 +33,10 @@ export interface ModelDownloadCompletePayload {
 export class TranscriptService {
   /**
    * Get transcript history from backend (for reload sync)
-   * @returns Promise<Transcript[]>
+   * @returns Promise<TranscriptHistorySegment[]>
    */
-  async getTranscriptHistory(): Promise<Transcript[]> {
-    return invoke<Transcript[]>('get_transcript_history');
+  async getTranscriptHistory(): Promise<TranscriptHistorySegment[]> {
+    return getTranscriptHistory();
   }
 
   /**
@@ -43,7 +44,7 @@ export class TranscriptService {
    * @returns Promise with transcription status
    */
   async getTranscriptionStatus(): Promise<TranscriptionStatus> {
-    return invoke<TranscriptionStatus>('get_transcription_status');
+    return getTranscriptionStatus();
   }
 
   // Event Listeners
@@ -54,7 +55,7 @@ export class TranscriptService {
    * @returns Promise that resolves to unlisten function
    */
   async onTranscriptUpdate(callback: (update: TranscriptUpdate) => void): Promise<UnlistenFn> {
-    return listen<TranscriptUpdate>('transcript-update', (event) => {
+    return listenTranscriptUpdate((event) => {
       callback(event.payload);
     });
   }
@@ -65,7 +66,7 @@ export class TranscriptService {
    * @returns Promise that resolves to unlisten function
    */
   async onTranscriptionComplete(callback: () => void): Promise<UnlistenFn> {
-    return listen('transcription-complete', callback);
+    return listenTranscriptionComplete(callback);
   }
 
   /**
@@ -74,7 +75,7 @@ export class TranscriptService {
    * @returns Promise that resolves to unlisten function
    */
   async onTranscriptionError(callback: (error: TranscriptionErrorPayload) => void): Promise<UnlistenFn> {
-    return listen<TranscriptionErrorPayload>('transcription-error', (event) => {
+    return listenTranscriptionError((event) => {
       callback(event.payload);
     });
   }
@@ -85,7 +86,7 @@ export class TranscriptService {
    * @returns Promise that resolves to unlisten function
    */
   async onTranscriptError(callback: (error: string) => void): Promise<UnlistenFn> {
-    return listen<string>('transcript-error', (event) => {
+    return listenTranscriptError((event) => {
       callback(event.payload);
     });
   }
@@ -96,7 +97,7 @@ export class TranscriptService {
    * @returns Promise that resolves to unlisten function
    */
   async onModelDownloadComplete(callback: (modelName: string) => void): Promise<UnlistenFn> {
-    return listen<ModelDownloadCompletePayload>('model-download-complete', (event) => {
+    return listenModelDownloadComplete((event) => {
       callback(event.payload.modelName);
     });
   }
@@ -107,7 +108,7 @@ export class TranscriptService {
    * @returns Promise that resolves to unlisten function
    */
   async onParakeetModelDownloadComplete(callback: (modelName: string) => void): Promise<UnlistenFn> {
-    return listen<ModelDownloadCompletePayload>('parakeet-model-download-complete', (event) => {
+    return listenParakeetModelDownloadComplete((event) => {
       callback(event.payload.modelName);
     });
   }

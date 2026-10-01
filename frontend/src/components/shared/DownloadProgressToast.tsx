@@ -1,7 +1,12 @@
 'use client';
 
 import React, { useEffect, useState, useCallback } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import {
+  listenParakeetModelDownloadProgress,
+  listenParakeetModelDownloadComplete,
+  listenParakeetModelDownloadError,
+  listenBuiltinAiDownloadProgress,
+} from '@/lib/ipc/models';
 import { toast } from 'sonner';
 import { X, Check, ArrowBigDownDash } from 'lucide-react';
 import { getDownloadTotalMb } from '@/lib/onboarding-summary-model';
@@ -220,14 +225,7 @@ export function useDownloadProgressToast() {
 
   // Listen to Parakeet download events
   useEffect(() => {
-    const unlistenProgress = listen<{
-      modelName: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status?: string;
-    }>('parakeet-model-download-progress', (event) => {
+    const unlistenProgress = listenParakeetModelDownloadProgress((event) => {
       const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
 
       const downloadData: DownloadProgress = {
@@ -253,8 +251,7 @@ export function useDownloadProgressToast() {
       // Removed direct showDownloadToast call here, handled by effect
     });
 
-    const unlistenComplete = listen<{ modelName: string }>(
-      'parakeet-model-download-complete',
+    const unlistenComplete = listenParakeetModelDownloadComplete(
       (event) => {
         const { modelName } = event.payload;
         const downloadData: DownloadProgress = {
@@ -272,8 +269,7 @@ export function useDownloadProgressToast() {
       }
     );
 
-    const unlistenError = listen<{ modelName: string; error: string }>(
-      'parakeet-model-download-error',
+    const unlistenError = listenParakeetModelDownloadError(
       (event) => {
         const { modelName, error } = event.payload;
         const downloadData: DownloadProgress = {
@@ -301,15 +297,7 @@ export function useDownloadProgressToast() {
 
   // Listen to Built-in AI summary model download events
   useEffect(() => {
-    const unlisten = listen<{
-      model: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status: string;
-      error?: string;
-    }>('builtin-ai-download-progress', (event) => {
+    const unlisten = listenBuiltinAiDownloadProgress((event) => {
       const { model, progress, downloaded_mb, total_mb, speed_mbps, status, error } = event.payload;
 
       const downloadData: DownloadProgress = {

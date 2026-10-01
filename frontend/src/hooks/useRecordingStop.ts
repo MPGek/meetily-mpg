@@ -1,6 +1,7 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { listen } from '@tauri-apps/api/event';
+import { listenRecordingStopped } from '@/lib/ipc/recording';
+import { listenTranscriptionComplete } from '@/lib/ipc/transcript';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -86,13 +87,7 @@ export function useRecordingStop(
     const setupRecordingStoppedListener = async () => {
       try {
         console.log('Setting up recording-stopped listener for navigation...');
-        unlistenFn = await listen<{
-          message: string;
-          folder_path?: string;
-          meeting_name?: string;
-          online_diarization_used?: boolean;
-          speaker_assignments?: { sequence_id: number; speaker: string }[];
-        }>('recording-stopped', async (event) => {
+        unlistenFn = await listenRecordingStopped(async (event) => {
           // Create promise that resolves when sessionStorage is set (prevents race condition)
           recordingStoppedDataRef.current = (async () => {
             const { folder_path, meeting_name, online_diarization_used, speaker_assignments } = event.payload;
@@ -174,7 +169,7 @@ export function useRecordingStop(
       let transcriptionComplete = false;
 
       // Listen for transcription-complete event
-      const unlistenComplete = await listen('transcription-complete', () => {
+      const unlistenComplete = await listenTranscriptionComplete(() => {
         console.log('Received transcription-complete event');
         transcriptionComplete = true;
       });

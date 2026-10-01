@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { Summary, SummaryResponse } from '@/types';
 import Analytics from '@/lib/analytics';
-import { invoke } from '@tauri-apps/api/core';
+import { emitModelConfigUpdated, saveModelConfig } from '@/lib/ipc/settings';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
 import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
@@ -96,7 +96,7 @@ export default function PageContent({
   const handleSaveModelConfig = async (config?: ModelConfig) => {
     if (!config) return;
     try {
-      await invoke('api_save_model_config', {
+      await saveModelConfig({
         provider: config.provider,
         model: config.model,
         whisperModel: config.whisperModel,
@@ -105,8 +105,7 @@ export default function PageContent({
       });
 
       // Emit event so ConfigContext and other listeners stay in sync
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('model-config-updated', config);
+      await emitModelConfigUpdated(config);
 
       toast.success('Model settings saved successfully');
     } catch (error) {

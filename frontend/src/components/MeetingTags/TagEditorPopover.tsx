@@ -2,7 +2,14 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { Check, Plus, Tag as TagIcon, Trash2, X } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  assignTag,
+  createAndAssignTag,
+  deleteTag as deleteTagCommand,
+  listTags,
+  setTagColor,
+  unassignTag,
+} from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import {
@@ -33,7 +40,7 @@ export const TagEditorPopover: React.FC<TagEditorPopoverProps> = ({
 
   const load = async () => {
     try {
-      const tags = await invoke<MeetingTagWithUsage[]>('list_tags');
+      const tags = await listTags();
       setAllTags(tags);
     } catch (e) {
       console.error('Failed to list tags:', e);
@@ -69,9 +76,9 @@ export const TagEditorPopover: React.FC<TagEditorPopoverProps> = ({
     setBusy(true);
     try {
       if (assignedIds.has(tag.id)) {
-        await invoke('unassign_tag', { meetingId, tagId: tag.id });
+        await unassignTag({ meetingId, tagId: tag.id });
       } else {
-        await invoke('assign_tag', { meetingId, tagId: tag.id });
+        await assignTag({ meetingId, tagId: tag.id });
       }
       await refresh();
     } catch (e) {
@@ -86,7 +93,7 @@ export const TagEditorPopover: React.FC<TagEditorPopoverProps> = ({
     if (!name || busy) return;
     setBusy(true);
     try {
-      await invoke('create_and_assign_tag', { meetingId, name });
+      await createAndAssignTag({ meetingId, name });
       setQuery('');
       await refresh();
     } catch (e) {
@@ -98,7 +105,7 @@ export const TagEditorPopover: React.FC<TagEditorPopoverProps> = ({
 
   const removeAssigned = async (tag: MeetingTag) => {
     try {
-      await invoke('unassign_tag', { meetingId, tagId: tag.id });
+      await unassignTag({ meetingId, tagId: tag.id });
       await refresh();
     } catch (e) {
       toast.error('Failed to remove tag', { description: String(e) });
@@ -107,7 +114,7 @@ export const TagEditorPopover: React.FC<TagEditorPopoverProps> = ({
 
   const deleteTag = async (tag: MeetingTagWithUsage) => {
     try {
-      await invoke('delete_tag', { tagId: tag.id });
+      await deleteTagCommand({ tagId: tag.id });
       toast.success(`Tag "${tag.name}" deleted`);
       await refresh();
     } catch (e) {
@@ -117,7 +124,7 @@ export const TagEditorPopover: React.FC<TagEditorPopoverProps> = ({
 
   const cycleColor = async (tag: MeetingTagWithUsage) => {
     try {
-      await invoke('set_tag_color', { tagId: tag.id, color: nextColor(tag.color) });
+      await setTagColor({ tagId: tag.id, color: nextColor(tag.color) });
       await refresh();
     } catch (e) {
       toast.error('Failed to change color', { description: String(e) });
