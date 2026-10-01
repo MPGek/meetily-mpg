@@ -45,6 +45,7 @@ pub mod ollama;
 pub mod onboarding;
 pub mod openai;
 pub mod openrouter;
+pub mod panic_log;
 pub mod parakeet_engine;
 pub mod state;
 pub mod summary;
@@ -394,6 +395,8 @@ pub fn get_language_preference_internal() -> Option<String> {
 }
 
 pub fn run() {
+    panic_log::install();
+
     log::set_max_level(log::LevelFilter::Info);
 
     let mut builder = tauri::Builder::default();

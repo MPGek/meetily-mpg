@@ -22,5 +22,8 @@ debug = false
 codegen-units = 256
 split-debuginfo = "unpacked"
 
+[profile.release]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 0
