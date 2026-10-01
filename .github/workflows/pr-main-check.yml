@@ -52,6 +52,10 @@ jobs:
             echo "Expected format: X.Y.Z (e.g., 1.0.0)"
           fi
 
+      - name: Check documentation links
+        continue-on-error: true
+        run: bash scripts/check-doc-links.sh
+
       - name: Generate validation summary
         run: |
           echo "## Validation Check Summary" >> $GITHUB_STEP_SUMMARY
