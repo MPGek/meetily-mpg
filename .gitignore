@@ -74,6 +74,8 @@ experiments/
 target/
 
 frontend/src-tauri/binaries/
+# graphify knowledge graph and wiki are derived artifacts, regenerated on demand:
+# `graphify update .` (graph) then `graphify export wiki` (graphify-out/wiki/).
 graphify-out/
 .kilo/
 baseline-oldcore-timing.txt

@@ -100,7 +100,7 @@ Raw Audio (Mic + System)
 
 ### Audio Device Modularization (Recently Completed)
 
-**Context**: The audio system was refactored from a monolithic 1028-line `core.rs` file into focused modules. See [AUDIO_MODULARIZATION_PLAN.md](AUDIO_MODULARIZATION_PLAN.md) for details.
+**Context**: The audio system is split into focused modules (devices, capture, pipeline, recording, diarization, and more). See [CODEBASE_MAP_ARCHITECTURE.md](CODEBASE_MAP_ARCHITECTURE.md) for the system-level overview.
 
 ```
 audio/
@@ -423,18 +423,18 @@ curl -fSL -o resource.tar.gz "https://download.example.com/resource"
 ## Key Files Reference
 
 **Core Coordination**:
-- [frontend/src-tauri/src/lib.rs](frontend/src-tauri/src/lib.rs) - Main Tauri entry point, command registration
-- [frontend/src-tauri/src/audio/mod.rs](frontend/src-tauri/src/audio/mod.rs) - Audio module exports
-- [frontend/src-tauri/src/database/mod.rs](frontend/src-tauri/src/database/mod.rs) - Local database module
+- [frontend/src-tauri/src/lib.rs](../frontend/src-tauri/src/lib.rs) - Main Tauri entry point, command registration
+- [frontend/src-tauri/src/audio/mod.rs](../frontend/src-tauri/src/audio/mod.rs) - Audio module exports
+- [frontend/src-tauri/src/database/mod.rs](../frontend/src-tauri/src/database/mod.rs) - Local database module
 
 **Audio System**:
-- [frontend/src-tauri/src/audio/recording_manager.rs](frontend/src-tauri/src/audio/recording_manager.rs) - Recording orchestration
-- [frontend/src-tauri/src/audio/pipeline.rs](frontend/src-tauri/src/audio/pipeline.rs) - Audio mixing and VAD
-- [frontend/src-tauri/src/audio/recording_saver.rs](frontend/src-tauri/src/audio/recording_saver.rs) - Audio file writing
+- [frontend/src-tauri/src/audio/recording_manager.rs](../frontend/src-tauri/src/audio/recording_manager.rs) - Recording orchestration
+- [frontend/src-tauri/src/audio/pipeline.rs](../frontend/src-tauri/src/audio/pipeline.rs) - Audio mixing and VAD
+- [frontend/src-tauri/src/audio/recording_saver.rs](../frontend/src-tauri/src/audio/recording_saver.rs) - Audio file writing
 
 **UI Components**:
-- [frontend/src/app/page.tsx](frontend/src/app/page.tsx) - Main recording interface
-- [frontend/src/components/Sidebar/SidebarProvider.tsx](frontend/src/components/Sidebar/SidebarProvider.tsx) - Global state management
+- [frontend/src/app/page.tsx](../frontend/src/app/page.tsx) - Main recording interface
+- [frontend/src/components/Sidebar/SidebarProvider.tsx](../frontend/src/components/Sidebar/SidebarProvider.tsx) - Global state management
 
 **Whisper Integration**:
-- [frontend/src-tauri/src/whisper_engine/whisper_engine.rs](frontend/src-tauri/src/whisper_engine/whisper_engine.rs) - Whisper model management and transcription
+- [frontend/src-tauri/src/whisper_engine/whisper_engine.rs](../frontend/src-tauri/src/whisper_engine/whisper_engine.rs) - Whisper model management and transcription
