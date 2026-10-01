@@ -37,17 +37,24 @@ impl SpeakerRepository {
         let affected_meetings_count = affected_meetings_set.len() as i64;
 
         // Count transcripts that would be affected (for reporting)
-        let mut affected_transcripts_count: i64 = 0;
-        for (mid, cluster) in &affected_clusters {
-            let (cnt,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?",
-            )
-            .bind(mid)
-            .bind(cluster)
-            .fetch_one(&mut *tx)
-            .await?;
-            affected_transcripts_count += cnt;
-        }
+        // One grouped query over the exact (meeting, cluster) pairs; the pairs
+        // are distinct (UNIQUE(meeting_id, cluster_label)), so the sum equals
+        // a per-pair count.
+        let affected_transcripts_count: i64 = if affected_clusters.is_empty() {
+            0
+        } else {
+            let values = vec!["(?, ?)"; affected_clusters.len()].join(", ");
+            let sql = format!(
+                "SELECT meeting_id, speaker, COUNT(*) FROM transcripts
+                 WHERE (meeting_id, speaker) IN (VALUES {values})
+                 GROUP BY meeting_id, speaker"
+            );
+            let mut q = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            for (mid, cluster) in &affected_clusters {
+                q = q.bind(mid).bind(cluster);
+            }
+            q.fetch_all(&mut *tx).await?.iter().map(|(_, _, cnt)| cnt).sum()
+        };
 
         if affected_clusters.is_empty() {
             // No bindings to move, still delete prototypes of source
@@ -96,7 +103,12 @@ impl SpeakerRepository {
 
         tx.commit().await?;
 
-        // Re-match affected meetings from centroids (outside transaction, best-effort)
+        // Re-match affected meetings from centroids (outside transaction, best-effort).
+        // Deliberately not part of the transaction above: these repository
+        // calls take the pool, not the transaction, and every result is
+        // tolerated on failure. A failed re-match must not roll back the
+        // committed re-bind and prototype deletion; a later re-match derives
+        // the same bindings from the committed centroids.
         for meeting_id in affected_meetings_set {
             let centroids = SpeakerRepository::get_cluster_centroids(pool, &meeting_id)
                 .await
@@ -165,17 +177,24 @@ impl SpeakerRepository {
         for (mid, _) in &affected_clusters {
             affected_meetings_set.insert(mid.clone());
         }
-        let mut affected_transcripts_count: i64 = 0;
-        for (mid, cluster) in &affected_clusters {
-            let (cnt,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?",
-            )
-            .bind(mid)
-            .bind(cluster)
-            .fetch_one(pool)
-            .await?;
-            affected_transcripts_count += cnt;
-        }
+        // One grouped query over the exact (meeting, cluster) pairs; the pairs
+        // are distinct (UNIQUE(meeting_id, cluster_label)), so the sum equals
+        // a per-pair count.
+        let affected_transcripts_count: i64 = if affected_clusters.is_empty() {
+            0
+        } else {
+            let values = vec!["(?, ?)"; affected_clusters.len()].join(", ");
+            let sql = format!(
+                "SELECT meeting_id, speaker, COUNT(*) FROM transcripts
+                 WHERE (meeting_id, speaker) IN (VALUES {values})
+                 GROUP BY meeting_id, speaker"
+            );
+            let mut q = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            for (mid, cluster) in &affected_clusters {
+                q = q.bind(mid).bind(cluster);
+            }
+            q.fetch_all(pool).await?.iter().map(|(_, _, cnt)| cnt).sum()
+        };
         Ok(ReplaceResult {
             affected_meetings: affected_meetings_set.len() as i64,
             affected_clusters: affected_clusters.len() as i64,
@@ -285,5 +304,72 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(cnt.0, 0);
+    }
+
+    #[tokio::test]
+    async fn replace_speaker_transcript_count_matches_per_cluster_sum() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m1").await;
+        insert_meeting(&pool, "m2").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob")
+            .await
+            .unwrap();
+
+        // (meeting, cluster, bound speaker, transcript rows). SPEAKER_00 is
+        // Alice's in m1 but Bob's in m2, so only exact pairs may count.
+        let fixture = [
+            ("m1", "SPEAKER_00", &alice.id, 3),
+            ("m1", "SPEAKER_01", &alice.id, 1),
+            ("m1", "SPEAKER_02", &bob.id, 2),
+            ("m2", "SPEAKER_00", &bob.id, 4),
+            ("m2", "SPEAKER_01", &alice.id, 2),
+        ];
+        for (mid, cluster, speaker_id, rows) in fixture {
+            SpeakerRepository::set_auto_binding_if_unbound(&pool, mid, cluster, speaker_id, 0.9)
+                .await
+                .unwrap();
+            for i in 0..rows {
+                insert_transcript(&pool, &format!("{mid}-{cluster}-{i}"), mid, cluster).await;
+            }
+        }
+
+        // Independent per-pair count over the same data.
+        let pairs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT meeting_id, cluster_label FROM meeting_speakers WHERE speaker_id = ? AND matched_by = 'auto'",
+        )
+        .bind(&alice.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut expected = 0i64;
+        for (mid, cluster) in &pairs {
+            let (cnt,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND speaker = ?",
+            )
+            .bind(mid)
+            .bind(cluster)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            expected += cnt;
+        }
+        assert_eq!(expected, 6);
+
+        let preview = SpeakerRepository::preview_replace_speaker(&pool, &alice.id)
+            .await
+            .unwrap();
+        assert_eq!(preview.affected_transcripts, expected);
+        assert_eq!(preview.affected_clusters, 3);
+        assert_eq!(preview.affected_meetings, 2);
+
+        let result = SpeakerRepository::replace_speaker(&pool, &alice.id, Some(&bob.id))
+            .await
+            .unwrap();
+        assert_eq!(result.affected_transcripts, expected);
+        assert_eq!(result.affected_clusters, 3);
+        assert_eq!(result.affected_meetings, 2);
     }
 }
