@@ -49,7 +49,8 @@ export interface VirtualizedTranscriptViewProps {
         label: string,
         transcriptId?: string,
         startTime?: number,
-        endTime?: number
+        endTime?: number,
+        subRow?: boolean
     ) => Promise<void>;
 
     // Meeting ID for speaker registry operations
@@ -140,17 +141,20 @@ function SpeakerLabel({
     endTime,
     matchedBy,
     matchScore,
+    subRow,
 }: {
     speaker: string;
     label?: string;
     color: string;
-    onUpdate?: (speaker: string, label: string, transcriptId?: string, startTime?: number, endTime?: number) => Promise<void>;
+    onUpdate?: (speaker: string, label: string, transcriptId?: string, startTime?: number, endTime?: number, subRow?: boolean) => Promise<void>;
     meetingId?: string;
     transcriptId?: string;
     startTime?: number;
     endTime?: number;
     matchedBy?: string;
     matchScore?: number;
+    /** A sub-row of a live-split block: single-block edits touch only it. */
+    subRow?: boolean;
 }) {
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
@@ -223,7 +227,7 @@ function SpeakerLabel({
             // Scope-aware local propagation: apply-to-all passes no
             // transcriptId so the updater relabels every block of the
             // cluster; single-block passes the id (design D11).
-            await onUpdate(speaker, sp.name, scopeAll ? undefined : transcriptId, startTime, endTime);
+            await onUpdate(speaker, sp.name, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && subRow);
         } catch (error) {
             console.error("Failed to assign speaker:", error);
             // Backend write runs before onUpdate, so the local label was never
@@ -256,7 +260,7 @@ function SpeakerLabel({
                     );
                 }
             }
-            await onUpdate(speaker, label, scopeAll ? undefined : transcriptId, startTime, endTime);
+            await onUpdate(speaker, label, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && subRow);
             toast.success("Speaker confirmed");
         } catch (error) {
             console.error("Failed to confirm speaker:", error);
@@ -293,7 +297,7 @@ function SpeakerLabel({
                     );
                 }
             }
-            await onUpdate(speaker, trimmed, scopeAll ? undefined : transcriptId, startTime, endTime);
+            await onUpdate(speaker, trimmed, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && subRow);
         } catch (error) {
             console.error("Failed to create speaker:", error);
             toast.error("Failed to assign speaker");
@@ -468,7 +472,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
         label: string,
         transcriptId?: string,
         startTime?: number,
-        endTime?: number
+        endTime?: number,
+        subRow?: boolean
     ) => Promise<void>;
     meetingId?: string;
     onPlayFrom?: (startTime: number) => void;
@@ -545,6 +550,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                             endTime={block.end}
                                             matchedBy={block.matched_by}
                                             matchScore={block.match_score}
+                                            subRow
                                         />
                                         {side.dotPosition === 'after' && (
                                             <span

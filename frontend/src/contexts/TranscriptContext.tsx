@@ -8,7 +8,7 @@ import { transcriptService } from '@/services/transcriptService';
 import { recordingService, type SpeakerTurn } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
 import { loadDiarizationSettings } from '@/lib/diarization';
-import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveLiveBlocks } from '@/lib/live-speaker-labels';
+import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveLiveBlocks, type LiveWindowOverride } from '@/lib/live-speaker-labels';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
@@ -29,7 +29,8 @@ interface TranscriptContextType {
     name: string,
     transcriptId?: string,
     startTime?: number,
-    endTime?: number
+    endTime?: number,
+    subRow?: boolean
   ) => void;
   /**
    * Live word-level diarization sub-rows for a transcript, resolved against
@@ -66,12 +67,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const liveBlocksRef = useRef<Map<number, LiveTranscriptBlocks>>(new Map());
   // Window-scoped single-turn overrides, re-keyed onto the covering sub-row
   // when a block is live-split (live-speaker-labels delta).
-  const windowOverridesRef = useRef<Array<{ cluster: string; start: number; end: number; name: string }>>([]);
-  // User-assigned live labels by transcript id: a transcript the user has
-  // explicitly assigned a speaker to is frozen for the rest of the session —
-  // it is never re-matched against the live turn stream, so no later
-  // (possibly stale) turn can revert the user's choice.
+  const windowOverridesRef = useRef<LiveWindowOverride[]>([]);
+  // User-pinned live labels by transcript id: the name the user gave a whole
+  // (unsplit) block, applied to every sub-row of its cluster after a split.
   const userAssignmentsRef = useRef<Map<string, { cluster: string; name: string }>>(new Map());
+  // Transcripts the user edited (whole block or a sub-row): frozen for the
+  // rest of the session, never re-matched against the live turn stream, so no
+  // later (possibly stale) turn can revert the user's choice.
+  const frozenTranscriptsRef = useRef<Set<string>>(new Set());
   // Cluster-wide live bindings: cluster label -> person name (apply-to-all).
   // Used to (re)apply the binding to the turn stream and future re-matches.
   const clusterBindingsRef = useRef<Map<string, string>>(new Map());
@@ -79,6 +82,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // Record a per-transcript assignment (single-block edit).
   const pinTranscript = (id: string, cluster: string, name: string) => {
     userAssignmentsRef.current.set(id, { cluster, name });
+    frozenTranscriptsRef.current.add(id);
   };
 
   // Record an apply-to-all cluster binding and rewrite the turn stream so every
@@ -235,7 +239,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         unlistenSpeakerTurn = await recordingService.onSpeakerTurn((turn) => {
           turnsRef.current = [...turnsRef.current, turn];
           setTranscripts(prev =>
-            rematchTranscripts(prev, turnsRef.current, userAssignmentsRef.current)
+            rematchTranscripts(prev, turnsRef.current, frozenTranscriptsRef.current)
           );
         });
       } catch (error) {
@@ -296,6 +300,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             // Reset live speaker turns for the new recording session
             turnsRef.current = [];
             userAssignmentsRef.current = new Map();
+            frozenTranscriptsRef.current = new Set();
             clusterBindingsRef.current = new Map();
             // Reset live word-level diarization display state too.
             liveBlocksRef.current = new Map();
@@ -728,6 +733,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     setTranscripts([]);
     turnsRef.current = [];
     userAssignmentsRef.current = new Map();
+    frozenTranscriptsRef.current = new Set();
     clusterBindingsRef.current = new Map();
     liveBlocksRef.current = new Map();
     windowOverridesRef.current = [];
@@ -768,7 +774,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     name: string,
     transcriptId?: string,
     startTime?: number,
-    endTime?: number
+    endTime?: number,
+    subRow?: boolean
   ) => {
     // Mutate refs OUTSIDE the state updater so the assignment maps stay in
     // sync and are never re-run/re-ordered by React batching.
@@ -789,15 +796,20 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           name
         );
       }
-      // Record the window-scoped override so a later live split re-keys the
-      // name onto the covering sub-row only.
-      windowOverridesRef.current = [
-        ...windowOverridesRef.current.filter(
-          o => !(o.cluster === clusterLabel && o.start === tStart && o.end === tEnd)
-        ),
-        { cluster: clusterLabel, start: tStart, end: tEnd, name },
-      ];
-      pinTranscript(transcriptId, clusterLabel, name);
+      if (subRow) {
+        // One sub-row of a split block: a window-scoped override for that
+        // sub-row only. The block's pin is left alone so siblings of the same
+        // cluster keep their own names (and confirm affordances).
+        windowOverridesRef.current = [
+          ...windowOverridesRef.current,
+          { cluster: clusterLabel, sourceDevice: target?.source_device, start: tStart, end: tEnd, name },
+        ];
+        frozenTranscriptsRef.current.add(transcriptId);
+      } else {
+        // Whole (unsplit) block: pin it; a later split carries the name onto
+        // every sub-row of this cluster.
+        pinTranscript(transcriptId, clusterLabel, name);
+      }
     } else {
       // Apply-to-all: record the cluster binding and rewrite every turn of
       // the cluster to the user's name.
@@ -813,6 +825,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       prev.map(t => {
         if (transcriptId !== undefined) {
           if (t.id !== transcriptId) return t;
+          // A sub-row edit leaves the parent's own label alone; the new
+          // object only re-resolves this block's sub-rows.
+          if (subRow) return { ...t };
           return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
         }
         if (t.speaker !== clusterLabel) return t;
@@ -833,6 +848,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       clusterBindings: clusterBindingsRef.current,
       pinned: userAssignmentsRef.current.get(transcript.id),
       windowOverrides: windowOverridesRef.current,
+      sourceDevice: transcript.source_device,
     });
   }, [liveBlocks]);
 

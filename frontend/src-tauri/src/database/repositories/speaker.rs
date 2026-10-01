@@ -150,6 +150,9 @@ impl SpeakerRepository {
         conn: &mut SqliteConnection,
         speaker_id: &str,
     ) -> Result<usize, SqlxError> {
+        // Duplicates go first, so they never count toward the cap or evict a
+        // distinct prototype.
+        Self::collapse_duplicate_prototypes(conn, speaker_id).await?;
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
                 .bind(speaker_id)
@@ -170,6 +173,56 @@ impl SpeakerRepository {
             .await?;
         }
         Ok(count.0.min(PER_PERSON_PROTOTYPE_CAP as i64) as usize)
+    }
+
+    /// Keep one row per identical voiceprint of a speaker: same meeting,
+    /// channel, audio window and embedding. The row kept is the verified one
+    /// if any, then one with a clip, then the oldest; it inherits a clip from
+    /// a removed copy when it has none. The migration
+    /// `20260930000000_dedupe_speaker_voiceprints.sql` runs the same rule over
+    /// every speaker once.
+    async fn collapse_duplicate_prototypes(
+        conn: &mut SqliteConnection,
+        speaker_id: &str,
+    ) -> Result<usize, SqlxError> {
+        const RANKED: &str = "ranked AS (
+                 SELECT id, audio_blob, audio_codec, audio_sample_rate,
+                        ROW_NUMBER() OVER w AS rn,
+                        FIRST_VALUE(id) OVER w AS keep_id
+                 FROM speaker_embeddings
+                 WHERE speaker_id = ?
+                 WINDOW w AS (
+                     PARTITION BY meeting_id, channel, audio_start_time, audio_end_time, embedding
+                     ORDER BY is_verified DESC, (audio_blob IS NOT NULL) DESC, created_at ASC, id ASC
+                 )
+             )";
+        sqlx::query(&format!(
+            "WITH {RANKED},
+             donor AS (
+                 SELECT keep_id, audio_blob, audio_codec, audio_sample_rate,
+                        ROW_NUMBER() OVER (PARTITION BY keep_id ORDER BY rn) AS dn
+                 FROM ranked WHERE rn > 1 AND audio_blob IS NOT NULL
+             )
+             UPDATE speaker_embeddings
+             SET audio_blob = donor.audio_blob,
+                 audio_codec = donor.audio_codec,
+                 audio_sample_rate = donor.audio_sample_rate
+             FROM donor
+             WHERE speaker_embeddings.id = donor.keep_id
+               AND donor.dn = 1
+               AND speaker_embeddings.audio_blob IS NULL"
+        ))
+        .bind(speaker_id)
+        .execute(&mut *conn)
+        .await?;
+        let removed = sqlx::query(&format!(
+            "WITH {RANKED}
+             DELETE FROM speaker_embeddings WHERE id IN (SELECT id FROM ranked WHERE rn > 1)"
+        ))
+        .bind(speaker_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(removed.rows_affected() as usize)
     }
 
     // ===== Speakers CRUD =====
@@ -777,6 +830,29 @@ impl SpeakerRepository {
             .collect();
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
         candidates.truncate(ENROLLMENT_BEST_K as usize);
+        // Skip chunks this speaker already holds (another override over the
+        // same chunk, or a repeated confirm), before any clip is cut.
+        let mut fresh = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let held: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM speaker_embeddings
+                 WHERE speaker_id = ? AND meeting_id = ? AND channel = ?
+                   AND audio_start_time = ? AND audio_end_time = ? AND embedding = ?
+                 LIMIT 1",
+            )
+            .bind(speaker_id)
+            .bind(meeting_id)
+            .bind(channel)
+            .bind(candidate.2 as f64)
+            .bind(candidate.3 as f64)
+            .bind(embedding_to_bytes(&candidate.1))
+            .fetch_optional(pool)
+            .await?;
+            if held.is_none() {
+                fresh.push(candidate);
+            }
+        }
+        let candidates = fresh;
         if candidates.is_empty() {
             return Ok(0);
         }
@@ -2862,6 +2938,182 @@ mod tests {
         .unwrap();
         assert_eq!(protos.len(), 1);
         assert_eq!(protos[0].channel, "mic");
+    }
+
+    async fn prototype_count(pool: &SqlitePool, speaker_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+            .bind(speaker_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Several sub-row overrides overlap one ~20 s chunk: re-enrolling it for
+    /// the same person must not add a second copy (fix-live-subrow-assignment-scope).
+    #[tokio::test]
+    async fn enroll_embeddings_from_buffer_does_not_duplicate_a_chunk() {
+        let pool = setup_pool().await;
+        let meeting_id = "meeting-dup";
+        insert_meeting(&pool, meeting_id).await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice")
+            .await
+            .unwrap();
+        let buffer = vec![(1473.4f32, 1493.2f32, emb(&[1.0, 0.0, 0.0, 0.0]))];
+
+        let first = SpeakerRepository::enroll_embeddings_from_buffer(
+            &pool, &alice.id, "system", &buffer, (1480.0, 1481.0), meeting_id, "SPEAKER_03",
+        )
+        .await
+        .unwrap();
+        // A second override, another sub-row in the same chunk, another cluster label.
+        let second = SpeakerRepository::enroll_embeddings_from_buffer(
+            &pool, &alice.id, "system", &buffer, (1485.0, 1486.0), meeting_id, "SPEAKER_26",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 0, "an already-held chunk is not re-enrolled");
+        assert_eq!(prototype_count(&pool, &alice.id).await, 1);
+    }
+
+    /// At the cap, a duplicate must be collapsed before pruning, so the
+    /// shortest distinct prototype is not evicted to make room for a copy.
+    #[tokio::test]
+    async fn duplicates_never_evict_a_distinct_prototype_at_the_cap() {
+        let pool = setup_pool().await;
+        let meeting_id = "meeting-cap-dup";
+        insert_meeting(&pool, meeting_id).await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let insert = |i: usize, dur: f64, x: f32| {
+            let pool = pool.clone();
+            let speaker = alice.id.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, created_at)
+                     VALUES (?, ?, 'titanet_large', 'system', ?, ?, ?, 'SPEAKER_00', ?, ?, '2026-01-01T00:00:00Z')",
+                )
+                .bind(format!("row-{i}"))
+                .bind(embedding_to_bytes(&emb(&[x, 0.0, 0.0, 0.0])))
+                .bind(dur)
+                .bind(&speaker)
+                .bind(meeting_id)
+                .bind(x as f64 * 100.0)
+                .bind(x as f64 * 100.0 + dur)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        // 63 long distinct prototypes plus one short distinct one: at the cap.
+        for i in 0..PER_PERSON_PROTOTYPE_CAP - 1 {
+            insert(i, 20.0, i as f32 + 1.0).await;
+        }
+        insert(900, 1.0, 900.0).await;
+        // A byte-identical copy of the first long prototype.
+        insert(901, 20.0, 1.0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let kept = SpeakerRepository::enforce_prototype_cap(&mut conn, &alice.id).await.unwrap();
+        drop(conn);
+
+        assert_eq!(kept, PER_PERSON_PROTOTYPE_CAP);
+        let short_survives: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE id = 'row-900'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(short_survives, 1, "the distinct short prototype stays");
+        let copies: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM speaker_embeddings WHERE id IN ('row-0', 'row-901')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(copies, 1, "only one of the identical pair remains");
+    }
+
+    /// The dedupe migration collapses 13 identical copies to one, keeps the
+    /// verified flag and a clip from different copies, and leaves distinct
+    /// rows and unassigned cache rows alone.
+    #[tokio::test]
+    async fn dedupe_migration_collapses_existing_duplicates() {
+        let pool = setup_pool().await;
+        insert_meeting(&pool, "m-mig").await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let row = |id: String, speaker: Option<String>, x: f32, verified: i64, clip: Option<Vec<u8>>, created: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO speaker_embeddings (id, embedding, model, channel, duration_secs, speaker_id, meeting_id, cluster_label, audio_start_time, audio_end_time, audio_blob, audio_codec, audio_sample_rate, is_verified, created_at)
+                     VALUES (?, ?, 'titanet_large', 'system', 19.8, ?, 'm-mig', 'SPEAKER_03', 1473.43, 1493.21, ?, 'opus', 16000, ?, ?)",
+                )
+                .bind(id)
+                .bind(embedding_to_bytes(&emb(&[x, 0.0, 0.0, 0.0])))
+                .bind(speaker)
+                .bind(clip)
+                .bind(verified)
+                .bind(created)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        // 13 copies: the oldest has neither flag nor clip, one is verified
+        // without a clip, one has a clip but is unverified.
+        row("dup-00".into(), Some(alice.id.clone()), 1.0, 0, None, "2026-01-01T00:00:00Z").await;
+        row("dup-01".into(), Some(alice.id.clone()), 1.0, 1, None, "2026-01-01T00:00:01Z").await;
+        row("dup-02".into(), Some(alice.id.clone()), 1.0, 0, Some(vec![7, 7]), "2026-01-01T00:00:02Z").await;
+        for i in 3..13 {
+            row(format!("dup-{i:02}"), Some(alice.id.clone()), 1.0, 0, None, "2026-01-01T00:00:03Z").await;
+        }
+        row("distinct".into(), Some(alice.id.clone()), 2.0, 0, None, "2026-01-01T00:00:00Z").await;
+        row("cache-a".into(), None, 1.0, 0, None, "2026-01-01T00:00:00Z").await;
+        row("cache-b".into(), None, 1.0, 0, None, "2026-01-01T00:00:00Z").await;
+
+        sqlx::raw_sql(include_str!("../../../migrations/20260930000000_dedupe_speaker_voiceprints.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let kept: Vec<(String, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT id, is_verified, audio_blob FROM speaker_embeddings WHERE speaker_id = ? ORDER BY id",
+        )
+        .bind(&alice.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept.len(), 2, "one of the 13 copies plus the distinct row");
+        let survivor = kept.iter().find(|r| r.0 != "distinct").unwrap();
+        assert_eq!(survivor.0, "dup-01", "the verified copy is kept");
+        assert_eq!(survivor.1, 1);
+        assert_eq!(survivor.2.as_deref(), Some(&[7u8, 7][..]), "it inherits the clip");
+        let caches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(caches, 2, "unassigned cache rows are untouched");
+    }
+
+    #[tokio::test]
+    async fn the_same_chunk_enrolls_for_a_different_person() {
+        let pool = setup_pool().await;
+        let meeting_id = "meeting-dup-2";
+        insert_meeting(&pool, meeting_id).await;
+        let alice = SpeakerRepository::find_or_create_by_name(&pool, "Alice").await.unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let buffer = vec![(0.0f32, 20.0f32, emb(&[1.0, 0.0, 0.0, 0.0]))];
+
+        for id in [&alice.id, &bob.id] {
+            SpeakerRepository::enroll_embeddings_from_buffer(
+                &pool, id, "system", &buffer, (1.0, 2.0), meeting_id, "SPEAKER_00",
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(prototype_count(&pool, &alice.id).await, 1);
+        assert_eq!(prototype_count(&pool, &bob.id).await, 1);
     }
 
     #[tokio::test]

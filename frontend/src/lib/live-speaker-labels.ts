@@ -88,14 +88,15 @@ export function rewriteTurnsInWindow(
 
 /**
  * Re-match a transcript list against a turn stream, freezing any transcript
- * present in `assigned` (a Map keyed by transcript id). Assigned transcripts
- * are user-owned and never re-matched, so stale auto turns cannot revert them.
- * Returns a new list only when something changed, else the input list.
+ * present in `assigned` (a Set or Map keyed by transcript id). Assigned
+ * transcripts are user-owned and never re-matched, so stale auto turns cannot
+ * revert them. Returns a new list only when something changed, else the input
+ * list.
  */
 export function rematchTranscripts(
   transcripts: Transcript[],
   turns: SpeakerTurn[],
-  assigned: ReadonlyMap<string, unknown>
+  assigned: { has(id: string): boolean }
 ): Transcript[] {
   let changed = false;
   const next = transcripts.map(t => {
@@ -142,24 +143,53 @@ export interface LiveBlockResolution {
   clusterBindings?: ReadonlyMap<string, string>;
   /** Parent-level single-block pin for the transcript being rendered. */
   pinned?: { cluster: string; name: string };
-  /** Window-scoped per-turn overrides (cluster + time window). */
-  windowOverrides?: ReadonlyArray<{ cluster: string; start: number; end: number; name: string }>;
+  /** Window-scoped per-turn overrides, oldest first. */
+  windowOverrides?: ReadonlyArray<LiveWindowOverride>;
+  /** Channel of the block being resolved; overrides of another channel skip it. */
+  sourceDevice?: string;
+}
+
+/** A user's single sub-row assignment: the time window it covers on a channel. */
+export interface LiveWindowOverride {
+  /** Cluster the row showed when edited (kept for reference, not matched on). */
+  cluster: string;
+  sourceDevice?: string;
+  start: number;
+  end: number;
+  name: string;
 }
 
 /**
  * Apply live user assignments across a block's sub-rows: a window-scoped
- * override lands on the sub-row whose time window it covers, a parent pin and
- * a cluster binding apply to every sub-row of that cluster. Returns new block
- * objects only for changed rows, so unchanged rows keep their identity.
+ * override lands on the sub-row whose time window it covers on the same
+ * channel, whatever cluster that window is now attributed to, and the most
+ * recent override wins; a parent pin and a cluster binding apply to every
+ * sub-row of that cluster. Returns new block objects only for changed rows,
+ * so unchanged rows keep their identity.
  */
 export function resolveLiveBlocks(
   blocks: LiveTranscriptBlock[],
   ctx: LiveBlockResolution
 ): LiveTranscriptBlock[] {
-  return blocks.map(b => {
-    const override = ctx.windowOverrides?.find(
-      o => o.cluster === b.speaker && o.start < b.end && o.end > b.start
-    );
+  // Each override lands on the one sub-row it overlaps most, so a boundary
+  // shift between revisions cannot spill it onto a neighbour. Later overrides
+  // replace earlier ones on the same sub-row.
+  const landed = new Map<number, LiveWindowOverride>();
+  for (const o of ctx.windowOverrides ?? []) {
+    if (o.sourceDevice && ctx.sourceDevice && o.sourceDevice !== ctx.sourceDevice) continue;
+    let best = -1;
+    let bestOverlap = 0;
+    blocks.forEach((b, i) => {
+      const overlap = Math.min(o.end, b.end) - Math.max(o.start, b.start);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = i;
+      }
+    });
+    if (best >= 0) landed.set(best, o);
+  }
+  return blocks.map((b, i) => {
+    const override = landed.get(i);
     let name: string | undefined;
     let matchedBy: string | undefined;
     if (override) {

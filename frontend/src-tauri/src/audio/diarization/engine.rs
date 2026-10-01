@@ -607,54 +607,15 @@ impl DiarizationEngine {
             .map(|o| (o.cluster_label, o.start_secs, o.end_secs, o.speaker_id))
             .collect();
 
-        // Ground-truth enrollment for each single-block override: the chunk
-        // embeddings overlapping the relabeled block's time window become
-        // prototypes of the chosen speaker, improving the global registry. A user
-        // pick is ground truth — it should strengthen the person's identity.
-        for (cluster_label, start, end, speaker_id) in &turn_overrides {
-            let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
-                Some("mic")
-            } else if cluster_label.starts_with("SPEAKER_") {
-                if session_data.cluster_embeddings.saw_system_audio {
-                    Some("system")
-                } else {
-                    Some("mic")
-                }
-            } else {
-                None
-            };
-            let Some(channel) = channel else { continue };
-            let buffer = if channel == "mic" {
-                &session_data.mic_embeddings
-            } else {
-                &session_data.sys_embeddings
-            };
-            match SpeakerRepository::enroll_embeddings_from_buffer(
-                pool,
-                speaker_id,
-                channel,
-                buffer,
-                (*start as f32, *end as f32),
-                &meeting_id,
-                cluster_label,
-            )
-            .await
-            {
-                Ok(n) => {
-                    if n > 0 {
-                        enrolled += n;
-                        info!(
-                            "Ground-truth enrollment: {} embeddings for {} from override {} [{:.1}s-{:.1}s]",
-                            n, speaker_id, cluster_label, start, end
-                        );
-                    }
-                }
-                Err(e) => warn!(
-                    "Failed to enroll ground-truth embeddings for {} from {}: {}",
-                    speaker_id, cluster_label, e
-                ),
-            }
-        }
+        enrolled += enroll_override_ground_truth(
+            pool,
+            &meeting_id,
+            &turn_overrides,
+            &session_data.mic_embeddings,
+            &session_data.sys_embeddings,
+            session_data.cluster_embeddings.saw_system_audio,
+        )
+        .await;
 
         if !turn_overrides.is_empty() {
             SpeakerRepository::apply_turn_overrides(pool, &meeting_id, &turn_overrides)
@@ -840,6 +801,69 @@ impl DiarizationEngine {
     }
 }
 
+/// Ground-truth enrollment for the single-block overrides of a stopped session:
+/// the chunk embeddings overlapping each relabeled window become prototypes of
+/// the chosen speaker. A user pick is ground truth - it should strengthen the
+/// person's identity. Sub-rows are much shorter than a chunk, so many overrides
+/// share a chunk; each person/channel/window is enrolled once, and the
+/// repository skips a chunk the person already holds, so a chunk is never
+/// stored twice however many overrides cover it.
+async fn enroll_override_ground_truth(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    turn_overrides: &[(String, f64, f64, String)],
+    mic_embeddings: &[(f32, f32, Vec<f32>)],
+    sys_embeddings: &[(f32, f32, Vec<f32>)],
+    saw_system_audio: bool,
+) -> usize {
+    let mut enrolled = 0;
+    let mut seen: std::collections::HashSet<(&str, &str, u64, u64)> = std::collections::HashSet::new();
+    for (cluster_label, start, end, speaker_id) in turn_overrides {
+        let channel = if cluster_label.starts_with("MIC_SPEAKER_") {
+            "mic"
+        } else if cluster_label.starts_with("SPEAKER_") {
+            if saw_system_audio {
+                "system"
+            } else {
+                "mic"
+            }
+        } else {
+            continue;
+        };
+        // A repeated edit or confirm of the same window adds nothing.
+        if !seen.insert((speaker_id.as_str(), channel, start.to_bits(), end.to_bits())) {
+            continue;
+        }
+        let buffer = if channel == "mic" { mic_embeddings } else { sys_embeddings };
+        match SpeakerRepository::enroll_embeddings_from_buffer(
+            pool,
+            speaker_id,
+            channel,
+            buffer,
+            (*start as f32, *end as f32),
+            meeting_id,
+            cluster_label,
+        )
+        .await
+        {
+            Ok(n) => {
+                if n > 0 {
+                    enrolled += n;
+                    info!(
+                        "Ground-truth enrollment: {} embeddings for {} from override {} [{:.1}s-{:.1}s]",
+                        n, speaker_id, cluster_label, start, end
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Failed to enroll ground-truth embeddings for {} from {}: {}",
+                speaker_id, cluster_label, e
+            ),
+        }
+    }
+    enrolled
+}
+
 /// One offline batch run over a saved meeting.
 pub struct BatchRequest {
     pub meeting_id: String,
@@ -946,5 +970,34 @@ mod tests {
             err.contains("No live diarization session active"),
             "error must name the missing session, got: {err}"
         );
+    }
+
+    /// Three sub-row overrides (one repeated) inside one ~20 s chunk must
+    /// enroll that chunk once (fix-live-subrow-assignment-scope).
+    #[tokio::test]
+    async fn overrides_sharing_a_chunk_enroll_it_once() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m-ov', 'M', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bob = SpeakerRepository::find_or_create_by_name(&pool, "Bob").await.unwrap();
+        let sys = vec![(1473.4f32, 1493.2f32, vec![1.0f32, 0.0, 0.0, 0.0])];
+        let overrides = vec![
+            ("SPEAKER_03".to_string(), 1475.0, 1476.0, bob.id.clone()),
+            ("SPEAKER_26".to_string(), 1480.0, 1481.5, bob.id.clone()),
+            ("SPEAKER_26".to_string(), 1480.0, 1481.5, bob.id.clone()),
+            ("SPEAKER_25".to_string(), 1490.0, 1491.0, bob.id.clone()),
+        ];
+
+        let enrolled = enroll_override_ground_truth(&pool, "m-ov", &overrides, &[], &sys, true).await;
+
+        assert_eq!(enrolled, 1);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM speaker_embeddings WHERE speaker_id = ?")
+            .bind(&bob.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "one prototype for the shared chunk");
     }
 }

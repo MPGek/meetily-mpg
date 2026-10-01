@@ -127,8 +127,8 @@ export function TranscriptPanel({
                 isStopping={isStopping}
                 enableStreaming={isRecording}
                 showConfidence={true}
-                onUpdateSpeakerLabel={async (speaker, label, transcriptId, startTime, endTime) => {
-                  applyLiveSpeakerLabel(speaker, label, transcriptId, startTime, endTime);
+                onUpdateSpeakerLabel={async (speaker, label, transcriptId, startTime, endTime, subRow) => {
+                  applyLiveSpeakerLabel(speaker, label, transcriptId, startTime, endTime, subRow);
                 }}
               />
             </div>

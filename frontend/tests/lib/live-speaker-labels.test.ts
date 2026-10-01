@@ -117,6 +117,13 @@ describe("rematchTranscripts freeze", () => {
     expect(u.speaker).toBe("SPEAKER_00");
   });
 
+  test("a transcript frozen by a sub-row edit is not re-matched, though nothing is pinned", () => {
+    const segments = [transcript({ id: "T", audio_start_time: 0, audio_end_time: 3, speaker: "SPEAKER_01", speaker_label: "Alice", speaker_matched_by: "auto" })];
+    const turns = [turn({ start_time: 0, end_time: 3, speaker: "SPEAKER_04", display_name: "Bob", matched_by: "auto" })];
+    const out = rematchTranscripts(segments, turns, new Set(["T"]));
+    expect(out).toBe(segments);
+  });
+
   test("unpinned transcripts still get retroactive label fill-in", () => {
     const segments = [transcript({ id: "U", audio_start_time: 0, audio_end_time: 3, source_device: "System" })];
     const assigned = new Map<string, unknown>();
@@ -190,11 +197,79 @@ describe("resolveLiveBlocks across a live split", () => {
     expect(out[1].display_name).toBeUndefined();
   });
 
-  test("an unrelated override leaves the auto display name in place", () => {
+  test("an override from another channel leaves the auto display name in place", () => {
     const withAuto = [block({ start: 0, end: 1, speaker: "SPEAKER_00", display_name: "Dana", matched_by: "auto" })];
     const out = resolveLiveBlocks(withAuto, {
-      windowOverrides: [{ cluster: "SPEAKER_09", start: 0, end: 1, name: "Eve" }],
+      sourceDevice: "System",
+      windowOverrides: [{ cluster: "MIC_SPEAKER_09", sourceDevice: "Microphone", start: 0, end: 1, name: "Eve" }],
     });
     expect(out[0]).toMatchObject({ display_name: "Dana", matched_by: "auto" });
+  });
+});
+
+describe("resolveLiveBlocks sub-row scope", () => {
+  // A, B, A: two sub-rows of one cluster around a second cluster, all auto.
+  const aba = [
+    block({ start: 0, end: 1, speaker: "SPEAKER_00", display_name: "Alice", matched_by: "auto", match_score: 0.9 }),
+    block({ start: 1, end: 2, speaker: "SPEAKER_01", display_name: "Alice", matched_by: "auto", match_score: 0.9 }),
+    block({ start: 2, end: 3, speaker: "SPEAKER_00", display_name: "Alice", matched_by: "auto", match_score: 0.9 }),
+  ];
+  const ov = (start: number, end: number, name: string, cluster = "SPEAKER_00") =>
+    ({ cluster, sourceDevice: "System", start, end, name });
+
+  test("editing one sub-row leaves same-cluster siblings alone", () => {
+    const out = resolveLiveBlocks(aba, { sourceDevice: "System", windowOverrides: [ov(0, 1, "Bob")] });
+    expect(out[0]).toMatchObject({ display_name: "Bob", matched_by: "user" });
+    expect(out[2]).toMatchObject({ display_name: "Alice", matched_by: "auto" });
+    expect(out[2]).toBe(aba[2]);
+  });
+
+  test("a later sub-row edit does not revert an earlier one", () => {
+    const out = resolveLiveBlocks(aba, {
+      sourceDevice: "System",
+      windowOverrides: [ov(1, 2, "Bob", "SPEAKER_01"), ov(2, 3, "Alice")],
+    });
+    expect(out[1]).toMatchObject({ display_name: "Bob", matched_by: "user" });
+    expect(out[2]).toMatchObject({ display_name: "Alice", matched_by: "user" });
+  });
+
+  test("confirm changes provenance only on the confirmed sub-row", () => {
+    const out = resolveLiveBlocks(aba, { sourceDevice: "System", windowOverrides: [ov(2, 3, "Alice")] });
+    expect(out.map(b => b.matched_by)).toEqual(["auto", "auto", "user"]);
+  });
+
+  test("re-attribution to another cluster keeps the override", () => {
+    const reattributed = [block({ start: 0, end: 1, speaker: "SPEAKER_05", display_name: "Carl", matched_by: "auto" })];
+    const out = resolveLiveBlocks(reattributed, { sourceDevice: "System", windowOverrides: [ov(0, 1, "Bob")] });
+    expect(out[0]).toMatchObject({ display_name: "Bob", matched_by: "user" });
+  });
+
+  test("a shifted boundary does not spill an override onto the neighbour", () => {
+    const shifted = [
+      block({ start: 0, end: 0.9, speaker: "SPEAKER_00", display_name: "Alice", matched_by: "auto" }),
+      block({ start: 0.9, end: 2, speaker: "SPEAKER_01", display_name: "Alice", matched_by: "auto" }),
+    ];
+    const out = resolveLiveBlocks(shifted, { sourceDevice: "System", windowOverrides: [ov(0, 1, "Bob")] });
+    expect(out[0].display_name).toBe("Bob");
+    expect(out[1]).toMatchObject({ display_name: "Alice", matched_by: "auto" });
+  });
+
+  test("the latest override wins", () => {
+    const out = resolveLiveBlocks(aba, {
+      sourceDevice: "System",
+      windowOverrides: [ov(0, 1, "Bob"), ov(0, 1.1, "Carol")],
+    });
+    expect(out[0].display_name).toBe("Carol");
+  });
+
+  test("a pin from before the split still applies after a sub-row edit", () => {
+    const out = resolveLiveBlocks(aba, {
+      sourceDevice: "System",
+      pinned: { cluster: "SPEAKER_00", name: "Alice" },
+      windowOverrides: [ov(1, 2, "Bob", "SPEAKER_01")],
+    });
+    expect(out[0]).toMatchObject({ display_name: "Alice", matched_by: "user" });
+    expect(out[1]).toMatchObject({ display_name: "Bob", matched_by: "user" });
+    expect(out[2]).toMatchObject({ display_name: "Alice", matched_by: "user" });
   });
 });
