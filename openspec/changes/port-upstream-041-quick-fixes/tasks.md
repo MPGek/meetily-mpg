@@ -127,8 +127,11 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 10. Integration checks
 
-- [ ] 10.1 Run the full Rust suite: `cargo test -p meetily --lib -- --skip audio::playback_monitor --skip audio::system_audio_commands`; verify: no failures, and the pass count equals the 0.1 baseline plus the new tests from groups 1-6 (expected +14 or +15: 3+1, 4, 1+1, 3, 0-1 for 5.3, 1).
-- [ ] 10.2 Run `cargo clippy -p meetily --all-targets --message-format=short`; verify: the warning count is at or below the 0.1 baseline, with no new warning in a file this change touched.
-- [ ] 10.3 Run the frontend checks in `frontend/`: `bun test tests/` and `pnpm exec tsc --noEmit -p .`; verify: both pass, and the test count equals the 0.1 baseline plus the 7.1 tests.
-- [ ] 10.4 Run `graphify update .` from the repo root; verify: it completes without errors (dirty `graphify-out/` files are expected).
-- [ ] 10.5 Run `openspec validate port-upstream-041-quick-fixes --strict`; verify: it reports the change as valid.
+- [x] 10.1 Run the full Rust suite: `cargo test -p meetily --lib -- --skip audio::playback_monitor --skip audio::system_audio_commands`; verify: no failures, and the pass count equals the 0.1 baseline plus the new tests from groups 1-6 (expected +14 or +15: 3+1, 4, 1+1, 3, 0-1 for 5.3, 1).
+  - Note (2026-10-02): 529 passed / 0 failed / 9 ignored (baseline 515 + 14 new: 4 chunking, 4 Claude, 2 decoder/retranscription, 3 worker, 1 analytics; 5.3 skipped).
+- [x] 10.2 Run `cargo clippy -p meetily --all-targets --message-format=short`; verify: the warning count is at or below the 0.1 baseline, with no new warning in a file this change touched.
+  - Note: 32 warnings, the same set as the baseline (compared with line numbers stripped).
+- [x] 10.3 Run the frontend checks in `frontend/`: `bun test tests/` and `pnpm exec tsc --noEmit -p .`; verify: both pass, and the test count equals the 0.1 baseline plus the 7.1 tests.
+  - Note: `bun test tests/` 96 pass (92 + 4 from 7.1); `tsc --noEmit` clean.
+- [x] 10.4 Run `graphify update .` from the repo root; verify: it completes without errors (dirty `graphify-out/` files are expected).
+- [x] 10.5 Run `openspec validate port-upstream-041-quick-fixes --strict`; verify: it reports the change as valid.
