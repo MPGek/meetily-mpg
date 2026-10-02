@@ -122,7 +122,7 @@ Layer-level view; for file- and symbol-level detail use graphify (see [CODEBASE_
 | **Entry Point** | `lib.rs`, `main.rs`, `tray.rs`, `onboarding.rs`, `panic_log.rs` | Tauri builder and command registration (`generate_handler!`), system tray, onboarding, panic hook writing `logs/panic.log` |
 | **Audio Capture & Devices** | `audio/capture/`, `audio/devices/`, `audio/devices/platform/` | Microphone + system audio streams (cpal, WASAPI, CoreAudio), device enumeration, disconnect/reconnect monitoring |
 | **Audio Pipeline** | `audio/` (pipeline, VAD, mixing, processing modules) | Per-channel Silero VAD, stereo mix (left=mic / right=system), RNNoise/HPF, ducking |
-| **Recording** | `audio/recording/` (lifecycle, devices, stop), `audio/recording_commands.rs` | Recording start/stop/pause orchestration; `recording_commands.rs` is the thin Tauri command layer over `audio/recording/` |
+| **Recording** | `audio/recording/` (lifecycle, devices, device_recovery, stop), `audio/recording_commands.rs` | Recording start/stop/pause orchestration and mid-recording mic recovery (`device_recovery`); `recording_commands.rs` is the thin Tauri command layer over `audio/recording/` |
 | **Saving & Import** | `audio/` (incremental saver, recording saver, retranscription, import) | Checkpoint-based saving for crash recovery, Enhance re-transcription, audio import |
 | **Speaker Diarization** | `audio/diarization/` | Offline (batch) + online (streaming) diarization and speaker identity matching behind one entry point, `DiarizationEngine` |
 | **Word Alignment** | `audio/word_alignment/` | Post-ASR CTC forced alignment refining per-token timestamps |
@@ -294,7 +294,7 @@ The Rust backend uses **tokio async runtime** extensively:
 - Transcription chunks are processed via parallel processor with rayon thread pool
 - Database operations use sqlx's async interface
 - Recording state is managed through `Arc<RwLock<T>>` and `Arc<AtomicBool>` for shared mutable state
-- Device monitoring uses mpsc channels for event-driven reconnection
+- Device monitoring feeds an mpsc channel consumed by a per-session backend processor (`audio/recording/device_recovery.rs`) that switches a disconnected mic to the system default input
 - Post-processing uses unbounded channels for decoupled pipeline stages
 - Summary cancellation uses `CancellationToken` for graceful shutdown
 - Model downloads (Parakeet, Whisper, word alignment) share `model_download::DownloadOwners`: one owner per model with its own `CancellationToken`, a cancel that returns `cancelled` or `pending` (after 5 s), and an owner released only by its worker after cleanup, so a retry cannot start a second writer. Parakeet and alignment use the exact-size resumable `model_download::transfer` (skip only on exact size, `Range` resume validated against `Content-Range`, partials kept on cancel or error)

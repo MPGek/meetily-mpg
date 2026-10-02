@@ -32,6 +32,9 @@ unsafe impl Send for StreamBackend {}
 pub struct AudioStream {
     device: Arc<AudioDevice>,
     backend: StreamBackend,
+    /// The device's native sample rate and channel count, before the capture
+    /// chain converts it to 48 kHz mono.
+    native_format: (u32, u16),
 }
 
 // SAFETY: AudioStream contains StreamBackend which we've marked as Send
@@ -151,6 +154,7 @@ impl AudioStream {
         Ok(Self {
             device,
             backend: StreamBackend::Cpal(stream),
+            native_format: (config.sample_rate().0, config.channels()),
         })
     }
 
@@ -255,6 +259,7 @@ impl AudioStream {
         Ok(Self {
             device: device.clone(),
             backend: StreamBackend::CoreAudio { task: Some(task) },
+            native_format: (sample_rate, 1),
         })
     }
 
@@ -345,6 +350,11 @@ impl AudioStream {
     /// Get device info
     pub fn device(&self) -> &AudioDevice {
         &self.device
+    }
+
+    /// Native sample rate (Hz) and channel count of the captured device.
+    pub fn native_format(&self) -> (u32, u16) {
+        self.native_format
     }
 
     /// Stop the stream
@@ -505,6 +515,18 @@ impl AudioStreamManager {
             info!("All audio streams stopped successfully");
             Ok(())
         }
+    }
+
+    /// Take the microphone stream out, leaving system audio running. The
+    /// caller stops it outside any lock: a cpal teardown of a vanished device
+    /// can stall.
+    pub fn take_mic_stream(&mut self) -> Option<AudioStream> {
+        self.microphone_stream.take()
+    }
+
+    /// Install a replacement microphone stream after a mic switch.
+    pub fn set_mic_stream(&mut self, stream: AudioStream) {
+        self.microphone_stream = Some(stream);
     }
 
     /// Get stream count

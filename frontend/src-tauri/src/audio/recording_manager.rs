@@ -548,6 +548,35 @@ impl RecordingManager {
         self.recording_saver.get_meeting_folder().cloned()
     }
 
+    /// Move the device event receiver out, for the session's device event
+    /// processor (`recording::device_recovery`). Returns `None` once taken.
+    pub fn take_device_event_receiver(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<DeviceEvent>> {
+        self.device_event_receiver.take()
+    }
+
+    /// Mic switch Phase 1: take the mic stream out so the caller can tear it
+    /// down without holding `RECORDING_MANAGER`. System audio keeps running.
+    pub fn take_mic_stream_for_swap(&mut self) -> Option<super::stream::AudioStream> {
+        self.stream_manager.take_mic_stream()
+    }
+
+    /// Mic switch Phase 3: install the replacement stream, record the new
+    /// device in the session state and point the device monitor at it.
+    /// Synchronous, so it is safe under the `RECORDING_MANAGER` lock.
+    pub fn install_swapped_mic(
+        &mut self,
+        stream: super::stream::AudioStream,
+        device: Arc<AudioDevice>,
+    ) {
+        self.stream_manager.set_mic_stream(stream);
+        if let Some(ref monitor) = self.device_monitor {
+            monitor.notify_mic_swapped(device.name.clone());
+        }
+        self.state.set_microphone_device(device);
+    }
+
     /// Get reference to recording state for external access
     pub fn get_state(&self) -> &Arc<RecordingState> {
         &self.state
