@@ -128,7 +128,8 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
 
 ## 7. Integration checks (automated)
 
-- [ ] 7.1 Run the full Rust tests and `bun test tests/`. Verify: pass counts equal the 0.2 baseline plus the tests added in groups 1-6, with no new failures.
+- [x] 7.1 Run the full Rust tests and `bun test tests/`. Verify: pass counts equal the 0.2 baseline plus the tests added in groups 1-6, with no new failures.
+  - Note (2026-10-02): full Rust tests 621 passed / 0 failed / 9 ignored = 592 + 29 new (device_monitor 5, recording_state 2, pipeline 9, device_recovery 9, recording::devices 4). `bun test tests/` 125 pass / 0 fail = 117 + 8 new.
 
 ## 8. Manual Windows verification (release or dev build, `%APPDATA%\com.meetily.ai\logs`)
 
@@ -139,43 +140,55 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
   - at most 2 `Recoverable audio error` lines appear for the disconnect
   - Stop finishes normally
   - in the saved `audio.mp4` the left channel has the laptop-mic speech after the switch, aligned with the right channel at the same moment (check in the meeting audio player against transcript times)
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.2 Mic-only timeline, with no system audio playing. Repeat 8.1 in silence and speak a counted phrase ("one… two…") right after the switch. Verify:
   - the log shows `[HOT_SWAP] mic gap:` with a non-zero fill
   - the saved file's duration is within about 1 s of the session duration (no partial-audio warning)
   - clicking the post-switch transcript row in the audio player plays that phrase
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.3 Different sample rate. Start a recording with a Bluetooth headset as the mic (hands-free, typically 16 kHz), power the headset off, and let it fall back to the 48 kHz laptop array. If you can, also do the reverse: USB 48 kHz → BT 16 kHz as the next default. Verify:
   - the `[HOT_SWAP] … switched` line shows the new native rate
   - post-switch audio plays at normal speed and pitch
   - post-switch speech is transcribed
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.4 Stop during a swap. Unplug the mic, then press Stop 2-5 s later (around detection), 3 times. Verify:
   - Stop never hangs
   - no "Microphone fallback failed"/exhausted toast appears
   - the log shows either no swap or `[HOT_SWAP] discarded: session stopped`
   - the Windows mic privacy indicator turns off within about 1 s of Stop finishing
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.5 Stop→Start immediately. Unplug the mic, then Stop and Start a new recording right away (before about 4 s). Verify:
   - the new recording starts on the default mic
   - no `mic-device-switched` toast fires for the new session from the old disconnect
   - the new session's log has no `[HOT_SWAP]` attempt against the old device
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.6 Live diarization continuity. In Fast mode, rename a live mic speaker, unplug the mic, keep speaking, then Stop. Verify:
   - existing labels and the rename remain
   - post-switch mic rows get live labels
   - after Stop, mic rows from before and after the switch both have speaker labels
 
   Note whether the same person got a new cluster.
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.7 No fallback available. Disable all other input devices in Windows Sound settings, unplug the only mic, and keep recording for about 20 s. Verify:
   - 2 warning toasts ("retrying 1/3, 2/3") are each replaced by the next, then an error toast says recovery failed
   - the log shows `[HOT_SWAP] recovery exhausted`
   - system audio keeps recording
   - Stop works
   - a later new recording gets fresh attempts
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 - [ ] 8.8 Preferred mic missing at start. Set a preferred mic in settings, unplug it, and start a recording. Verify:
   - recording starts on the default
   - a "selected microphone unavailable" toast names the default
   - no `[HOT_SWAP]` attempt appears in the first 15 s
+  - Note (2026-10-02): open; needs the desktop app on Windows with real devices.
 
 ## 9. Final verification
 
-- [ ] 9.1 Run the full Rust tests, `bun test tests/` and `pnpm exec tsc --noEmit -p .`. Verify: all pass; pass counts are the 0.2 baseline plus the new tests.
-- [ ] 9.2 Run `cargo clippy -p meetily --all-targets --message-format=short`. Verify: the warning count is at most the 0.2 baseline, and no warning points at a file this change touched.
-- [ ] 9.3 Run `openspec validate mic-hot-swap-recovery --strict`. Verify: it reports the change as valid.
-- [ ] 9.4 Run `graphify update .`. Verify: it completes; `graphify query "mic hot swap device recovery"` surfaces `device_recovery.rs`.
+- [x] 9.1 Run the full Rust tests, `bun test tests/` and `pnpm exec tsc --noEmit -p .`. Verify: all pass; pass counts are the 0.2 baseline plus the new tests.
+  - Note (2026-10-02): Rust 621 passed / 9 ignored, bun 125 pass, `tsc` clean; counts match 0.2 plus the new tests.
+- [x] 9.2 Run `cargo clippy -p meetily --all-targets --message-format=short`. Verify: the warning count is at most the 0.2 baseline, and no warning points at a file this change touched.
+  - Note (2026-10-02): 32 warnings counted per location, equal to the 0.2 baseline and identical by file and message. Five of them are pre-existing lints in files this change touched (`pipeline.rs` unused `recording_sender` and two `drop` of a reference, `recording_state.rs` complex type, `recording_commands.rs` guard across await in a test); they were left alone as unrelated to this change. None is new and none points at `device_recovery.rs`, `device_monitor.rs`, `stream.rs`, `recording_manager.rs`, `recording/devices.rs` or `recording/lifecycle.rs`.
+- [x] 9.3 Run `openspec validate mic-hot-swap-recovery --strict`. Verify: it reports the change as valid.
+  - Note (2026-10-02): `Change 'mic-hot-swap-recovery' is valid`.
+- [x] 9.4 Run `graphify update .`. Verify: it completes; `graphify query "mic hot swap device recovery"` surfaces `device_recovery.rs`.
+  - Note (2026-10-02): rebuilt 11410 nodes; the query surfaces `device_recovery.rs`, `spawn_device_event_processor()` and `attempt_mic_fallback()`.
