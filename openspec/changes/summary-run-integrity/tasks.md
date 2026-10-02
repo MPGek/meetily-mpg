@@ -2,25 +2,28 @@
 
 ## 0. Preconditions
 
-- [ ] 0.1 Confirm `port-upstream-041-quick-fixes` is archived (applied): #603 `chunk_text` coverage and #694 Claude thinking-block parsing are in `summary/processor.rs` / `summary/llm_client.rs`. Re-verify every file:line cited in proposal.md and design.md against that code, and record any drift as a note under this task. Verify: `openspec list` shows it archived, and `git log --oneline -- frontend/src-tauri/src/summary/llm_client.rs` shows its commit.
-- [ ] 0.2 Record baselines in this task's note. Run each command from the folder named in docs/CODEBASE_MAP_OPERATIONS.md:
+- [x] 0.1 Confirm `port-upstream-041-quick-fixes` is archived (applied): #603 `chunk_text` coverage and #694 Claude thinking-block parsing are in `summary/processor.rs` / `summary/llm_client.rs`. Re-verify every file:line cited in proposal.md and design.md against that code, and record any drift as a note under this task. Verify: `openspec list` shows it archived, and `git log --oneline -- frontend/src-tauri/src/summary/llm_client.rs` shows its commit.
+  - Note (2026-10-02): archived as `archive/2026-10-02-port-upstream-041-quick-fixes` (not in `openspec list`); `llm_client.rs` log shows 4210193 (#694), `processor.rs` has c0cd183 (#603). Drift, all from those two commits: `llm_client.rs` `generate_summary` is now 129-409 (was 114-394), the cancel `select!` 322-347 (305-330), `.json()` 354/368 (336/352), request body 245-282 (230-265); `ChatRequest` 17-27 and `MessageContent` 40-43 unchanged. `processor.rs` shifted +5: `generate_meeting_summary` 332-609, chunk loop 405-451 (push 440, skip 443-449), empty-chunks branch 453-458, combine 467-494, final report 526-542, completion `info!` 607, `run_markdown_transform` 612-655, `clean_llm_markdown_output` 269-289; regex 11-12 unchanged. `service.rs`, `commands.rs`, `repositories/summary.rs`, `setup.rs` and the frontend citations match.
+- [x] 0.2 Record baselines in this task's note. Run each command from the folder named in docs/CODEBASE_MAP_OPERATIONS.md:
   - `cargo test -p meetily --lib -- --skip audio::playback_monitor --skip audio::system_audio_commands` (passed/failed/ignored counts);
   - `cargo test -p meetily --lib summary` and `cargo test -p meetily --lib database::repositories::summary` (counts);
   - `cargo clippy -p meetily --all-targets --message-format=short 2>&1 | grep -c "^warning"` (warning count);
   - `bun test tests/` and `pnpm exec tsc --noEmit -p .` in `frontend/` (pass counts, tsc clean or not).
 
   Verify: all five numbers are written down.
+  - Note (2026-10-02): full lib suite 563 passed / 0 failed / 9 ignored; `--lib summary` 97 passed; `--lib database::repositories::summary` 0 tests; clippy `grep -c "^warning"` = 18 (mostly build-script noise lines), the real per-location count `grep -c ": warning"` = 32 (pre-existing in touched files: `llm_client.rs:94` `from_str` should-implement-trait, `templates/defaults.rs:15`); `bun test tests/` 99 pass / 0 fail; `tsc --noEmit` clean. The ": warning" count is the one compared in later tasks.
 
 ## 1. LLM client compatibility and stage cleaning (proposal a + c)
 
-- [ ] 1.1 In `summary/llm_client.rs`:
+- [x] 1.1 In `summary/llm_client.rs`:
   - add `reasoning_effort: Option<&'static str>` (skip if none) to `ChatRequest`, set to `Some("none")` only for `LLMProvider::Ollama`;
   - make `MessageContent` `{ content: Option<String>, reasoning: Option<String>, reasoning_content: Option<String> }` with `#[serde(default)]`;
   - read the visible text as `content.unwrap_or_default().trim()`;
   - `info!` the discarded reasoning length when non-empty (design D4/D5).
 
   Verify: unit tests (a) the Ollama body has `reasoning_effort == "none"` and the OpenAI/Groq/OpenRouter/CustomOpenAI bodies do not; (b) `{"content":null,"reasoning_content":"x"}` and a message with no `content` key both parse to empty text; (c) `content` plus `reasoning` yields only `content`. Run `cargo test -p meetily --lib summary::llm_client`.
-- [ ] 1.2 Add `ollama_rejected_reasoning_effort(&LlmError) -> bool`: true for `LlmError::Http { status: 400 | 422, body }` when the lowercased body contains `reasoning_effort` or `think`. In `generate_summary`, wrap the send in one async block inside the existing cancellation `select!`. On a matching Ollama error, re-send once with `reasoning_effort` removed from a cloned body (design D5).
+  - Note (2026-10-02): the OpenAI-compatible body is built by a new private `build_chat_request` helper (moved out of `generate_summary` unchanged apart from `reasoning_effort`) so test (a) can cover OpenAI/Groq/OpenRouter, whose URLs are hardcoded and cannot be pointed at wiremock. Visible text / discarded-reasoning length are `MessageContent::visible_text` / `discarded_reasoning_len`.
+- [x] 1.2 Add `ollama_rejected_reasoning_effort(&LlmError) -> bool`: true for `LlmError::Http { status: 400 | 422, body }` when the lowercased body contains `reasoning_effort` or `think`. In `generate_summary`, wrap the send in one async block inside the existing cancellation `select!`. On a matching Ollama error, re-send once with `reasoning_effort` removed from a cloned body (design D5).
 
   Verify: unit test of the matcher (400/422 positive; 401, 500, and a 400 `"invalid model"` negative). Wiremock tests on `/v1/chat/completions`:
   - first request 400 `{"error":{"param":"reasoning_effort"}}`, second 200 → success, 2 requests received, the second body has no `reasoning_effort`;
@@ -29,16 +32,19 @@
   - a non-Ollama provider pointed at the mock with a reasoning-400 → exactly 1 request.
 
   Run `cargo test -p meetily --lib summary::llm_client`.
-- [ ] 1.3 In `summary/processor.rs`:
+  - Note (2026-10-02): the 401 negative case is `LlmError::AuthFailed { status: 401 }`, since `send_with_retry` never returns 401 as `LlmError::Http`; the non-Ollama wiremock case uses `CustomOpenAI` pointed at the mock.
+- [x] 1.3 In `summary/processor.rs`:
   - replace `THINKING_TAG_REGEX` with the envelope regex `(?is)<think(?:ing)?(?:\s[^>]*)?>.*?</think(?:ing)?\s*>` and the marker regex `(?i)</?think(?:ing)?(?:\s[^>]*)?>`;
   - keep `clean_llm_markdown_output`'s signature and re-export, using the envelope regex;
   - add private `clean_stage_output(stage, raw) -> Result<StageOutput { markdown, reasoning_stripped }, String>` with the two error messages from design D6.
 
   Verify: unit tests for closed envelopes anywhere (mixed case, attributes, inside a code fence), `<thinker>` kept unchanged, the unclosed `<think>…`, stray `</thinking>` and attributed-unclosed cases → marker error, reasoning-only and empty-fence output → empty error. Run `cargo test -p meetily --lib summary::processor`.
-- [ ] 1.4 Apply `clean_stage_output` to the final-report stage (`"Final summary"`), the combine stage (`"Combined summary"`), and `run_markdown_transform` (stage label = its `failure_label`). OR `reasoning_stripped` across stages in `generate_meeting_summary` and include it in the completion `info!` line. Do not change the return type (design D4).
+- [x] 1.4 Apply `clean_stage_output` to the final-report stage (`"Final summary"`), the combine stage (`"Combined summary"`), and `run_markdown_transform` (stage label = its `failure_label`). OR `reasoning_stripped` across stages in `generate_meeting_summary` and include it in the completion `info!` line. Do not change the return type (design D4).
 
   Verify: unit tests — empty normalization output still falls back to the pass-1 markdown (`english_markdown_after_normalization_result`); a cancelled normalization still errors. Run `cargo test -p meetily --lib summary` (all pass) and `cargo check -p meetily`.
-- [ ] 1.5 Commit group 1 on its own. Verify: `cargo test -p meetily --lib summary` passes and `cargo clippy -p meetily --all-targets --message-format=short` shows no new warnings against the 0.2 baseline.
+  - Note (2026-10-02): the cancelled-normalization case is covered by the existing `cancelled_english_normalization_is_not_swallowed`; the new test is `empty_normalization_output_falls_back_to_pass_one_markdown`. `run_markdown_transform`, `translate_markdown` and `normalize_markdown_to_english` now return the private `StageOutput` so the flag can be ORed. `cargo test -p meetily --lib summary`: 111 passed (97 + 14 new).
+- [x] 1.5 Commit group 1 on its own. Verify: `cargo test -p meetily --lib summary` passes and `cargo clippy -p meetily --all-targets --message-format=short` shows no new warnings against the 0.2 baseline.
+  - Note (2026-10-02): clippy 32 `: warning` lines, same as baseline (only pre-existing `llm_client.rs` `from_str`, now line 170). rustfmt applied to the two touched files; it changed only the new code.
 
 ## 2. Chunk failure semantics (proposal b)
 

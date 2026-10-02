@@ -8,8 +8,41 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 // Compile regex once and reuse (significant performance improvement for repeated calls)
-static THINKING_TAG_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?s)<think(?:ing)?>.*?</think(?:ing)?>").unwrap());
+/// A closed `<think>`/`<thinking>` envelope, any case, optional attributes.
+static THINKING_ENVELOPE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<think(?:ing)?(?:\s[^>]*)?>.*?</think(?:ing)?\s*>").unwrap());
+
+/// Any opening or closing reasoning marker left after envelope removal.
+static THINKING_MARKER_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)</?think(?:ing)?(?:\s[^>]*)?>").unwrap());
+
+/// One stage's cleaned output, and whether a reasoning envelope was removed.
+#[derive(Debug, PartialEq)]
+struct StageOutput {
+    markdown: String,
+    reasoning_stripped: bool,
+}
+
+/// Cleans a stage's raw LLM output strictly: an unterminated or stray
+/// reasoning marker, or nothing visible after cleaning, fails the stage.
+fn clean_stage_output(stage: &str, raw: &str) -> Result<StageOutput, String> {
+    let reasoning_stripped = THINKING_ENVELOPE_REGEX.is_match(raw);
+    let markdown = clean_llm_markdown_output(raw);
+    if THINKING_MARKER_REGEX.is_match(&markdown) {
+        return Err(format!(
+            "{stage} contained an unterminated reasoning marker"
+        ));
+    }
+    if markdown.is_empty() {
+        return Err(format!(
+            "{stage} returned no visible summary content after reasoning removal"
+        ));
+    }
+    Ok(StageOutput {
+        markdown,
+        reasoning_stripped,
+    })
+}
 
 const ENGLISH_BASE_SUMMARY_INSTRUCTION: &str =
     "**Write the summary/report in English regardless of transcript language; non-English prose is invalid.**";
@@ -268,7 +301,7 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
 /// Cleaned markdown string
 pub fn clean_llm_markdown_output(markdown: &str) -> String {
     // Remove <think>...</think> or <thinking>...</thinking> blocks using cached regex
-    let without_thinking = THINKING_TAG_REGEX.replace_all(markdown, "");
+    let without_thinking = THINKING_ENVELOPE_REGEX.replace_all(markdown, "");
 
     let trimmed = without_thinking.trim();
 
@@ -363,6 +396,9 @@ pub async fn generate_meeting_summary(
 
     let total_tokens = rough_token_count(text);
     info!("Transcript length: {} tokens", total_tokens);
+
+    // Whether any stage removed a reasoning envelope; logged once, not persisted.
+    let mut reasoning_stripped = false;
 
     let (mut english_markdown, successful_chunk_count) = if let Some(cached) =
         resolve_cached_english(cached_english, summary_language)
@@ -472,7 +508,7 @@ pub async fn generate_meeting_summary(
                 let combined_text = chunk_summaries.join("\n---\n");
                 let system_prompt_combine = "You are an expert at synthesizing meeting summaries.";
                 let user_prompt_combine = build_combine_summary_user_prompt(&combined_text);
-                generate_summary(
+                let raw_combined = generate_summary(
                     client,
                     provider,
                     model_name,
@@ -488,7 +524,10 @@ pub async fn generate_meeting_summary(
                     debug_log_dir.clone(),
                     cancellation_token,
                 )
-                .await?
+                .await?;
+                let combined = clean_stage_output("Combined summary", &raw_combined)?;
+                reasoning_stripped |= combined.reasoning_stripped;
+                combined.markdown
             } else {
                 chunk_summaries.remove(0)
             };
@@ -541,7 +580,9 @@ pub async fn generate_meeting_summary(
         )
         .await?;
 
-        let english_markdown = clean_llm_markdown_output(&raw_markdown);
+        let final_report = clean_stage_output("Final summary", &raw_markdown)?;
+        reasoning_stripped |= final_report.reasoning_stripped;
+        let english_markdown = final_report.markdown;
         info!("Summary pass completed ({} chars)", english_markdown.len());
 
         (english_markdown, successful_chunk_count)
@@ -570,7 +611,10 @@ pub async fn generate_meeting_summary(
             )
             .await
             {
-                Ok(translated) => translated,
+                Ok(translated) => {
+                    reasoning_stripped |= translated.reasoning_stripped;
+                    translated.markdown
+                }
                 Err(e) => return Err(format!("Translation to {} failed: {}", name, e)),
             }
         }
@@ -579,32 +623,38 @@ pub async fn generate_meeting_summary(
                 "English target with detected transcript language {:?}; running soft English normalization",
                 detected_transcript_language
             );
-            let normalized = english_markdown_after_normalization_result(
+            let normalization = normalize_markdown_to_english(
+                client,
+                provider,
+                model_name,
+                api_key,
                 &english_markdown,
-                normalize_markdown_to_english(
-                    client,
-                    provider,
-                    model_name,
-                    api_key,
-                    &english_markdown,
-                    ollama_endpoint,
-                    custom_openai_endpoint,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    app_data_dir,
-                    cancellation_token,
-                    debug_log_dir.clone(),
-                )
-                .await,
-            )?;
+                ollama_endpoint,
+                custom_openai_endpoint,
+                max_tokens,
+                temperature,
+                top_p,
+                app_data_dir,
+                cancellation_token,
+                debug_log_dir.clone(),
+            )
+            .await
+            .map(|output| {
+                reasoning_stripped |= output.reasoning_stripped;
+                output.markdown
+            });
+            let normalized =
+                english_markdown_after_normalization_result(&english_markdown, normalization)?;
             english_markdown = normalized.clone();
             normalized
         }
         FinalLanguageAction::ReturnEnglish => english_markdown.clone(),
     };
 
-    info!("Summary generation completed successfully");
+    info!(
+        "Summary generation completed successfully (reasoning_stripped: {})",
+        reasoning_stripped
+    );
     Ok((final_markdown, english_markdown, successful_chunk_count))
 }
 
@@ -625,7 +675,7 @@ async fn run_markdown_transform(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
     debug_log_dir: Option<PathBuf>,
-) -> Result<String, String> {
+) -> Result<StageOutput, String> {
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
             return Err("Summary generation was cancelled".to_string());
@@ -651,7 +701,7 @@ async fn run_markdown_transform(
     .await
     .map_err(|e| format!("{failure_label} failed: {e}"))?;
 
-    Ok(clean_llm_markdown_output(&raw))
+    clean_stage_output(failure_label, &raw)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -670,7 +720,7 @@ async fn translate_markdown(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
     debug_log_dir: Option<PathBuf>,
-) -> Result<String, String> {
+) -> Result<StageOutput, String> {
     info!("Translation pass: target language = {}", target_language);
 
     let system_prompt = translation_system_prompt(target_language);
@@ -713,7 +763,7 @@ async fn normalize_markdown_to_english(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
     debug_log_dir: Option<PathBuf>,
-) -> Result<String, String> {
+) -> Result<StageOutput, String> {
     info!("English normalization pass: preserving Markdown structure");
 
     let user_prompt = format!(
@@ -885,6 +935,69 @@ mod tests {
             Err("Summary generation was cancelled".to_string())
         )
         .is_err());
+    }
+
+    // reasoning cleaning ------------------------------------------------------
+
+    #[test]
+    fn envelope_with_attributes_and_mixed_case_is_removed() {
+        let cleaned = clean_llm_markdown_output(
+            r#"Intro <THINKING class="internal">private</THINKING> # Meeting"#,
+        );
+        assert!(cleaned.contains("Intro"));
+        assert!(cleaned.contains("# Meeting"));
+        assert!(!cleaned.contains("private"));
+    }
+
+    #[test]
+    fn envelopes_anywhere_are_removed_including_inside_a_fence() {
+        let raw = "<think>a</think>\n```markdown\n<Think >b\nc</think >\n# Title\nBody\n```\n<thinking>d</thinking>";
+        let out = clean_stage_output("Final summary", raw).unwrap();
+        assert_eq!(out.markdown, "# Title\nBody");
+        assert!(out.reasoning_stripped);
+    }
+
+    #[test]
+    fn lookalike_thinker_tag_is_kept() {
+        let out = clean_stage_output("Final summary", "<thinker>Visible</thinker>").unwrap();
+        assert_eq!(out.markdown, "<thinker>Visible</thinker>");
+        assert!(!out.reasoning_stripped);
+    }
+
+    #[test]
+    fn unclosed_or_stray_markers_fail_the_stage() {
+        for raw in [
+            "Visible text\n<think>private",
+            "Visible</thinking> text",
+            "Visible <think reason=\"x\">private",
+        ] {
+            assert_eq!(
+                clean_stage_output("Final summary", raw).unwrap_err(),
+                "Final summary contained an unterminated reasoning marker",
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_only_or_empty_fence_output_fails_the_stage() {
+        for raw in ["<think>only reasoning</think>", "```markdown\n```", "  "] {
+            assert_eq!(
+                clean_stage_output("Summary chunk", raw).unwrap_err(),
+                "Summary chunk returned no visible summary content after reasoning removal",
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_normalization_output_falls_back_to_pass_one_markdown() {
+        let stage = clean_stage_output("English normalization pass", "<think>x</think>")
+            .map(|output| output.markdown);
+        assert_eq!(
+            english_markdown_after_normalization_result("# Original", stage).unwrap(),
+            "# Original"
+        );
     }
 
     // resolve_cached_english matrix -------------------------------------------
