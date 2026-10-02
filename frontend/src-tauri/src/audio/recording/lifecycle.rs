@@ -8,7 +8,10 @@ use log::{error, info, warn};
 use std::sync::{atomic::Ordering, Arc};
 use tauri::{AppHandle, Emitter, Runtime};
 
-use super::devices::{resolve_microphone_device, resolve_system_audio_device};
+use super::device_recovery::{
+    spawn_device_event_processor, MicDeviceSwitchedPayload, SwitchReason, UserEvent,
+};
+use super::devices::{resolve_microphone_device, resolve_system_audio_device, ResolvedMic};
 use crate::audio::diarization::engine::{DiarizationEngine, LiveSessionConfig};
 use crate::audio::online_diarization::{clear_stats, DiarizationMode};
 use crate::audio::recording_commands::{
@@ -17,9 +20,20 @@ use crate::audio::recording_commands::{
 };
 use crate::audio::sync_ext::LockRecover;
 use crate::audio::transcription::{self, reset_speech_detected_flag, TranscriptUpdate};
-use crate::audio::{
-    default_input_device, default_output_device, parse_audio_device, RecordingManager,
-};
+use crate::audio::{default_output_device, parse_audio_device, RecordingManager};
+
+/// Tell the user when the start fell back from an unavailable requested or
+/// preferred mic to the system default (design D6).
+fn notify_mic_unavailable_at_start<R: Runtime>(app: &AppHandle<R>, resolved: &ResolvedMic) {
+    if let Some(previous) = &resolved.fell_back_from {
+        UserEvent::MicDeviceSwitched(MicDeviceSwitchedPayload {
+            device_name: resolved.device.name.clone(),
+            previous_device_name: previous.clone(),
+            reason: SwitchReason::UnavailableAtStart,
+        })
+        .emit(app);
+    }
+}
 
 /// Start recording with default devices and optional meeting name
 pub async fn start_recording_with_meeting_name<R: Runtime>(
@@ -87,52 +101,20 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // ============================================================================
     // MICROPHONE DEVICE RESOLUTION: Preference → Default → Error
     // ============================================================================
-    let microphone_device = match preferred_mic_name {
-        Some(pref_name) => {
-            info!("🎤 Attempting to use preferred microphone: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
-                Ok(device) => {
-                    info!("✅ Using preferred microphone: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!(
-                        "⚠️ Preferred microphone '{}' not available: {}",
-                        pref_name, e
-                    );
-                    warn!("   Falling back to system default microphone...");
-                    match default_input_device() {
-                        Ok(device) => {
-                            info!("✅ Using default microphone: '{}'", device.name);
-                            Some(Arc::new(device))
-                        }
-                        Err(default_err) => {
-                            error!(
-                                "❌ No microphone available (preferred and default both failed)"
-                            );
-                            return Err(format!(
-                                "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
-                                pref_name, default_err
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            info!("🎤 No microphone preference set, using system default");
-            match default_input_device() {
-                Ok(device) => {
-                    info!("✅ Using default microphone: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    error!("❌ No default microphone available");
-                    return Err(format!("No microphone device available: {}", e));
-                }
-            }
+    let resolved_mic = match resolve_microphone_device(None, preferred_mic_name.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(no_mic) => {
+            error!("❌ No microphone available");
+            return Err(match &preferred_mic_name {
+                Some(pref_name) => format!(
+                    "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
+                    pref_name, no_mic.default_error
+                ),
+                None => no_mic.message(),
+            });
         }
     };
+    let microphone_device = Some(resolved_mic.device.clone());
 
     // ============================================================================
     // SYSTEM AUDIO DEVICE RESOLUTION: Preference → Default → None (optional)
@@ -203,6 +185,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         .start_recording(microphone_device, system_device, auto_save)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    notify_mic_unavailable_at_start(&app, &resolved_mic);
+
+    // The session's device events go to its recovery processor.
+    let device_events = manager.take_device_event_receiver();
+    let session = manager.get_state().clone();
 
     // Store the manager globally to keep it alive
     {
@@ -225,6 +212,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     IS_RECORDING.store(true, Ordering::SeqCst);
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
+
+    // Backend mic recovery for this session (mic-disconnect-recovery).
+    if let Some(device_events) = device_events {
+        spawn_device_event_processor(app.clone(), device_events, session);
+    }
 
     // Start optimized parallel transcription task and store handle
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -367,10 +359,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Resolve devices with fallback: explicit name → saved preference → system default.
     // Microphone is required; system audio is optional (skipped only when no
     // default output device exists).
-    let mic_device = Some(resolve_microphone_device(
-        mic_device_name.as_deref(),
-        preferred_mic_name.as_deref(),
-    )?);
+    let resolved_mic =
+        resolve_microphone_device(mic_device_name.as_deref(), preferred_mic_name.as_deref())
+            .map_err(|no_mic| no_mic.message())?;
+    let mic_device = Some(resolved_mic.device.clone());
 
     let system_device = resolve_system_audio_device(
         system_device_name.as_deref(),
@@ -430,6 +422,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         .start_recording(mic_device, system_device, auto_save)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    notify_mic_unavailable_at_start(&app, &resolved_mic);
+
+    // The session's device events go to its recovery processor.
+    let device_events = manager.take_device_event_receiver();
+    let session = manager.get_state().clone();
 
     // Store the manager globally to keep it alive
     {
@@ -452,6 +449,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     IS_RECORDING.store(true, Ordering::SeqCst);
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
+
+    // Backend mic recovery for this session (mic-disconnect-recovery).
+    if let Some(device_events) = device_events {
+        spawn_device_event_processor(app.clone(), device_events, session);
+    }
 
     // Start optimized parallel transcription task and store handle
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);

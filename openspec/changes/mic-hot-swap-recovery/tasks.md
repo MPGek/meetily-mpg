@@ -99,15 +99,18 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
 
 ## 5. Start-path wiring and start-time mic resolution
 
-- [ ] 5.1 Add the pure `match_input_name(requested, enumerated: &[String]) -> Option<String>`. On Windows it accepts an exact or `contains` match, mirroring `get_windows_device`; elsewhere it requires an exact match. Add a thin `find_present_input(name)` over the platform's input enumeration. Change `resolve_microphone_device` to return `ResolvedMic { device /* enumerated name */, fell_back_from }` (design D6). Verify with unit tests in `recording/devices.rs`:
+- [x] 5.1 Add the pure `match_input_name(requested, enumerated: &[String]) -> Option<String>`. On Windows it accepts an exact or `contains` match, mirroring `get_windows_device`; elsewhere it requires an exact match. Add a thin `find_present_input(name)` over the platform's input enumeration. Change `resolve_microphone_device` to return `ResolvedMic { device /* enumerated name */, fell_back_from }` (design D6). Verify with unit tests in `recording/devices.rs`:
   - an exact match returns the enumerated name
   - on Windows, a substring match returns the full enumerated name
   - a missing name returns `None`
   - an empty list returns `None`
-- [ ] 5.2 Replace the inline mic resolution in `start_recording_with_meeting_name` (`lifecycle.rs:90-135`) with `resolve_microphone_device(None, preferred_mic_name)`. Keep its existing error message text for "no microphone". In both start paths, after `start_recording` succeeds, emit `mic-device-switched { reason: "unavailable_at_start" }` when `fell_back_from` is set. Verify: `cargo check -p meetily`; `cargo test -p meetily --lib recording` passes.
-- [ ] 5.3 In both start paths, call `manager.take_device_event_receiver()` and clone `manager.get_state()` before storing the manager. Spawn the processor after `IS_RECORDING.store(true)`. Verify:
+  - Note (2026-10-02): `resolve_microphone_device` now returns `Result<ResolvedMic, NoMicrophone>` instead of `Result<_, String>`, so the default-start path can keep its longer error text (`NoMicrophone::message()` keeps the old "No microphone device available: …" text for the device path). The name checked against enumeration is the parsed one (the "(input)" suffix stripped), as `get_windows_device` does. `fell_back_from` is set only when the start lands on the system default after a given name missed, and not when the default carries that same name. `match_input_name` also rejects an empty name, which would otherwise be a substring of every device on Windows. The substring test is Windows-only; a non-Windows twin asserts no substring match.
+- [x] 5.2 Replace the inline mic resolution in `start_recording_with_meeting_name` (`lifecycle.rs:90-135`) with `resolve_microphone_device(None, preferred_mic_name)`. Keep its existing error message text for "no microphone". In both start paths, after `start_recording` succeeds, emit `mic-device-switched { reason: "unavailable_at_start" }` when `fell_back_from` is set. Verify: `cargo check -p meetily`; `cargo test -p meetily --lib recording` passes.
+  - Note (2026-10-02): the `mic-device-switched` event is emitted right after `start_recording` returns, before `recording-started`, through the same typed `UserEvent` the processor uses. The default-start path's "no microphone" texts are unchanged, both with and without a preference. `cargo test -p meetily --lib recording`: 29 passed.
+- [x] 5.3 In both start paths, call `manager.take_device_event_receiver()` and clone `manager.get_state()` before storing the manager. Spawn the processor after `IS_RECORDING.store(true)`. Verify:
   - `grep -n "spawn_device_event_processor" frontend/src-tauri/src/audio/recording/lifecycle.rs` shows exactly 2 call sites, each after its `IS_RECORDING.store(true`
   - `cargo check -p meetily` is clean of new warnings from groups 2-4 (all helpers are now used)
+  - Note (2026-10-02): the grep shows the 2 call sites at `lifecycle.rs:218` and `:455`, each after its `IS_RECORDING.store(true` (`:212`, `:449`). Clippy is back at the baseline 32 per-location warnings, identical by location and message to 0.2; nothing new from groups 2-5.
 
 ## 6. Frontend toasts
 
