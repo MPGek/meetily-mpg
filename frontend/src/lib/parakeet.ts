@@ -1,6 +1,6 @@
 // Types for Parakeet (NVIDIA NeMo) integration
-import type { ParakeetModelInfo, QuantizationType, ModelAccuracy, ModelStatus } from '@/lib/ipc/models';
-export type { ParakeetModelInfo, QuantizationType, ModelAccuracy, ModelStatus } from '@/lib/ipc/models';
+import type { ParakeetModelInfo, QuantizationType, ModelAccuracy, ModelStatus, CancelDownloadOutcome } from '@/lib/ipc/models';
+export type { ParakeetModelInfo, QuantizationType, ModelAccuracy, ModelStatus, CancelDownloadOutcome } from '@/lib/ipc/models';
 
 export type ProcessingSpeed = 'Slow' | 'Medium' | 'Fast' | 'Very Fast' | 'Ultra Fast';
 
@@ -181,8 +181,8 @@ export class ParakeetAPI {
     await parakeetDownloadModel({ modelName });
   }
 
-  static async cancelDownload(modelName: string): Promise<void> {
-    await parakeetCancelDownload({ modelName });
+  static async cancelDownload(modelName: string): Promise<CancelDownloadOutcome> {
+    return await parakeetCancelDownload({ modelName });
   }
 
   static async deleteCorruptedModel(modelName: string): Promise<string> {

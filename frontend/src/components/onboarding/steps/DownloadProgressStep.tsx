@@ -19,7 +19,7 @@ import { getSummaryModelSizeLabel, getSummaryModelSizeMb } from '@/lib/onboardin
 
 const PARAKEET_MODEL = 'parakeet-tdt-0.6b-v3-int8';
 
-type DownloadStatus = 'waiting' | 'downloading' | 'completed' | 'error';
+type DownloadStatus = 'waiting' | 'downloading' | 'completed' | 'cancelled' | 'error';
 
 interface DownloadState {
   status: DownloadStatus;
@@ -207,19 +207,32 @@ export function DownloadProgressStep() {
   useEffect(() => {
     const unlistenProgress = listenParakeetModelDownloadProgress((event) => {
       const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
-      if (modelName === PARAKEET_MODEL) {
+      if (modelName !== PARAKEET_MODEL) return;
+
+      if (status === 'cancelled') {
         setParakeetState((prev) => ({
           ...prev,
-          status: status === 'completed' ? 'completed' : 'downloading',
-          progress,
-          downloadedMb: downloaded_mb ?? prev.downloadedMb,
-          totalMb: total_mb ?? prev.totalMb,
-          speedMbps: speed_mbps ?? prev.speedMbps,
+          status: 'cancelled',
+          progress: 0,
+          downloadedMb: 0,
+          speedMbps: 0,
         }));
+        setParakeetDownloaded(false);
+        return;
+      }
 
-        if (status === 'completed' || progress >= 100) {
-          setParakeetDownloaded(true);
-        }
+      setParakeetState((prev) => ({
+        ...prev,
+        status: status === 'completed' ? 'completed' : 'downloading',
+        progress,
+        downloadedMb: downloaded_mb ?? prev.downloadedMb,
+        totalMb: total_mb ?? prev.totalMb,
+        speedMbps: speed_mbps ?? prev.speedMbps,
+      }));
+
+      // Only the backend's post-commit `completed` event marks the model ready.
+      if (status === 'completed') {
+        setParakeetDownloaded(true);
       }
     });
 
@@ -335,7 +348,10 @@ export function DownloadProgressStep() {
           status: 'completed',
           progress: 100,
         }));
-      } else if (!actuallyAvailable && parakeetState.status === 'error') {
+      } else if (
+        !actuallyAvailable &&
+        (parakeetState.status === 'error' || parakeetState.status === 'cancelled')
+      ) {
         toast.error('Transcription engine required', {
           description: 'Please retry the download before continuing.',
         });
@@ -413,6 +429,9 @@ export function DownloadProgressStep() {
           {state.status === 'error' && (
             <span className="text-sm text-red-500">Failed</span>
           )}
+          {state.status === 'cancelled' && (
+            <span className="text-sm text-gray-500">Cancelled</span>
+          )}
         </div>
       </div>
 
@@ -443,10 +462,12 @@ export function DownloadProgressStep() {
         </div>
       )}
 
-      {state.status === 'error' && state.error && (
+      {(state.status === 'error' || state.status === 'cancelled') && (
         <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-md">
-          <p className="text-sm text-red-600 font-medium">Download Error</p>
-          <p className="text-xs text-red-500 mt-1">{state.error}</p>
+          <p className="text-sm text-red-600 font-medium">
+            {state.status === 'cancelled' ? 'Download cancelled' : 'Download Error'}
+          </p>
+          {state.error && <p className="text-xs text-red-500 mt-1">{state.error}</p>}
           {(title === 'Transcription Engine' || title === 'Summary Engine') && (
             <button
               onClick={title === 'Transcription Engine' ? handleRetryDownload : handleRetrySummaryDownload}

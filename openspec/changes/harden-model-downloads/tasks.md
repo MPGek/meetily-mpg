@@ -4,7 +4,7 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
 
 ## 0. Preconditions and baseline
 
-- [ ] 0.1 Record the baseline before any edit:
+- [x] 0.1 Record the baseline before any edit:
   - `git rev-parse HEAD` (the "group-0 base")
   - `cargo clippy -p meetily --all-targets --message-format=short 2>&1 | grep -c "^warning"` (expect `32` per `docs/CODEBASE_MAP_OPERATIONS.md`)
   - the prescribed-skips test summary line
@@ -12,23 +12,26 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   - `pnpm exec tsc --noEmit -p .` (frontend/), expected clean
 
   verify: all five results are written into this task's note.
-- [ ] 0.2 Re-check the live facts design.md relies on, which were verified 2026-10-02:
+  - Note (2026-10-02): group-0 base `b1acbf1`; clippy 32 warnings; Rust 529 passed / 0 failed / 9 ignored; `bun test tests/` 96 pass; tsc clean; `next lint` 42 findings in 20 files (pre-existing; `OnboardingContext.tsx` is among them).
+- [x] 0.2 Re-check the live facts design.md relies on, which were verified 2026-10-02:
   - `curl -s https://huggingface.co/api/models/istupakov/parakeet-tdt-0.6b-v2-onnx | grep -o '"sha":"[0-9a-f]*"'` equals `0bbb45a3365852604aef28b538a8f066f4ccaa85`
   - `curl -sI https://meetily.towardsgeneralintelligence.com/models/parakeet-tdt-0.6b-v3-onnx/<file>` `Content-Length` equals upstream's `PARAKEET_V3_ARTIFACTS` for all 4 files (652183999 / 18202004 / 139764 / 93939)
   - the alignment repo tree at `2d48b01b6429d9018f81914550565112d56f6ba7` lists the six sizes in `audio/word_alignment/catalog.rs:60-65`
 
   verify: every value matches; if any differs, stop and update design.md D3/D5 before coding.
-- [ ] 0.3 Re-confirm the fork-only Parakeet code to preserve: `git log --oneline 0281737..HEAD -- frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs` lists `82fe7c5` (`transcribe_audio_with_tokens`) and `fe437a1` (`catch_unwind`); `grep -n "fn transcribe_audio_with_tokens\|catch_unwind" frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs` finds `:495` and `:515`. verify: both commits and both lines are present; note the current line numbers if they moved.
+  - Note (2026-10-02): all match: v2 sha `0bbb45a…`; v3 Content-Length 652183999 / 18202004 / 139764 / 93939; alignment tree at `2d48b01…` gives model_fp16.onnx 651760843, config.json 2280, vocab.json 146914, preprocessor_config.json 214, special_tokens_map.json 96, tokenizer_config.json 1132.
+- [x] 0.3 Re-confirm the fork-only Parakeet code to preserve: `git log --oneline 0281737..HEAD -- frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs` lists `82fe7c5` (`transcribe_audio_with_tokens`) and `fe437a1` (`catch_unwind`); `grep -n "fn transcribe_audio_with_tokens\|catch_unwind" frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs` finds `:495` and `:515`. verify: both commits and both lines are present; note the current line numbers if they moved.
+  - Note: both commits present; lines unchanged (`:495`, `:515`).
 
 ## 1. Parakeet download hardening (upstream #682 + #749) and the shared `model_download` module
 
-- [ ] 1.1 Create `frontend/src-tauri/src/model_download/{mod.rs,owners.rs}` and add `pub mod model_download;` to `frontend/src-tauri/src/lib.rs` (next to `pub mod parakeet_engine;` at `:49`).
+- [x] 1.1 Create `frontend/src-tauri/src/model_download/{mod.rs,owners.rs}` and add `pub mod model_download;` to `frontend/src-tauri/src/lib.rs` (next to `pub mod parakeet_engine;` at `:49`).
   - `owners.rs` contains `DownloadOwner` (with `progress: AtomicU8`), `DownloadOwners` (`reserve`, `lock` → guard with `is_owner`/`contains`/`owner`/`release`/`revision`, `cancel_with_timeout`), `DownloadCancelled`, `is_download_cancelled`, `CancelDownloadOutcome` (lowercase serde) and `CANCEL_DOWNLOAD_CLEANUP_TIMEOUT` (5 s), lifted from upstream v0.4.1 `parakeet_engine.rs:147-173,656-672,1196-1229` per design D1.
   - The `mod.rs` doc comment names those upstream line ranges.
   - Add unit tests: `reserve_rejects_a_second_owner`, `cancel_without_owner_reports_cancelled`, `cancel_times_out_to_pending_and_keeps_owner`, `release_bumps_revision_and_signals_completion`.
 
   verify: `cargo test -p meetily --lib model_download::owners` passes 4 tests.
-- [ ] 1.2 Add `frontend/src-tauri/src/model_download/transfer.rs`. It holds:
+- [x] 1.2 Add `frontend/src-tauri/src/model_download/transfer.rs`. It holds:
   - `ArtifactSpec { remote, local, exact_bytes }` with `const fn same(name, bytes)`
   - `parse_content_range` and `validate_full_response` / `validate_partial_response` / `validate_unsatisfied_response` (upstream `:190-230,712-810`)
   - `TransferProgress`
@@ -37,14 +40,15 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   - unit tests `content_range_parses_range_and_unsatisfied_forms` and `content_range_rejects_malformed_and_inverted`
 
   verify: `cargo test -p meetily --lib model_download::transfer` passes 2 tests.
-- [ ] 1.3 In `frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs`, replace the catalog and validation:
+  - Note (2026-10-02): `on_progress` is `&mut (dyn FnMut(TransferProgress) + Send)` instead of `&(dyn Fn + Send + Sync)`: the engines' callbacks are `Box<dyn Fn + Send>` (not `Sync`), and a shared reference held across `.await` made the Tauri command future non-`Send`. The transfer also logs every request (`Requesting <url> (Range: bytes=N-)`) and every skip/resume for the manual checks, and keeps the fork's friendly stream-error prefixes.
+- [x] 1.3 In `frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs`, replace the catalog and validation:
   - Add upstream's `ModelSpec`, `PARAKEET_V3_ARTIFACTS`, `PARAKEET_V2_ARTIFACTS` (using `ArtifactSpec::same`), `PARAKEET_MODEL_SPECS` (with the v2 URL pinned at `resolve/0bbb45a3365852604aef28b538a8f066f4ccaa85`) and `find_model_spec`.
   - Replace `discover_models` (`:174-278`) with `discover_models` → `discover_models_from_specs`, which does the revision retry and overlays `Downloading { progress: owner.progress() }` (design D2).
   - Replace `validate_model_directory` (`:281-345`) with the exact-size `fn validate_model_directory(dir, artifacts)`.
   - Delete `clean_incomplete_model_directory` (`:347-398`) and its call (`:722-727`), the approximate size table (`:740-780`), the 0.99 tolerances (`:832-842`, `:884-892`) and the FP32 file lists.
 
   verify: `cargo check -p meetily`, and `grep -n "clean_incomplete_model_directory\|0\.99\|resolve/main" frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs` returns nothing.
-- [ ] 1.4 In the same file, replace `cancel_download_flag`/`active_downloads` (`:123-125`, `:167-169`) with `downloads: DownloadOwners`. Then:
+- [x] 1.4 In the same file, replace `cancel_download_flag`/`active_downloads` (`:123-125`, `:167-169`) with `downloads: DownloadOwners`. Then:
   - Rewrite `download_model_detailed` (`:631-1195`) as upstream's `download_model_detailed` → `download_model_detailed_from_source` (reserve owner, then `transfer::download_artifacts`, then `finish_download`).
   - Port `finish_download` (upstream `:1133-1193`): exact re-validation, then the owners lock, then the `available_models` write lock, then the owner check; set `Available`/`Missing`; `release`; `signal_done()`; the final `completed` progress only after commit.
   - Replace `cancel_download` (`:1197-1237`) with `cancel_download` → `cancel_download_with_timeout(.., CANCEL_DOWNLOAD_CLEANUP_TIMEOUT)` returning `CancelDownloadOutcome`, with no sleep and no file removal.
@@ -52,7 +56,7 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   - Re-export `CancelDownloadOutcome` and `is_download_cancelled` from `parakeet_engine/mod.rs:28-30` (which re-exports them from `model_download`).
 
   verify: `cargo check -p meetily`, and `grep -n "cancel_download_flag\|sleep(" frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs` returns nothing.
-- [ ] 1.5 Serialize the model lifecycle (design D3):
+- [x] 1.5 Serialize the model lifecycle (design D3):
   - Add `model_lifecycle_lock: tokio::sync::Mutex<()>`.
   - `load_model` (`:401-459`) clones `ModelInfo`, drops the catalog read guard, takes the lifecycle lock, unloads through `unload_model_locked`, and builds `ParakeetModel::new` in `tokio::task::spawn_blocking`.
   - `unload_model` (`:462-473`) takes the lifecycle lock.
@@ -60,19 +64,21 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   - Leave `transcribe_audio`, `transcribe_audio_with_tokens` and its `catch_unwind` block (`:486-556`) unchanged.
 
   verify: `cargo check -p meetily`, and `git diff -U0 HEAD -- frontend/src-tauri/src/parakeet_engine/parakeet_engine.rs | grep -n "transcribe_audio_with_tokens\|catch_unwind"` shows no removed (`-`) lines.
-- [ ] 1.6 Confirm `spawn_blocking` compiles with the fork's `ParakeetModel` (`parakeet_engine/model.rs`). If `ParakeetModel` is not `Send`, use the design Risks fallback: keep `ParakeetModel::new` inline after dropping the catalog guard and under the lifecycle lock. Record which path was taken in this task's note. verify: `cargo check -p meetily` succeeds with the chosen path.
-- [ ] 1.7 In `frontend/src-tauri/src/parakeet_engine/commands.rs`:
+- [x] 1.6 Confirm `spawn_blocking` compiles with the fork's `ParakeetModel` (`parakeet_engine/model.rs`). If `ParakeetModel` is not `Send`, use the design Risks fallback: keep `ParakeetModel::new` inline after dropping the catalog guard and under the lifecycle lock. Record which path was taken in this task's note. verify: `cargo check -p meetily` succeeds with the chosen path.
+  - Note (2026-10-02): `spawn_blocking` path; the fork's `ParakeetModel` is `Send`, no fallback needed.
+- [x] 1.7 In `frontend/src-tauri/src/parakeet_engine/commands.rs`:
   - `parakeet_download_model` (`:388-476`): add an `Err(e) if is_download_cancelled(&e)` arm returning `Ok(())` and emitting `parakeet-model-download-progress {modelName, progress: 0, status: "cancelled"}`, with no error event.
   - `parakeet_cancel_download` (`:479-509`): drop its `app_handle` parameter and its emit, and return `Result<CancelDownloadOutcome, String>`.
   - `parakeet_retry_download` (`:512-558`): delete the force-reset block (`:524-550`) and call `parakeet_download_model`.
 
   verify: `cargo check -p meetily`, `grep -n "active_downloads\|ModelStatus::Missing" frontend/src-tauri/src/parakeet_engine/commands.rs` returns nothing, and `lib.rs:666-667` still registers both commands unchanged.
-- [ ] 1.8 Port upstream's 10 Parakeet tests (v0.4.1 `parakeet_engine.rs:1232-2016`) into `parakeet_engine.rs` `#[cfg(test)] mod tests`, using the names listed in design D8.
+- [x] 1.8 Port upstream's 10 Parakeet tests (v0.4.1 `parakeet_engine.rs:1232-2016`) into `parakeet_engine.rs` `#[cfg(test)] mod tests`, using the names listed in design D8.
   - Adapt them to `downloads`/`ArtifactSpec::same`/`model_download::transfer::test_server`.
   - Add `cancelled_download_leaves_partial_files_on_disk`, which asserts the seeded encoder prefix is still on disk after `cancel_download` returns `Cancelled`.
 
   verify: `cargo test -p meetily --lib parakeet_engine::parakeet_engine::tests` passes 11 tests, and runs offline (loopback only).
-- [ ] 1.9 Fix the frontend `ModelStatus` shape (design D6). In `frontend/src/lib/ipc/models.ts:50-64`:
+  - Note: 11 pass, loopback only. A directory with missing files now reports Corrupted rather than Missing (upstream behavior, design D3).
+- [x] 1.9 Fix the frontend `ModelStatus` shape (design D6). In `frontend/src/lib/ipc/models.ts:50-64`:
   - set `{ Downloading: { progress: number } }`
   - delete the "Known drift" paragraph (`:54-57`)
   - add `export type CancelDownloadOutcome = 'cancelled' | 'pending'`
@@ -86,14 +92,14 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   Change `ParakeetAPI.cancelDownload` (`frontend/src/lib/parakeet.ts:184-186`) to return the outcome.
 
   verify: `pnpm exec tsc --noEmit -p .` (frontend/) is clean, `grep -rn "{ Downloading: progress }\|{ Downloading: 0 }" frontend/src` returns nothing, and every hit of `grep -rn "status.Downloading" frontend/src` reads `.Downloading.progress`.
-- [ ] 1.10 Port the #749 Parakeet UI (design D7):
+- [x] 1.10 Port the #749 Parakeet UI (design D7):
   - In `ParakeetModelManager.tsx`, add `cancellingModels`, `clearCancellingModel`, the `listenersReady` gate and `latestStatusByModelRef`. The progress listener (`:88-111`) handles `status === 'cancelled'` (→ Missing, clear sets, info toast) and `status === 'completed'` (→ Available). `cancelDownload` (`:212-246`) only marks cancelling and toasts on `pending`. `downloadModel` (`:248-285`) returns early while cancelling. `ModelCard` gets `isCancelling`, with download/retry/re-download disabled.
   - In `OnboardingContext.tsx:251-265`, `DownloadProgressStep.tsx:208-224` and `DownloadProgressToast.tsx:228-250`, drop `progress >= 100` for Parakeet only (leave the summary-model listeners at `OnboardingContext.tsx:308`, `DownloadProgressStep.tsx:273` and `DownloadProgressToast.tsx:311` alone).
   - Also in `OnboardingContext.tsx` and `DownloadProgressStep.tsx`, handle `cancelled` as in upstream `d1f7a11`.
 
   verify: `pnpm exec tsc --noEmit -p .` and `pnpm exec next lint` (frontend/) report no new findings in these files, and `grep -n "progress >= 100" frontend/src/contexts/OnboardingContext.tsx frontend/src/components/onboarding/steps/DownloadProgressStep.tsx frontend/src/components/shared/DownloadProgressToast.tsx` lists only the three summary-model lines.
-- [ ] 1.11 Add `frontend/tests/lib/ipc/models.test.ts`, following `tests/lib/ipc/analytics.test.ts` and mocking both `@tauri-apps/api/core` and `@tauri-apps/api/event`. The test `parakeetCancelDownload passes the cancelled/pending outcome through` asserts that `invoke('parakeet_cancel_download', { modelName })` is called and both outcomes resolve unchanged. verify: `bun test tests/lib/ipc/models.test.ts` (frontend/) passes.
-- [ ] 1.12 Document the protocol: add one bullet under the async-patterns list in `docs/CODEBASE_MAP_ARCHITECTURE.md` (next to `:299`, "Summary cancellation uses `CancellationToken`"). It says that model downloads (Parakeet/Whisper/alignment) share `model_download::DownloadOwners` (per-model owner, `cancelled`/`pending` cancel, owner released only after cleanup) and that Parakeet/alignment use the exact-size resumable `model_download::transfer`. verify: `bash scripts/check-doc-links.sh` passes.
+- [x] 1.11 Add `frontend/tests/lib/ipc/models.test.ts`, following `tests/lib/ipc/analytics.test.ts` and mocking both `@tauri-apps/api/core` and `@tauri-apps/api/event`. The test `parakeetCancelDownload passes the cancelled/pending outcome through` asserts that `invoke('parakeet_cancel_download', { modelName })` is called and both outcomes resolve unchanged. verify: `bun test tests/lib/ipc/models.test.ts` (frontend/) passes.
+- [x] 1.12 Document the protocol: add one bullet under the async-patterns list in `docs/CODEBASE_MAP_ARCHITECTURE.md` (next to `:299`, "Summary cancellation uses `CancellationToken`"). It says that model downloads (Parakeet/Whisper/alignment) share `model_download::DownloadOwners` (per-model owner, `cancelled`/`pending` cancel, owner released only after cleanup) and that Parakeet/alignment use the exact-size resumable `model_download::transfer`. verify: `bash scripts/check-doc-links.sh` passes.
 - [ ] 1.13 Manual Windows check, network loss after the encoder completes.
   1. Start with `RUST_LOG=info` via `frontend\dev-gpu.bat`, after deleting `%APPDATA%\com.meetily.ai\models\parakeet\parakeet-tdt-0.6b-v3-int8\`.
   2. Download v3 Int8.
@@ -101,6 +107,7 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   4. Re-enable the network and click Retry.
 
   verify: the encoder's `LastWriteTime` and size are unchanged after the retry completes, the console log shows no GET for `encoder-model.int8.onnx` on the retry, the model loads, and a short recording transcribes.
+  - Note (2026-10-02): open; needs the desktop app on Windows. Left for the manual-check pass.
 - [ ] 1.14 Manual Windows check, cancel near the end.
   1. Start a fresh v3 download.
   2. Click Cancel at ≥ 97% overall.
@@ -108,12 +115,14 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   4. Click Download again.
 
   verify: the console log shows a `Range: bytes=<n>-` resume for the unfinished file (no re-fetch of finished files), progress continues from about the cancelled percent, not from 0, and the model becomes Available.
+  - Note (2026-10-02): open; needs the desktop app on Windows. Left for the manual-check pass.
 - [ ] 1.15 Manual Windows check, cancel then immediate retry.
   1. Start a download.
   2. Click Cancel, then immediately click Retry/Download several times (also try the onboarding Retry).
 
   verify: Retry stays disabled until the `cancelled` event arrives, no `Download already in progress` error toast appears, the console log shows exactly one request sequence after the cancel, and the final files match the exact sizes.
-- [ ] 1.16 Commit group 1 after running `cargo test -p meetily --lib model_download parakeet_engine`, `bun test tests/` and `pnpm exec tsc --noEmit -p .` (frontend/). verify: all pass; `git show --stat HEAD` lists only group 1 files.
+  - Note (2026-10-02): open; needs the desktop app on Windows. Left for the manual-check pass.
+- [x] 1.16 Commit group 1 after running `cargo test -p meetily --lib model_download parakeet_engine`, `bun test tests/` and `pnpm exec tsc --noEmit -p .` (frontend/). verify: all pass; `git show --stat HEAD` lists only group 1 files.
 
 ## 2. Whisper download hardening (upstream #737, download part)
 

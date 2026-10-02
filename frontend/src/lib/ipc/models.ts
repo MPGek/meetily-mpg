@@ -50,16 +50,11 @@ export type ProcessingSpeed = 'Slow' | 'Medium' | 'Fast' | 'Very Fast';
 /**
  * Externally tagged Rust enum, shared by the Whisper and Parakeet engines
  * (identical definitions in whisper_engine.rs and parakeet_engine.rs).
- *
- * Known drift: Rust serializes `Downloading { progress }` as
- * `{ Downloading: { progress: n } }`, but the model managers build and read
- * `{ Downloading: n }` locally from download events. The frontend shape is kept
- * here so this change stays type-only; reconciling it is a follow-up.
  */
 export type ModelStatus =
   | 'Available'
   | 'Missing'
-  | { Downloading: number }
+  | { Downloading: { progress: number } }
   | { Error: string }
   | { Corrupted: { file_size: number; expected_min_size: number } };
 
@@ -91,7 +86,9 @@ export interface ParakeetModelInfo {
 
 /**
  * `parakeet-model-download-progress`. The byte/MB/speed fields are absent on
- * the `cancelled` event emitted by `parakeet_cancel_download`.
+ * the `cancelled` event, which `parakeet_download_model` emits once a cancelled
+ * download has finished cleanup. `completed` (100) is emitted only after the
+ * model is committed Available; in-flight progress stays at most 99.
  */
 export interface ParakeetModelDownloadProgressPayload {
   modelName: string;
@@ -222,8 +219,15 @@ export async function parakeetRetryDownload(args: ModelNameArgs): Promise<void> 
   return invokeTyped<void>('parakeet_retry_download', args);
 }
 
-export async function parakeetCancelDownload(args: ModelNameArgs): Promise<void> {
-  return invokeTyped<void>('parakeet_cancel_download', args);
+/**
+ * `cancelled`: the download stopped and released the model. `pending`: it was
+ * told to stop but cleanup is still running; retry stays rejected until the
+ * backend emits its `status: "cancelled"` progress event.
+ */
+export type CancelDownloadOutcome = 'cancelled' | 'pending';
+
+export async function parakeetCancelDownload(args: ModelNameArgs): Promise<CancelDownloadOutcome> {
+  return invokeTyped<CancelDownloadOutcome>('parakeet_cancel_download', args);
 }
 
 export async function parakeetDeleteCorruptedModel(args: ModelNameArgs): Promise<string> {

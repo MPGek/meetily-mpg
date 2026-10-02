@@ -297,6 +297,7 @@ The Rust backend uses **tokio async runtime** extensively:
 - Device monitoring uses mpsc channels for event-driven reconnection
 - Post-processing uses unbounded channels for decoupled pipeline stages
 - Summary cancellation uses `CancellationToken` for graceful shutdown
+- Model downloads (Parakeet, Whisper, word alignment) share `model_download::DownloadOwners`: one owner per model with its own `CancellationToken`, a cancel that returns `cancelled` or `pending` (after 5 s), and an owner released only by its worker after cleanup, so a retry cannot start a second writer. Parakeet and alignment use the exact-size resumable `model_download::transfer` (skip only on exact size, `Range` resume validated against `Content-Range`, partials kept on cancel or error)
 
 ## Build Features (GPU Acceleration)
 

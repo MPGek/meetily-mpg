@@ -251,17 +251,31 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
     const unlisten = listenParakeetModelDownloadProgress(
       (event) => {
         const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
-        if (modelName === PARAKEET_MODEL) {
-          setParakeetProgress(progress);
+        if (modelName !== PARAKEET_MODEL) return;
+
+        if (status === 'cancelled') {
+          setIsBackgroundDownloading(false);
+          setParakeetDownloaded(false);
+          setParakeetProgress(0);
           setParakeetProgressInfo({
-            percent: progress,
-            downloadedMb: downloaded_mb ?? 0,
-            totalMb: total_mb ?? 0,
-            speedMbps: speed_mbps ?? 0,
+            percent: 0,
+            downloadedMb: 0,
+            totalMb: 0,
+            speedMbps: 0,
           });
-          if (status === 'completed' || progress >= 100) {
-            setParakeetDownloaded(true);
-          }
+          return;
+        }
+
+        setParakeetProgress(progress);
+        setParakeetProgressInfo({
+          percent: progress,
+          downloadedMb: downloaded_mb ?? 0,
+          totalMb: total_mb ?? 0,
+          speedMbps: speed_mbps ?? 0,
+        });
+        // Only the backend's post-commit `completed` event marks the model ready.
+        if (status === 'completed') {
+          setParakeetDownloaded(true);
         }
       }
     );

@@ -1,14 +1,17 @@
+use crate::model_download::transfer::{self, ArtifactSpec, TransferProgress};
+use crate::model_download::{
+    is_download_cancelled, CancelDownloadOutcome, DownloadCancelled, DownloadOwner,
+    DownloadOwners, CANCEL_DOWNLOAD_CLEANUP_TIMEOUT,
+};
 use crate::parakeet_engine::model::ParakeetModel;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::RwLock;
-use tokio::time::timeout;
+use tokio::sync::{Mutex, RwLock};
 
 /// Quantization type for Parakeet models
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -115,14 +118,101 @@ impl From<std::io::Error> for ParakeetEngineError {
     }
 }
 
+struct ModelSpec {
+    name: &'static str,
+    size_mb: u32,
+    quantization: QuantizationType,
+    speed: &'static str,
+    description: &'static str,
+    source_base_url: &'static str,
+    artifacts: &'static [ArtifactSpec],
+}
+
+impl ModelSpec {
+    fn exact_bytes(&self) -> u64 {
+        self.artifacts.iter().map(|artifact| artifact.exact_bytes).sum()
+    }
+}
+
+const PARAKEET_V3_ARTIFACTS: &[ArtifactSpec] = &[
+    ArtifactSpec::same("encoder-model.int8.onnx", 652_183_999),
+    ArtifactSpec::same("decoder_joint-model.int8.onnx", 18_202_004),
+    ArtifactSpec::same("nemo128.onnx", 139_764),
+    ArtifactSpec::same("vocab.txt", 93_939),
+];
+
+const PARAKEET_V2_ARTIFACTS: &[ArtifactSpec] = &[
+    ArtifactSpec::same("encoder-model.int8.onnx", 652_184_014),
+    ArtifactSpec::same("decoder_joint-model.int8.onnx", 8_998_286),
+    ArtifactSpec::same("nemo128.onnx", 139_764),
+    ArtifactSpec::same("vocab.txt", 9_384),
+];
+
+const PARAKEET_MODEL_SPECS: &[ModelSpec] = &[
+    ModelSpec {
+        name: "parakeet-tdt-0.6b-v3-int8",
+        size_mb: 670,
+        quantization: QuantizationType::Int8,
+        speed: "Ultra Fast (v3)",
+        description: "Real time on M4 Max, latest version with int8 quantization",
+        source_base_url:
+            "https://meetily.towardsgeneralintelligence.com/models/parakeet-tdt-0.6b-v3-onnx",
+        artifacts: PARAKEET_V3_ARTIFACTS,
+    },
+    ModelSpec {
+        name: "parakeet-tdt-0.6b-v2-int8",
+        size_mb: 661,
+        quantization: QuantizationType::Int8,
+        speed: "Fast (v2)",
+        description: "Previous version with int8 quantization, good balance of speed and accuracy",
+        source_base_url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/0bbb45a3365852604aef28b538a8f066f4ccaa85",
+        artifacts: PARAKEET_V2_ARTIFACTS,
+    },
+];
+
+fn find_model_spec(model_name: &str) -> Option<&'static ModelSpec> {
+    PARAKEET_MODEL_SPECS
+        .iter()
+        .find(|spec| spec.name == model_name)
+}
+
+#[cfg(test)]
+struct DownloadStateTestHook {
+    finalization_ready: tokio::sync::Notify,
+    continue_finalization: tokio::sync::Notify,
+    discovery_scanned: tokio::sync::Notify,
+    continue_discovery: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct ModelLifecycleTestHook {
+    load_started: tokio::sync::Notify,
+    continue_load: tokio::sync::Notify,
+    unload_attempted: tokio::sync::Notify,
+}
+
+fn to_download_progress(progress: TransferProgress) -> DownloadProgress {
+    let mut detailed = DownloadProgress::new(
+        progress.confirmed_bytes,
+        progress.total_bytes,
+        progress.speed_mbps,
+    );
+    detailed.percent = progress.percent;
+    detailed
+}
+
 pub struct ParakeetEngine {
     models_dir: PathBuf,
     current_model: Arc<RwLock<Option<ParakeetModel>>>,
     current_model_name: Arc<RwLock<Option<String>>>,
+    model_lifecycle_lock: Mutex<()>,
     pub(crate) available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
-    cancel_download_flag: Arc<RwLock<Option<String>>>, // Model name being cancelled
-    // Active downloads tracking to prevent concurrent downloads
-    pub(crate) active_downloads: Arc<RwLock<HashSet<String>>>, // Set of models currently being downloaded
+    // Per-model download owners; a claim is released only by its own worker after cleanup.
+    downloads: DownloadOwners,
+    #[cfg(test)]
+    download_state_test_hook: Mutex<Option<Arc<DownloadStateTestHook>>>,
+    #[cfg(test)]
+    model_lifecycle_test_hook: Mutex<Option<Arc<ModelLifecycleTestHook>>>,
 }
 
 impl ParakeetEngine {
@@ -163,274 +253,192 @@ impl ParakeetEngine {
             models_dir,
             current_model: Arc::new(RwLock::new(None)),
             current_model_name: Arc::new(RwLock::new(None)),
+            model_lifecycle_lock: Mutex::new(()),
             available_models: Arc::new(RwLock::new(HashMap::new())),
-            cancel_download_flag: Arc::new(RwLock::new(None)),
-            // Initialize active downloads tracking
-            active_downloads: Arc::new(RwLock::new(HashSet::new())),
+            downloads: DownloadOwners::new(),
+            #[cfg(test)]
+            download_state_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            model_lifecycle_test_hook: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    async fn test_hook(&self) -> Option<Arc<DownloadStateTestHook>> {
+        self.download_state_test_hook.lock().await.clone()
+    }
+
+    #[cfg(test)]
+    async fn load_test_hook(&self) -> Option<Arc<ModelLifecycleTestHook>> {
+        self.model_lifecycle_test_hook.lock().await.clone()
     }
 
     /// Discover available Parakeet models
     pub async fn discover_models(&self) -> Result<Vec<ModelInfo>> {
-        let models_dir = &self.models_dir;
-        let mut models = Vec::new();
+        self.discover_models_from_specs(PARAKEET_MODEL_SPECS).await
+    }
 
-        // Parakeet model configurations
-        // Model name format: parakeet-tdt-0.6b-v{version}-{quantization}
-        // Sizes match actual download sizes (encoder + decoder + preprocessor + vocab)
-        let model_configs = [
-            (
-                "parakeet-tdt-0.6b-v3-int8",
-                670,
-                QuantizationType::Int8,
-                "Ultra Fast (v3)",
-                "Real time on M4 Max, latest version with int8 quantization",
-            ),
-            (
-                "parakeet-tdt-0.6b-v2-int8",
-                661,
-                QuantizationType::Int8,
-                "Fast (v2)",
-                "Previous version with int8 quantization, good balance of speed and accuracy",
-            ),
-        ];
+    /// Scan disk without locks, then commit the result unless a download was
+    /// reserved or released meanwhile (revision changed), in which case rescan.
+    /// Owned models are reported as Downloading with the owner's progress.
+    async fn discover_models_from_specs(&self, specs: &[ModelSpec]) -> Result<Vec<ModelInfo>> {
+        loop {
+            let revision = self.downloads.lock().await.revision();
+            let mut models = Vec::with_capacity(specs.len());
+            let mut validation_errors = Vec::new();
 
-        // Get active downloads to override status
-        let active_downloads = self.active_downloads.read().await;
-
-        for (name, size_mb, quantization, speed, description) in model_configs {
-            let model_path = models_dir.join(name);
-
-            // Check if model is currently downloading
-            let status = if active_downloads.contains(name) {
-                // If downloading, preserve that status regardless of file system
-                // We don't know the exact progress here without more state, but 0 is safe fallback
-                // The progress events will update the UI
-                ModelStatus::Downloading { progress: 0 }
-            } else if model_path.exists() {
-                // Check for required ONNX files
-                let required_files = match quantization {
-                    QuantizationType::Int8 => vec![
-                        "encoder-model.int8.onnx",
-                        "decoder_joint-model.int8.onnx",
-                        "nemo128.onnx",
-                        "vocab.txt",
-                    ],
-                    QuantizationType::FP32 => vec![
-                        "encoder-model.onnx",
-                        "decoder_joint-model.onnx",
-                        "nemo128.onnx",
-                        "vocab.txt",
-                    ],
-                };
-
-                let all_files_exist = required_files
-                    .iter()
-                    .all(|file| model_path.join(file).exists());
-
-                if all_files_exist {
-                    // Validate model by checking file sizes
-                    match self.validate_model_directory(&model_path).await {
-                        Ok(_) => ModelStatus::Available,
-                        Err(_) => {
-                            log::warn!("Model directory {} appears corrupted", name);
-                            // Calculate total size of existing files
-                            let mut total_size = 0u64;
-                            for file in required_files {
-                                if let Ok(metadata) = std::fs::metadata(model_path.join(file)) {
-                                    total_size += metadata.len();
-                                }
-                            }
+            for spec in specs {
+                let model_path = self.models_dir.join(spec.name);
+                let status = if model_path.exists() {
+                    match Self::validate_model_directory(&model_path, spec.artifacts) {
+                        Ok(()) => ModelStatus::Available,
+                        Err(error) => {
+                            let file_size = spec
+                                .artifacts
+                                .iter()
+                                .filter_map(|artifact| {
+                                    std::fs::metadata(model_path.join(artifact.local)).ok()
+                                })
+                                .map(|metadata| metadata.len())
+                                .sum();
+                            validation_errors.push((spec.name, error));
                             ModelStatus::Corrupted {
-                                file_size: total_size,
-                                expected_min_size: (size_mb as u64) * 1024 * 1024,
+                                file_size,
+                                expected_min_size: spec.exact_bytes(),
                             }
                         }
                     }
                 } else {
                     ModelStatus::Missing
-                }
-            } else {
-                ModelStatus::Missing
-            };
+                };
 
-            let model_info = ModelInfo {
-                name: name.to_string(),
-                path: model_path,
-                size_mb: size_mb as u32,
-                quantization: quantization.clone(),
-                speed: speed.to_string(),
-                status,
-                description: description.to_string(),
-            };
-
-            models.push(model_info);
-        }
-
-        // Update internal cache
-        let mut available_models = self.available_models.write().await;
-        available_models.clear();
-        for model in &models {
-            available_models.insert(model.name.clone(), model.clone());
-        }
-
-        Ok(models)
-    }
-
-    /// Validate model directory by checking if all required files exist AND have valid sizes
-    async fn validate_model_directory(&self, model_dir: &Path) -> Result<()> {
-        // Check if vocab.txt exists and is readable
-        let vocab_path = model_dir.join("vocab.txt");
-        if !vocab_path.exists() {
-            return Err(anyhow!("vocab.txt not found"));
-        }
-
-        // Determine which files to check based on what exists
-        let is_int8 = model_dir.join("encoder-model.int8.onnx").exists();
-        let is_fp32 = model_dir.join("encoder-model.onnx").exists();
-
-        if !is_int8 && !is_fp32 {
-            return Err(anyhow!("No ONNX model files found"));
-        }
-
-        // Check preprocessor
-        if !model_dir.join("nemo128.onnx").exists() {
-            return Err(anyhow!("Preprocessor (nemo128.onnx) not found"));
-        }
-
-        // Define minimum file sizes (90% of expected to allow some variance)
-        // These are critical to catch partial downloads that would crash on load
-        let expected_sizes: Vec<(&str, u64)> = if is_int8 {
-            vec![
-                ("encoder-model.int8.onnx", 580_000_000), // ~652 MB, min 580 MB (89%)
-                ("decoder_joint-model.int8.onnx", 8_000_000), // ~18 MB, min 8 MB
-                ("nemo128.onnx", 100_000),                // ~140 KB, min 100 KB
-                ("vocab.txt", 5_000),                     // ~94 KB, min 5 KB
-            ]
-        } else {
-            vec![
-                ("encoder-model.onnx", 2_200_000_000), // ~2.44 GB, min 2.2 GB
-                ("decoder_joint-model.onnx", 65_000_000), // ~72 MB, min 65 MB
-                ("nemo128.onnx", 100_000),             // ~140 KB, min 100 KB
-                ("vocab.txt", 5_000),                  // ~94 KB, min 5 KB
-            ]
-        };
-
-        // Validate each file exists AND has sufficient size
-        for (filename, min_size) in expected_sizes {
-            let file_path = model_dir.join(filename);
-            if !file_path.exists() {
-                return Err(anyhow!("{} not found", filename));
+                models.push(ModelInfo {
+                    name: spec.name.to_string(),
+                    path: model_path,
+                    size_mb: spec.size_mb,
+                    quantization: spec.quantization.clone(),
+                    speed: spec.speed.to_string(),
+                    status,
+                    description: spec.description.to_string(),
+                });
             }
 
-            match std::fs::metadata(&file_path) {
-                Ok(metadata) => {
-                    let actual_size = metadata.len();
-                    if actual_size < min_size {
-                        return Err(anyhow!(
-                            "{} is incomplete: {} bytes (expected at least {} bytes)",
-                            filename,
-                            actual_size,
-                            min_size
-                        ));
-                    }
+            #[cfg(test)]
+            if let Some(hook) = self.test_hook().await {
+                hook.discovery_scanned.notify_one();
+                hook.continue_discovery.notified().await;
+            }
+
+            let downloads = self.downloads.lock().await;
+            if downloads.revision() != revision {
+                continue;
+            }
+
+            validation_errors.retain(|(model_name, _)| !downloads.contains(model_name));
+            for model in &mut models {
+                if let Some(owner) = downloads.owner(&model.name) {
+                    model.status = ModelStatus::Downloading {
+                        progress: owner.progress(),
+                    };
                 }
-                Err(e) => {
-                    return Err(anyhow!("Failed to read {} metadata: {}", filename, e));
-                }
+            }
+
+            let mut available_models = self.available_models.write().await;
+            available_models.clear();
+            for model in &models {
+                available_models.insert(model.name.clone(), model.clone());
+            }
+            drop(available_models);
+            drop(downloads);
+
+            for (model_name, error) in validation_errors {
+                log::warn!("Model directory {} appears corrupted: {}", model_name, error);
+            }
+            return Ok(models);
+        }
+    }
+
+    /// Validate a model directory: every artifact must exist with exactly its catalogued size.
+    fn validate_model_directory(model_dir: &Path, artifacts: &[ArtifactSpec]) -> Result<()> {
+        for artifact in artifacts {
+            let path = model_dir.join(artifact.local);
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| anyhow!("Failed to read {} metadata: {}", artifact.local, error))?;
+            if metadata.len() != artifact.exact_bytes {
+                return Err(anyhow!(
+                    "{} has {} bytes, expected exactly {} bytes",
+                    artifact.local,
+                    metadata.len(),
+                    artifact.exact_bytes
+                ));
             }
         }
 
         Ok(())
     }
 
-    /// Clean incomplete model directory before download
-    /// Removes all files if directory exists but model is not Available
-    async fn clean_incomplete_model_directory(&self, model_dir: &PathBuf) -> Result<()> {
-        if !model_dir.exists() {
-            return Ok(()); // Nothing to clean
-        }
-
-        // Validate the directory
-        match self.validate_model_directory(model_dir).await {
-            Ok(_) => {
-                log::info!("Model directory is valid, no cleanup needed");
-                Ok(())
-            }
-            Err(validation_error) => {
-                log::warn!(
-                    "Model directory exists but is invalid: {}. Cleaning up...",
-                    validation_error
-                );
-
-                // List and remove all files in the directory
-                let mut entries = fs::read_dir(model_dir)
-                    .await
-                    .map_err(|e| anyhow!("Failed to read model directory: {}", e))?;
-
-                let mut removed_count = 0;
-                while let Some(entry) = entries
-                    .next_entry()
-                    .await
-                    .map_err(|e| anyhow!("Failed to read directory entry: {}", e))?
-                {
-                    let path = entry.path();
-                    if path.is_file() {
-                        match fs::remove_file(&path).await {
-                            Ok(_) => {
-                                log::info!("Removed incomplete file: {:?}", path.file_name());
-                                removed_count += 1;
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to remove file {:?}: {}", path, e);
-                            }
-                        }
-                    }
-                }
-
-                log::info!(
-                    "Cleaned {} incomplete files from model directory",
-                    removed_count
-                );
-                Ok(())
-            }
-        }
-    }
-
     /// Load a Parakeet model
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
-        let models = self.available_models.read().await;
-        let model_info = models
-            .get(model_name)
-            .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
+        // Clone the entry and release the catalog lock before the native load.
+        let model_info = {
+            let models = self.available_models.read().await;
+            models
+                .get(model_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("Model {} not found", model_name))?
+        };
 
-        match model_info.status {
+        match &model_info.status {
             ModelStatus::Available => {
+                let _lifecycle_guard = self.model_lifecycle_lock.lock().await;
                 // Check if this model is already loaded
-                if let Some(current_model) = self.current_model_name.read().await.as_ref() {
-                    if current_model == model_name {
-                        log::info!(
-                            "Parakeet model {} is already loaded, skipping reload",
-                            model_name
-                        );
-                        return Ok(());
-                    }
+                let current_model = self.current_model_name.read().await.clone();
+                if current_model.as_deref() == Some(model_name) {
+                    log::info!(
+                        "Parakeet model {} is already loaded, skipping reload",
+                        model_name
+                    );
+                    return Ok(());
+                }
 
+                if let Some(current_model) = current_model {
                     // Unload current model before loading new one
                     log::info!(
                         "Unloading current Parakeet model '{}' before loading '{}'",
                         current_model,
                         model_name
                     );
-                    self.unload_model().await;
                 }
+                self.unload_model_locked().await;
 
                 log::info!("Loading Parakeet model: {}", model_name);
 
-                // Load model based on quantization type
+                // Load model based on quantization type, off the async runtime
                 let quantized = model_info.quantization == QuantizationType::Int8;
-                let model = ParakeetModel::new(&model_info.path, quantized)
-                    .map_err(|e| anyhow!("Failed to load Parakeet model {}: {}", model_name, e))?;
+                let model_path = model_info.path.clone();
+                #[cfg(test)]
+                let model_lifecycle_test_hook = self.load_test_hook().await;
+                #[cfg(test)]
+                let runtime_handle = tokio::runtime::Handle::current();
+                let model = tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(hook) = model_lifecycle_test_hook {
+                        hook.load_started.notify_one();
+                        runtime_handle.block_on(hook.continue_load.notified());
+                    }
+                    ParakeetModel::new(&model_path, quantized).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "Parakeet model load task failed for {}: {}",
+                        model_name,
+                        error
+                    )
+                })?
+                .map_err(|error| {
+                    anyhow!("Failed to load Parakeet model {}: {}", model_name, error)
+                })?;
 
                 // Update current model and model name
                 *self.current_model.write().await = Some(model);
@@ -448,7 +456,7 @@ impl ParakeetEngine {
                 "Parakeet model {} is currently downloading",
                 model_name
             )),
-            ModelStatus::Error(ref err) => {
+            ModelStatus::Error(err) => {
                 Err(anyhow!("Parakeet model {} has error: {}", model_name, err))
             }
             ModelStatus::Corrupted { .. } => Err(anyhow!(
@@ -458,17 +466,22 @@ impl ParakeetEngine {
         }
     }
 
-    /// Unload the current model
+    /// Unload the current model. Waits for any in-flight load to finish first.
     pub async fn unload_model(&self) -> bool {
-        let mut model_guard = self.current_model.write().await;
-        let unloaded = model_guard.take().is_some();
+        #[cfg(test)]
+        if let Some(hook) = self.load_test_hook().await {
+            hook.unload_attempted.notify_one();
+        }
+        let _lifecycle_guard = self.model_lifecycle_lock.lock().await;
+        self.unload_model_locked().await
+    }
+
+    async fn unload_model_locked(&self) -> bool {
+        let unloaded = self.current_model.write().await.take().is_some();
         if unloaded {
             log::info!("Parakeet model unloaded");
         }
-
-        let mut model_name_guard = self.current_model_name.write().await;
-        model_name_guard.take();
-
+        self.current_model_name.write().await.take();
         unloaded
     }
 
@@ -627,7 +640,7 @@ impl ParakeetEngine {
             .await
     }
 
-    /// Download a Parakeet model with detailed progress (MB/speed/resume support)
+    /// Download a catalogued Parakeet model with detailed progress (MB/speed/resume support)
     pub async fn download_model_detailed(
         &self,
         model_name: &str,
@@ -635,97 +648,42 @@ impl ParakeetEngine {
     ) -> Result<()> {
         log::info!("Starting download for Parakeet model: {}", model_name);
 
-        // Check if download is already in progress for this model
-        {
-            let active = self.active_downloads.read().await;
-            if active.contains(model_name) {
-                log::warn!(
-                    "Download already in progress for Parakeet model: {}",
-                    model_name
-                );
-                return Err(anyhow!(
-                    "Download already in progress for model: {}",
-                    model_name
-                ));
-            }
+        let model_info = self
+            .available_models
+            .read()
+            .await
+            .get(model_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
+        let spec = find_model_spec(model_name)
+            .ok_or_else(|| anyhow!("Unsupported Parakeet model: {}", model_name))?;
+
+        self.download_model_detailed_from_source(
+            model_name,
+            &model_info.path,
+            spec.source_base_url,
+            spec.artifacts,
+            progress_callback,
+        )
+        .await
+    }
+
+    async fn set_downloading_status(&self, model_name: &str, progress: u8) {
+        let mut models = self.available_models.write().await;
+        if let Some(model) = models.get_mut(model_name) {
+            model.status = ModelStatus::Downloading { progress };
         }
+    }
 
-        // Add to active downloads
-        {
-            let mut active = self.active_downloads.write().await;
-            active.insert(model_name.to_string());
-        }
-
-        // Clear any previous cancellation flag for this model
-        {
-            let mut cancel_flag = self.cancel_download_flag.write().await;
-            *cancel_flag = None;
-        }
-
-        // Get model info
-        let model_info = {
-            let models = self.available_models.read().await;
-            match models.get(model_name).cloned() {
-                Some(info) => info,
-                None => {
-                    // Remove from active downloads on error
-                    let mut active = self.active_downloads.write().await;
-                    active.remove(model_name);
-                    return Err(anyhow!("Model {} not found", model_name));
-                }
-            }
-        };
-
-        // Update model status to downloading
-        {
-            let mut models = self.available_models.write().await;
-            if let Some(model) = models.get_mut(model_name) {
-                model.status = ModelStatus::Downloading { progress: 0 };
-            }
-        }
-
-        // HuggingFace base URL for Parakeet models (version-specific)
-        let base_url = if model_name.contains("-v2-") {
-            "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/main"
-        } else {
-            // Default to v3 for v3 models
-            "https://meetily.towardsgeneralintelligence.com/models/parakeet-tdt-0.6b-v3-onnx"
-        };
-
-        // Determine which files to download based on quantization
-        let files_to_download = match model_info.quantization {
-            QuantizationType::Int8 => vec![
-                "encoder-model.int8.onnx",
-                "decoder_joint-model.int8.onnx",
-                "nemo128.onnx",
-                "vocab.txt",
-            ],
-            QuantizationType::FP32 => vec![
-                "encoder-model.onnx",
-                "decoder_joint-model.onnx",
-                "nemo128.onnx",
-                "vocab.txt",
-            ],
-        };
-
-        // Create model directory
-        let model_dir = &model_info.path;
-        if !model_dir.exists() {
-            if let Err(e) = fs::create_dir_all(model_dir).await {
-                // Remove from active downloads on error
-                let mut active = self.active_downloads.write().await;
-                active.remove(model_name);
-                return Err(anyhow!("Failed to create model directory: {}", e));
-            }
-        }
-
-        // Clean up incomplete downloads before starting
-        log::info!("Checking for incomplete model files to clean up...");
-        if let Err(e) = self.clean_incomplete_model_directory(model_dir).await {
-            log::warn!("Failed to clean incomplete model directory: {}", e);
-            // Continue anyway - we'll handle errors during download
-        }
-
+    /// Reserve the model's owner, run the shared exact-size transfer, then commit.
+    async fn download_model_detailed_from_source(
+        &self,
+        model_name: &str,
+        model_dir: &Path,
+        base_url: &str,
+        artifacts: &[ArtifactSpec],
+        progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+    ) -> Result<()> {
         // Optimized HTTP client for large file downloads
         let client = reqwest::Client::builder()
             .tcp_nodelay(true) // Disable Nagle's algorithm for better streaming
@@ -735,504 +693,865 @@ impl ParakeetEngine {
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
-        let total_files = files_to_download.len();
+        let owner = self.downloads.reserve(model_name).await?;
+        self.set_downloading_status(model_name, 0).await;
 
-        // Calculate total download size for weighted progress
-        // Note: These are approximate sizes based on HuggingFace repo inspection
-        let file_sizes: std::collections::HashMap<&str, u64> = match model_info.quantization {
-            QuantizationType::Int8 => {
-                if model_name.contains("-v2-") {
-                    // V2 model sizes
-                    [
-                        ("encoder-model.int8.onnx", 652_000_000u64),     // 652 MB
-                        ("decoder_joint-model.int8.onnx", 9_000_000u64), // 9 MB
-                        ("nemo128.onnx", 140_000u64),                    // 140 KB
-                        ("vocab.txt", 9_380u64),                         // 9.38 KB
-                    ]
-                    .iter()
-                    .cloned()
-                    .collect()
-                } else {
-                    // V3 model sizes (default)
-                    [
-                        ("encoder-model.int8.onnx", 652_000_000u64), // 652 MB
-                        ("decoder_joint-model.int8.onnx", 18_200_000u64), // 18.2 MB
-                        ("nemo128.onnx", 140_000u64),                // 140 KB
-                        ("vocab.txt", 93_900u64),                    // 93.9 KB
-                    ]
-                    .iter()
-                    .cloned()
-                    .collect()
+        let mut progress_callback = progress_callback;
+        let result = {
+            let mut on_progress = |progress: TransferProgress| {
+                if let Some(callback) = progress_callback.as_mut() {
+                    callback(to_download_progress(progress));
                 }
-            }
-            QuantizationType::FP32 => {
-                // FP32 model sizes (encoder has .onnx + .onnx.data)
-                [
-                    ("encoder-model.onnx", 41_800_000u64 + 2_440_000_000u64), // 41.8 MB + 2.44 GB
-                    ("decoder_joint-model.onnx", 72_500_000u64),              // 72.5 MB
-                    ("nemo128.onnx", 140_000u64),                             // 140 KB
-                    ("vocab.txt", 93_900u64),                                 // 93.9 KB
-                ]
-                .iter()
-                .cloned()
-                .collect()
-            }
+            };
+            transfer::download_artifacts(
+                &client,
+                base_url,
+                model_dir,
+                artifacts,
+                &owner,
+                &mut on_progress,
+            )
+            .await
         };
 
-        // Calculate total expected download size
-        let total_size_bytes: u64 = files_to_download
-            .iter()
-            .filter_map(|f| file_sizes.get(*f))
-            .copied()
-            .sum();
+        self.finish_download(
+            model_name,
+            model_dir,
+            artifacts,
+            &owner,
+            result.map(to_download_progress),
+            progress_callback,
+        )
+        .await
+    }
 
-        // Check for existing downloads (complete or partial) to calculate resume offset
-        let mut already_downloaded: u64 = 0;
-        for filename in &files_to_download {
-            let file_path = model_dir.join(filename);
-            if file_path.exists() {
-                if let Ok(metadata) = fs::metadata(&file_path).await {
-                    let file_size = metadata.len();
-                    let expected_size = file_sizes.get(*filename).copied().unwrap_or(0);
-                    // Count all existing bytes (complete files capped at expected size, partial as-is)
-                    // This ensures progress starts from where we left off
-                    already_downloaded += file_size.min(expected_size);
-                }
-            }
+    /// Commit a finished transfer: re-validate exact sizes, then, under the
+    /// owners lock and the catalog lock, release this owner and publish
+    /// Available or Missing. Partial files are never deleted here. The final
+    /// 100% progress is reported only after the commit.
+    async fn finish_download(
+        &self,
+        model_name: &str,
+        model_dir: &Path,
+        artifacts: &[ArtifactSpec],
+        owner: &Arc<DownloadOwner>,
+        mut result: Result<DownloadProgress>,
+        progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+    ) -> Result<()> {
+        if result.is_ok() && !owner.cancellation().is_cancelled() {
+            let final_progress = result.expect("successful transfer must carry final progress");
+            result = Self::validate_model_directory(model_dir, artifacts).map(|()| final_progress);
         }
 
-        let mut total_downloaded: u64 = already_downloaded;
-
-        // Timing for speed calculation
-        let download_start_time = Instant::now();
-        let mut last_report_time = Instant::now();
-        let mut bytes_since_last_report: u64 = 0;
-        let mut last_reported_progress: u8 = 0;
-
-        log::info!(
-            "Starting weighted download for {} files, total size: {:.2} MB (already downloaded: {:.2} MB)",
-            total_files,
-            total_size_bytes as f64 / 1_048_576.0,
-            already_downloaded as f64 / 1_048_576.0
-        );
-
-        for (index, filename) in files_to_download.iter().enumerate() {
-            let file_url = format!("{}/{}", base_url, filename);
-            let file_path = model_dir.join(filename);
-
-            // Check for existing partial file to resume
-            let existing_size: u64 = if file_path.exists() {
-                fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0)
-            } else {
-                0
-            };
-
-            let expected_size = file_sizes.get(*filename).copied().unwrap_or(0);
-
-            // Skip if file is already complete (with 1% tolerance for size variations)
-            let size_tolerance = (expected_size as f64 * 0.99) as u64;
-            if existing_size >= size_tolerance && expected_size > 0 {
-                log::info!(
-                    "Skipping complete file: {} ({:.2} MB, expected: {:.2} MB)",
-                    filename,
-                    existing_size as f64 / 1_048_576.0,
-                    expected_size as f64 / 1_048_576.0
-                );
-                continue;
-            }
-
-            log::info!(
-                "Downloading file {}/{}: {} (resuming from {} bytes)",
-                index + 1,
-                total_files,
-                filename,
-                existing_size
-            );
-
-            // Build request with optional Range header for resume
-            let mut request = client.get(&file_url);
-            if existing_size > 0 {
-                request = request.header("Range", format!("bytes={}-", existing_size));
-                log::info!("Resuming download from byte {}", existing_size);
-            }
-
-            let mut response = request
-                .send()
-                .await
-                .map_err(|e| anyhow!("Failed to start download for {}: {}", filename, e))?;
-
-            // Handle response status
-            let (file_total_size, resuming) =
-                if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                    // Server supports resume, get remaining size
-                    let remaining = response.content_length().unwrap_or(0);
-                    log::info!("Server supports resume, remaining: {} bytes", remaining);
-                    (existing_size + remaining, true)
-                } else if response.status().is_success() {
-                    // Fresh download or server doesn't support resume
-                    if existing_size > 0 {
-                        log::warn!(
-                            "Server doesn't support resume for {}, starting fresh download",
-                            filename
-                        );
-                    }
-                    (response.content_length().unwrap_or(0), false)
-                } else if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                    // 416: Range not satisfiable - file complete or invalid range
-                    log::warn!("Server returned 416 Range Not Satisfiable for {}", filename);
-
-                    let size_tolerance = (expected_size as f64 * 0.99) as u64;
-                    if existing_size >= size_tolerance && expected_size > 0 {
-                        // File is complete - skip it
-                        log::info!(
-                            "File {} complete ({} bytes). Skipping.",
-                            filename,
-                            existing_size
-                        );
-                        continue;
-                    } else {
-                        // File incomplete but server won't accept range - delete and retry
-                        log::warn!(
-                            "File {} incomplete ({}/{} bytes). Deleting and retrying.",
-                            filename,
-                            existing_size,
-                            expected_size
-                        );
-
-                        if let Err(e) = fs::remove_file(&file_path).await {
-                            let mut active = self.active_downloads.write().await;
-                            active.remove(model_name);
-                            return Err(anyhow!(
-                                "Failed to delete incomplete file {}: {}",
-                                filename,
-                                e
-                            ));
-                        }
-
-                        // Retry without Range header
-                        log::info!("Retrying {} without resume", filename);
-                        response = client
-                            .get(&file_url)
-                            .send()
-                            .await
-                            .map_err(|e| anyhow!("Retry failed for {}: {}", filename, e))?;
-
-                        if !response.status().is_success() {
-                            let mut active = self.active_downloads.write().await;
-                            active.remove(model_name);
-                            return Err(anyhow!(
-                                "Retry failed for {} with status: {}",
-                                filename,
-                                response.status()
-                            ));
-                        }
-
-                        (response.content_length().unwrap_or(0), false)
-                    }
-                } else {
-                    // Other errors
-                    let mut active = self.active_downloads.write().await;
-                    active.remove(model_name);
-                    return Err(anyhow!(
-                        "Download failed for {} with status: {}",
-                        filename,
-                        response.status()
-                    ));
-                };
-
-            // Open file for writing (append if resuming, create new if not)
-            let file = if resuming {
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(&file_path)
-                    .await
-                    .map_err(|e| anyhow!("Failed to open file for resume {}: {}", filename, e))?
-            } else {
-                fs::File::create(&file_path)
-                    .await
-                    .map_err(|e| anyhow!("Failed to create file {}: {}", filename, e))?
-            };
-
-            // Use buffered writer for better I/O performance (8MB buffer)
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-
-            // Stream download
-            use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
-            let mut file_downloaded = if resuming { existing_size } else { 0u64 };
-
-            loop {
-                // Check for cancellation before processing chunk
-                {
-                    let cancel_flag = self.cancel_download_flag.read().await;
-                    if cancel_flag.as_ref() == Some(&model_name.to_string()) {
-                        log::info!("Download cancelled for {}", model_name);
-                        // Flush and keep partial file for resume on next attempt
-                        let _ = writer.flush().await;
-                        drop(writer);
-                        // Remove from active downloads on cancellation
-                        let mut active = self.active_downloads.write().await;
-                        active.remove(model_name);
-                        return Err(anyhow!("Download cancelled by user"));
-                    }
-                }
-
-                // Add per-chunk timeout (30 seconds) to detect stalled connections
-                let next_result = timeout(Duration::from_secs(30), stream.next()).await;
-
-                let chunk = match next_result {
-                    // Timeout - no data received for 30 seconds
-                    Err(_) => {
-                        log::warn!(
-                            "Download timeout for {}: no data received for 30 seconds",
-                            model_name
-                        );
-                        let _ = writer.flush().await;
-
-                        // Remove from active downloads
-                        {
-                            let mut active = self.active_downloads.write().await;
-                            active.remove(model_name);
-                        }
-
-                        // Update model status to Missing so retry can work
-                        {
-                            let mut models = self.available_models.write().await;
-                            if let Some(model) = models.get_mut(model_name) {
-                                model.status = ModelStatus::Missing;
-                            }
-                        }
-
-                        return Err(anyhow!(
-                            "Download timeout - No data received for 30 seconds"
-                        ));
-                    }
-                    // Stream ended
-                    Ok(None) => break,
-                    // Got chunk result
-                    Ok(Some(chunk_result)) => {
-                        match chunk_result {
-                            Ok(c) => c,
-                            // Detect error type for better user feedback
-                            Err(e) => {
-                                log::error!("Download error for {}: {:?}", model_name, e);
-                                let _ = writer.flush().await;
-
-                                // Remove from active downloads
-                                {
-                                    let mut active = self.active_downloads.write().await;
-                                    active.remove(model_name);
-                                }
-
-                                // Update model status to Missing so retry can work
-                                {
-                                    let mut models = self.available_models.write().await;
-                                    if let Some(model) = models.get_mut(model_name) {
-                                        model.status = ModelStatus::Missing;
-                                    }
-                                }
-
-                                let error_msg = if e.is_timeout() {
-                                    "Connection timeout - Check your internet"
-                                } else if e.is_connect() {
-                                    "Connection failed - Check your internet"
-                                } else if e.is_body() {
-                                    "Stream interrupted - Network unstable"
-                                } else {
-                                    "Download error"
-                                };
-
-                                return Err(anyhow!("{}: {}", error_msg, e));
-                            }
-                        }
-                    }
-                };
-
-                if let Err(e) = writer.write_all(&chunk).await {
-                    // Remove from active downloads on error
-                    {
-                        let mut active = self.active_downloads.write().await;
-                        active.remove(model_name);
-                    }
-
-                    // Update model status to Missing so retry can work
-                    {
-                        let mut models = self.available_models.write().await;
-                        if let Some(model) = models.get_mut(model_name) {
-                            model.status = ModelStatus::Missing;
-                        }
-                    }
-
-                    return Err(anyhow!("Failed to write chunk to file: {}", e));
-                }
-
-                let chunk_len = chunk.len() as u64;
-                file_downloaded += chunk_len;
-                total_downloaded += chunk_len;
-                bytes_since_last_report += chunk_len;
-
-                // Calculate weighted overall progress based on total bytes downloaded
-                let overall_progress = if total_size_bytes > 0 {
-                    ((total_downloaded as f64 / total_size_bytes as f64) * 100.0).min(99.0) as u8
-                } else {
-                    // Fallback to per-file progress if total size unknown
-                    ((index as f64 + (file_downloaded as f64 / file_total_size.max(1) as f64))
-                        / total_files as f64
-                        * 100.0) as u8
-                };
-
-                // Report every 1% progress change OR every 500ms for smooth UI updates
-                let elapsed_since_report = last_report_time.elapsed();
-                let progress_changed = overall_progress > last_reported_progress;
-                let time_threshold = elapsed_since_report >= Duration::from_millis(500);
-                let is_complete = file_downloaded >= file_total_size;
-
-                let should_report = progress_changed || time_threshold || is_complete;
-
-                if should_report {
-                    // Calculate download speed
-                    let speed_mbps = if elapsed_since_report.as_secs_f64() >= 0.1 {
-                        (bytes_since_last_report as f64 / (1024.0 * 1024.0))
-                            / elapsed_since_report.as_secs_f64()
-                    } else {
-                        // Fallback to overall average speed
-                        let total_elapsed = download_start_time.elapsed().as_secs_f64();
-                        if total_elapsed > 0.0 {
-                            ((total_downloaded - already_downloaded) as f64 / (1024.0 * 1024.0))
-                                / total_elapsed
-                        } else {
-                            0.0
-                        }
-                    };
-
-                    last_reported_progress = overall_progress;
-                    last_report_time = Instant::now();
-                    bytes_since_last_report = 0;
-
-                    // Create detailed progress and report
-                    let progress =
-                        DownloadProgress::new(total_downloaded, total_size_bytes, speed_mbps);
-                    if let Some(ref callback) = progress_callback {
-                        callback(progress);
-                    }
-
-                    // Update model status
-                    {
-                        let mut models = self.available_models.write().await;
-                        if let Some(model) = models.get_mut(model_name) {
-                            model.status = ModelStatus::Downloading {
-                                progress: overall_progress,
-                            };
-                        }
-                    }
-                }
-            }
-
-            // Flush the buffered writer
-            if let Err(e) = writer.flush().await {
-                // Remove from active downloads on error
-                {
-                    let mut active = self.active_downloads.write().await;
-                    active.remove(model_name);
-                }
-
-                // Update model status to Missing so retry can work
-                {
-                    let mut models = self.available_models.write().await;
-                    if let Some(model) = models.get_mut(model_name) {
-                        model.status = ModelStatus::Missing;
-                    }
-                }
-
-                return Err(anyhow!("Failed to flush file {}: {}", filename, e));
-            }
-
-            log::info!(
-                "Completed download: {} ({:.2} MB, overall progress: {:.1}%)",
-                filename,
-                file_downloaded as f64 / 1_048_576.0,
-                (total_downloaded as f64 / total_size_bytes as f64) * 100.0
-            );
+        #[cfg(test)]
+        if let Some(hook) = self.test_hook().await {
+            hook.finalization_ready.notify_one();
+            hook.continue_finalization.notified().await;
         }
 
-        // Report 100% progress with final speed
-        let total_elapsed = download_start_time.elapsed().as_secs_f64();
-        let final_speed = if total_elapsed > 0.0 {
-            ((total_downloaded - already_downloaded) as f64 / (1024.0 * 1024.0)) / total_elapsed
-        } else {
-            0.0
-        };
-        let final_progress = DownloadProgress::new(total_size_bytes, total_size_bytes, final_speed);
-        if let Some(ref callback) = progress_callback {
+        let mut downloads = self.downloads.lock().await;
+        if !downloads.is_owner(model_name, owner) {
+            drop(downloads);
+            owner.signal_done();
+            return result.map(|_| ());
+        }
+
+        let cancellation_won = owner.cancellation().is_cancelled()
+            || result.as_ref().err().is_some_and(is_download_cancelled);
+        let mut models = self.available_models.write().await;
+        downloads.release(model_name);
+        if let Some(model) = models.get_mut(model_name) {
+            if cancellation_won || result.is_err() {
+                model.status = ModelStatus::Missing;
+            } else {
+                model.status = ModelStatus::Available;
+                model.path = model_dir.to_path_buf();
+            }
+        }
+        drop(models);
+        drop(downloads);
+        owner.signal_done();
+
+        if cancellation_won {
+            log::info!("Download cancelled for Parakeet model: {}", model_name);
+            return Err(DownloadCancelled.into());
+        }
+        let final_progress = result.inspect_err(|error| {
+            log::error!("Download failed for Parakeet model {}: {}", model_name, error);
+        })?;
+        if let Some(callback) = progress_callback {
             callback(final_progress);
         }
-
-        // Update model status to available
-        {
-            let mut models = self.available_models.write().await;
-            if let Some(model) = models.get_mut(model_name) {
-                model.status = ModelStatus::Available;
-                model.path = model_dir.clone();
-            }
-        }
-
-        // Remove from active downloads on completion
-        {
-            let mut active = self.active_downloads.write().await;
-            active.remove(model_name);
-        }
-
-        // Clear cancellation flag on successful completion
-        {
-            let mut cancel_flag = self.cancel_download_flag.write().await;
-            if cancel_flag.as_ref() == Some(&model_name.to_string()) {
-                *cancel_flag = None;
-            }
-        }
-
         log::info!("Download completed for Parakeet model: {}", model_name);
         Ok(())
     }
 
-    /// Cancel an ongoing model download
-    pub async fn cancel_download(&self, model_name: &str) -> Result<()> {
+    /// Cancel an ongoing model download. Partial files are kept for resume.
+    pub async fn cancel_download(&self, model_name: &str) -> Result<CancelDownloadOutcome> {
         log::info!("Cancelling download for Parakeet model: {}", model_name);
+        self.cancel_download_with_timeout(model_name, CANCEL_DOWNLOAD_CLEANUP_TIMEOUT)
+            .await
+    }
 
-        // Set cancellation flag to interrupt the download loop
+    async fn cancel_download_with_timeout(
+        &self,
+        model_name: &str,
+        cleanup_timeout: Duration,
+    ) -> Result<CancelDownloadOutcome> {
+        self.downloads
+            .cancel_with_timeout(model_name, cleanup_timeout)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_download::transfer::test_server::{response, serve_requests, ExpectedResponse};
+    use crossbeam::queue::SegQueue;
+    use tempfile::tempdir;
+    use tokio::sync::oneshot;
+    const TEST_MODEL_NAME: &str = "parakeet-test";
+    const SMALL_ARTIFACTS: &[ArtifactSpec] = &[
+        ArtifactSpec::same("encoder.bin", 4),
+        ArtifactSpec::same("decoder.bin", 3),
+        ArtifactSpec::same("nemo.bin", 2),
+        ArtifactSpec::same("vocab.txt", 1),
+    ];
+    const SMALL_MODEL_SPECS: &[ModelSpec] = &[ModelSpec {
+        name: TEST_MODEL_NAME,
+        size_mb: 1,
+        quantization: QuantizationType::Int8,
+        speed: "test",
+        description: "test model",
+        source_base_url: "",
+        artifacts: SMALL_ARTIFACTS,
+    }];
+
+    async fn test_engine() -> (tempfile::TempDir, Arc<ParakeetEngine>, PathBuf) {
+        let temp_dir = tempdir().expect("create temporary models directory");
+        let engine = Arc::new(
+            ParakeetEngine::new_with_models_dir(Some(temp_dir.path().to_path_buf()))
+                .expect("create Parakeet engine"),
+        );
+        let model_dir = engine.models_dir.join(TEST_MODEL_NAME);
+        engine.available_models.write().await.insert(
+            TEST_MODEL_NAME.to_string(),
+            ModelInfo {
+                name: TEST_MODEL_NAME.to_string(),
+                path: model_dir.clone(),
+                size_mb: 1,
+                quantization: QuantizationType::Int8,
+                speed: "test".to_string(),
+                status: ModelStatus::Missing,
+                description: "test model".to_string(),
+            },
+        );
+        (temp_dir, engine, model_dir)
+    }
+
+    async fn test_model_status(engine: &ParakeetEngine) -> ModelStatus {
+        engine
+            .available_models
+            .read()
+            .await
+            .get(TEST_MODEL_NAME)
+            .expect("test model remains registered")
+            .status
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn directory_validation_requires_exact_artifact_sizes() {
+        let temp_dir = tempdir().expect("create temporary model directory");
+        for artifact in SMALL_ARTIFACTS {
+            fs::write(
+                temp_dir.path().join(artifact.local),
+                vec![0; artifact.exact_bytes as usize],
+            )
+            .await
+            .expect("seed exact artifact");
+        }
+        assert!(ParakeetEngine::validate_model_directory(temp_dir.path(), SMALL_ARTIFACTS).is_ok());
+
+        fs::remove_file(temp_dir.path().join("vocab.txt"))
+            .await
+            .expect("remove required artifact");
+        assert!(ParakeetEngine::validate_model_directory(temp_dir.path(), SMALL_ARTIFACTS).is_err());
+
+        fs::write(temp_dir.path().join("vocab.txt"), [])
+            .await
+            .expect("restore undersized artifact");
+        fs::write(temp_dir.path().join("encoder.bin"), [0; 3])
+            .await
+            .expect("seed one-byte-short artifact");
+        assert!(ParakeetEngine::validate_model_directory(temp_dir.path(), SMALL_ARTIFACTS).is_err());
+
+        fs::write(temp_dir.path().join("encoder.bin"), [0; 5])
+            .await
+            .expect("seed one-byte-oversized artifact");
+        assert!(ParakeetEngine::validate_model_directory(temp_dir.path(), SMALL_ARTIFACTS).is_err());
+    }
+
+    #[tokio::test]
+    async fn loading_releases_available_models_and_serializes_unload() {
+        let (_temp_dir, engine, _model_dir) = test_engine().await;
+        engine
+            .available_models
+            .write()
+            .await
+            .get_mut(TEST_MODEL_NAME)
+            .expect("test model remains registered")
+            .status = ModelStatus::Available;
+        *engine.current_model_name.write().await = Some("previous-test-model".to_string());
+
+        let hook = Arc::new(ModelLifecycleTestHook {
+            load_started: tokio::sync::Notify::new(),
+            continue_load: tokio::sync::Notify::new(),
+            unload_attempted: tokio::sync::Notify::new(),
+        });
+        *engine.model_lifecycle_test_hook.lock().await = Some(Arc::clone(&hook));
+
+        let load_engine = Arc::clone(&engine);
+        let load = tokio::spawn(async move { load_engine.load_model(TEST_MODEL_NAME).await });
+        tokio::time::timeout(Duration::from_secs(1), hook.load_started.notified())
+            .await
+            .expect("model load must reach its blocking task");
+
         {
-            let mut cancel_flag = self.cancel_download_flag.write().await;
-            *cancel_flag = Some(model_name.to_string());
+            let mut models = tokio::time::timeout(
+                Duration::from_secs(1),
+                engine.available_models.write(),
+            )
+            .await
+            .expect("model cache must remain writable during native loading");
+            models
+                .get_mut(TEST_MODEL_NAME)
+                .expect("test model remains registered")
+                .description = "updated while native load is paused".to_string();
         }
 
-        // Remove from active downloads
-        {
-            let mut active = self.active_downloads.write().await;
-            active.remove(model_name);
+        let (unloaded_tx, mut unloaded_rx) = oneshot::channel();
+        let unload_engine = Arc::clone(&engine);
+        let unload = tokio::spawn(async move {
+            let unloaded = unload_engine.unload_model().await;
+            unloaded_tx
+                .send(unloaded)
+                .expect("unload receiver remains connected");
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.unload_attempted.notified())
+            .await
+            .expect("unload must reach the lifecycle boundary");
+        assert!(matches!(
+            unloaded_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        hook.continue_load.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), load)
+            .await
+            .expect("model load must finish after release")
+            .expect("join model load task")
+            .expect_err("empty model directory must fail loading");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), unloaded_rx)
+                .await
+                .expect("unload must finish after model load")
+                .expect("unload sender remains connected")
+        );
+        tokio::time::timeout(Duration::from_secs(1), unload)
+            .await
+            .expect("unload task must join")
+            .expect("join unload task");
+
+        assert_eq!(
+            engine
+                .available_models
+                .read()
+                .await
+                .get(TEST_MODEL_NAME)
+                .expect("test model remains registered")
+                .description,
+            "updated while native load is paused"
+        );
+        assert!(engine.current_model.read().await.is_none());
+        assert!(engine.current_model_name.read().await.is_none());
+        *engine.model_lifecycle_test_hook.lock().await = None;
+    }
+
+    #[tokio::test]
+    async fn completed_sibling_survives_403_then_retry_resumes_partial() {
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        fs::create_dir_all(&model_dir).await.expect("create model directory");
+        fs::write(model_dir.join("encoder.bin"), b"ABCD")
+            .await
+            .expect("seed completed sibling");
+        fs::write(model_dir.join("decoder.bin"), b"X")
+            .await
+            .expect("seed resumable artifact");
+
+        let (base_url, server) = serve_requests(vec![response(
+            "decoder.bin",
+            Some("bytes=1-"),
+            "403 Forbidden",
+            b"",
+            None,
+        )])
+        .await;
+        let error = engine
+            .download_model_detailed_from_source(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                SMALL_ARTIFACTS,
+                None,
+            )
+            .await
+            .expect_err("403 must fail without destructive cleanup");
+        server.await.expect("join 403 server");
+        assert!(error.to_string().contains("403"));
+        assert_eq!(fs::read(model_dir.join("encoder.bin")).await.unwrap(), b"ABCD");
+        assert_eq!(fs::read(model_dir.join("decoder.bin")).await.unwrap(), b"X");
+        assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
+
+        let (base_url, server) = serve_requests(vec![
+            response(
+                "decoder.bin",
+                Some("bytes=1-"),
+                "206 Partial Content",
+                b"YZ",
+                Some("bytes 1-2/3"),
+            ),
+            response("nemo.bin", None, "200 OK", b"NO", None),
+            response("vocab.txt", None, "200 OK", b"V", None),
+        ])
+        .await;
+        engine
+            .download_model_detailed_from_source(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                SMALL_ARTIFACTS,
+                None,
+            )
+            .await
+            .expect("retry resumes only the partial artifact");
+        server.await.expect("join retry server");
+
+        assert_eq!(fs::read(model_dir.join("encoder.bin")).await.unwrap(), b"ABCD");
+        assert_eq!(fs::read(model_dir.join("decoder.bin")).await.unwrap(), b"XYZ");
+        assert!(matches!(test_model_status(&engine).await, ModelStatus::Available));
+        assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
+    }
+
+    #[tokio::test]
+    async fn cancelled_near_complete_artifact_is_resumed_on_retry() {
+        const ARTIFACTS: &[ArtifactSpec] = &[ArtifactSpec::same("near.bin", 100)];
+        const PREFIX: &[u8] = &[b'A'; 99];
+
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        let (release_tx, release_rx) = oneshot::channel();
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let progress_tx = Arc::new(std::sync::Mutex::new(Some(progress_tx)));
+        let (base_url, server) = serve_requests(vec![ExpectedResponse {
+            filename: "near.bin",
+            range: None,
+            status: "200 OK",
+            content_length: Some(100),
+            content_range: None,
+            body: PREFIX,
+            release_after_body: Some(release_rx),
+        }])
+        .await;
+
+        let download_engine = Arc::clone(&engine);
+        let download_dir = model_dir.clone();
+        let download = tokio::spawn(async move {
+            download_engine
+                .download_model_detailed_from_source(
+                    TEST_MODEL_NAME,
+                    &download_dir,
+                    &base_url,
+                    ARTIFACTS,
+                    Some(Box::new(move |progress| {
+                        if progress.downloaded_bytes == 99 {
+                            if let Some(sender) = progress_tx
+                                .lock()
+                                .expect("lock progress sender")
+                                .take()
+                            {
+                                let _ = sender.send(());
+                            }
+                        }
+                    })),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), progress_rx)
+            .await
+            .expect("receive near-complete progress")
+            .expect("progress sender remains connected");
+        assert_eq!(
+            engine
+                .cancel_download_with_timeout(TEST_MODEL_NAME, Duration::from_secs(5))
+                .await
+                .expect("cancel near-complete download"),
+            CancelDownloadOutcome::Cancelled
+        );
+        release_tx.send(()).expect("release partial response");
+        let error = download
+            .await
+            .expect("join cancelled download")
+            .expect_err("cancelled download must not succeed");
+        server.await.expect("join partial-response server");
+
+        assert!(is_download_cancelled(&error));
+        assert_eq!(fs::metadata(model_dir.join("near.bin")).await.unwrap().len(), 99);
+        assert!(matches!(test_model_status(&engine).await, ModelStatus::Missing));
+
+        let (base_url, server) = serve_requests(vec![response(
+            "near.bin",
+            Some("bytes=99-"),
+            "206 Partial Content",
+            b"B",
+            Some("bytes 99-99/100"),
+        )])
+        .await;
+        engine
+            .download_model_detailed_from_source(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                ARTIFACTS,
+                None,
+            )
+            .await
+            .expect("retry resumes the cancelled near-complete artifact");
+        server.await.expect("join retry server");
+
+        assert_eq!(fs::metadata(model_dir.join("near.bin")).await.unwrap().len(), 100);
+        assert!(matches!(test_model_status(&engine).await, ModelStatus::Available));
+    }
+
+    #[tokio::test]
+    async fn range_ignored_replaces_partial_with_honest_progress() {
+        const ARTIFACTS: &[ArtifactSpec] = &[ArtifactSpec::same("model.bin", 4)];
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        fs::create_dir_all(&model_dir).await.expect("create model directory");
+        fs::write(model_dir.join("model.bin"), b"zz")
+            .await
+            .expect("seed partial artifact");
+        let events = Arc::new(SegQueue::new());
+        let callback_events = Arc::clone(&events);
+
+        let (base_url, server) = serve_requests(vec![response(
+            "model.bin",
+            Some("bytes=2-"),
+            "200 OK",
+            b"ABCD",
+            None,
+        )])
+        .await;
+        engine
+            .download_model_detailed_from_source(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                ARTIFACTS,
+                Some(Box::new(move |progress| {
+                    callback_events.push(progress);
+                })),
+            )
+            .await
+            .expect("range-ignored response replaces the partial artifact");
+        server.await.expect("join range-ignored server");
+
+        let events: Vec<_> = std::iter::from_fn(|| events.pop()).collect();
+        assert_eq!(fs::read(model_dir.join("model.bin")).await.unwrap(), b"ABCD");
+        assert!(events.iter().all(|progress| progress.downloaded_bytes <= progress.total_bytes));
+        assert_eq!(events.last().expect("final event").percent, 100);
+        assert!(events[..events.len() - 1].iter().all(|progress| progress.percent < 100));
+    }
+
+    #[tokio::test]
+    async fn range_416_retries_fresh_with_honest_progress() {
+        const ARTIFACTS: &[ArtifactSpec] = &[ArtifactSpec::same("model.bin", 4)];
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        fs::create_dir_all(&model_dir).await.expect("create model directory");
+        fs::write(model_dir.join("model.bin"), b"zz")
+            .await
+            .expect("seed partial artifact");
+        let events = Arc::new(SegQueue::new());
+        let callback_events = Arc::clone(&events);
+
+        let (base_url, server) = serve_requests(vec![
+            response(
+                "model.bin",
+                Some("bytes=2-"),
+                "416 Range Not Satisfiable",
+                b"",
+                Some("bytes */4"),
+            ),
+            response("model.bin", None, "200 OK", b"ABCD", None),
+        ])
+        .await;
+        engine
+            .download_model_detailed_from_source(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                ARTIFACTS,
+                Some(Box::new(move |progress| {
+                    callback_events.push(progress);
+                })),
+            )
+            .await
+            .expect("416 should retry without Range");
+        server.await.expect("join 416 server");
+
+        assert_eq!(fs::read(model_dir.join("model.bin")).await.unwrap(), b"ABCD");
+        assert!(std::iter::from_fn(|| events.pop())
+            .all(|progress| progress.downloaded_bytes <= progress.total_bytes));
+    }
+
+    #[tokio::test]
+    async fn invalid_or_short_response_never_publishes_available() {
+        const ARTIFACTS: &[ArtifactSpec] = &[
+            ArtifactSpec::same("complete.bin", 1),
+            ArtifactSpec::same("target.bin", 4),
+        ];
+        let cases = vec![
+            (
+                "malformed",
+                ExpectedResponse {
+                    filename: "target.bin",
+                    range: Some("bytes=1-"),
+                    status: "206 Partial Content",
+                    content_length: Some(3),
+                    content_range: Some("bytes invalid"),
+                    body: b"XYZ",
+                    release_after_body: None,
+                },
+            ),
+            (
+                "wrong-start",
+                ExpectedResponse {
+                    filename: "target.bin",
+                    range: Some("bytes=1-"),
+                    status: "206 Partial Content",
+                    content_length: Some(4),
+                    content_range: Some("bytes 0-3/4"),
+                    body: b"ABCD",
+                    release_after_body: None,
+                },
+            ),
+            (
+                "wrong-total",
+                ExpectedResponse {
+                    filename: "target.bin",
+                    range: Some("bytes=1-"),
+                    status: "206 Partial Content",
+                    content_length: Some(3),
+                    content_range: Some("bytes 1-3/5"),
+                    body: b"XYZ",
+                    release_after_body: None,
+                },
+            ),
+            (
+                "short",
+                ExpectedResponse {
+                    filename: "target.bin",
+                    range: Some("bytes=1-"),
+                    status: "200 OK",
+                    content_length: Some(4),
+                    content_range: None,
+                    body: b"ABC",
+                    release_after_body: None,
+                },
+            ),
+            (
+                "overlong",
+                ExpectedResponse {
+                    filename: "target.bin",
+                    range: Some("bytes=1-"),
+                    status: "200 OK",
+                    content_length: Some(5),
+                    content_range: None,
+                    body: b"ABCDE",
+                    release_after_body: None,
+                },
+            ),
+        ];
+
+        for (case_name, invalid_response) in cases {
+            let (_temp_dir, engine, model_dir) = test_engine().await;
+            fs::create_dir_all(&model_dir).await.expect("create model directory");
+            fs::write(model_dir.join("complete.bin"), b"C")
+                .await
+                .expect("seed completed sibling");
+            fs::write(model_dir.join("target.bin"), b"Z")
+                .await
+                .expect("seed retained prefix");
+
+            let (base_url, server) = serve_requests(vec![invalid_response]).await;
+            assert!(
+                engine
+                    .download_model_detailed_from_source(
+                        TEST_MODEL_NAME,
+                        &model_dir,
+                        &base_url,
+                        ARTIFACTS,
+                        None,
+                    )
+                    .await
+                    .is_err(),
+                "{case_name} response must fail"
+            );
+            server.await.expect("join invalid-response server");
+            assert_eq!(fs::read(model_dir.join("complete.bin")).await.unwrap(), b"C");
+            assert!(!matches!(test_model_status(&engine).await, ModelStatus::Available));
+            assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_cancellation_keeps_owner_and_blocks_retry() {
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        fs::create_dir_all(&model_dir).await.expect("create model directory");
+        fs::write(model_dir.join("encoder.bin"), b"AB")
+            .await
+            .expect("seed resumable prefix");
+        let owner = engine
+            .downloads
+            .reserve(TEST_MODEL_NAME)
+            .await
+            .expect("reserve initial owner");
+
+        assert_eq!(
+            engine
+                .cancel_download_with_timeout(TEST_MODEL_NAME, Duration::from_millis(1))
+                .await
+                .expect("request cancellation"),
+            CancelDownloadOutcome::Pending
+        );
+        assert!(engine.downloads.reserve(TEST_MODEL_NAME).await.is_err());
+
+        let error = engine
+            .finish_download(
+                TEST_MODEL_NAME,
+                &model_dir,
+                SMALL_ARTIFACTS,
+                &owner,
+                Err(DownloadCancelled.into()),
+                None,
+            )
+            .await
+            .expect_err("cancelled owner must finish as cancellation");
+        assert!(is_download_cancelled(&error));
+        assert_eq!(fs::read(model_dir.join("encoder.bin")).await.unwrap(), b"AB");
+        assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
+        assert!(engine.downloads.reserve(TEST_MODEL_NAME).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_before_terminal_commit() {
+        const ARTIFACTS: &[ArtifactSpec] = &[ArtifactSpec::same("model.bin", 4)];
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        let hook = Arc::new(DownloadStateTestHook {
+            finalization_ready: tokio::sync::Notify::new(),
+            continue_finalization: tokio::sync::Notify::new(),
+            discovery_scanned: tokio::sync::Notify::new(),
+            continue_discovery: tokio::sync::Notify::new(),
+        });
+        *engine.download_state_test_hook.lock().await = Some(Arc::clone(&hook));
+        let events = Arc::new(SegQueue::new());
+        let callback_events = Arc::clone(&events);
+
+        let (base_url, server) =
+            serve_requests(vec![response("model.bin", None, "200 OK", b"ABCD", None)]).await;
+        let download_engine = Arc::clone(&engine);
+        let download_dir = model_dir.clone();
+        let download = tokio::spawn(async move {
+            download_engine
+                .download_model_detailed_from_source(
+                    TEST_MODEL_NAME,
+                    &download_dir,
+                    &base_url,
+                    ARTIFACTS,
+                    Some(Box::new(move |progress| {
+                        callback_events.push(progress);
+                    })),
+                )
+                .await
+        });
+
+        hook.finalization_ready.notified().await;
+        assert_eq!(
+            engine
+                .cancel_download_with_timeout(TEST_MODEL_NAME, Duration::from_millis(1))
+                .await
+                .expect("request cancellation while finalization is paused"),
+            CancelDownloadOutcome::Pending
+        );
+        hook.continue_finalization.notify_one();
+
+        let error = download
+            .await
+            .expect("join download task")
+            .expect_err("cancellation must win before terminal commit");
+        server.await.expect("join cancellation server");
+        assert!(is_download_cancelled(&error));
+        assert!(std::iter::from_fn(|| events.pop()).all(|progress| progress.percent < 100));
+        assert!(matches!(test_model_status(&engine).await, ModelStatus::Missing));
+        assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
+    }
+
+    #[tokio::test]
+    async fn discovery_retries_when_download_finalizes_after_disk_scan() {
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        let hook = Arc::new(DownloadStateTestHook {
+            finalization_ready: tokio::sync::Notify::new(),
+            continue_finalization: tokio::sync::Notify::new(),
+            discovery_scanned: tokio::sync::Notify::new(),
+            continue_discovery: tokio::sync::Notify::new(),
+        });
+        *engine.download_state_test_hook.lock().await = Some(Arc::clone(&hook));
+
+        let discovery_engine = Arc::clone(&engine);
+        let discovery = tokio::spawn(async move {
+            discovery_engine
+                .discover_models_from_specs(SMALL_MODEL_SPECS)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.discovery_scanned.notified())
+            .await
+            .expect("discovery must finish its first disk scan");
+
+        fs::create_dir_all(&model_dir).await.expect("create model directory");
+        for artifact in SMALL_ARTIFACTS {
+            fs::write(
+                model_dir.join(artifact.local),
+                vec![0; artifact.exact_bytes as usize],
+            )
+            .await
+            .expect("seed exact artifact");
         }
 
-        // Update model status to Missing (so it can be retried)
-        {
-            let mut models = self.available_models.write().await;
-            if let Some(model) = models.get_mut(model_name) {
-                model.status = ModelStatus::Missing;
-            }
-        }
+        let owner = engine
+            .downloads
+            .reserve(TEST_MODEL_NAME)
+            .await
+            .expect("reserve download owner");
+        let finalization_engine = Arc::clone(&engine);
+        let finalization_dir = model_dir.clone();
+        let finalization_owner = Arc::clone(&owner);
+        let finalization = tokio::spawn(async move {
+            finalization_engine
+                .finish_download(
+                    TEST_MODEL_NAME,
+                    &finalization_dir,
+                    SMALL_ARTIFACTS,
+                    &finalization_owner,
+                    Ok(DownloadProgress::new(10, 10, 0.0)),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.finalization_ready.notified())
+            .await
+            .expect("finalization must reach its commit barrier");
+        hook.continue_finalization.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), finalization)
+            .await
+            .expect("finalization must complete")
+            .expect("join finalization task")
+            .expect("successful download must finalize");
 
-        // Clean up partially downloaded files
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Brief delay to let download loop exit
+        *engine.download_state_test_hook.lock().await = None;
+        hook.continue_discovery.notify_one();
+        let discovered = tokio::time::timeout(Duration::from_secs(1), discovery)
+            .await
+            .expect("discovery must complete")
+            .expect("join discovery task")
+            .expect("discovery must succeed");
 
-        let model_path = self.models_dir.join(model_name);
-        if model_path.exists() {
-            if let Err(e) = fs::remove_dir_all(&model_path).await {
-                log::warn!("Failed to clean up cancelled download directory: {}", e);
-            } else {
-                log::info!(
-                    "Cleaned up cancelled download directory: {}",
-                    model_path.display()
-                );
-            }
-        }
+        let discovered_model = discovered
+            .iter()
+            .find(|model| model.name == TEST_MODEL_NAME)
+            .expect("test model must be discovered");
+        assert!(matches!(discovered_model.status, ModelStatus::Available));
+        assert!(matches!(test_model_status(&engine).await, ModelStatus::Available));
+        assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
+    }
 
-        Ok(())
+    // Fork test (harden-model-downloads 1.8): cancel keeps the bytes already written.
+    #[tokio::test]
+    async fn cancelled_download_leaves_partial_files_on_disk() {
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        fs::create_dir_all(&model_dir).await.expect("create model directory");
+        fs::write(model_dir.join("encoder.bin"), b"AB")
+            .await
+            .expect("seed encoder prefix");
+        let (release_tx, release_rx) = oneshot::channel();
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let progress_tx = Arc::new(std::sync::Mutex::new(Some(progress_tx)));
+        let (base_url, server) = serve_requests(vec![ExpectedResponse {
+            filename: "encoder.bin",
+            range: Some("bytes=2-"),
+            status: "206 Partial Content",
+            content_length: Some(2),
+            content_range: Some("bytes 2-3/4"),
+            body: b"C",
+            release_after_body: Some(release_rx),
+        }])
+        .await;
+
+        let download_engine = Arc::clone(&engine);
+        let download_dir = model_dir.clone();
+        let download = tokio::spawn(async move {
+            download_engine
+                .download_model_detailed_from_source(
+                    TEST_MODEL_NAME,
+                    &download_dir,
+                    &base_url,
+                    SMALL_ARTIFACTS,
+                    Some(Box::new(move |progress| {
+                        if progress.downloaded_bytes == 3 {
+                            if let Some(sender) = progress_tx
+                                .lock()
+                                .expect("lock progress sender")
+                                .take()
+                            {
+                                let _ = sender.send(());
+                            }
+                        }
+                    })),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), progress_rx)
+            .await
+            .expect("receive partial progress")
+            .expect("progress sender remains connected");
+        assert_eq!(
+            engine
+                .cancel_download(TEST_MODEL_NAME)
+                .await
+                .expect("cancel download"),
+            CancelDownloadOutcome::Cancelled
+        );
+        release_tx.send(()).expect("release partial response");
+        let error = download
+            .await
+            .expect("join cancelled download")
+            .expect_err("cancelled download must not succeed");
+        server.await.expect("join partial-response server");
+
+        assert!(is_download_cancelled(&error));
+        assert_eq!(fs::read(model_dir.join("encoder.bin")).await.unwrap(), b"ABC");
+        assert!(matches!(test_model_status(&engine).await, ModelStatus::Missing));
+        assert!(!engine.downloads.lock().await.contains(TEST_MODEL_NAME));
     }
 }
