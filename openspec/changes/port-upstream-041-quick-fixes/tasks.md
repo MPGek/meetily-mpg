@@ -41,14 +41,14 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 4. Live transcription keeps short utterances (#681)
 
-- [ ] 4.1 In `audio/transcription/worker.rs`:
+- [x] 4.1 In `audio/transcription/worker.rs`:
   - add `fn should_emit_transcript(text: &str) -> bool { !text.trim().is_empty() }`, with upstream's doc comment;
   - remove `confidence_threshold` and `meets_threshold` (`:259-276`) and change the emit condition (`:278`) to `if should_emit_transcript(&transcript)`;
   - drop `threshold=` from the result log (`:271-272`), keeping `confidence=`;
   - delete the low-confidence `else if` branch (`:401-406`).
 
   Keep the tokens, the `TranscriptUpdate.confidence` value (`:351`) and the alignment-queue push (`:386-398`) unchanged. verify: `cargo check -p meetily` succeeds, and `grep -n "confidence_threshold\|low-confidence" frontend/src-tauri/src/audio/transcription/worker.rs` returns nothing.
-- [ ] 4.2 Add a `#[cfg(test)] mod tests` to `worker.rs` with upstream's `keeps_short_acknowledgements` (`"Yes"`, `"ok"`) and `drops_empty_and_whitespace_only`, plus `keeps_short_cyrillic_reply` (`"Да"`, `" Да."`); verify: `cargo test -p meetily --lib audio::transcription::worker` passes (3 tests).
+- [x] 4.2 Add a `#[cfg(test)] mod tests` to `worker.rs` with upstream's `keeps_short_acknowledgements` (`"Yes"`, `"ok"`) and `drops_empty_and_whitespace_only`, plus `keeps_short_cyrillic_reply` (`"Да"`, `" Да."`); verify: `cargo test -p meetily --lib audio::transcription::worker` passes (3 tests).
 
 ## 5. VAD init failure fails the start instead of panicking (#767 idea)
 
