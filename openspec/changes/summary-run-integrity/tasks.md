@@ -71,7 +71,7 @@
 
 ## 3. Run-scoped DB writes, cancellation and IPC (proposal d)
 
-- [ ] 3.1 In `database/repositories/summary.rs`:
+- [x] 3.1 In `database/repositories/summary.rs`:
   - `create_or_reset_process(pool, meeting_id, started_at)` binds the caller's `started_at` for `start_time` (it no longer reads `now` internally);
   - `update_process_completed/failed/cancelled` take `started_at`, add `AND start_time = ? AND LOWER(status) = 'pending'`, and return `Result<bool, _>`;
   - add `fail_interrupted_runs(pool) -> Result<u64, _>` (design D3/D8).
@@ -84,7 +84,8 @@
   - `start_time` read back equals the bound value.
 
   Run `cargo test -p meetily --lib database::repositories::summary`.
-- [ ] 3.2 In `summary/service.rs`, per design D1/D2:
+  - Note (2026-10-02): the interrupted error text is a `pub const INTERRUPTED_RUN_ERROR` in the repository; terminal writes log their success line only when they applied. 5 new tests; `--lib database::repositories::summary`: 5 passed (baseline 0).
+- [x] 3.2 In `summary/service.rs`, per design D1/D2:
   - replace the registry with `HashMap<meeting_id, { started_at, token }>`;
   - add `register_run(meeting_id) -> (DateTime<Utc>, CancellationToken)`. It is monotonic per meeting and cancels the previous token;
   - `cancel_summary(meeting_id, started_at) -> bool` and `cleanup_run(meeting_id, started_at)` act only on a matching entry;
@@ -94,20 +95,24 @@
   - the existing cache and language-detection code is kept unchanged.
 
   Verify: unit tests — registering run B cancels run A's token; `cleanup_run(A)` after B registered keeps B cancellable; `cancel_summary(meeting, A)` returns `false` and leaves B's token uncancelled; two `register_run` calls in a row yield strictly increasing starts; `run_id` round-trips through `DateTime::parse_from_rfc3339`. Run `cargo test -p meetily --lib summary::service`.
-- [ ] 3.3 In `summary/commands.rs`, per design D2/D3:
+  - Note (2026-10-02): `process_transcript_background` is now a thin wrapper around a private `run_transcript_processing` and always calls `cleanup_run` afterwards: with registration moved before spawn, the early-return failure paths (bad provider, missing API key/config, template load) would otherwise leave the run registered forever. Cleanup now happens after the terminal write instead of before it, so a Stop during that write reaches a registered run and gets the "already finished" reply. The service-level `update_process_failed` became `pub(crate)` and takes `started_at` so the command can use it. 5 new registry tests (unique meeting id per test, the registry is global).
+- [x] 3.3 In `summary/commands.rs`, per design D2/D3:
   - `api_process_transcript` calls `register_run` first. A `create_or_reset_process` error removes the registration. A `save_transcript_data` error does a CAS-fail of the run with the message, removes the registration, and returns `Err`;
   - it passes `started_at` and the token into the spawn, and returns `process_id = run_id(started_at)`;
   - `api_get_summary`'s `start` uses `run_id`;
   - `api_cancel_summary` takes a required `process_id: String`, parses it (invalid → `Err("Invalid summary process ID")`), and cancels and CAS-writes only that run, with messages for cancelled, already finished, and no active run.
 
   Verify: `cargo check -p meetily`, and `grep -n "cancel_summary\|create_or_reset_process\|update_process_" frontend/src-tauri/src` shows no call without `started_at`.
-- [ ] 3.4 In `database/setup.rs`'s normal startup branch, call `SummaryProcessesRepository::fail_interrupted_runs` once after the pool is created and before `app.manage`, and log the count. A failure is logged and does not block startup. Verify: `cargo check -p meetily`, plus the 3.1 test covering the query.
-- [ ] 3.5 Keep Stop working at this commit (design D11):
+  - Note (2026-10-02): `api_cancel_summary` returns "No active summary generation to cancel" when no matching run is registered and "Summary generation already finished" when the run is registered but its CAS cancel did not apply (it already wrote a terminal status). The grep shows every call passes `started_at`; `api_get_summary`'s `end` keeps `to_rfc3339()` (only `start` is a run id).
+- [x] 3.4 In `database/setup.rs`'s normal startup branch, call `SummaryProcessesRepository::fail_interrupted_runs` once after the pool is created and before `app.manage`, and log the count. A failure is logged and does not block startup. Verify: `cargo check -p meetily`, plus the 3.1 test covering the query.
+- [x] 3.5 Keep Stop working at this commit (design D11):
   - `frontend/src/lib/ipc/summary.ts` gets `CancelSummaryArgs { meetingId; processId }` for `cancelSummary`;
   - `useSummaryGeneration.ts` stores `result.process_id` in an `activeProcessIdRef` and passes it to `cancelSummary`. No other frontend behavior changes.
 
   Verify: `pnpm exec tsc --noEmit -p .` and `bun test tests/` in `frontend/` pass (baseline counts).
-- [ ] 3.6 Commit group 3 on its own. Verify: `cargo test -p meetily --lib summary` and `cargo test -p meetily --lib database` pass, clippy shows no new warnings against the 0.2 baseline, and tsc is clean.
+  - Note (2026-10-02): if Stop is pressed before `processTranscript` has returned a `process_id`, no cancel is sent (there is no run id to name yet); polling stop and the idle reset still happen. Group 4 handles the late start response. tsc clean, `bun test tests/` 99 pass.
+- [x] 3.6 Commit group 3 on its own. Verify: `cargo test -p meetily --lib summary` and `cargo test -p meetily --lib database` pass, clippy shows no new warnings against the 0.2 baseline, and tsc is clean.
+  - Note (2026-10-02): `--lib summary` 126 passed, `--lib database` 83 passed, clippy 32 `: warning` lines (baseline; none new in touched files), tsc clean.
 
 ## 4. Frontend progress resume and stale-result guards (proposal e)
 

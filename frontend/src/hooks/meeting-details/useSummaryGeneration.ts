@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { Transcript, Summary, MeetingMetadata } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -77,6 +77,8 @@ export function useSummaryGeneration({
 }: UseSummaryGenerationProps) {
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  // The run this view tracks (`process_id` / status `start`); cancel targets it.
+  const activeProcessIdRef = useRef<string | null>(null);
 
   const { startSummaryPolling, stopSummaryPolling } = useSidebar();
 
@@ -162,6 +164,7 @@ export function useSummaryGeneration({
       });
 
       const process_id = result.process_id;
+      activeProcessIdRef.current = process_id;
       console.log('Process ID:', process_id);
 
       // Start global polling via context
@@ -615,11 +618,15 @@ export function useSummaryGeneration({
     console.log('Stopping summary generation for meeting:', meeting.id);
 
     try {
-      // Call backend to cancel the summary generation
-      await cancelSummary({
-        meetingId: meeting.id
-      });
-      console.log('✓ Backend cancellation request sent for meeting:', meeting.id);
+      // Call backend to cancel this view's run (by its process id)
+      const processId = activeProcessIdRef.current;
+      if (processId) {
+        await cancelSummary({
+          meetingId: meeting.id,
+          processId,
+        });
+        console.log('✓ Backend cancellation request sent for meeting:', meeting.id);
+      }
     } catch (error) {
       console.error('Failed to cancel summary generation:', error);
       // Continue with frontend cleanup even if backend call fails

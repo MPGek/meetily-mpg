@@ -8,7 +8,8 @@ use crate::summary::metadata::{
     read_detected_summary_language_from_metadata, read_summary_language_from_metadata,
     write_detected_summary_language_to_metadata, write_summary_language_to_metadata,
 };
-use crate::summary::service::SummaryService;
+use crate::summary::service::{run_id, SummaryService};
+use chrono::{DateTime, Utc};
 use log::{error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -281,7 +282,7 @@ pub async fn api_get_summary<R: Runtime>(
                 status: status.clone(),
                 meeting_name,
                 meeting_id: meeting_id.clone(),
-                start: process.start_time.map(|t| t.to_rfc3339()),
+                start: process.start_time.as_ref().map(run_id),
                 end: process.end_time.map(|t| t.to_rfc3339()),
                 data,
                 error,
@@ -364,10 +365,17 @@ pub async fn api_process_transcript<R: Runtime>(
         }
     });
 
+    // Register the run first (supersedes any previous run of this meeting), so
+    // a Stop that arrives right after this command returns reaches it.
+    let (started_at, cancellation_token) = SummaryService::register_run(&m_id);
+
     // Create or reset the process entry in the database
-    SummaryProcessesRepository::create_or_reset_process(&pool, &m_id)
-        .await
-        .map_err(|e| format!("Failed to initialize process: {}", e))?;
+    if let Err(e) =
+        SummaryProcessesRepository::create_or_reset_process(&pool, &m_id, started_at).await
+    {
+        SummaryService::cleanup_run(&m_id, started_at);
+        return Err(format!("Failed to initialize process: {}", e));
+    }
 
     log_info!("✓ Summary process initialized for meeting_id: {}", m_id);
 
@@ -375,7 +383,7 @@ pub async fn api_process_transcript<R: Runtime>(
     let chunk_size = _chunk_size.unwrap_or(40000);
     let overlap = _overlap.unwrap_or(1000);
 
-    TranscriptChunksRepository::save_transcript_data(
+    if let Err(e) = TranscriptChunksRepository::save_transcript_data(
         &pool,
         &m_id,
         &text,
@@ -385,7 +393,12 @@ pub async fn api_process_transcript<R: Runtime>(
         overlap,
     )
     .await
-    .map_err(|e| format!("Failed to save transcript data: {}", e))?;
+    {
+        let err_msg = format!("Failed to save transcript data: {}", e);
+        SummaryService::update_process_failed(&pool, &m_id, started_at, &err_msg).await;
+        SummaryService::cleanup_run(&m_id, started_at);
+        return Err(err_msg);
+    }
 
     log_info!("✓ Transcript chunks saved for meeting_id: {}", m_id);
 
@@ -402,6 +415,8 @@ pub async fn api_process_transcript<R: Runtime>(
             final_prompt,
             final_template_id,
             summary_language,
+            started_at,
+            cancellation_token,
         )
         .await;
     });
@@ -410,47 +425,70 @@ pub async fn api_process_transcript<R: Runtime>(
 
     Ok(ProcessTranscriptResponse {
         message: "Summary generation started".to_string(),
-        process_id: m_id,
+        process_id: run_id(&started_at),
     })
 }
 
 /// Cancels an ongoing summary generation process
 ///
-/// This command triggers the cancellation token for the specified meeting,
-/// stopping the summary generation gracefully.
+/// This command triggers the cancellation token of the run named by
+/// `process_id` (the id `api_process_transcript` returned), stopping that run
+/// gracefully. It never affects another run of the same meeting.
 #[tauri::command]
 pub async fn api_cancel_summary<R: Runtime>(
     _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
+    process_id: String,
 ) -> Result<serde_json::Value, String> {
-    log_info!("api_cancel_summary called for meeting_id: {}", meeting_id);
+    log_info!(
+        "api_cancel_summary called for meeting_id: {}, process_id: {}",
+        meeting_id,
+        process_id
+    );
+
+    let started_at = DateTime::parse_from_rfc3339(&process_id)
+        .map_err(|_| "Invalid summary process ID".to_string())?
+        .with_timezone(&Utc);
 
     // Trigger cancellation via the service
-    let cancelled = SummaryService::cancel_summary(&meeting_id);
+    let cancelled = SummaryService::cancel_summary(&meeting_id, started_at);
 
     if cancelled {
-        // Update database status to cancelled
+        // Update database status to cancelled (first terminal write wins)
         let pool = state.db_manager.pool();
-        if let Err(e) =
-            SummaryProcessesRepository::update_process_cancelled(pool, &meeting_id).await
+        match SummaryProcessesRepository::update_process_cancelled(pool, &meeting_id, started_at)
+            .await
         {
-            log_error!(
-                "Failed to update DB status to cancelled for {}: {}",
-                meeting_id,
-                e
-            );
-            return Err(format!("Failed to update cancellation status: {}", e));
+            Ok(true) => {
+                log_info!(
+                    "Successfully cancelled summary generation for meeting_id: {}",
+                    meeting_id
+                );
+                Ok(serde_json::json!({
+                    "message": "Summary generation cancelled successfully",
+                    "meeting_id": meeting_id,
+                }))
+            }
+            Ok(false) => {
+                log_info!(
+                    "Summary generation already finished for meeting_id: {}",
+                    meeting_id
+                );
+                Ok(serde_json::json!({
+                    "message": "Summary generation already finished",
+                    "meeting_id": meeting_id,
+                }))
+            }
+            Err(e) => {
+                log_error!(
+                    "Failed to update DB status to cancelled for {}: {}",
+                    meeting_id,
+                    e
+                );
+                Err(format!("Failed to update cancellation status: {}", e))
+            }
         }
-
-        log_info!(
-            "Successfully cancelled summary generation for meeting_id: {}",
-            meeting_id
-        );
-        Ok(serde_json::json!({
-            "message": "Summary generation cancelled successfully",
-            "meeting_id": meeting_id,
-        }))
     } else {
         log_warn!(
             "No active summary generation found for meeting_id: {}",

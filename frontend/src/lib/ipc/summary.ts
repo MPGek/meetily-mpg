@@ -94,7 +94,14 @@ export async function processTranscript(args: ProcessTranscriptArgs): Promise<Pr
   return invokeTyped<ProcessTranscriptResponse>('api_process_transcript', args);
 }
 
-export async function cancelSummary(args: MeetingIdArgs): Promise<CancelSummaryResponse> {
+export interface CancelSummaryArgs {
+  meetingId: string;
+  /** The run to cancel: `process_id` from `processTranscript` (equals the status `start`). */
+  processId: string;
+}
+
+/** Cancels only the named run; another run of the same meeting is unaffected. */
+export async function cancelSummary(args: CancelSummaryArgs): Promise<CancelSummaryResponse> {
   return invokeTyped<CancelSummaryResponse>('api_cancel_summary', args);
 }
 

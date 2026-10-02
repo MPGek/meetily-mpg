@@ -1,7 +1,8 @@
-use log::info;
+use log::{info, warn};
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::manager::DatabaseManager;
+use super::repositories::summary::SummaryProcessesRepository;
 use crate::state::AppState;
 
 /// Initialize database on app startup
@@ -29,6 +30,14 @@ pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), Strin
         let db_manager = DatabaseManager::new_from_app_handle(app)
             .await
             .map_err(|e| format!("Failed to initialize database manager: {}", e))?;
+
+        // No summary run can be active in this process yet, so any `pending`
+        // row was left by a previous process that exited mid-run.
+        match SummaryProcessesRepository::fail_interrupted_runs(db_manager.pool()).await {
+            Ok(0) => {}
+            Ok(count) => info!("Marked {} interrupted summary run(s) as failed", count),
+            Err(e) => warn!("Failed to mark interrupted summary runs as failed: {}", e),
+        }
 
         app.manage(AppState { db_manager });
         info!("Database initialized successfully");
