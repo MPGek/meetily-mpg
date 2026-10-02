@@ -11,7 +11,7 @@ The system SHALL list available audio input devices with their names, IDs, and t
 - **THEN** system returns a list of detected audio devices with name, ID, and type
 
 ### Requirement: Audio recording start/stop
-The system SHALL support starting and stopping audio recording with configurable mic and system capture devices, resolving any unspecified device to the system default instead of disabling its capture.
+The system SHALL support starting and stopping audio recording with configurable mic and system capture devices, resolving any unspecified device to the system default instead of disabling its capture. A failure to initialize the audio processing pipeline (including voice activity detection) SHALL fail the start request with an error that states the cause, and SHALL NOT terminate the application.
 
 #### Scenario: Start recording with default devices
 - **WHEN** user clicks "Start Recording" without specifying devices
@@ -28,6 +28,14 @@ The system SHALL support starting and stopping audio recording with configurable
 #### Scenario: Stop recording gracefully
 - **WHEN** user clicks "Stop Recording" during an active session
 - **THEN** system stops capture, saves audio file, and releases resources
+
+#### Scenario: Voice activity detection cannot be initialized
+- **WHEN** the user starts a recording and the microphone or system-audio voice activity detector fails to initialize
+- **THEN** the start request SHALL return an error naming the failed component and its cause, the application SHALL keep running, and the recording state SHALL be left as not recording, so a later start attempt is possible
+
+#### Scenario: Start failure shown to the user
+- **WHEN** a recording start initiated from the home page or the sidebar fails
+- **THEN** the message shown to the user SHALL include the error text returned by the backend, instead of only telling the user to check the console
 
 ### Requirement: Dual-channel audio capture
 The system SHALL simultaneously capture microphone and system audio on supported platforms, keeping each source on a dedicated stereo channel (microphone on left, system audio on right) without mixing.
@@ -112,4 +120,3 @@ The system SHALL properly terminate the online diarization processor and free it
 #### Scenario: Fast mode processor stopped on recording stop
 - **WHEN** recording stops in Fast mode
 - **THEN** the system SHALL signal the polyvoice `StreamingPipeline` to flush remaining turns and shut down
-
