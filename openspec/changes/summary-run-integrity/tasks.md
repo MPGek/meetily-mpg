@@ -48,7 +48,7 @@
 
 ## 2. Chunk failure semantics (proposal b)
 
-- [ ] 2.1 Rewrite the chunk loop in `generate_meeting_summary` (`processor.rs` ~400-459) per design D7:
+- [x] 2.1 Rewrite the chunk loop in `generate_meeting_summary` (`processor.rs` ~400-459) per design D7:
   - `MAX_CHUNK_ATTEMPTS = 2`;
   - each attempt is `generate_summary` + `clean_stage_output("Summary chunk", …)`;
   - push only cleaned markdown;
@@ -57,14 +57,17 @@
   - remove the now-unreachable empty-chunks branch.
 
   Verify: `cargo check -p meetily`.
-- [ ] 2.2 Add end-to-end tests that call `generate_meeting_summary` with `LLMProvider::Ollama`, an `ollama_endpoint` pointing at a wiremock server, and a `token_threshold` small enough to produce 3 chunks. Cover:
+  - Note (2026-10-02): the empty-chunk-summaries branch is removed, but `chunk_text` can still return no chunks when the chunk budget is zero (`token_threshold == 300`), which would make the single-chunk `remove(0)` panic in the spawned task and leave the row pending; a guard on `chunks.is_empty()` before the loop keeps the old error there instead. Chunk reasoning flags are ORed into `reasoning_stripped` too.
+- [x] 2.2 Add end-to-end tests that call `generate_meeting_summary` with `LLMProvider::Ollama`, an `ollama_endpoint` pointing at a wiremock server, and a `token_threshold` small enough to produce 3 chunks. Cover:
   - (a) chunk 2's first response is 200 with empty content and its second is valid → `Ok`, `successful_chunk_count == 3`;
   - (b) chunk 2 returns empty content twice → `Err` containing `"transcript section 2 of 3"`, and no request with the combine prompt (`<summaries>`) or final-report prompt (`<transcript_chunks>`) was received;
   - (c) chunk outputs wrapped in `<think>…</think>` → the combine request body (from `received_requests()`) contains none of the think text;
   - (d) the token is cancelled after chunk 1 → `Err` "cancelled" and no retry request for chunk 2.
 
   Avoid 5xx/timeouts so transport backoff does not slow the tests. Run `cargo test -p meetily --lib summary::processor`.
-- [ ] 2.3 Commit group 2 on its own. Verify: `cargo test -p meetily --lib summary` passes and clippy shows no new warnings against the 0.2 baseline.
+  - Note (2026-10-02): added a fifth test pinning that the fixture splits into exactly 3 chunks with the chunk-2 marker (`w0160`) only in chunk 2; stages are told apart by `body_string_contains` on `<transcript_chunk>`, `<summaries>`, `<transcript_chunks>`. Case (d) cancels the token from inside the mock while chunk 2 is being served (a custom `Respond`), which exercises the no-retry path; cancelling between chunks would only hit the existing pre-chunk check. `--lib summary::processor`: 36 passed.
+- [x] 2.3 Commit group 2 on its own. Verify: `cargo test -p meetily --lib summary` passes and clippy shows no new warnings against the 0.2 baseline.
+  - Note (2026-10-02): `--lib summary` 116 passed; clippy 32 `: warning` lines (baseline).
 
 ## 3. Run-scoped DB writes, cancellation and IPC (proposal d)
 

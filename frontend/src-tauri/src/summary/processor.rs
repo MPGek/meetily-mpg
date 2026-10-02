@@ -5,7 +5,7 @@ use regex::Regex;
 use reqwest::Client;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // Compile regex once and reuse (significant performance improvement for repeated calls)
 /// A closed `<think>`/`<thinking>` envelope, any case, optional attributes.
@@ -43,6 +43,9 @@ fn clean_stage_output(stage: &str, raw: &str) -> Result<StageOutput, String> {
         reasoning_stripped,
     })
 }
+
+/// A failed chunk is retried once; a second failure fails the whole run.
+const MAX_CHUNK_ATTEMPTS: usize = 2;
 
 const ENGLISH_BASE_SUMMARY_INSTRUCTION: &str =
     "**Write the summary/report in English regardless of transcript language; non-English prose is invalid.**";
@@ -434,6 +437,13 @@ pub async fn generate_meeting_summary(
             let chunks = chunk_text(text, token_threshold - 300, 100);
             let num_chunks = chunks.len();
             info!("Split transcript into {} chunks", num_chunks);
+            if chunks.is_empty() {
+                // Only when the chunk budget is zero (token_threshold == 300).
+                return Err(
+                    "Multi-level summarization failed: the transcript produced no chunks."
+                        .to_string(),
+                );
+            }
 
             let mut chunk_summaries = Vec::new();
             let system_prompt_chunk = "You are an expert meeting summarizer.";
@@ -454,43 +464,63 @@ pub async fn generate_meeting_summary(
                 info!("Processing chunk {}/{}", i + 1, num_chunks);
                 let user_prompt_chunk = build_chunk_summary_user_prompt(chunk);
 
-                match generate_summary(
-                    client,
-                    provider,
-                    model_name,
-                    api_key,
-                    system_prompt_chunk,
-                    &user_prompt_chunk,
-                    ollama_endpoint,
-                    custom_openai_endpoint,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    app_data_dir,
-                    debug_log_dir.clone(),
-                    cancellation_token,
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        chunk_summaries.push(summary);
-                        info!("✓ Chunk {}/{} processed successfully", i + 1, num_chunks);
-                    }
-                    Err(e) => {
-                        // Check if error is due to cancellation
-                        if e.contains("cancelled") {
-                            return Err(e);
-                        }
-                        error!("Failed processing chunk {}/{}: {}", i + 1, num_chunks, e);
-                    }
-                }
-            }
+                let mut attempt = 1;
+                let chunk_output = loop {
+                    let result = generate_summary(
+                        client,
+                        provider,
+                        model_name,
+                        api_key,
+                        system_prompt_chunk,
+                        &user_prompt_chunk,
+                        ollama_endpoint,
+                        custom_openai_endpoint,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        app_data_dir,
+                        debug_log_dir.clone(),
+                        cancellation_token,
+                    )
+                    .await
+                    .and_then(|raw| clean_stage_output("Summary chunk", &raw));
 
-            if chunk_summaries.is_empty() {
-                return Err(
-                    "Multi-level summarization failed: No chunks were processed successfully."
-                        .to_string(),
-                );
+                    match result {
+                        Ok(output) => break output,
+                        Err(_) if cancellation_token.is_some_and(|t| t.is_cancelled()) => {
+                            info!(
+                                "Summary generation cancelled during chunk {}/{}",
+                                i + 1,
+                                num_chunks
+                            );
+                            return Err("Summary generation was cancelled".to_string());
+                        }
+                        Err(e) if attempt < MAX_CHUNK_ATTEMPTS => {
+                            warn!(
+                                "Chunk {}/{} failed on attempt {}; retrying: {}",
+                                i + 1,
+                                num_chunks,
+                                attempt,
+                                e
+                            );
+                            attempt += 1;
+                        }
+                        Err(e) => {
+                            error!("Failed processing chunk {}/{}: {}", i + 1, num_chunks, e);
+                            return Err(format!(
+                                "Summary generation could not complete because transcript section {} of {} failed after {} attempts: {}. Please retry.",
+                                i + 1,
+                                num_chunks,
+                                MAX_CHUNK_ATTEMPTS,
+                                e
+                            ));
+                        }
+                    }
+                };
+
+                reasoning_stripped |= chunk_output.reasoning_stripped;
+                chunk_summaries.push(chunk_output.markdown);
+                info!("✓ Chunk {}/{} processed successfully", i + 1, num_chunks);
             }
 
             successful_chunk_count = chunk_summaries.len() as i64;
@@ -998,6 +1028,195 @@ mod tests {
             english_markdown_after_normalization_result("# Original", stage).unwrap(),
             "# Original"
         );
+    }
+
+    // chunk loop, end to end against wiremock ---------------------------------
+
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// 300 unique words, 1800 chars: with `token_threshold = 600` this is
+    /// 630 tokens and splits into 3 chunks; `w0160` is only in chunk 2.
+    fn three_chunk_transcript() -> String {
+        (1..=300).map(|n| format!("w{n:04} ")).collect()
+    }
+
+    const CHUNK_2_MARKER: &str = "w0160";
+
+    fn chat_ok(text: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"choices": [{"message": {"content": text}}]}))
+    }
+
+    async fn mount(
+        server: &MockServer,
+        needle: &str,
+        response: ResponseTemplate,
+        times: Option<u64>,
+    ) {
+        let mock = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(needle))
+            .respond_with(response);
+        match times {
+            Some(n) => mock.up_to_n_times(n).mount(server).await,
+            None => mock.mount(server).await,
+        }
+    }
+
+    /// Generic responses for every stage after any scenario-specific mocks.
+    async fn mount_defaults(server: &MockServer, chunk_text: &str) {
+        mount(server, "<transcript_chunk>", chat_ok(chunk_text), None).await;
+        mount(server, "<summaries>", chat_ok("Combined notes"), None).await;
+        mount(
+            server,
+            "<transcript_chunks>",
+            chat_ok("# Title\nBody"),
+            None,
+        )
+        .await;
+    }
+
+    async fn run(
+        server: &MockServer,
+        token: Option<&CancellationToken>,
+    ) -> Result<(String, String, i64), String> {
+        let endpoint = server.uri();
+        let template = Template {
+            name: "Test".to_string(),
+            description: "Test template".to_string(),
+            sections: vec![crate::summary::templates::TemplateSection {
+                title: "Summary".to_string(),
+                instruction: "Summarize".to_string(),
+                format: "paragraph".to_string(),
+                item_format: None,
+                example_item_format: None,
+            }],
+        };
+        generate_meeting_summary(
+            crate::llm::shared_client(),
+            &LLMProvider::Ollama,
+            "m",
+            "",
+            &three_chunk_transcript(),
+            "",
+            "test",
+            &template,
+            600,
+            Some(&endpoint),
+            None,
+            None,
+            None,
+            None,
+            None,
+            token,
+            None,
+            None,
+            Some("en"),
+            None,
+        )
+        .await
+    }
+
+    async fn bodies(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn count_containing(bodies: &[String], needle: &str) -> usize {
+        bodies.iter().filter(|b| b.contains(needle)).count()
+    }
+
+    #[test]
+    fn test_transcript_splits_into_three_chunks_with_unique_chunk_2_marker() {
+        let chunks = chunk_text(&three_chunk_transcript(), 300, 100);
+        assert_eq!(chunks.len(), 3);
+        let with_marker: Vec<usize> = (0..3)
+            .filter(|&i| chunks[i].contains(CHUNK_2_MARKER))
+            .collect();
+        assert_eq!(with_marker, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_succeeds_on_retry() {
+        let server = MockServer::start().await;
+        mount(&server, CHUNK_2_MARKER, chat_ok(""), Some(1)).await;
+        mount_defaults(&server, "Chunk notes").await;
+
+        let (_, _, chunks) = run(&server, None).await.expect("retry should recover");
+
+        assert_eq!(chunks, 3);
+        let bodies = bodies(&server).await;
+        assert_eq!(count_containing(&bodies, CHUNK_2_MARKER), 2);
+        assert_eq!(count_containing(&bodies, "<summaries>"), 1);
+    }
+
+    #[tokio::test]
+    async fn chunk_failing_twice_fails_the_run_before_combine() {
+        let server = MockServer::start().await;
+        mount(&server, CHUNK_2_MARKER, chat_ok(""), None).await;
+        mount_defaults(&server, "Chunk notes").await;
+
+        let err = run(&server, None).await.unwrap_err();
+
+        assert!(err.contains("transcript section 2 of 3"), "{err}");
+        assert!(err.contains("Please retry"), "{err}");
+        let bodies = bodies(&server).await;
+        assert_eq!(count_containing(&bodies, CHUNK_2_MARKER), 2);
+        assert_eq!(count_containing(&bodies, "<summaries>"), 0);
+        assert_eq!(count_containing(&bodies, "<transcript_chunks>"), 0);
+    }
+
+    #[tokio::test]
+    async fn chunk_reasoning_never_reaches_the_combine_request() {
+        let server = MockServer::start().await;
+        mount_defaults(&server, "<think>SECRET_THOUGHT</think>Chunk notes").await;
+
+        run(&server, None).await.expect("run should complete");
+
+        let bodies = bodies(&server).await;
+        let combine: Vec<&String> = bodies
+            .iter()
+            .filter(|b| b.contains("<summaries>"))
+            .collect();
+        assert_eq!(combine.len(), 1);
+        assert!(combine[0].contains("Chunk notes"));
+        assert!(!combine[0].contains("SECRET_THOUGHT"));
+    }
+
+    /// Cancels the run's token while serving the request, then fails it.
+    struct CancelWhileServing(CancellationToken);
+
+    impl Respond for CancelWhileServing {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            self.0.cancel();
+            chat_ok("")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_chunk_is_not_retried() {
+        let server = MockServer::start().await;
+        let token = CancellationToken::new();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(CHUNK_2_MARKER))
+            .respond_with(CancelWhileServing(token.clone()))
+            .mount(&server)
+            .await;
+        mount_defaults(&server, "Chunk notes").await;
+
+        let err = run(&server, Some(&token)).await.unwrap_err();
+
+        assert!(err.contains("cancelled"), "{err}");
+        let bodies = bodies(&server).await;
+        assert_eq!(count_containing(&bodies, CHUNK_2_MARKER), 1);
+        assert_eq!(count_containing(&bodies, "<summaries>"), 0);
     }
 
     // resolve_cached_english matrix -------------------------------------------
