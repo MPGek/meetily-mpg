@@ -723,7 +723,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
-    ) -> Self {
+    ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
         info!(
@@ -760,7 +760,9 @@ impl AudioPipeline {
             }
             Err(e) => {
                 error!("Failed to create VAD processor for mic: {}", e);
-                panic!("VAD processor creation failed: {}", e);
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize voice activity detection for microphone: {e}"
+                ));
             }
         };
 
@@ -772,7 +774,9 @@ impl AudioPipeline {
             }
             Err(e) => {
                 error!("Failed to create VAD processor for system audio: {}", e);
-                panic!("VAD processor creation failed: {}", e);
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize voice activity detection for system audio: {e}"
+                ));
             }
         };
 
@@ -803,7 +807,7 @@ impl AudioPipeline {
             channel.set_pending_triggers(500, 25_000);
         }
 
-        Self {
+        Ok(Self {
             receiver,
             transcription_sender,
             embedding_sender,
@@ -833,7 +837,7 @@ impl AudioPipeline {
             vad_sys_buffer_real_base: None,
             vad_mic_anchors: Vec::new(),
             vad_sys_anchors: Vec::new(),
-        }
+        })
     }
 
     /// Publish one channel's live telemetry: the fills of the buffers that gate
@@ -1332,9 +1336,6 @@ impl AudioPipelineManager {
         // dropping chunks, instead of growing memory unboundedly.
         let (audio_sender, audio_receiver) = mpsc::channel::<AudioChunk>(128);
 
-        // Set sender in state for audio captures to use
-        state.set_audio_sender(audio_sender.clone());
-
         // Create and start pipeline with device information for adaptive mixing
         let mut pipeline = AudioPipeline::new(
             audio_receiver,
@@ -1347,7 +1348,11 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
-        );
+        )?;
+
+        // Set sender in state for audio captures to use, only once the
+        // pipeline exists, so captures never feed a dropped receiver.
+        state.set_audio_sender(audio_sender.clone());
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings

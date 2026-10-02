@@ -52,21 +52,23 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 5. VAD init failure fails the start instead of panicking (#767 idea)
 
-- [ ] 5.1 In `audio/pipeline.rs`:
+- [x] 5.1 In `audio/pipeline.rs`:
   - change `AudioPipeline::new` (`:715`) to return `anyhow::Result<Self>`;
   - replace both `panic!("VAD processor creation failed: {}", e)` arms (`:763`, `:775`) with an `error!` log plus `Err(anyhow!("Failed to initialize voice activity detection for microphone: {e}"))`, and the same for `system audio`;
   - wrap the final struct literal in `Ok(...)`.
 
   In `AudioPipelineManager::start`, call `AudioPipeline::new(...)?` and move `state.set_audio_sender(audio_sender.clone())` (`:1336`) to after it (design D5). verify: `cargo check -p meetily` succeeds, and `grep -n "panic!" frontend/src-tauri/src/audio/pipeline.rs` shows no VAD panic.
-- [ ] 5.2 In `audio/recording_manager.rs` `start_recording` (`:65-155`), change the `self.pipeline_manager.start(...)?` call (`:121-132`) to an `if let Err(e) = ... { self.state.stop_recording(); return Err(e); }`, so a failed start leaves the state not recording; verify: `cargo check -p meetily` succeeds.
-- [ ] 5.3 Add a unit test in `pipeline.rs`'s test module (or `recording_manager.rs`'s, wherever an `Arc<RecordingState>` can be built without devices): an `AudioPipelineManager::start` whose VAD creation fails returns `Err` with the "voice activity detection" text, does not panic, and leaves `state`'s audio sender unset.
+- [x] 5.2 In `audio/recording_manager.rs` `start_recording` (`:65-155`), change the `self.pipeline_manager.start(...)?` call (`:121-132`) to an `if let Err(e) = ... { self.state.stop_recording(); return Err(e); }`, so a failed start leaves the state not recording; verify: `cargo check -p meetily` succeeds.
+- [x] 5.3 Add a unit test in `pipeline.rs`'s test module (or `recording_manager.rs`'s, wherever an `Arc<RecordingState>` can be built without devices): an `AudioPipelineManager::start` whose VAD creation fails returns `Err` with the "voice activity detection" text, does not panic, and leaves `state`'s audio sender unset.
 
   The failure can be forced by:
   - a sample rate `ContinuousVadProcessor::new` rejects, if there is one (check `audio/vad.rs`);
   - otherwise a `#[cfg(test)]` failure hook on the VAD constructor.
 
   If neither works without production-code contortions, record the reason under this task and rely on 5.4. verify: `cargo test -p meetily --lib audio::pipeline` passes, or a note explains the skip.
+  - Note (2026-10-02): skipped the unit test. `ContinuousVadProcessor::new` (`audio/vad.rs:397`) accepts any input rate (a resampler failure only logs and falls back), and its only fallible step is the ONNX session built from the embedded `silero_vad_v6.onnx`, so no input makes it fail. A `#[cfg(test)]` failure hook would add test-only state to the VAD constructor for one assertion; relying on 5.4 instead.
 - [ ] 5.4 Manual check: temporarily make `ContinuousVadProcessor::new` return `Err` (local edit, not committed) and start a recording from the home page in `pnpm tauri:dev`. The app keeps running, the alert shows `Failed to start recording: Failed to initialize voice activity detection for microphone: ...`, and a second start attempt (after reverting the edit and restarting) succeeds; verify: the observed alert text is noted under this task. This depends on group 7.1 for the alert text; if group 7 lands later, check the error in the devtools console instead.
+  - Note (2026-10-02): open. Needs `pnpm tauri:dev` with a temporary local edit; left for the manual-check pass.
 
 ## 6. Ending an analytics session does not deadlock (#784)
 

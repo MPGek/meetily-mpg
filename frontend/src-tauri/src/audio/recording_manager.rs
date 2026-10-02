@@ -118,7 +118,7 @@ impl RecordingManager {
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
         let embedding_sender = self.embedding_sender.clone();
-        self.pipeline_manager.start(
+        if let Err(e) = self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
             embedding_sender,
@@ -129,7 +129,12 @@ impl RecordingManager {
             mic_kind,
             sys_name,
             sys_kind,
-        )?;
+        ) {
+            // The state was marked recording above; a failed start must not
+            // leave it reporting an active recording.
+            self.state.stop_recording();
+            return Err(e);
+        }
 
         // Give the pipeline a moment to fully initialize before starting streams
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
