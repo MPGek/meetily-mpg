@@ -4,25 +4,30 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
 
 ## 0. Preconditions and baseline
 
-- [ ] 0.1 Re-verify the anchors this plan cites. Verify: each of the following still matches design.md (Context, D11), and any drift is noted in this task:
+- [x] 0.1 Re-verify the anchors this plan cites. Verify: each of the following still matches design.md (Context, D11), and any drift is noted in this task:
   - `grep -rn "poll_audio_device_events\|get_reconnection_status\|attempt_device_reconnect" frontend/src` is empty
   - `grep -n "poll_audio_device_events\|get_reconnection_status\|attempt_device_reconnect" frontend/src-tauri/src/lib.rs` shows the 3 registrations
   - `recording_manager.rs:44,144-151` (monitor created and started) and `:546-682` (reconnect methods)
   - `device_monitor.rs:241` (fire once at `==` threshold)
   - `stop.rs:43-46` (Stop's first mutation is `take()`)
   - `stream.rs:42-47` (4-argument `AudioStream::create`)
-- [ ] 0.2 Record the baselines in this task's note:
+  - Note (2026-10-02): verified at d78ecf7. Frontend grep is empty; `stop.rs:43-46`, `stream.rs:42-47`, `device_monitor.rs:241`, `recording_manager.rs:44` and the `lifecycle.rs`/`recording_commands.rs`/`recording_state.rs` anchors still match. Drift from the three changes landed since f9919e4 (`port-upstream-041-quick-fixes`, `harden-model-downloads`, `summary-run-integrity`): `lib.rs` registrations are at 707-709 (design said 705-708; the comment line is 706); `recording_manager.rs` monitor start is at 149-156 and the reconnect methods at 551-687 (+5, because `start_recording` now resets state when `pipeline_manager.start` fails, 121-137); `pipeline.rs` anchors moved by about +4 (flush check 964-974, STEP 3 1136-1173, force flush 1395-1459) and `AudioPipeline::new` now returns `Result` with the audio sender published after it (`pipeline.rs:1340-1355`). Both landed behaviors are kept unchanged by this change.
+- [x] 0.2 Record the baselines in this task's note:
   - full Rust tests (pass/fail/ignored counts)
   - `cargo clippy -p meetily --all-targets --message-format=short 2>&1 | grep -c "^warning"`
   - `bun test tests/` and `pnpm exec tsc --noEmit -p .`
 
   Verify: the four numbers or outcomes are written down. Group 9 compares against them.
+  - Note (2026-10-02): full Rust tests 592 passed / 0 failed / 9 ignored. Clippy: the literal `grep -c "^warning"` counts 18 lines (build-script notes and summaries, not lints, because `--message-format=short` prefixes lints with the path); counted per location (`grep -c "^frontend.*warning:"`) it is 32, which is the number group 9 compares. Pre-existing lints already in files this change touches: `pipeline.rs:177` (unused `recording_sender`), `pipeline.rs:1092,1109` (`drop` of a reference), `recording_state.rs:127` (complex type), `recording_commands.rs:673` (guard across await in a test). `bun test tests/` 117 pass / 0 fail; `pnpm exec tsc --noEmit -p .` clean.
 
 ## 1. Remove the dead reconnect surface
 
-- [ ] 1.1 Delete the commands `poll_audio_device_events`, `get_reconnection_status` and `attempt_device_reconnect`, with `DeviceEventResponse`, `ReconnectionStatus` and `DisconnectedDeviceInfo` (`audio/recording_commands.rs`). Keep `get_active_audio_output`. Remove their 3 registrations and the comment line in `lib.rs` `generate_handler!`. Drop the `DeviceEvent`/`DeviceMonitorType` imports in `recording_commands.rs` if they become unused. Verify: `cargo check -p meetily` succeeds.
-- [ ] 1.2 Delete `RecordingManager::{poll_device_events, attempt_device_reconnect, handle_device_disconnect, handle_device_reconnect, is_reconnecting}`. Delete `RecordingState`'s `is_reconnecting` / `disconnected_device` fields, their accessors, and the init/cleanup lines that touch them (design D11). Remove imports that become unused (`list_audio_devices`, `RecordingDeviceType`, `DeviceMonitorType` in `recording_manager.rs`). Verify: `cargo check -p meetily`, and `grep -rn "is_reconnecting\|disconnected_device\|poll_device_events\|handle_device_reconnect" frontend/src-tauri/src --include=*.rs` returns only `recording_commands.rs.backup` hits, if any.
-- [ ] 1.3 Reword the doc comment of `take_drop_await_restore_does_not_hold_the_lock_across_the_await` (`recording_commands.rs` tests) so it names the mic-swap phases instead of `attempt_device_reconnect`. Leave the test body unchanged. Verify: `cargo test -p meetily --lib recording_commands` passes with the same 4 tests.
+- [x] 1.1 Delete the commands `poll_audio_device_events`, `get_reconnection_status` and `attempt_device_reconnect`, with `DeviceEventResponse`, `ReconnectionStatus` and `DisconnectedDeviceInfo` (`audio/recording_commands.rs`). Keep `get_active_audio_output`. Remove their 3 registrations and the comment line in `lib.rs` `generate_handler!`. Drop the `DeviceEvent`/`DeviceMonitorType` imports in `recording_commands.rs` if they become unused. Verify: `cargo check -p meetily` succeeds.
+  - Note (2026-10-02): removed as listed, plus the now-unused `error`/`warn` log imports; the section header above `get_active_audio_output` now reads "PLAYBACK DEVICE COMMANDS". The 3 registrations sat at `lib.rs:707-709` (drift noted in 0.1).
+- [x] 1.2 Delete `RecordingManager::{poll_device_events, attempt_device_reconnect, handle_device_disconnect, handle_device_reconnect, is_reconnecting}`. Delete `RecordingState`'s `is_reconnecting` / `disconnected_device` fields, their accessors, and the init/cleanup lines that touch them (design D11). Remove imports that become unused (`list_audio_devices`, `RecordingDeviceType`, `DeviceMonitorType` in `recording_manager.rs`). Verify: `cargo check -p meetily`, and `grep -rn "is_reconnecting\|disconnected_device\|poll_device_events\|handle_device_reconnect" frontend/src-tauri/src --include=*.rs` returns only `recording_commands.rs.backup` hits, if any.
+  - Note (2026-10-02): `cargo check` is clean apart from one expected intermediate warning, `device_event_receiver` never read, which task 4.1's `take_device_event_receiver` resolves. The grep returns nothing (no `.backup` file exists).
+- [x] 1.3 Reword the doc comment of `take_drop_await_restore_does_not_hold_the_lock_across_the_await` (`recording_commands.rs` tests) so it names the mic-swap phases instead of `attempt_device_reconnect`. Leave the test body unchanged. Verify: `cargo test -p meetily --lib recording_commands` passes with the same 4 tests.
+  - Note (2026-10-02): the inline comment inside the test that also named `attempt_device_reconnect` was reworded too (comment only, no code change), so no reference to the removed command remains. 4 tests pass.
 
 ## 2. Device monitor: re-fire for the mic and a retarget mailbox
 

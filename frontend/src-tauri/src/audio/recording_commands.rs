@@ -4,7 +4,7 @@
 // Delegates to transcription and recording modules for actual implementation.
 
 use anyhow::Result;
-use log::{error, info, warn};
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -13,11 +13,7 @@ use std::sync::{
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::task::JoinHandle;
 
-use super::{
-    DeviceEvent,
-    DeviceMonitorType,
-    RecordingManager,
-};
+use super::RecordingManager;
 use super::diarization::engine::{DiarizationEngine, LiveSpeakerAssignment};
 use super::sync_ext::LockRecover;
 
@@ -284,106 +280,8 @@ pub async fn get_recording_meeting_name() -> Result<Option<String>, String> {
 }
 
 // ============================================================================
-// DEVICE MONITORING COMMANDS (AirPods/Bluetooth disconnect/reconnect support)
+// PLAYBACK DEVICE COMMANDS
 // ============================================================================
-
-/// Response structure for device events
-#[derive(Debug, Serialize, Clone)]
-#[serde(tag = "type")]
-pub enum DeviceEventResponse {
-    DeviceDisconnected {
-        device_name: String,
-        device_type: String,
-    },
-    DeviceReconnected {
-        device_name: String,
-        device_type: String,
-    },
-    DeviceListChanged,
-}
-
-impl From<DeviceEvent> for DeviceEventResponse {
-    fn from(event: DeviceEvent) -> Self {
-        match event {
-            DeviceEvent::DeviceDisconnected {
-                device_name,
-                device_type,
-            } => DeviceEventResponse::DeviceDisconnected {
-                device_name,
-                device_type: format!("{:?}", device_type),
-            },
-            DeviceEvent::DeviceReconnected {
-                device_name,
-                device_type,
-            } => DeviceEventResponse::DeviceReconnected {
-                device_name,
-                device_type: format!("{:?}", device_type),
-            },
-            DeviceEvent::DeviceListChanged => DeviceEventResponse::DeviceListChanged,
-        }
-    }
-}
-
-/// Reconnection status information
-#[derive(Debug, Serialize, Clone)]
-pub struct ReconnectionStatus {
-    pub is_reconnecting: bool,
-    pub disconnected_device: Option<DisconnectedDeviceInfo>,
-}
-
-/// Information about a disconnected device
-#[derive(Debug, Serialize, Clone)]
-pub struct DisconnectedDeviceInfo {
-    pub name: String,
-    pub device_type: String,
-}
-
-/// Poll for audio device events (disconnect/reconnect)
-/// Should be called periodically (every 1-2 seconds) by frontend during recording
-#[tauri::command]
-pub async fn poll_audio_device_events() -> Result<Option<DeviceEventResponse>, String> {
-    let mut manager_guard = RECORDING_MANAGER.lock_or_recover();
-
-    if let Some(manager) = manager_guard.as_mut() {
-        if let Some(event) = manager.poll_device_events() {
-            info!("📱 Device event polled: {:?}", event);
-            Ok(Some(event.into()))
-        } else {
-            Ok(None)
-        }
-    } else {
-        // Not recording, no events
-        Ok(None)
-    }
-}
-
-/// Get current reconnection status
-/// Returns whether the system is attempting to reconnect and which device
-#[tauri::command]
-pub async fn get_reconnection_status() -> Result<ReconnectionStatus, String> {
-    let manager_guard = RECORDING_MANAGER.lock_or_recover();
-
-    if let Some(manager) = manager_guard.as_ref() {
-        let state = manager.get_state();
-        let disconnected_device = state
-            .get_disconnected_device()
-            .map(|(device, device_type)| DisconnectedDeviceInfo {
-                name: device.name.clone(),
-                device_type: format!("{:?}", device_type),
-            });
-
-        Ok(ReconnectionStatus {
-            is_reconnecting: manager.is_reconnecting(),
-            disconnected_device,
-        })
-    } else {
-        // Not recording, no reconnection in progress
-        Ok(ReconnectionStatus {
-            is_reconnecting: false,
-            disconnected_device: None,
-        })
-    }
-}
 
 /// Get information about the active audio output device
 /// Used to warn users about Bluetooth playback issues
@@ -392,54 +290,6 @@ pub async fn get_active_audio_output() -> Result<super::playback_monitor::AudioO
     super::playback_monitor::get_active_audio_output()
         .await
         .map_err(|e| format!("Failed to get audio output info: {}", e))
-}
-
-/// Manually trigger device reconnection attempt
-/// Useful for UI "Retry" button
-#[tauri::command]
-pub async fn attempt_device_reconnect(
-    device_name: String,
-    device_type: String,
-) -> Result<bool, String> {
-    // Parse device type first
-    let monitor_type = match device_type.as_str() {
-        "Microphone" => DeviceMonitorType::Microphone,
-        "SystemAudio" => DeviceMonitorType::SystemAudio,
-        _ => return Err(format!("Invalid device type: {}", device_type)),
-    };
-
-    // Take the manager out of the lock (mirroring `stop_recording`'s Step 1,
-    // recording_commands.rs:928-931) so the lock is not held across the
-    // `.await` below and other commands can acquire it while a reconnect is
-    // in progress.
-    let mut manager = {
-        let mut guard = RECORDING_MANAGER.lock_or_recover();
-        guard.take().ok_or_else(|| "Recording not active".to_string())?
-    };
-
-    let result = manager
-        .attempt_device_reconnect(&device_name, monitor_type)
-        .await;
-
-    {
-        let mut guard = RECORDING_MANAGER.lock_or_recover();
-        *guard = Some(manager);
-    }
-
-    match result {
-        Ok(success) => {
-            if success {
-                info!("✅ Manual reconnection successful");
-            } else {
-                warn!("❌ Manual reconnection failed - device not available");
-            }
-            Ok(success)
-        }
-        Err(e) => {
-            error!("Manual reconnection error: {}", e);
-            Err(e.to_string())
-        }
-    }
 }
 
 // ============================================================================
@@ -768,10 +618,13 @@ mod tests {
 
     /// `RecordingManager` cannot be constructed cheaply in a unit test (its
     /// `new()` wires up real device monitoring), so this proves the
-    /// take-lock/drop-lock/await/re-lock/restore shape that
-    /// `attempt_device_reconnect` (task 2.1) and `stop_recording`'s Step 1
-    /// both use: a slow operation running on an owned, taken-out value must
-    /// not block a concurrent lock acquisition on the slot it was taken from.
+    /// short-lock/drop-lock/await/re-lock shape that the mid-recording mic
+    /// swap (`device_recovery::attempt_mic_fallback`: Phase 1 takes the mic
+    /// stream under a short lock, teardown and Phase 2 stream creation await
+    /// with no lock held, Phase 3 re-locks to install) and `stop_recording`'s
+    /// Step 1 both use: a slow operation running on an owned, taken-out value
+    /// must not block a concurrent lock acquisition on the slot it was taken
+    /// from.
     #[tokio::test]
     async fn take_drop_await_restore_does_not_hold_the_lock_across_the_await() {
         use std::time::{Duration, Instant};
@@ -783,7 +636,7 @@ mod tests {
         let reconnect_slot = Arc::clone(&manager_slot);
         let reconnect_taken = Arc::clone(&taken);
         let reconnect = tokio::spawn(async move {
-            // Mirrors `attempt_device_reconnect`: take the value out under
+            // Mirrors the mic swap phases: take the value out under
             // the lock, drop the lock, then `.await` a slow operation on the
             // owned value before restoring it.
             let value = {
