@@ -4,18 +4,20 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 0. Baseline
 
-- [ ] 0.1 Record the pre-change baselines:
+- [x] 0.1 Record the pre-change baselines:
   - `cargo test -p meetily --lib -- --skip audio::playback_monitor --skip audio::system_audio_commands` (pass/fail/ignored counts)
   - `cargo clippy -p meetily --all-targets --message-format=short 2>&1 | grep -c "^warning"` (the operations doc says 32)
   - `bun test tests/` and `pnpm exec tsc --noEmit -p .` in `frontend/`
 
   verify: all four commands ran and their counts are noted in the PR description.
-- [ ] 0.2 Re-check every `file:line` cited in `proposal.md` and `design.md` against HEAD (they were taken on 2026-10-02 at `f9919e4`), and fix any drifted reference in the artifacts before editing code; verify: each cited line still holds the quoted code (`grep -n` spot checks for `step = chunk_size_chars`, `max_tokens: 2048`, `let sample_rate = track`, `confidence_threshold`, `panic!("VAD processor creation failed`, `let mut session_guard`, `Check console for details`, `<motion.div`, `<span className="text-lg`).
+  - Note (2026-10-02): baseline at dbe3ac4: Rust 515 passed / 0 failed / 9 ignored; clippy 32 warnings; `bun test tests/` 92 pass; `tsc --noEmit` clean.
+- [x] 0.2 Re-check every `file:line` cited in `proposal.md` and `design.md` against HEAD (they were taken on 2026-10-02 at `f9919e4`), and fix any drifted reference in the artifacts before editing code; verify: each cited line still holds the quoted code (`grep -n` spot checks for `step = chunk_size_chars`, `max_tokens: 2048`, `let sample_rate = track`, `confidence_threshold`, `panic!("VAD processor creation failed`, `let mut session_guard`, `Check console for details`, `<motion.div`, `<span className="text-lg`).
 
 ## 1. Summary chunking keeps every character (#603)
 
-- [ ] 1.1 Apply upstream's patch: `git -C $UP diff 84370b3^1 84370b3 -- frontend/src-tauri/src/summary/processor.rs > <scratch>/603.patch` and `git apply <scratch>/603.patch`. It replaces the fixed `step` (`summary/processor.rs:221`, `:250`) with `emitted_end_char`, accepts a boundary only if it lies beyond `overlap_chars`, and computes the next start as `.saturating_sub(overlap_chars).max(start_char + 1)`. It also adds `chunk_text_preserves_content_after_early_sentence_boundary`, `chunk_text_keeps_unicode_boundaries` and `chunk_text_progresses_when_overlap_matches_window`; verify: `git apply --check` succeeds before applying, and `cargo test -p meetily --lib summary::processor` passes, including the 3 new tests.
-- [ ] 1.2 Add one fork test, `chunk_text_covers_every_character`: on a ~5,000-char text with sentence boundaries placed so that the snap-back exceeds the overlap, the chunks taken in order and with overlaps removed contain every character of the input; verify: `cargo test -p meetily --lib summary::processor::tests::chunk_text_covers_every_character` passes, and fails when run against the pre-1.1 `chunk_text` (check with `git stash` of 1.1 or by reasoning on the old `step` arithmetic, noted in the commit message).
+- [x] 1.1 Apply upstream's patch: `git -C $UP diff 84370b3^1 84370b3 -- frontend/src-tauri/src/summary/processor.rs > <scratch>/603.patch` and `git apply <scratch>/603.patch`. It replaces the fixed `step` (`summary/processor.rs:221`, `:250`) with `emitted_end_char`, accepts a boundary only if it lies beyond `overlap_chars`, and computes the next start as `.saturating_sub(overlap_chars).max(start_char + 1)`. It also adds `chunk_text_preserves_content_after_early_sentence_boundary`, `chunk_text_keeps_unicode_boundaries` and `chunk_text_progresses_when_overlap_matches_window`; verify: `git apply --check` succeeds before applying, and `cargo test -p meetily --lib summary::processor` passes, including the 3 new tests.
+- [x] 1.2 Add one fork test, `chunk_text_covers_every_character`: on a ~5,000-char text with sentence boundaries placed so that the snap-back exceeds the overlap, the chunks taken in order and with overlaps removed contain every character of the input; verify: `cargo test -p meetily --lib summary::processor::tests::chunk_text_covers_every_character` passes, and fails when run against the pre-1.1 `chunk_text` (check with `git stash` of 1.1 or by reasoning on the old `step` arithmetic, noted in the commit message).
+  - Note: on the pre-1.1 code the first 286-char window holds only the leading `a. `, so `chunk_text` emits `a. ` and jumps to char 257 via the fixed `step`, leaving chars 3..257 in no chunk; the test asserts that gap away.
 
 ## 2. Claude summaries skip thinking blocks (#694)
 
