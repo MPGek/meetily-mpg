@@ -10,6 +10,9 @@ import {
   getRecordingState,
   isRecording,
   listenChunkDropWarning,
+  listenMicDeviceSwitched,
+  listenMicRecoveryExhausted,
+  listenMicSwapFailed,
   listenRecordingPaused,
   listenRecordingResumed,
   listenRecordingStarted,
@@ -20,6 +23,9 @@ import {
   startRecording,
   startRecordingWithDevicesAndMeeting,
   stopRecording,
+  type MicDeviceSwitchedPayload,
+  type MicRecoveryExhaustedPayload,
+  type MicSwapFailedPayload,
   type RecordingState,
   type RecordingStoppedPayload,
 } from '@/lib/ipc/recording';
@@ -50,7 +56,14 @@ import {
 import type { UnlistenFn } from '@/lib/ipc/core';
 import type { DiarizationProgress, DiarizationResult, LiveTranscriptBlocks } from '@/types';
 
-export type { RecordingState, RecordingStoppedPayload, SpeakerAssignment } from '@/lib/ipc/recording';
+export type {
+  MicDeviceSwitchedPayload,
+  MicRecoveryExhaustedPayload,
+  MicSwapFailedPayload,
+  RecordingState,
+  RecordingStoppedPayload,
+  SpeakerAssignment,
+} from '@/lib/ipc/recording';
 export type { SpeakerTurn } from '@/lib/ipc/speakers';
 export type DiarizationProgressPayload = DiarizationProgress;
 export type DiarizationResultPayload = DiarizationResult;
@@ -205,6 +218,40 @@ export class RecordingService {
    */
   async onSpeechDetected(callback: () => void): Promise<UnlistenFn> {
     return listenSpeechDetected(callback);
+  }
+
+  /**
+   * Listen for mic-device-switched event (the recording mic changed without
+   * the user picking it: mid-recording fallback or unavailable at start)
+   * @param callback - Function to call with the switch details
+   * @returns Promise that resolves to unlisten function
+   */
+  async onMicDeviceSwitched(callback: (payload: MicDeviceSwitchedPayload) => void): Promise<UnlistenFn> {
+    return listenMicDeviceSwitched((event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for mic-swap-failed event (a mid-recording fallback attempt failed)
+   * @param callback - Function to call with the failed attempt
+   * @returns Promise that resolves to unlisten function
+   */
+  async onMicSwapFailed(callback: (payload: MicSwapFailedPayload) => void): Promise<UnlistenFn> {
+    return listenMicSwapFailed((event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for mic-recovery-exhausted event (mid-recording recovery gave up)
+   * @param callback - Function to call with the lost device
+   * @returns Promise that resolves to unlisten function
+   */
+  async onMicRecoveryExhausted(callback: (payload: MicRecoveryExhaustedPayload) => void): Promise<UnlistenFn> {
+    return listenMicRecoveryExhausted((event) => {
+      callback(event.payload);
+    });
   }
 
   // Diarization Methods

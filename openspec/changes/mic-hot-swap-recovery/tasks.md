@@ -114,14 +114,17 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
 
 ## 6. Frontend toasts
 
-- [ ] 6.1 Add `MicDeviceSwitchedPayload`, `MicSwapFailedPayload` and `MicRecoveryExhaustedPayload` with `listenMicDeviceSwitched`, `listenMicSwapFailed` and `listenMicRecoveryExhausted` (via `listenTyped`) to `src/lib/ipc/recording.ts`. Add 1-to-1 `onMicDeviceSwitched`, `onMicSwapFailed` and `onMicRecoveryExhausted` wrappers to `src/services/recordingService.ts`. Verify with `tests/lib/ipc/recording-mic-events.test.ts`. It mocks both `@tauri-apps/api/core` and `@tauri-apps/api/event`, per the gotcha in `docs/CODEBASE_MAP_OPERATIONS.md`, and asserts each listener registers the exact event name.
-- [ ] 6.2 Add the pure `micRecoveryToast(kind, payload)` in `src/lib/mic-recovery-toasts.ts` (design D12 copy):
+- [x] 6.1 Add `MicDeviceSwitchedPayload`, `MicSwapFailedPayload` and `MicRecoveryExhaustedPayload` with `listenMicDeviceSwitched`, `listenMicSwapFailed` and `listenMicRecoveryExhausted` (via `listenTyped`) to `src/lib/ipc/recording.ts`. Add 1-to-1 `onMicDeviceSwitched`, `onMicSwapFailed` and `onMicRecoveryExhausted` wrappers to `src/services/recordingService.ts`. Verify with `tests/lib/ipc/recording-mic-events.test.ts`. It mocks both `@tauri-apps/api/core` and `@tauri-apps/api/event`, per the gotcha in `docs/CODEBASE_MAP_OPERATIONS.md`, and asserts each listener registers the exact event name.
+  - Note (2026-10-02): the payload types are re-exported from `recordingService.ts` too. The test file also checks that the handler receives the backend payload unchanged (4 tests).
+- [x] 6.2 Add the pure `micRecoveryToast(kind, payload)` in `src/lib/mic-recovery-toasts.ts` (design D12 copy):
   - switched → info naming the device; "for this meeting" for `disconnected`, "selected microphone unavailable" for `unavailable_at_start`
   - failed → warning with "retrying (n/3)"
   - exhausted → error saying the recording continues without a microphone, and to stop and restart
 
   Verify with `tests/lib/mic-recovery-toasts.test.ts`, covering all 4 variants with the device names in the text.
-- [ ] 6.3 Add one mount-once effect to `RecordingStateProvider`. It registers the 3 listeners with a `cancelled` guard and an `isRecordingRef`, and shows `toast[level](title, { id: 'mic-recovery', description, duration })`. Suppress failed/exhausted toasts when not recording. Unlisten on cleanup. Verify: `bun test tests/` and `pnpm exec tsc --noEmit -p .` pass; `pnpm exec next lint` reports no new `no-restricted-imports` errors.
+  - Note (2026-10-02): the helper has one overload per kind and returns `{ level, title, description }` as D12 says; the title is "Microphone switched" for both switch reasons (the reason is in the description). 4 tests, one per variant, each asserting the device names in the text.
+- [x] 6.3 Add one mount-once effect to `RecordingStateProvider`. It registers the 3 listeners with a `cancelled` guard and an `isRecordingRef`, and shows `toast[level](title, { id: 'mic-recovery', description, duration })`. Suppress failed/exhausted toasts when not recording. Unlisten on cleanup. Verify: `bun test tests/` and `pnpm exec tsc --noEmit -p .` pass; `pnpm exec next lint` reports no new `no-restricted-imports` errors.
+  - Note (2026-10-02): toast durations live in the provider, by level (info 6 s, warning 8 s, error 10 s). `bun test tests/`: 125 pass / 0 fail (117 + 8 new). `tsc` clean. `pnpm exec next lint`: 42 findings, the pre-existing count, none in the touched files.
 
 ## 7. Integration checks (automated)
 

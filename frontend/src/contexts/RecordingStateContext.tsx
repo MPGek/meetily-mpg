@@ -1,7 +1,16 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { toast } from 'sonner';
 import { recordingService } from '@/services/recordingService';
+import { micRecoveryToast, type MicRecoveryToast, type MicRecoveryToastLevel } from '@/lib/mic-recovery-toasts';
+
+/** How long each mic recovery toast stays up, by severity. */
+const MIC_RECOVERY_TOAST_DURATION_MS: Record<MicRecoveryToastLevel, number> = {
+  info: 6000,
+  warning: 8000,
+  error: 10000,
+};
 
 /**
  * Recording state synchronized with backend
@@ -215,6 +224,73 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       stopPolling();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event listeners and polling; startPolling is recreated every render and would restart polling
+  }, []);
+
+  // Latest isRecording for the mount-once mic recovery listeners below, which
+  // cannot read state directly (they would capture the initial value).
+  const isRecordingRef = useRef(false);
+  useEffect(() => {
+    isRecordingRef.current = state.isRecording;
+  }, [state.isRecording]);
+
+  /**
+   * Mic recovery toasts (mic-disconnect-recovery). The backend switches a
+   * disconnected microphone to the system default by itself; these listeners
+   * only tell the user, on whatever page is open. A fixed toast id makes each
+   * notification replace the previous one. Failure and exhaustion toasts are
+   * also dropped once the recording has stopped (an event already in flight);
+   * the switch toast is not, because its start-time variant arrives before
+   * `recording-started`.
+   */
+  useEffect(() => {
+    // `cancelled` guards against a cleanup (StrictMode/HMR) that runs before
+    // the async registrations resolve.
+    let cancelled = false;
+    const unlisteners: (() => void)[] = [];
+
+    const show = (t: MicRecoveryToast) => {
+      toast[t.level](t.title, {
+        id: 'mic-recovery',
+        description: t.description,
+        duration: MIC_RECOVERY_TOAST_DURATION_MS[t.level],
+      });
+    };
+
+    const setup = async () => {
+      try {
+        const registrations = [
+          recordingService.onMicDeviceSwitched((payload) => {
+            console.log('[RecordingStateContext] mic-device-switched', payload);
+            show(micRecoveryToast('switched', payload));
+          }),
+          recordingService.onMicSwapFailed((payload) => {
+            console.warn('[RecordingStateContext] mic-swap-failed', payload);
+            if (isRecordingRef.current) show(micRecoveryToast('failed', payload));
+          }),
+          recordingService.onMicRecoveryExhausted((payload) => {
+            console.error('[RecordingStateContext] mic-recovery-exhausted', payload);
+            if (isRecordingRef.current) show(micRecoveryToast('exhausted', payload));
+          }),
+        ];
+        for (const registration of registrations) {
+          const unlisten = await registration;
+          if (cancelled) {
+            unlisten();
+          } else {
+            unlisteners.push(unlisten);
+          }
+        }
+      } catch (error) {
+        console.error('[RecordingStateContext] Failed to set up mic recovery listeners:', error);
+      }
+    };
+
+    setup();
+
+    return () => {
+      cancelled = true;
+      unlisteners.forEach(unlisten => unlisten());
+    };
   }, []);
 
   /**

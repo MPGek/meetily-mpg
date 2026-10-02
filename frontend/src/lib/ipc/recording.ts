@@ -479,3 +479,46 @@ export interface AudioLevelUpdate {
 export function listenAudioLevels(handler: EventCallback<AudioLevelUpdate>): Promise<UnlistenFn> {
   return listenTyped<AudioLevelUpdate>('audio-levels', handler);
 }
+
+// --- Microphone recovery events (mic-disconnect-recovery) -----------------------
+
+/** The recording mic changed without the user picking it. */
+export interface MicDeviceSwitchedPayload {
+  /** The microphone now in use. */
+  device_name: string;
+  previous_device_name: string;
+  /** `disconnected`: mid-recording fallback; `unavailable_at_start`: the selected mic was missing at start. */
+  reason: 'disconnected' | 'unavailable_at_start';
+}
+
+/** A mid-recording fallback attempt failed and attempts remain. */
+export interface MicSwapFailedPayload {
+  /** The lost microphone. */
+  device_name: string;
+  error: string;
+  attempt: number;
+  max_attempts: number;
+}
+
+/** Mid-recording recovery gave up; the recording continues without a mic. */
+export interface MicRecoveryExhaustedPayload {
+  device_name: string;
+}
+
+export function listenMicDeviceSwitched(
+  handler: EventCallback<MicDeviceSwitchedPayload>,
+): Promise<UnlistenFn> {
+  return listenTyped<MicDeviceSwitchedPayload>('mic-device-switched', handler);
+}
+
+export function listenMicSwapFailed(
+  handler: EventCallback<MicSwapFailedPayload>,
+): Promise<UnlistenFn> {
+  return listenTyped<MicSwapFailedPayload>('mic-swap-failed', handler);
+}
+
+export function listenMicRecoveryExhausted(
+  handler: EventCallback<MicRecoveryExhaustedPayload>,
+): Promise<UnlistenFn> {
+  return listenTyped<MicRecoveryExhaustedPayload>('mic-recovery-exhausted', handler);
+}
