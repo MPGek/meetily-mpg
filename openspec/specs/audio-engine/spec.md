@@ -60,11 +60,15 @@ The system SHALL monitor and report audio levels (RMS) for active capture device
 - **THEN** system emits periodic audio level updates via Tauri events
 
 ### Requirement: Device detection and reconnection
-The system SHALL detect Bluetooth/AirPods disconnect/reconnect events and attempt automatic reconnection.
+During a recording, the system SHALL detect that the active microphone (wired, USB or Bluetooth) has disconnected. It SHALL recover microphone capture by switching to the system default input device instead of waiting to reconnect the same device. The detection bound, the switch, its guards and its notifications are specified by the `mic-disconnect-recovery` capability.
 
 #### Scenario: Detect AirPods disconnection
-- **WHEN** user removes AirPods during recording
-- **THEN** system detects device change within 2 seconds and shows notification
+- **WHEN** the user removes AirPods (or powers off any headset) providing the recording microphone during recording
+- **THEN** the system SHALL detect the disconnect within 10 seconds, switch microphone capture to the system default input, and show a notification naming the microphone now in use
+
+#### Scenario: Disconnected device returns
+- **WHEN** the original microphone reconnects after the system switched to the default input
+- **THEN** the recording SHALL stay on the default input for the rest of the session
 
 ### Requirement: Audio backend selection
 The system SHALL support multiple audio capture backends (CoreAudio on macOS, WASAPI on Windows, PulseAudio/ALSA on Linux).

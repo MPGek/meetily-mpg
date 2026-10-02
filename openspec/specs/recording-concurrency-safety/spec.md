@@ -6,15 +6,15 @@ Guarantees that the recording engine's shared locks, background threads, and int
 ## Requirements
 ### Requirement: Recording commands stay responsive during a device reconnect
 
-The system SHALL NOT hold the global recording-manager lock for the duration of an in-progress device reconnect attempt. A command that needs the recording manager for an unrelated operation SHALL be able to acquire it without waiting for a concurrent reconnect attempt to finish.
+The system SHALL NOT hold the global recording-manager lock while a mid-recording microphone switch is in progress. This covers tearing down the lost device's stream, resolving the replacement device and opening its stream. A command that needs the recording manager for an unrelated operation, including Stop, SHALL be able to acquire it without waiting for a concurrent switch to finish.
 
 #### Scenario: Stop completes while a reconnect is in progress
-- **WHEN** `stop_recording` is invoked while a device reconnect attempt is in progress
-- **THEN** `stop_recording` SHALL acquire the recording manager and proceed without blocking for the remaining duration of the reconnect attempt
+- **WHEN** `stop_recording` is invoked while a microphone switch is in progress
+- **THEN** `stop_recording` SHALL acquire the recording manager and proceed without blocking for the remaining duration of the switch, and the switch SHALL be discarded instead of applied to the stopped session
 
 #### Scenario: Reconnect attempt still completes and updates state
-- **WHEN** a device reconnect attempt finishes after being invoked concurrently with another recording command
-- **THEN** its success or failure SHALL still be reflected in the recording manager's state once both operations have completed
+- **WHEN** a microphone switch finishes while other recording commands (for example pause, resume or a recording-state query) ran concurrently, and the session was not stopped
+- **THEN** the session's recorded microphone device and active microphone stream SHALL reflect the replacement device once both operations have completed
 
 ### Requirement: A poisoned shared lock does not permanently disable recording commands
 
