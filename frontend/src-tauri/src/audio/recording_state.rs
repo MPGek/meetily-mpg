@@ -285,6 +285,32 @@ impl RecordingState {
         }
     }
 
+    /// Send the mic discontinuity marker to the pipeline (mic-disconnect-
+    /// recovery D7): an empty Microphone chunk with the reserved id
+    /// `MIC_DISCONTINUITY_CHUNK_ID`. Unlike audio, it is sent while paused too,
+    /// so a switch during a pause still closes the old mic's speech. Returns
+    /// whether the pipeline received it.
+    pub fn mark_mic_discontinuity(&self) -> bool {
+        let marker = AudioChunk {
+            data: Vec::new(),
+            sample_rate: 48000,
+            timestamp: self.get_recording_duration().unwrap_or(0.0),
+            chunk_id: super::pipeline::MIC_DISCONTINUITY_CHUNK_ID,
+            device_type: DeviceType::Microphone,
+            channels: 1,
+        };
+        match self.audio_sender.lock_or_recover().as_ref() {
+            Some(sender) => match sender.try_send(marker) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("[HOT_SWAP] mic discontinuity marker not delivered: {}", e);
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
     // Error handling
     pub fn set_error_callback<F>(&self, callback: F)
     where
@@ -500,5 +526,32 @@ mod bounded_channel_tests {
         sender
             .try_send(sample_chunk(3))
             .expect("capacity freed after drain");
+    }
+
+    #[tokio::test]
+    async fn mic_discontinuity_marker_is_sent_while_paused_but_audio_is_not() {
+        let state = RecordingState::new();
+        let (sender, mut receiver) = mpsc::channel::<AudioChunk>(4);
+        state.set_audio_sender(sender);
+        state.start_recording().unwrap();
+        state.pause_recording().unwrap();
+
+        state.send_audio_chunk(sample_chunk(1)).unwrap();
+        assert!(state.mark_mic_discontinuity());
+
+        let received = receiver.recv().await.expect("marker delivered");
+        assert_eq!(received.chunk_id, super::super::pipeline::MIC_DISCONTINUITY_CHUNK_ID);
+        assert_eq!(received.device_type, DeviceType::Microphone);
+        assert!(received.data.is_empty());
+        assert!(
+            receiver.try_recv().is_err(),
+            "the audio chunk sent while paused must be dropped"
+        );
+    }
+
+    #[test]
+    fn mic_discontinuity_marker_reports_no_pipeline() {
+        let state = RecordingState::new();
+        assert!(!state.mark_mic_discontinuity());
     }
 }

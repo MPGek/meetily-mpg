@@ -41,16 +41,19 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
 
 ## 3. Pipeline continuity: discontinuity marker, mic VAD close, gap fill
 
-- [ ] 3.1 Add `pub const MIC_DISCONTINUITY_CHUNK_ID: u64 = u64::MAX - 20` (in `pipeline.rs`, outside the flush range `>= u64::MAX - 10`). Add `RecordingState::mark_mic_discontinuity(&self) -> bool`. It `try_send`s an empty Microphone marker chunk with that id even while paused, and returns whether it was delivered. Verify with a `recording_state.rs` unit test: with a capacity-4 sender installed and the state paused, the marker arrives with the reserved id, and a normal chunk sent while paused does not.
-- [ ] 3.2 Split `flush_remaining_audio` into a per-channel `flush_channel(DeviceType)` (dispatch the buffer with its anchor, `vad.flush()`, `flush_pending_segments`). `flush_remaining_audio` calls it for both channels. Factor STEP 3 of `run` into `emit_ready_windows(timestamp)`. Behavior must not change. Verify: the existing `pipeline.rs` tests pass, and a new test shows `ContinuousVadProcessor` keeps returning segments after a mid-stream `flush()` (speech, flush, speech → two separate segments).
-- [ ] 3.3 Add `mic_pad_since_gap: Option<usize>` to `AudioMixerRingBuffer`. While it is `Some`, `extract_window` adds every zero it pads onto the mic side (both the partial and the empty branch). Add `begin_mic_gap()`, which sets it only if it is unset, and `take_mic_gap_padding() -> usize`. Verify with a unit test: with only system samples for 3 windows after `begin_mic_gap()`, `take_mic_gap_padding()` returns `3 × window`; without a gap it counts nothing.
-- [ ] 3.4 Add the pure `mic_gap_fill_samples(gap_start, first_chunk_start, padded, sample_rate, cap_secs) -> usize` (design D7), returning `gap × rate − padded`, saturating at 0 and capped. Verify with unit tests for:
+- [x] 3.1 Add `pub const MIC_DISCONTINUITY_CHUNK_ID: u64 = u64::MAX - 20` (in `pipeline.rs`, outside the flush range `>= u64::MAX - 10`). Add `RecordingState::mark_mic_discontinuity(&self) -> bool`. It `try_send`s an empty Microphone marker chunk with that id even while paused, and returns whether it was delivered. Verify with a `recording_state.rs` unit test: with a capacity-4 sender installed and the state paused, the marker arrives with the reserved id, and a normal chunk sent while paused does not.
+  - Note (2026-10-02): the marker carries the current recording duration as its timestamp (the pipeline uses it as the gap start only if no mic chunk was ever seen) and `sample_rate` 48000. A failed `try_send` logs `[HOT_SWAP] mic discontinuity marker not delivered`. Added a second test, `mic_discontinuity_marker_reports_no_pipeline`.
+- [x] 3.2 Split `flush_remaining_audio` into a per-channel `flush_channel(DeviceType)` (dispatch the buffer with its anchor, `vad.flush()`, `flush_pending_segments`). `flush_remaining_audio` calls it for both channels. Factor STEP 3 of `run` into `emit_ready_windows(timestamp)`. Behavior must not change. Verify: the existing `pipeline.rs` tests pass, and a new test shows `ContinuousVadProcessor` keeps returning segments after a mid-stream `flush()` (speech, flush, speech → two separate segments).
+  - Note (2026-10-02): `flush_remaining_audio` now runs each channel to completion in turn (mic: dispatch, `flush()`, send; then system) instead of both dispatches, both flushes, both sends. The segments sent are the same and mic segments still precede system ones in the transcription queue. The new test (`vad_processor_keeps_segmenting_after_a_mid_stream_flush`, in `pipeline.rs`) sets the VAD thresholds to 0 so every frame is speech, because Silero's score on a synthetic signal is not reliable.
+- [x] 3.3 Add `mic_pad_since_gap: Option<usize>` to `AudioMixerRingBuffer`. While it is `Some`, `extract_window` adds every zero it pads onto the mic side (both the partial and the empty branch). Add `begin_mic_gap()`, which sets it only if it is unset, and `take_mic_gap_padding() -> usize`. Verify with a unit test: with only system samples for 3 windows after `begin_mic_gap()`, `take_mic_gap_padding()` returns `3 × window`; without a gap it counts nothing.
+  - Note (2026-10-02): the test also checks a partial mic window (its padding counts) and that a second `begin_mic_gap()` keeps the count.
+- [x] 3.4 Add the pure `mic_gap_fill_samples(gap_start, first_chunk_start, padded, sample_rate, cap_secs) -> usize` (design D7), returning `gap × rate − padded`, saturating at 0 and capped. Verify with unit tests for:
   - system audio covered the gap → 0
   - no system audio → the full gap
   - partial coverage → the remainder
   - a negative gap → 0
   - a gap over 30 s → the cap
-- [ ] 3.5 Handle the marker in `AudioPipeline::run`, before the flush check:
+- [x] 3.5 Handle the marker in `AudioPipeline::run`, before the flush check:
   - `flush_channel(Microphone)`
   - if no gap is open: `mic_gap_start = last_mic_chunk_end` (tracked from every mic chunk's timestamp) and `ring_buffer.begin_mic_gap()`
   - `continue`
@@ -62,6 +65,7 @@ Run Rust commands from the repo root. Run frontend commands from `frontend/`. "F
   - close the gap, then process the chunk normally
 
   Verify with a `pipeline.rs` test that runs a real `AudioPipeline` (hold `TELEMETRY_TEST_LOCK`) with a recording receiver. Feed 2 s of mic chunks with consecutive timestamps, then the marker, then mic chunks stamped 5 s later and no system chunks. Assert that the interleaved left-channel samples emitted before the first post-gap sample total the elapsed recording time within one window. Run the same feed with continuous system chunks and assert no extra fill. `cargo test -p meetily --lib pipeline` passes.
+  - Note (2026-10-02): both tests drive `AudioPipeline::run` on a local current-thread runtime while holding `TELEMETRY_TEST_LOCK`, so no guard is held across an `.await` (no new clippy lint), with 100 ms chunks. No system audio: the first post-gap mic frame lands at 7.0 s within one window. With system audio: the check is that mic and system post-gap frames are within one window of each other and of 7.0 s, not exact equality, because the ring buffer already zero-pads whichever side is short when the other completes a window (pre-existing behavior; with this in-phase synthetic feed each side shifts by less than one window). A double fill would put the mic about 4.6 s late and fails both checks. `cargo test -p meetily --lib pipeline`: 15 passed, 3 ignored (pre-existing ignores in other modules).
 
 ## 4. Mic recovery module and stream plumbing
 
