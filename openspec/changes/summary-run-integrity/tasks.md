@@ -116,8 +116,9 @@
 
 ## 4. Frontend progress resume and stale-result guards (proposal e)
 
-- [ ] 4.1 Add dev-dependencies `react-test-renderer@18.3.1` and `@types/react-test-renderer@18.3.1` with `pnpm add -D` in `frontend/`. Verify: `pnpm-lock.yaml` updated, and `bun test tests/` and tsc are still green.
-- [ ] 4.2 Rewrite summary polling in `components/Sidebar/SidebarProvider.tsx` per design D9:
+- [x] 4.1 Add dev-dependencies `react-test-renderer@18.3.1` and `@types/react-test-renderer@18.3.1` with `pnpm add -D` in `frontend/`. Verify: `pnpm-lock.yaml` updated, and `bun test tests/` and tsc are still green.
+  - Note (2026-10-02): pnpm 11.20.0 also moved `@types/bun` into sorted position in `package.json` and rewrote the ProseMirror `peerDependencies` specs in `pnpm-lock.yaml` to the `pnpm-workspace.yaml` override pins (tool output, kept as written). tsc clean, `bun test tests/` 99 pass before the new file.
+- [x] 4.2 Rewrite summary polling in `components/Sidebar/SidebarProvider.tsx` per design D9:
   - a ref-held `Map<meetingId, { processId, timer, inFlight }>`;
   - stable `startSummaryPolling` / `stopSummaryPolling(meetingId, processId?)`;
   - an in-flight guard, and `result.start !== processId` results ignored;
@@ -127,7 +128,8 @@
   - `activeSummaryPolls` removed from the context type and value (no consumers — re-check with `grep -rn activeSummaryPolls frontend/src`).
 
   Verify: tests in `frontend/tests/hooks/summary-generation.test.tsx` — a throwing callback and a failing read each stop the poll (no timers left); one meeting's poll ending does not clear another's; a result with another `start` is ignored.
-- [ ] 4.3 In `hooks/meeting-details/useSummaryGeneration.ts`, per design D10:
+  - Note (2026-10-02): an `idle` result has no run id, so it skips the identity check and keeps the old "idle after the first poll stops" rule (otherwise a vanished row would poll until the 200-poll timeout). `onUpdate` may now return a promise. The tests live in the same new file (`sidebar summary polling` block, 5 tests, including a stop that names another run).
+- [x] 4.3 In `hooks/meeting-details/useSummaryGeneration.ts`, per design D10:
   - add an `initialSummary` prop, with a lazy `useState` status initializer used only when `meeting_id` matches (pending → processing/regenerating, failed/error → error with the stored message and no toast, else idle);
   - add a mount effect that resumes polling for `initialSummary.start`;
   - extract a ref-held `handlePollingResult` shared by start and resume;
@@ -137,12 +139,14 @@
   - a resumed run emits no completion analytics.
 
   Verify: the hook tests in 4.5.
-- [ ] 4.4 Wire the pages:
+  - Note (2026-10-02): as D10 says, stored `completed`/`cancelled` restore `idle` (upstream restores `completed`); a `pending` row without `start` also restores `idle`, since there is no run to track. Unmount does not bump `generationIdRef` (only `mountedRef`), which is how a late start response tells "left the meeting" (do nothing) from "Stop/new start" (cancel that `process_id`). A start superseded before `processTranscript` is called sends nothing. The poll result is typed `Partial<SummaryStatusResponse> & { status }`, which needed one `as unknown as Summary` cast on the existing markdown branch.
+- [x] 4.4 Wire the pages:
   - `app/meeting-details/page.tsx` keeps the `getSummary` response in state, guards the fetch effect with a `cancelled` flag, passes `initialSummary` and `key={meetingId}` to `PageContent`, gates `checkAutoGen` on `!isLoading && summaryResponse?.status === 'idle'`, and removes its stop-polling cleanup effect (now in the hook);
   - `app/meeting-details/page-content.tsx` forwards `initialSummary` to the hook and adds `summaryGeneration.summaryStatus === 'idle'` to the auto-generate condition.
 
   Verify: `pnpm exec tsc --noEmit -p .`, and a test in 4.5 that a pending stored status with `shouldAutoGenerate` starts no `api_process_transcript`.
-- [ ] 4.5 Adapt upstream `frontend/tests/hooks/summary-generation.test.tsx` (e4cc94b) to the fork, per design D12:
+  - Note (2026-10-02): the auto-generate condition is an exported `shouldAutoStartSummary(shouldAutoGenerate, transcriptCount, summaryStatus)` in the hook module, used by `page-content.tsx`, so the test exercises the same predicate; the test harness mirrors page-content's effect instead of rendering `PageContent` (which pulls in framer-motion, BlockNote and the panels). page.tsx also resets the stored response when the meeting changes and only clears `isLoading` for the current fetch.
+- [x] 4.5 Adapt upstream `frontend/tests/hooks/summary-generation.test.tsx` (e4cc94b) to the fork, per design D12:
   - mock `@tauri-apps/api/core` `invoke` and `@tauri-apps/api/event`, plus `next/navigation`, `RecordingStateContext`, `sonner`, `@/lib/analytics`, `@/lib/summary-language-preferences`, restoring the originals in `afterAll`;
   - use a fake `setInterval`;
   - use the fork's `SummaryStatusResponse` and `SummaryDataResponse`;
@@ -162,7 +166,9 @@
   - leaving before the start response arrives sends no cancel, and resume works later.
 
   Verify: `bun test tests/` passes, the new file included.
-- [ ] 4.6 Commit group 4 on its own. Verify: `bun test tests/` passes, `pnpm exec tsc --noEmit -p .` is clean, and `pnpm exec next lint` shows no new errors in the touched files.
+  - Note (2026-10-02): 13 hook tests + 5 sidebar tests (18, all pass). Besides the listed cases: an idle stored status auto-generates exactly once, and a start response arriving after Stop cancels its own run. Dropped with the model-retention case: upstream's two recovery-read-failure cases (the fork restores idle on a failed reload, and they are not in this list). "Regeneration resume keeps the old notes" is asserted on the hook's summary state; the real SummaryPanel shows its spinner instead of the notes during any regeneration, which is existing UI and unchanged. A mutation pass (removing each guard in turn) failed the matching test for the run-identity check, the meeting-id check, the unmount check and the resume analytics flag; the sidebar and hook staleness guards back each other up, so removing either one alone fails nothing.
+- [x] 4.6 Commit group 4 on its own. Verify: `bun test tests/` passes, `pnpm exec tsc --noEmit -p .` is clean, and `pnpm exec next lint` shows no new errors in the touched files.
+  - Note (2026-10-02): `bun test tests/` 117 pass / 0 fail (99 + 18), tsc clean, `next lint` 42 findings, same as before (per touched file: page-content 2, page 6, SidebarProvider 4, useSummaryGeneration 0, ipc/summary 0, all pre-existing).
 
 ## 5. Integration verification
 

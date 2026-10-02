@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { Summary, SummaryResponse } from '@/types';
 import Analytics from '@/lib/analytics';
 import { emitModelConfigUpdated, saveModelConfig } from '@/lib/ipc/settings';
+import type { SummaryStatusResponse } from '@/lib/ipc/summary';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
 import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
@@ -11,7 +12,7 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 
 // Custom hooks
 import { useMeetingData } from '@/hooks/meeting-details/useMeetingData';
-import { useSummaryGeneration } from '@/hooks/meeting-details/useSummaryGeneration';
+import { shouldAutoStartSummary, useSummaryGeneration } from '@/hooks/meeting-details/useSummaryGeneration';
 import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
@@ -20,6 +21,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 export default function PageContent({
   meeting,
   summaryData,
+  initialSummary = null,
   shouldAutoGenerate = false,
   onAutoGenerateComplete,
   onMeetingUpdated,
@@ -36,6 +38,8 @@ export default function PageContent({
 }: {
   meeting: any;
   summaryData: Summary | null;
+  /** Stored summary status read on open; resumes an in-progress run. */
+  initialSummary?: SummaryStatusResponse | null;
   shouldAutoGenerate?: boolean;
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
@@ -124,6 +128,7 @@ export default function PageContent({
     updateMeetingTitle: meetingData.updateMeetingTitle,
     setAiSummary: meetingData.setAiSummary,
     onOpenModelSettings: handleOpenModelSettings,
+    initialSummary,
   });
 
   const copyOperations = useCopyOperations({
@@ -148,7 +153,10 @@ export default function PageContent({
     let cancelled = false;
 
     const autoGenerate = async () => {
-      if (shouldAutoGenerate && meetingData.transcripts.length > 0 && !cancelled) {
+      if (
+        shouldAutoStartSummary(shouldAutoGenerate, meetingData.transcripts.length, summaryGeneration.summaryStatus) &&
+        !cancelled
+      ) {
         console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
         await summaryGeneration.handleGenerateSummary('');
 
