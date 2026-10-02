@@ -1,6 +1,6 @@
 // Types for whisper-rs integration
-import type { ModelInfo, ModelAccuracy, ProcessingSpeed, ModelStatus } from '@/lib/ipc/models';
-export type { ModelInfo, ModelAccuracy, ProcessingSpeed, ModelStatus } from '@/lib/ipc/models';
+import type { ModelInfo, ModelAccuracy, ProcessingSpeed, ModelStatus, CancelDownloadOutcome } from '@/lib/ipc/models';
+export type { ModelInfo, ModelAccuracy, ProcessingSpeed, ModelStatus, CancelDownloadOutcome } from '@/lib/ipc/models';
 
 export interface ModelDownloadProgress {
   modelName: string;
@@ -309,8 +309,8 @@ export class WhisperAPI {
     await whisperDownloadModel({ modelName });
   }
 
-  static async cancelDownload(modelName: string): Promise<void> {
-    await whisperCancelDownload({ modelName });
+  static async cancelDownload(modelName: string): Promise<CancelDownloadOutcome> {
+    return await whisperCancelDownload({ modelName });
   }
 
   static async deleteCorruptedModel(modelName: string): Promise<string> {

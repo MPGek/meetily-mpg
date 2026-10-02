@@ -18,4 +18,12 @@ describe("lib/ipc/models", () => {
       expect(invoke).toHaveBeenLastCalledWith("parakeet_cancel_download", { modelName: "parakeet-tdt-0.6b-v3-int8" });
     }
   });
+
+  test("whisperCancelDownload passes the cancelled/pending outcome through", async () => {
+    for (const outcome of ["cancelled", "pending"] as const) {
+      invoke.mockImplementation(async () => outcome);
+      await expect(models.whisperCancelDownload({ modelName: "base" })).resolves.toBe(outcome);
+      expect(invoke).toHaveBeenLastCalledWith("whisper_cancel_download", { modelName: "base" });
+    }
+  });
 });

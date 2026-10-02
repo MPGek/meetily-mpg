@@ -126,12 +126,13 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
 
 ## 2. Whisper download hardening (upstream #737, download part)
 
-- [ ] 2.1 In `frontend/src-tauri/src/whisper_engine/whisper_engine.rs`:
+- [x] 2.1 In `frontend/src-tauri/src/whisper_engine/whisper_engine.rs`:
   - Replace `cancel_download_flag`/`active_downloads` (`:51-54`, `:179-182`) with `downloads: DownloadOwners`.
   - Replace the partial-file Downloading heuristic in `discover_models` (`:217-246`) with the owner overlay (`Downloading { progress: owner.progress() }`), as in upstream `9f24062` `:239-291`.
 
   verify: `cargo check -p meetily`.
-- [ ] 2.2 Rewrite `download_model` (`:1210-1438`) as `download_model` (URL table `:1242-1262`, unsupported model rejected before reserving) → `download_model_from_url` → `download_model_with_owner` + `finish_download`, ported from upstream `9f24062` `:948-1237`. The port must:
+  - Note (2026-10-02): discovery also uses the Parakeet-style owner-revision retry (not in upstream Whisper), so a scan that started before a commit cannot overwrite the committed status; the disk scan moved to `scan_models_on_disk` with the old Corrupted/Missing rules.
+- [x] 2.2 Rewrite `download_model` (`:1210-1438`) as `download_model` (URL table `:1242-1262`, unsupported model rejected before reserving) → `download_model_from_url` → `download_model_with_owner` + `finish_download`, ported from upstream `9f24062` `:948-1237`. The port must:
   - use `Client::builder().user_agent(concat!("Meetily/", env!("CARGO_PKG_VERSION")))`
   - use `select!` on the owner token for send and for each chunk
   - call `owner.set_progress`
@@ -140,25 +141,29 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   Then replace `cancel_download` (`:1440-1480`) with `cancel_download` → `cancel_download_with_timeout` returning `CancelDownloadOutcome`.
 
   verify: `cargo check -p meetily`, and `grep -n "cancel_download_flag\|Client::new()\|sleep(" frontend/src-tauri/src/whisper_engine/whisper_engine.rs` returns nothing.
-- [ ] 2.3 In `frontend/src-tauri/src/whisper_engine/commands.rs`:
+  - Note (2026-10-02): `finish_download` takes the owners and catalog locks once (simpler than upstream's two passes); a cancel that lands after validation deletes the file while the owner is still held, so no retry can start before it is gone. Per D2 the cache is written only at reserve and commit. The final `callback(100)` is kept; completion is still the separate `model-download-complete` event.
+- [x] 2.3 In `frontend/src-tauri/src/whisper_engine/commands.rs`:
   - `whisper_download_model` (`:426-490`) gets an `Err(e) if is_download_cancelled(&e)` arm that returns `Ok(())` and emits `model-download-progress {modelName, progress: 0, status: "cancelled"}`, with no `model-download-error` (design D4).
   - `whisper_cancel_download` (`:493-507`) returns `Result<CancelDownloadOutcome, String>`.
 
   verify: `cargo check -p meetily`; `lib.rs:653` is unchanged.
-- [ ] 2.4 Port upstream `9f24062`'s 13 Whisper tests (`whisper_engine.rs:1275+`, names per design D8) into `whisper_engine.rs` `#[cfg(test)] mod tests`, reusing `model_download::transfer::test_server` where the response shape fits and keeping upstream's `stalled_http_server` otherwise. Add `cancelled_download_is_reported_as_cancelled_not_error`. verify: `cargo test -p meetily --lib whisper_engine::whisper_engine::tests` passes 14 tests offline.
-- [ ] 2.5 Frontend:
+- [x] 2.4 Port upstream `9f24062`'s 13 Whisper tests (`whisper_engine.rs:1275+`, names per design D8) into `whisper_engine.rs` `#[cfg(test)] mod tests`, reusing `model_download::transfer::test_server` where the response shape fits and keeping upstream's `stalled_http_server` otherwise. Add `cancelled_download_is_reported_as_cancelled_not_error`. verify: `cargo test -p meetily --lib whisper_engine::whisper_engine::tests` passes 14 tests offline.
+  - Note (2026-10-02): 14 pass, loopback only. Adaptations: the progress-42 test sets `owner.set_progress(42)`; two tests reuse `transfer::test_server`; upstream's `stalled_http_server` and `response_http_server` (needed to capture the User-Agent) are kept.
+- [x] 2.5 Frontend:
   - Add a Whisper-only `WhisperModelDownloadProgressPayload` (`ModelDownloadProgressPayload & { status?: 'cancelled' }`) for `listenModelDownloadProgress` (`frontend/src/lib/ipc/models.ts:163-167`), leaving the Ollama listener (`:427-431`) on the old type.
   - `whisperCancelDownload` (`:147-149`) and `WhisperAPI.cancelDownload` (`frontend/src/lib/whisper.ts:312-314`) return `CancelDownloadOutcome`.
   - In `WhisperModelManager.tsx`, add `cancellingModels`. The progress listener (`:136-160`) handles `status === 'cancelled'` (→ Missing, clear both sets, info toast). `cancelDownload` (`:259-292`) only marks cancelling and toasts on `pending`. `downloadModel` returns early while cancelling. `ModelCard` gets `isCancelling`. No timers or polling (unlike upstream's `reconcileCancellation`).
 
   verify: `pnpm exec tsc --noEmit -p .` is clean, and `grep -n "setTimeout\|setInterval" frontend/src/components/WhisperModelManager.tsx` shows no new occurrence vs `git show HEAD:frontend/src/components/WhisperModelManager.tsx`.
-- [ ] 2.6 Extend `frontend/tests/lib/ipc/models.test.ts` with `whisperCancelDownload passes the cancelled/pending outcome through`. verify: `bun test tests/lib/ipc/models.test.ts` (frontend/) passes.
+  - Note (2026-10-02): complete/error handlers now use the localStorage-persisted `updateDownloadingModels`, as upstream does; `setTimeout`/`setInterval` count 0 before and after.
+- [x] 2.6 Extend `frontend/tests/lib/ipc/models.test.ts` with `whisperCancelDownload passes the cancelled/pending outcome through`. verify: `bun test tests/lib/ipc/models.test.ts` (frontend/) passes.
 - [ ] 2.7 Manual Windows check: in settings, download Whisper `base`, cancel at about 50%, then immediately click Download. verify:
   - Download stays disabled until the cancelled toast appears.
   - `%APPDATA%\com.meetily.ai\models\ggml-base.bin` is absent between the cancel and the new start.
   - The second download completes, loads and transcribes.
   - No "Failed to download" toast appears after the cancel.
-- [ ] 2.8 Commit group 2 after `cargo test -p meetily --lib model_download whisper_engine`, `bun test tests/` and `pnpm exec tsc --noEmit -p .` (frontend/). verify: all pass; `git show --stat HEAD` lists only group 2 files.
+  - Note (2026-10-02): open; needs the desktop app on Windows. Left for the manual-check pass.
+- [x] 2.8 Commit group 2 after `cargo test -p meetily --lib model_download whisper_engine`, `bun test tests/` and `pnpm exec tsc --noEmit -p .` (frontend/). verify: all pass; `git show --stat HEAD` lists only group 2 files.
 
 ## 3. Word-alignment download hardening (fork-only)
 

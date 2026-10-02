@@ -1,4 +1,5 @@
 use crate::config::WHISPER_MODEL_CATALOG;
+use crate::model_download::{is_download_cancelled, CancelDownloadOutcome};
 use crate::whisper_engine::{ModelInfo, WhisperEngine};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -470,6 +471,22 @@ pub async fn whisper_download_model(
                 }
                 Ok(())
             }
+            Err(e) if is_download_cancelled(&e) => {
+                // A user cancel is not an error: the progress event is the single
+                // source of cancel state in the UI (design D4, no frontend polling).
+                if let Err(emit_e) = app_handle.emit(
+                    "model-download-progress",
+                    serde_json::json!({
+                        "modelName": model_name,
+                        "progress": 0,
+                        "status": "cancelled"
+                    }),
+                ) {
+                    log::error!("Failed to emit download cancellation event: {}", emit_e);
+                }
+                log::info!("Download cancelled for {}", model_name);
+                Ok(())
+            }
             Err(e) => {
                 // Emit error event
                 if let Err(emit_e) = app_handle.emit(
@@ -490,7 +507,9 @@ pub async fn whisper_download_model(
 }
 
 #[command]
-pub async fn whisper_cancel_download(model_name: String) -> Result<(), String> {
+pub async fn whisper_cancel_download(
+    model_name: String,
+) -> Result<CancelDownloadOutcome, String> {
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap();
         guard.as_ref().cloned()

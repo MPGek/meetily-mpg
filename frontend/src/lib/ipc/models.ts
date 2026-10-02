@@ -27,6 +27,15 @@ export interface ModelDownloadProgressPayload {
   progress: number;
 }
 
+/**
+ * Whisper `model-download-progress`. `whisper_download_model` emits one
+ * `status: 'cancelled'` event (progress 0) once a cancelled download has
+ * finished cleanup; in-flight events carry no status.
+ */
+export type WhisperModelDownloadProgressPayload = ModelDownloadProgressPayload & {
+  status?: 'cancelled';
+};
+
 /** `model-download-complete`, `parakeet-model-download-complete`, `ollama-model-download-complete`. */
 export interface ModelDownloadCompletePayload {
   modelName: string;
@@ -141,8 +150,8 @@ export async function whisperDownloadModel(args: ModelNameArgs): Promise<void> {
   return invokeTyped<void>('whisper_download_model', args);
 }
 
-export async function whisperCancelDownload(args: ModelNameArgs): Promise<void> {
-  return invokeTyped<void>('whisper_cancel_download', args);
+export async function whisperCancelDownload(args: ModelNameArgs): Promise<CancelDownloadOutcome> {
+  return invokeTyped<CancelDownloadOutcome>('whisper_cancel_download', args);
 }
 
 export async function whisperDeleteCorruptedModel(args: ModelNameArgs): Promise<string> {
@@ -158,9 +167,9 @@ export async function openModelsFolder(): Promise<void> {
 }
 
 export function listenModelDownloadProgress(
-  handler: EventCallback<ModelDownloadProgressPayload>,
+  handler: EventCallback<WhisperModelDownloadProgressPayload>,
 ): Promise<UnlistenFn> {
-  return listenTyped<ModelDownloadProgressPayload>('model-download-progress', handler);
+  return listenTyped<WhisperModelDownloadProgressPayload>('model-download-progress', handler);
 }
 
 export function listenModelDownloadComplete(
