@@ -21,14 +21,14 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 2. Claude summaries skip thinking blocks (#694)
 
-- [ ] 2.1 In `summary/llm_client.rs`:
+- [x] 2.1 In `summary/llm_client.rs`:
   - change `ClaudeChatContent` (`:61-63`) to `{ #[serde(rename = "type")] pub kind: String, pub text: Option<String> }`;
   - add `impl ClaudeChatResponse { fn first_text(&self) -> Option<&str> }`, returning the first block with `kind == "text"` and `Some(text)`;
   - replace the `.content.first()...text` read (`:343-349`) with `.first_text().ok_or("No text content in LLM response")?.trim().to_string()`;
   - change Claude `max_tokens: 2048` (`:259`) to `8192`, with upstream's comment that the budget is shared with thinking.
 
   Leave `crate::llm::send_with_retry` (`:286-290`) untouched. verify: `cargo check -p meetily` succeeds, and `git diff` shows no change to the `send_with_retry` call.
-- [ ] 2.2 Port upstream's 3 tests into a new `#[cfg(test)] mod tests` in `llm_client.rs`: `claude_response_skips_leading_thinking_block`, `claude_response_reads_plain_text_block` and `claude_response_without_text_block_returns_none` (`git -C $UP diff 4c450e1^1 4c450e1`). Add one more, `claude_response_ignores_non_text_block_carrying_text`: a block with `"type": "server_tool_result", "text": "x"` is skipped in favor of the later `"type": "text"` block; verify: `cargo test -p meetily --lib summary::llm_client` passes (4 tests).
+- [x] 2.2 Port upstream's 3 tests into a new `#[cfg(test)] mod tests` in `llm_client.rs`: `claude_response_skips_leading_thinking_block`, `claude_response_reads_plain_text_block` and `claude_response_without_text_block_returns_none` (`git -C $UP diff 4c450e1^1 4c450e1`). Add one more, `claude_response_ignores_non_text_block_carrying_text`: a block with `"type": "server_tool_result", "text": "x"` is skipped in favor of the later `"type": "text"` block; verify: `cargo test -p meetily --lib summary::llm_client` passes (4 tests).
 
 ## 3. HE-AAC decodes at the decoded rate; retranscription stores the real duration (#608, #737)
 

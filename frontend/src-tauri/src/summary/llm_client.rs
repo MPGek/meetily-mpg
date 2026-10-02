@@ -59,7 +59,22 @@ pub struct ClaudeChatResponse {
 
 #[derive(Deserialize, Debug)]
 pub struct ClaudeChatContent {
-    pub text: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    // Only `text` blocks carry this field. Models that enable thinking by
+    // default (Sonnet 5, Opus 5) also return `thinking` blocks, which don't.
+    pub text: Option<String>,
+}
+
+impl ClaudeChatResponse {
+    /// First `text` block. With thinking enabled the leading block is a
+    /// `thinking` block, so `content[0]` is not necessarily the answer.
+    fn first_text(&self) -> Option<&str> {
+        self.content
+            .iter()
+            .filter(|block| block.kind == "text")
+            .find_map(|block| block.text.as_deref())
+    }
 }
 
 /// LLM Provider enumeration for multi-provider support
@@ -256,7 +271,9 @@ pub async fn generate_summary(
         serde_json::json!(ClaudeRequest {
             system: system_prompt.to_string(),
             model: model_name.to_string(),
-            max_tokens: 2048,
+            // Shared budget: on models with thinking enabled by default this
+            // covers thinking tokens as well as the answer.
+            max_tokens: 8192,
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
@@ -341,10 +358,8 @@ pub async fn generate_summary(
         info!("🐞 LLM Response received from Claude");
 
         let content = chat_response
-            .content
-            .first()
-            .ok_or("No content in LLM response")?
-            .text
+            .first_text()
+            .ok_or("No text content in LLM response")?
             .trim()
             .to_string();
         Ok(content)
@@ -403,5 +418,59 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn claude_response_skips_leading_thinking_block() {
+        // Shape returned by models with thinking enabled by default,
+        // e.g. claude-sonnet-5 / claude-opus-5.
+        let response: ClaudeChatResponse = serde_json::from_value(json!({
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "abc"},
+                {"type": "text", "text": "Meeting summary."}
+            ]
+        }))
+        .expect("thinking blocks must not fail deserialization");
+
+        assert_eq!(response.first_text(), Some("Meeting summary."));
+    }
+
+    #[test]
+    fn claude_response_reads_plain_text_block() {
+        let response: ClaudeChatResponse = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "Meeting summary."}]
+        }))
+        .unwrap();
+
+        assert_eq!(response.first_text(), Some("Meeting summary."));
+    }
+
+    #[test]
+    fn claude_response_without_text_block_returns_none() {
+        let response: ClaudeChatResponse = serde_json::from_value(json!({
+            "content": [{"type": "thinking", "thinking": "", "signature": "abc"}]
+        }))
+        .unwrap();
+
+        assert_eq!(response.first_text(), None);
+    }
+
+    #[test]
+    fn claude_response_ignores_non_text_block_carrying_text() {
+        let response: ClaudeChatResponse = serde_json::from_value(json!({
+            "content": [
+                {"type": "server_tool_result", "text": "x"},
+                {"type": "text", "text": "Meeting summary."}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(response.first_text(), Some("Meeting summary."));
     }
 }
