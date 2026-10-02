@@ -1,21 +1,26 @@
-//! HF multi-file download for alignment models (task 3.3, design D5).
+//! HF multi-file download for alignment models (task 3.3, design D5;
+//! hardened by openspec `harden-model-downloads` group 3).
 //!
-//! Structurally mirrors `ParakeetEngine::download_model_detailed`: weighted
-//! byte progress, Range resume, cancellation with partial cleanup, delete.
+//! Uses the shared protocol in `crate::model_download`: a per-model
+//! `DownloadOwners` claim (released only by the worker, after cleanup) and the
+//! exact-size resumable `transfer::download_artifacts` (skip only on exact
+//! size, validated `Range` resume, partials kept on cancel or error).
 //! Models live under `app_data_dir/models/alignment/<id>/`.
 
 use super::catalog::{
-    model_dir, resolve_status, spec_by_id, AlignmentModelStatus, DEFAULT_ALIGNMENT_MODEL_ID,
+    model_dir, resolve_status, spec_by_id, AlignmentModelSpec, AlignmentModelStatus,
+    DEFAULT_ALIGNMENT_MODEL_ID,
+};
+use crate::model_download::transfer::{self, TransferProgress};
+use crate::model_download::{
+    is_download_cancelled, CancelDownloadOutcome, DownloadCancelled, DownloadOwner,
+    DownloadOwners, CANCEL_DOWNLOAD_CLEANUP_TIMEOUT,
 };
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::RwLock;
-use tokio::time::timeout;
 
 /// Detailed download progress reported to the UI.
 #[derive(Debug, Clone)]
@@ -26,19 +31,38 @@ pub struct AlignmentDownloadProgress {
     pub speed_mbps: f64,
 }
 
+impl From<TransferProgress> for AlignmentDownloadProgress {
+    fn from(progress: TransferProgress) -> Self {
+        Self {
+            downloaded_bytes: progress.confirmed_bytes,
+            total_bytes: progress.total_bytes,
+            percent: progress.percent,
+            speed_mbps: progress.speed_mbps,
+        }
+    }
+}
+
+type ProgressCallback = Box<dyn Fn(AlignmentDownloadProgress) + Send + Sync>;
+
+/// Pinned Hugging Face base URL for a catalogued model.
+fn source_base_url(spec: &AlignmentModelSpec) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/{}",
+        spec.hf_repo, spec.revision
+    )
+}
+
 /// Manages catalogued alignment models: status, download, cancel, delete.
 pub struct AlignmentModelManager {
     models_root: PathBuf,
-    cancel_flag: Arc<RwLock<Option<String>>>,
-    active_downloads: Arc<RwLock<HashSet<String>>>,
+    downloads: DownloadOwners,
 }
 
 impl AlignmentModelManager {
     pub fn new(models_root: PathBuf) -> Self {
         Self {
             models_root,
-            cancel_flag: Arc::new(RwLock::new(None)),
-            active_downloads: Arc::new(RwLock::new(HashSet::new())),
+            downloads: DownloadOwners::new(),
         }
     }
 
@@ -46,22 +70,27 @@ impl AlignmentModelManager {
         &self.models_root
     }
 
-    /// Current status of one model id, overriding the filesystem view while a
-    /// download is in flight.
+    /// Current status of one model id, overriding the filesystem view with
+    /// the owner's progress while a download is in flight.
     pub async fn status(&self, id: &str) -> AlignmentModelStatus {
         let spec = match spec_by_id(id) {
             Some(s) => s,
             None => return AlignmentModelStatus::Missing,
         };
-        if self.active_downloads.read().await.contains(id) {
-            return AlignmentModelStatus::Downloading { progress: 0 };
+        if let Some(owner) = self.downloads.lock().await.owner(id) {
+            return AlignmentModelStatus::Downloading {
+                progress: owner.progress(),
+            };
         }
         resolve_status(&model_dir(&self.models_root, id), spec)
     }
 
-    /// Delete a downloaded (or partial) model directory.
+    /// Delete a downloaded (or partial) model directory. Rejected while a
+    /// download owns the model; the owners lock is held across the removal so
+    /// no download can start in between.
     pub async fn delete_model(&self, id: &str) -> Result<()> {
-        if self.active_downloads.read().await.contains(id) {
+        let downloads = self.downloads.lock().await;
+        if downloads.contains(id) {
             return Err(anyhow!("Cannot delete while downloading"));
         }
         let dir = model_dir(&self.models_root, id);
@@ -71,63 +100,29 @@ impl AlignmentModelManager {
                 .map_err(|e| anyhow!("Failed to delete model directory: {}", e))?;
             log::info!("Deleted alignment model {} ({})", id, dir.display());
         }
+        drop(downloads);
         Ok(())
     }
 
-    /// Download a catalogued model with weighted progress and Range resume.
+    /// Download a catalogued model with weighted progress and validated resume.
     pub async fn download_model(
         &self,
         id: &str,
-        progress_callback: Option<Box<dyn Fn(AlignmentDownloadProgress) + Send + Sync>>,
+        progress_callback: Option<ProgressCallback>,
     ) -> Result<()> {
         let spec = spec_by_id(id).ok_or_else(|| anyhow!("Unknown alignment model: {}", id))?;
-
-        {
-            let mut active = self.active_downloads.write().await;
-            if !active.insert(id.to_string()) {
-                return Err(anyhow!("Download already in progress for: {}", id));
-            }
-        }
-        *self.cancel_flag.write().await = None;
-
-        let result = self
-            .download_model_inner(spec, progress_callback.as_deref())
-            .await;
-
-        self.active_downloads.write().await.remove(id);
-
-        if let Err(e) = &result {
-            log::warn!("Alignment model download failed for {}: {}", id, e);
-        }
-        result
+        self.download_spec_from_source(spec, &source_base_url(spec), progress_callback)
+            .await
     }
 
-    async fn download_model_inner(
+    /// Reserve the owner, run the shared transfer and the integrity gate, then
+    /// release the owner. Partial files are never deleted here.
+    async fn download_spec_from_source(
         &self,
-        spec: &super::catalog::AlignmentModelSpec,
-        progress_callback: Option<&(dyn Fn(AlignmentDownloadProgress) + Send + Sync)>,
+        spec: &AlignmentModelSpec,
+        base_url: &str,
+        progress_callback: Option<ProgressCallback>,
     ) -> Result<()> {
-        let model_dir = model_dir(&self.models_root, spec.id);
-        fs::create_dir_all(&model_dir)
-            .await
-            .map_err(|e| anyhow!("Failed to create model directory: {}", e))?;
-
-        let base_url = format!("https://huggingface.co/{}/resolve/main", spec.hf_repo);
-        let total_size_bytes: u64 = spec.files.iter().map(|f| f.expected_bytes).sum();
-
-        let mut already_downloaded: u64 = 0;
-        for f in spec.files {
-            let path = model_dir.join(f.local);
-            let size = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-            already_downloaded += size.min(f.expected_bytes);
-        }
-
-        let mut total_downloaded = already_downloaded;
-        let download_start = Instant::now();
-        let mut last_report_time = Instant::now();
-        let mut bytes_since_last_report: u64 = 0;
-        let mut last_reported_progress: u8 = 0;
-
         let client = reqwest::Client::builder()
             .tcp_nodelay(true)
             .pool_max_idle_per_host(1)
@@ -136,170 +131,74 @@ impl AlignmentModelManager {
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
+        let owner = self.downloads.reserve(spec.id).await?;
         log::info!(
-            "Downloading alignment model {} ({} files, {:.1} MB total, {:.1} MB present)",
+            "Downloading alignment model {} ({} files) from {}",
             spec.id,
             spec.files.len(),
-            total_size_bytes as f64 / 1_048_576.0,
-            already_downloaded as f64 / 1_048_576.0
+            base_url
         );
 
-        for (index, spec_file) in spec.files.iter().enumerate() {
-            let file_url = format!("{}/{}", base_url, spec_file.remote);
-            let local_rel = PathBuf::from(spec_file.local);
-            let file_path = model_dir.join(&local_rel);
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent).await.ok();
+        let result = self
+            .download_with_owner(&client, spec, base_url, &owner, progress_callback.as_deref())
+            .await;
+
+        // Release only after the worker is done with the files.
+        let cancellation_won = owner.cancellation().is_cancelled()
+            || result.as_ref().err().is_some_and(is_download_cancelled);
+        {
+            let mut downloads = self.downloads.lock().await;
+            if downloads.is_owner(spec.id, &owner) {
+                downloads.release(spec.id);
             }
-
-            let existing_size = fs::metadata(&file_path).await.map(|m| m.len()).unwrap_or(0);
-            if existing_size >= spec_file.min_bytes {
-                log::info!(
-                    "Skipping complete file {}/{}: {}",
-                    index + 1,
-                    spec.files.len(),
-                    spec_file.local
-                );
-                continue;
-            }
-
-            let mut request = client.get(&file_url);
-            if existing_size > 0 {
-                request = request.header("Range", format!("bytes={}-", existing_size));
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| anyhow!("Failed to start download for {}: {}", spec_file.local, e))?;
-
-            let (file_total_size, resuming) = if response.status()
-                == reqwest::StatusCode::PARTIAL_CONTENT
-            {
-                (existing_size + response.content_length().unwrap_or(0), true)
-            } else if response.status().is_success() {
-                if existing_size > 0 {
-                    log::warn!(
-                        "Server does not support resume for {}, restarting",
-                        spec_file.local
-                    );
-                }
-                (response.content_length().unwrap_or(0), false)
-            } else {
-                return Err(anyhow!(
-                    "Download failed for {} with status: {}",
-                    spec_file.local,
-                    response.status()
-                ));
-            };
-
-            let file = if resuming {
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(&file_path)
-                    .await
-                    .map_err(|e| anyhow!("Failed to open {} for resume: {}", spec_file.local, e))?
-            } else {
-                fs::File::create(&file_path)
-                    .await
-                    .map_err(|e| anyhow!("Failed to create {}: {}", spec_file.local, e))?
-            };
-            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-
-            use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
-            let mut file_downloaded = if resuming { existing_size } else { 0u64 };
-
-            loop {
-                if self.cancel_flag.read().await.as_deref() == Some(spec.id) {
-                    let _ = writer.flush().await;
-                    drop(writer);
-                    // Cancel: partial files are cleaned up by cancel_download().
-                    return Err(anyhow!("Download cancelled by user"));
-                }
-
-                let next = timeout(Duration::from_secs(30), stream.next()).await;
-                let chunk = match next {
-                    Err(_) => {
-                        let _ = writer.flush().await;
-                        return Err(anyhow!(
-                            "Download timeout - no data received for 30 seconds ({})",
-                            spec_file.local
-                        ));
-                    }
-                    Ok(None) => break,
-                    Ok(Some(Ok(c))) => c,
-                    Ok(Some(Err(e))) => {
-                        let _ = writer.flush().await;
-                        return Err(anyhow!(
-                            "Download stream error for {}: {}",
-                            spec_file.local,
-                            e
-                        ));
-                    }
-                };
-
-                writer
-                    .write_all(&chunk)
-                    .await
-                    .map_err(|e| anyhow!("Failed to write {}: {}", spec_file.local, e))?;
-
-                let chunk_len = chunk.len() as u64;
-                file_downloaded += chunk_len;
-                total_downloaded += chunk_len;
-                bytes_since_last_report += chunk_len;
-
-                let overall_progress = if total_size_bytes > 0 {
-                    ((total_downloaded as f64 / total_size_bytes as f64) * 100.0).min(99.0) as u8
-                } else {
-                    0
-                };
-
-                let elapsed_since_report = last_report_time.elapsed();
-                if overall_progress > last_reported_progress
-                    || elapsed_since_report >= Duration::from_millis(500)
-                    || file_downloaded >= file_total_size
-                {
-                    let total_elapsed = download_start.elapsed().as_secs_f64();
-                    let speed_mbps = if elapsed_since_report.as_secs_f64() >= 0.1 {
-                        (bytes_since_last_report as f64 / (1024.0 * 1024.0))
-                            / elapsed_since_report.as_secs_f64()
-                    } else if total_elapsed > 0.0 {
-                        ((total_downloaded - already_downloaded) as f64 / (1024.0 * 1024.0))
-                            / total_elapsed
-                    } else {
-                        0.0
-                    };
-                    last_reported_progress = overall_progress;
-                    last_report_time = Instant::now();
-                    bytes_since_last_report = 0;
-
-                    if let Some(cb) = progress_callback {
-                        cb(AlignmentDownloadProgress {
-                            downloaded_bytes: total_downloaded,
-                            total_bytes: total_size_bytes,
-                            percent: overall_progress,
-                            speed_mbps,
-                        });
-                    }
-                }
-            }
-
-            writer
-                .flush()
-                .await
-                .map_err(|e| anyhow!("Failed to flush {}: {}", spec_file.local, e))?;
-            log::info!(
-                "Completed download {}/{}: {} ({:.2} MB)",
-                index + 1,
-                spec.files.len(),
-                spec_file.local,
-                file_downloaded as f64 / 1_048_576.0
-            );
         }
+        owner.signal_done();
 
-        // Integrity gate: every file must meet its minimum size before the
-        // model is reported available.
+        if cancellation_won {
+            log::info!("Alignment model download cancelled: {}", spec.id);
+            return Err(DownloadCancelled.into());
+        }
+        match result {
+            Ok(final_progress) => {
+                if let Some(cb) = progress_callback.as_deref() {
+                    cb(final_progress.into());
+                }
+                log::info!("Alignment model {} downloaded successfully", spec.id);
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("Alignment model download failed for {}: {}", spec.id, e);
+                Err(e)
+            }
+        }
+    }
+
+    async fn download_with_owner(
+        &self,
+        client: &reqwest::Client,
+        spec: &AlignmentModelSpec,
+        base_url: &str,
+        owner: &DownloadOwner,
+        progress_callback: Option<&(dyn Fn(AlignmentDownloadProgress) + Send + Sync)>,
+    ) -> Result<TransferProgress> {
+        let model_dir = model_dir(&self.models_root, spec.id);
+        let mut on_progress = |progress: TransferProgress| {
+            if let Some(cb) = progress_callback {
+                cb(progress.into());
+            }
+        };
+        let final_progress = transfer::download_artifacts(
+            client,
+            base_url,
+            &model_dir,
+            spec.files,
+            owner,
+            &mut on_progress,
+        )
+        .await?;
+
+        // Integrity gate: every file must have exactly its catalogued size
+        // before the model is reported available.
         let status = resolve_status(&model_dir, spec);
         if status != AlignmentModelStatus::Available {
             return Err(anyhow!(
@@ -307,60 +206,23 @@ impl AlignmentModelManager {
                 status
             ));
         }
-
-        if let Some(cb) = progress_callback {
-            let total_elapsed = download_start.elapsed().as_secs_f64().max(0.001);
-            cb(AlignmentDownloadProgress {
-                downloaded_bytes: total_size_bytes,
-                total_bytes: total_size_bytes,
-                percent: 100,
-                speed_mbps: ((total_size_bytes - already_downloaded) as f64 / (1024.0 * 1024.0))
-                    / total_elapsed,
-            });
-        }
-        log::info!("Alignment model {} downloaded successfully", spec.id);
-        Ok(())
+        Ok(final_progress)
     }
 
-    /// Cancel an in-flight download and remove all partial files.
-    pub async fn cancel_download(&self, id: &str) -> Result<()> {
-        if !self.active_downloads.read().await.contains(id) {
-            return Ok(());
-        }
+    /// Cancel an in-flight download. Partial files are kept for resume.
+    /// Returns `Pending` if the worker has not finished cleanup within 5 s.
+    pub async fn cancel_download(&self, id: &str) -> Result<CancelDownloadOutcome> {
+        self.cancel_download_with_timeout(id, CANCEL_DOWNLOAD_CLEANUP_TIMEOUT)
+            .await
+    }
+
+    async fn cancel_download_with_timeout(
+        &self,
+        id: &str,
+        cleanup_timeout: Duration,
+    ) -> Result<CancelDownloadOutcome> {
         log::info!("Cancelling alignment model download: {}", id);
-        *self.cancel_flag.write().await = Some(id.to_string());
-
-        // Wait briefly for the download loop to exit, then clean partials.
-        for _ in 0..50 {
-            if !self.active_downloads.read().await.contains(id) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        let spec = spec_by_id(id);
-        if let (Some(spec), true) = (spec, model_dir(&self.models_root, id).exists()) {
-            let dir = model_dir(&self.models_root, id);
-            // Remove any file that is not complete; the directory itself goes
-            // away once empty.
-            for file in spec.files {
-                let path = dir.join(file.local);
-                let size = fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-                if path.exists() && size < file.min_bytes {
-                    let _ = fs::remove_file(&path).await;
-                }
-            }
-            let mut dir_read = match fs::read_dir(&dir).await {
-                Ok(r) => r,
-                Err(_) => return Ok(()),
-            };
-            let remaining = dir_read.next_entry().await.ok().flatten().is_some();
-            if !remaining {
-                let _ = fs::remove_dir_all(&dir).await;
-            }
-            log::info!("Cleaned up cancelled alignment download for {}", id);
-        }
-        Ok(())
+        self.downloads.cancel_with_timeout(id, cleanup_timeout).await
     }
 }
 
@@ -369,14 +231,177 @@ pub fn default_model_id() -> String {
     DEFAULT_ALIGNMENT_MODEL_ID.to_string()
 }
 
-/// Convenience map of spec id -> expected sizes (used by tests/UI sizing).
+/// Convenience map of spec id -> exact sizes (used by tests/UI sizing).
 pub fn expected_sizes(id: &str) -> HashMap<&'static str, u64> {
     spec_by_id(id)
         .map(|spec| {
             spec.files
                 .iter()
-                .map(|f| (f.local, f.expected_bytes))
+                .map(|f| (f.local, f.exact_bytes))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::model_download::transfer::test_server::{response, serve_requests, ExpectedResponse};
+    use crate::model_download::transfer::ArtifactSpec;
+    use tokio::sync::oneshot;
+
+    const TEST_ID: &str = "alignment-test";
+    static TEST_SPEC: AlignmentModelSpec = AlignmentModelSpec {
+        id: TEST_ID,
+        name: "test",
+        hf_repo: "test/repo",
+        revision: "0000000000000000000000000000000000000000",
+        size_mb: 1,
+        languages: "test",
+        description: "test",
+        files: &[
+            ArtifactSpec {
+                remote: "onnx/model.bin",
+                local: "model.bin",
+                exact_bytes: 4,
+            },
+            ArtifactSpec::same("config.json", 3),
+        ],
+    };
+
+    fn test_manager() -> (tempfile::TempDir, Arc<AlignmentModelManager>, PathBuf) {
+        let temp_dir = tempfile::tempdir().expect("create temporary models root");
+        let manager = Arc::new(AlignmentModelManager::new(temp_dir.path().to_path_buf()));
+        let dir = model_dir(temp_dir.path(), TEST_ID);
+        (temp_dir, manager, dir)
+    }
+
+    #[tokio::test]
+    async fn completed_file_is_skipped_and_partial_resumes_with_validated_range() {
+        let (_temp_dir, manager, dir) = test_manager();
+        fs::create_dir_all(&dir).await.unwrap();
+        fs::write(dir.join("model.bin"), b"ABCD").await.unwrap();
+        fs::write(dir.join("config.json"), b"X").await.unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+
+        // Only the partial file is requested; the complete one is skipped.
+        let (base_url, server) = serve_requests(vec![response(
+            "config.json",
+            Some("bytes=1-"),
+            "206 Partial Content",
+            b"YZ",
+            Some("bytes 1-2/3"),
+        )])
+        .await;
+        manager
+            .download_spec_from_source(
+                &TEST_SPEC,
+                &base_url,
+                Some(Box::new(move |progress| {
+                    callback_events.lock().unwrap().push(progress.percent);
+                })),
+            )
+            .await
+            .expect("resume completes the model");
+        server.await.expect("join resume server");
+
+        assert_eq!(fs::read(dir.join("model.bin")).await.unwrap(), b"ABCD");
+        assert_eq!(fs::read(dir.join("config.json")).await.unwrap(), b"XYZ");
+        assert_eq!(resolve_status(&dir, &TEST_SPEC), AlignmentModelStatus::Available);
+        assert!(!manager.downloads.lock().await.contains(TEST_ID));
+        let events = events.lock().unwrap();
+        assert_eq!(events.last().copied(), Some(100));
+        assert!(events[..events.len() - 1].iter().all(|percent| *percent < 100));
+    }
+
+    #[tokio::test]
+    async fn mismatched_content_range_fails_without_publishing_available() {
+        let (_temp_dir, manager, dir) = test_manager();
+        fs::create_dir_all(&dir).await.unwrap();
+        fs::write(dir.join("model.bin"), b"AB").await.unwrap();
+
+        // The remote path differs from the local name; the 206 starts at the wrong byte.
+        let (base_url, server) = serve_requests(vec![ExpectedResponse {
+            filename: "onnx/model.bin",
+            range: Some("bytes=2-"),
+            status: "206 Partial Content",
+            content_length: Some(3),
+            content_range: Some("bytes 1-3/4"),
+            body: b"BCD",
+            release_after_body: None,
+        }])
+        .await;
+        let error = manager
+            .download_spec_from_source(&TEST_SPEC, &base_url, None)
+            .await
+            .expect_err("a mismatched Content-Range must fail");
+        server.await.expect("join mismatch server");
+
+        assert!(!is_download_cancelled(&error));
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert_eq!(fs::read(dir.join("model.bin")).await.unwrap(), b"AB");
+        assert_ne!(manager.status(TEST_ID).await, AlignmentModelStatus::Available);
+        assert_ne!(resolve_status(&dir, &TEST_SPEC), AlignmentModelStatus::Available);
+        assert!(!manager.downloads.lock().await.contains(TEST_ID));
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_partials_and_releases_owner() {
+        let (_temp_dir, manager, dir) = test_manager();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let progress_tx = Arc::new(std::sync::Mutex::new(Some(progress_tx)));
+        let (base_url, server) = serve_requests(vec![ExpectedResponse {
+            filename: "onnx/model.bin",
+            range: None,
+            status: "200 OK",
+            content_length: Some(4),
+            content_range: None,
+            body: b"AB",
+            release_after_body: Some(release_rx),
+        }])
+        .await;
+
+        let download_manager = Arc::clone(&manager);
+        let download = tokio::spawn(async move {
+            download_manager
+                .download_spec_from_source(
+                    &TEST_SPEC,
+                    &base_url,
+                    Some(Box::new(move |progress| {
+                        if progress.downloaded_bytes == 2 {
+                            if let Some(sender) = progress_tx.lock().unwrap().take() {
+                                let _ = sender.send(());
+                            }
+                        }
+                    })),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), progress_rx)
+            .await
+            .expect("receive partial progress")
+            .expect("progress sender remains connected");
+        assert!(manager.downloads.lock().await.contains(TEST_ID));
+        assert_eq!(
+            manager.cancel_download(TEST_ID).await.expect("cancel"),
+            CancelDownloadOutcome::Cancelled
+        );
+        release_tx.send(()).expect("release partial response");
+        let error = download
+            .await
+            .expect("join cancelled download")
+            .expect_err("cancelled download must not succeed");
+        server.await.expect("join partial-response server");
+
+        assert!(is_download_cancelled(&error));
+        assert_eq!(fs::read(dir.join("model.bin")).await.unwrap(), b"AB");
+        assert!(!manager.downloads.lock().await.contains(TEST_ID));
+        assert_ne!(resolve_status(&dir, &TEST_SPEC), AlignmentModelStatus::Available);
+        // A retry can reserve the model again once the cancel has returned.
+        assert!(manager.downloads.reserve(TEST_ID).await.is_ok());
+    }
 }

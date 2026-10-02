@@ -26,4 +26,12 @@ describe("lib/ipc/models", () => {
       expect(invoke).toHaveBeenLastCalledWith("whisper_cancel_download", { modelName: "base" });
     }
   });
+
+  test("cancelAlignmentDownload passes the outcome through", async () => {
+    for (const outcome of ["cancelled", "pending"] as const) {
+      invoke.mockImplementation(async () => outcome);
+      await expect(models.cancelAlignmentDownload({ modelId: "wav2vec2-xlsr-56" })).resolves.toBe(outcome);
+      expect(invoke).toHaveBeenLastCalledWith("cancel_alignment_download", { modelId: "wav2vec2-xlsr-56" });
+    }
+  });
 });

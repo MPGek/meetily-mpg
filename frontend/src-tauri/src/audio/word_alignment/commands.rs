@@ -1,11 +1,13 @@
 //! Tauri commands for alignment model management (task 3.4).
 //!
 //! Mirrors the Parakeet command surface: list/check report catalog + status,
-//! download streams progress events, cancel cleans partials, delete removes.
+//! download streams progress events, cancel keeps partials for resume, delete
+//! removes.
 
 use super::catalog::{list_models, AlignmentModelInfo, AlignmentModelStatus};
 use super::download::{AlignmentDownloadProgress, AlignmentModelManager};
 use super::settings;
+use crate::model_download::{is_download_cancelled, CancelDownloadOutcome};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -51,11 +53,16 @@ fn get_manager() -> Result<Arc<AlignmentModelManager>, String> {
     Ok(mgr)
 }
 
-/// List catalogued alignment models with their current status.
+/// List catalogued alignment models with their current status (an owned
+/// download is reported as Downloading, as in `check_alignment_models`).
 #[command]
 pub async fn list_alignment_models() -> Result<Vec<AlignmentModelInfo>, String> {
     let mgr = get_manager()?;
-    Ok(list_models(mgr.models_root()))
+    let mut infos = list_models(mgr.models_root());
+    for info in &mut infos {
+        info.status = mgr.status(&info.id).await;
+    }
+    Ok(infos)
 }
 
 /// Readiness of every catalogued model, keyed by id (independent of
@@ -104,6 +111,19 @@ pub async fn download_alignment_model<R: Runtime>(
             );
             Ok(())
         }
+        Err(e) if is_download_cancelled(&e) => {
+            // A user cancel is not a failure: the progress event is the single
+            // source of cancel state in the UI.
+            let _ = app_handle.emit(
+                "alignment-model-download-progress",
+                serde_json::json!({
+                    "modelId": model_id,
+                    "progress": 0,
+                    "status": "cancelled",
+                }),
+            );
+            Ok(())
+        }
         Err(e) => {
             let _ = app_handle.emit(
                 "alignment-model-download-failed",
@@ -114,9 +134,9 @@ pub async fn download_alignment_model<R: Runtime>(
     }
 }
 
-/// Cancel an in-flight download and remove partial files.
+/// Cancel an in-flight download; partial files are kept for resume.
 #[command]
-pub async fn cancel_alignment_download(model_id: String) -> Result<(), String> {
+pub async fn cancel_alignment_download(model_id: String) -> Result<CancelDownloadOutcome, String> {
     let mgr = get_manager()?;
     mgr.cancel_download(&model_id)
         .await

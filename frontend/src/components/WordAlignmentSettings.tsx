@@ -41,7 +41,18 @@ export function WordAlignmentSettings() {
   const [modelId, setModelId] = useState(() => loadAlignmentSettings().modelId);
   const [models, setModels] = useState<AlignmentModelInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  // Models whose cancel is still pending; Download stays disabled until the
+  // backend's `cancelled` progress event arrives.
+  const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
   const mountedRef = useRef(false);
+
+  const clearCancelling = useCallback((id: string) => {
+    setCancellingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -62,6 +73,11 @@ export function WordAlignmentSettings() {
     (async () => {
       unsubs.push(
         await alignmentService.onDownloadProgress((p) => {
+          if (p.status === "cancelled") {
+            clearCancelling(p.modelId);
+            refresh();
+            return;
+          }
           setModels((prev) =>
             prev.map((m) =>
               m.id === p.modelId
@@ -72,12 +88,14 @@ export function WordAlignmentSettings() {
         })
       );
       unsubs.push(
-        await alignmentService.onDownloadCompleted(() => {
+        await alignmentService.onDownloadCompleted((id) => {
+          clearCancelling(id);
           refresh();
         })
       );
       unsubs.push(
-        await alignmentService.onDownloadFailed(() => {
+        await alignmentService.onDownloadFailed((id) => {
+          clearCancelling(id);
           refresh();
         })
       );
@@ -87,7 +105,7 @@ export function WordAlignmentSettings() {
       mountedRef.current = false;
       unsubs.forEach((u) => u());
     };
-  }, [refresh]);
+  }, [refresh, clearCancelling]);
 
   const toggleEnabled = (checked: boolean) => {
     setEnabled(checked);
@@ -104,6 +122,7 @@ export function WordAlignmentSettings() {
   };
 
   const download = async (id: string) => {
+    if (cancellingIds.has(id)) return;
     setModels((prev) =>
       prev.map((m) =>
         m.id === id ? { ...m, status: { state: "Downloading", detail: { progress: 0 } } } : m
@@ -119,9 +138,13 @@ export function WordAlignmentSettings() {
   };
 
   const cancel = async (id: string) => {
+    setCancellingIds((prev) => new Set([...prev, id]));
     try {
-      await alignmentService.cancelDownload(id);
+      const outcome = await alignmentService.cancelDownload(id);
+      // On `pending` the `cancelled` progress event clears the flag later.
+      if (outcome === "cancelled") clearCancelling(id);
     } catch (err) {
+      clearCancelling(id);
       console.error("Alignment cancel failed:", err);
     } finally {
       refresh();
@@ -156,6 +179,7 @@ export function WordAlignmentSettings() {
         {models.map((model) => {
           const ready = model.status.state === "Available";
           const downloading = model.status.state === "Downloading";
+          const cancelling = cancellingIds.has(model.id);
           const selected = model.id === modelId;
           return (
             <div
@@ -206,10 +230,15 @@ export function WordAlignmentSettings() {
                         <Trash2 className="w-3.5 h-3.5" />
                       </Button>
                     </>
-                  ) : downloading ? (
-                    <Button size="sm" variant="outline" onClick={() => cancel(model.id)}>
+                  ) : downloading || cancelling ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={cancelling}
+                      onClick={() => cancel(model.id)}
+                    >
                       <X className="w-3.5 h-3.5 mr-1" />
-                      Cancel
+                      {cancelling ? "Cancelling…" : "Cancel"}
                     </Button>
                   ) : (
                     <Button size="sm" onClick={() => download(model.id)}>

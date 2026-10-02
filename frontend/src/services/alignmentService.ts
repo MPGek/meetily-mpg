@@ -4,7 +4,7 @@
  * Typed wrappers for the CTC word-alignment model management commands
  * (word-level-diarization-alignment). Mirrors the Parakeet model-management
  * surface: list/check report catalog + readiness, download streams progress
- * events, cancel cleans partials, delete removes.
+ * events, cancel keeps partials for resume, delete removes.
  */
 
 import {
@@ -19,6 +19,7 @@ import {
   type AlignmentDownloadProgressPayload,
   type AlignmentModelInfo,
   type AlignmentModelStatus,
+  type CancelDownloadOutcome,
 } from '@/lib/ipc/models';
 import type { UnlistenFn } from '@/lib/ipc/core';
 
@@ -44,8 +45,12 @@ export class AlignmentService {
     return downloadAlignmentModel({ modelId });
   }
 
-  /** Cancel an in-flight download and remove partial files. */
-  async cancelDownload(modelId: string): Promise<void> {
+  /**
+   * Cancel an in-flight download; partial files are kept for resume.
+   * `pending` means cleanup is still running: a `status: 'cancelled'` progress
+   * event follows when it ends.
+   */
+  async cancelDownload(modelId: string): Promise<CancelDownloadOutcome> {
     return cancelAlignmentDownload({ modelId });
   }
 

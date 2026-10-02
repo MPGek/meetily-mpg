@@ -476,12 +476,18 @@ export interface AlignmentModelInfo {
   status: AlignmentModelStatus;
 }
 
+/**
+ * `alignment-model-download-progress`. `download_alignment_model` emits one
+ * `status: 'cancelled'` event (progress 0, no byte fields) once a cancelled
+ * download has finished cleanup; in-flight events carry no status.
+ */
 export interface AlignmentDownloadProgressPayload {
   modelId: string;
   progress: number;
-  downloaded_bytes: number;
-  total_bytes: number;
-  speed_mbps: number;
+  downloaded_bytes?: number;
+  total_bytes?: number;
+  speed_mbps?: number;
+  status?: 'cancelled';
 }
 
 export interface AlignmentDownloadCompletedPayload {
@@ -506,8 +512,8 @@ export async function downloadAlignmentModel(args: ModelIdArgs): Promise<void> {
   return invokeTyped<void>('download_alignment_model', args);
 }
 
-export async function cancelAlignmentDownload(args: ModelIdArgs): Promise<void> {
-  return invokeTyped<void>('cancel_alignment_download', args);
+export async function cancelAlignmentDownload(args: ModelIdArgs): Promise<CancelDownloadOutcome> {
+  return invokeTyped<CancelDownloadOutcome>('cancel_alignment_download', args);
 }
 
 export async function deleteAlignmentModel(args: ModelIdArgs): Promise<void> {

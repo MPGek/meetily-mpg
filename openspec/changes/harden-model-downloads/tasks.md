@@ -167,7 +167,7 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
 
 ## 3. Word-alignment download hardening (fork-only)
 
-- [ ] 3.1 In `frontend/src-tauri/src/audio/word_alignment/catalog.rs`:
+- [x] 3.1 In `frontend/src-tauri/src/audio/word_alignment/catalog.rs`:
   - Replace `ModelFile` and the `model_file` const fn (`:11-50`) with `model_download::transfer::ArtifactSpec`, keeping the existing byte values as `exact_bytes`.
   - Add `revision: "2d48b01b6429d9018f81914550565112d56f6ba7"` to `AlignmentModelSpec`.
   - `resolve_status` (`:102-125`) requires `len == exact_bytes`.
@@ -175,7 +175,8 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   - Update `expected_sizes` (`download.rs:373-382`) to the new field.
 
   verify: `cargo test -p meetily --lib audio::word_alignment::catalog` passes 3 tests, and `grep -rn "min_bytes" frontend/src-tauri/src` returns nothing.
-- [ ] 3.2 In `frontend/src-tauri/src/audio/word_alignment/download.rs`:
+  - Note (2026-10-02): the catalog test creates files with `File::set_len` (sparse) instead of writing ~650 MB; truncated and one-byte-short checks both report Corrupted.
+- [x] 3.2 In `frontend/src-tauri/src/audio/word_alignment/download.rs`:
   - Replace `cancel_flag`/`active_downloads` (`:32-41`) with `DownloadOwners`.
   - `download_model_inner` (`:105-323`) calls `transfer::download_artifacts` with base URL `https://huggingface.co/{hf_repo}/resolve/{revision}`, then keeps the integrity gate (`:303-309`).
   - `status()` (`:51-60`) overlays `owner.progress()`.
@@ -183,26 +184,29 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
   - `delete_model` keeps rejecting while owned.
 
   verify: `cargo check -p meetily`, and `grep -n "resolve/main\|cancel_flag\|sleep(" frontend/src-tauri/src/audio/word_alignment/download.rs` returns nothing.
-- [ ] 3.3 In `frontend/src-tauri/src/audio/word_alignment/commands.rs`:
+  - Note (2026-10-02): `delete_model` also holds the owners lock while removing the directory, so a download cannot start between the ownership check and the delete. A private `download_spec_from_source` seam lets tests use a 2-file spec against a loopback server. Final 100% progress is reported only after the owner is released.
+- [x] 3.3 In `frontend/src-tauri/src/audio/word_alignment/commands.rs`:
   - `download_alignment_model` (`:78-115`) maps a cancel to `Ok(())` plus `alignment-model-download-progress {modelId, progress: 0, status: "cancelled"}` instead of `alignment-model-download-failed`.
   - `cancel_alignment_download` (`:119-124`) returns `Result<CancelDownloadOutcome, String>`.
   - `list_alignment_models` (`:56-59`) overlays manager status, as `check_alignment_models` does (`:63-73`).
 
   verify: `cargo check -p meetily`; `lib.rs:673` is unchanged.
-- [ ] 3.4 Add loopback tests to `download.rs` `#[cfg(test)] mod tests` using `model_download::transfer::test_server` and a 2-file test spec: `completed_file_is_skipped_and_partial_resumes_with_validated_range`, `mismatched_content_range_fails_without_publishing_available`, `cancel_keeps_partials_and_releases_owner`. verify: `cargo test -p meetily --lib audio::word_alignment::download` passes 3 tests offline.
-- [ ] 3.5 Frontend:
+- [x] 3.4 Add loopback tests to `download.rs` `#[cfg(test)] mod tests` using `model_download::transfer::test_server` and a 2-file test spec: `completed_file_is_skipped_and_partial_resumes_with_validated_range`, `mismatched_content_range_fails_without_publishing_available`, `cancel_keeps_partials_and_releases_owner`. verify: `cargo test -p meetily --lib audio::word_alignment::download` passes 3 tests offline.
+- [x] 3.5 Frontend:
   - In `frontend/src/lib/ipc/models.ts`, `AlignmentDownloadProgressPayload` (`:466-472`) gains `status?: 'cancelled'`, and `cancelAlignmentDownload` (`:496-498`) and `alignmentService.cancelDownload` (`frontend/src/services/alignmentService.ts:48-50`) return `CancelDownloadOutcome`.
   - In `WordAlignmentSettings.tsx`, the progress listener (`:64-72`) calls `refresh()` on `cancelled`, and `cancel` (`:120-128`) keeps Download disabled while the result is `pending`.
   - Extend `frontend/tests/lib/ipc/models.test.ts` with `cancelAlignmentDownload passes the outcome through`.
 
   verify: `pnpm exec tsc --noEmit -p .` and `bun test tests/lib/ipc/models.test.ts` (frontend/) pass.
+  - Note (2026-10-02): the payload's byte/speed fields became optional (the cancelled event carries none; nothing reads them). A `cancelled` outcome clears the pending state immediately, so a cancel that finds no download cannot leave the card stuck.
 - [ ] 3.6 Manual Windows check:
   1. Enable word alignment in settings and download `wav2vec2-xlsr-56`.
   2. Cancel at about 40%, then reopen settings.
   3. Download again.
 
   verify: after reopening, the card shows "Needs re-download" (not Downloading), `model_fp16.onnx` still holds its partial bytes, the console log shows a resume `Range` request that the HF CDN answers with `206`, and the final file is exactly 651760843 bytes and reported Ready.
-- [ ] 3.7 Commit group 3 after `cargo test -p meetily --lib model_download audio::word_alignment`, `bun test tests/` and `pnpm exec tsc --noEmit -p .` (frontend/). verify: all pass; `git show --stat HEAD` lists only group 3 files.
+  - Note (2026-10-02): open; needs the desktop app on Windows. Left for the manual-check pass.
+- [x] 3.7 Commit group 3 after `cargo test -p meetily --lib model_download audio::word_alignment`, `bun test tests/` and `pnpm exec tsc --noEmit -p .` (frontend/). verify: all pass; `git show --stat HEAD` lists only group 3 files.
 
 ## 4. Final integration checks
 
