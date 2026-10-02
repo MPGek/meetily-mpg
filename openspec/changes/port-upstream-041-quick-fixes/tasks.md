@@ -92,20 +92,23 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 8. CI: portable Windows Whisper build
 
-- [ ] 8.1 Copy upstream's `.github/verify-portable-ggml.cjs` (`git -C $UP show 41daaa5:.github/verify-portable-ggml.cjs`). It requires `GGML_NATIVE:BOOL=OFF` and `GGML_AVX512{,_VBMI,_VNNI,_BF16}:BOOL=OFF` in every `target/<triple>/<profile>/build/whisper-rs-sys-*/out/build/CMakeCache.txt`. Do not copy `force-portable-ggml.cmake` (design D8). Copy upstream's `verify-portable-ggml.test.cjs` only if it runs under plain `node` with no extra dependencies; verify: `node .github/verify-portable-ggml.cjs` with no args exits 1 with the usage message; `node .github/verify-portable-ggml.test.cjs` passes, if copied.
-- [ ] 8.2 Edit `.github/workflows/build-windows.yml`:
+- [x] 8.1 Copy upstream's `.github/verify-portable-ggml.cjs` (`git -C $UP show 41daaa5:.github/verify-portable-ggml.cjs`). It requires `GGML_NATIVE:BOOL=OFF` and `GGML_AVX512{,_VBMI,_VNNI,_BF16}:BOOL=OFF` in every `target/<triple>/<profile>/build/whisper-rs-sys-*/out/build/CMakeCache.txt`. Do not copy `force-portable-ggml.cmake` (design D8). Copy upstream's `verify-portable-ggml.test.cjs` only if it runs under plain `node` with no extra dependencies; verify: `node .github/verify-portable-ggml.cjs` with no args exits 1 with the usage message; `node .github/verify-portable-ggml.test.cjs` passes, if copied.
+  - Note (2026-10-02): both files copied verbatim from `41daaa5`; `node --test .github/verify-portable-ggml.test.cjs` passes 14/14 under plain node.
+- [x] 8.2 Edit `.github/workflows/build-windows.yml`:
   - add `GGML_NATIVE: "OFF"` to the workflow or job `env:` (`:35`);
   - change the rust-cache `key: windows-x64-vulkan-v2` (`:507`) to `windows-x64-vulkan-v2-portable-v1`;
   - add a step before "Build Tauri app" (`:669`) that writes a temp Tauri config with `build.beforeBundleCommand = { script: "node .github/verify-portable-ggml.cjs target/x86_64-pc-windows-msvc/<profile>", cwd: $GITHUB_WORKSPACE }`, and append `--config <path>` to the tauri-action `args` (`:683`), as upstream's `windows-portability` step does.
 
   verify: `actionlint .github/workflows/build-windows.yml` reports no new findings (if actionlint is unavailable, `python -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" .github/workflows/build-windows.yml`), and the diff matches design D8.
-- [ ] 8.3 Edit `.github/workflows/build.yml`, which is reused by `build-test.yml` and `release.yml`:
+- [x] 8.3 Edit `.github/workflows/build.yml`, which is reused by `build-test.yml` and `release.yml`:
+  - Note (2026-10-02): actionlint and PyYAML are not installed; all three workflows parse with js-yaml 4.3.2 from `frontend/node_modules`. Non-Windows cache keys evaluate to their old values (the suffix expression yields an empty string).
   - in a Windows-only step (`if: contains(inputs.platform, 'windows')`), append `GGML_NATIVE=OFF` to `$GITHUB_ENV`;
   - change the rust-cache key (`:114`) to `${{ inputs.platform }}-${{ inputs.target }}-vulkan-v2${{ contains(inputs.platform, 'windows') && '-portable-v1' || '' }}`;
   - add the same `beforeBundleCommand` override for Windows only, appended to the tauri-action `args` (`:594`).
 
   Do the same in `.github/workflows/build-devtest.yml`, but only the env var and the key bump (`:100`), with no bundle check (design D8). verify: both files parse (actionlint or the yaml one-liner), and the non-Windows matrix legs' cache keys are unchanged.
 - [ ] 8.4 After pushing, trigger `build-windows.yml` (workflow_dispatch) once; verify: the "Verified Windows Whisper CPU portability before bundling." line appears in the tauri-action log, and the run produces the MSI/NSIS artifacts. If CI cannot be run before archive, note this task as open.
+  - Note (2026-10-02): open. Nothing has been pushed; needs a push and a `workflow_dispatch` run of `build-windows.yml`.
 
 ## 9. CI: pnpm 9 with a frozen lockfile
 

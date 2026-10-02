@@ -93,11 +93,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Configure portable Windows Whisper build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Build whisper.cpp for a portable x64 baseline, not the runner's
+          # CPU (e.g. AVX-512); whisper-rs-sys forwards GGML_* env to CMake.
+          "GGML_NATIVE=OFF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: ${{ matrix.platform }}-${{ matrix.target }}
+          key: ${{ matrix.platform }}-${{ matrix.target }}${{ runner.os == 'Windows' && '-portable-v1' || '' }}
 
       # Platform-specific dependencies
       - name: Install dependencies (Ubuntu 24.04)
