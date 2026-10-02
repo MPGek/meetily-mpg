@@ -210,8 +210,12 @@ Commands run from the repo root unless they say `(frontend/)`. "Prescribed skips
 
 ## 4. Final integration checks
 
-- [ ] 4.1 Run the prescribed-skips full Rust suite. verify: 0 failed; passed = task 0.1 baseline + the new tests (owners 4, transfer 2, Parakeet 11, Whisper 14, alignment download 3, alignment catalog net 0).
-- [ ] 4.2 Run `cargo clippy -p meetily --all-targets --message-format=short`. verify: the warning count is ≤ the task 0.1 baseline, and none of the warnings points into `model_download/`, `parakeet_engine/`, `whisper_engine/whisper_engine.rs` or `audio/word_alignment/`.
-- [ ] 4.3 Run `bun test tests/`, `pnpm exec tsc --noEmit -p .` and `pnpm exec next lint` (frontend/). verify: tests pass (baseline + 3 new), tsc is clean, and lint has no new findings vs task 0.1.
-- [ ] 4.4 Confirm the IPC names are stable. verify: `git diff <group-0 base>..HEAD -- frontend/src-tauri/src/lib.rs` adds only the `pub mod model_download;` line (no `generate_handler!` edits), and `git grep -hoE '"[a-z-]+-download-(progress|complete|completed|error|failed)"' <ref> -- frontend/src-tauri/src | sort -u` prints the same list for `<ref>` = `HEAD` and `<ref>` = the group-0 base.
-- [ ] 4.5 Run `graphify update .`, then `openspec validate harden-model-downloads --strict`. verify: graphify finishes without error, and validate reports the change valid.
+- [x] 4.1 Run the prescribed-skips full Rust suite. verify: 0 failed; passed = task 0.1 baseline + the new tests (owners 4, transfer 2, Parakeet 11, Whisper 14, alignment download 3, alignment catalog net 0).
+  - Note (2026-10-02): 563 passed / 0 failed / 9 ignored = 529 + 34 (owners 4, transfer 2, Parakeet 11, Whisper 14, alignment download 3).
+- [x] 4.2 Run `cargo clippy -p meetily --all-targets --message-format=short`. verify: the warning count is ≤ the task 0.1 baseline, and none of the warnings points into `model_download/`, `parakeet_engine/`, `whisper_engine/whisper_engine.rs` or `audio/word_alignment/`.
+  - Note: 32 warnings, none in the touched modules.
+- [x] 4.3 Run `bun test tests/`, `pnpm exec tsc --noEmit -p .` and `pnpm exec next lint` (frontend/). verify: tests pass (baseline + 3 new), tsc is clean, and lint has no new findings vs task 0.1.
+  - Note: 99 pass (96 + 3), tsc clean, lint 42 findings as at baseline.
+- [x] 4.4 Confirm the IPC names are stable. verify: `git diff <group-0 base>..HEAD -- frontend/src-tauri/src/lib.rs` adds only the `pub mod model_download;` line (no `generate_handler!` edits), and `git grep -hoE '"[a-z-]+-download-(progress|complete|completed|error|failed)"' <ref> -- frontend/src-tauri/src | sort -u` prints the same list for `<ref>` = `HEAD` and `<ref>` = the group-0 base.
+  - Note: lib.rs diff is only `+pub mod model_download;`; the 13 download event names are identical at HEAD and `b1acbf1`.
+- [x] 4.5 Run `graphify update .`, then `openspec validate harden-model-downloads --strict`. verify: graphify finishes without error, and validate reports the change valid.
