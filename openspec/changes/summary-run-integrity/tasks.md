@@ -172,13 +172,19 @@
 
 ## 5. Integration verification
 
-- [ ] 5.1 Run `cargo test -p meetily --lib -- --skip audio::playback_monitor --skip audio::system_audio_commands` from the repo root. Verify: 0 failed, and passed = baseline (0.2) + the new tests.
-- [ ] 5.2 Run `cargo clippy -p meetily --all-targets --message-format=short`. Verify: the warning count is ≤ the 0.2 baseline, and no warning points into a file this change touched.
-- [ ] 5.3 Run `bun test tests/` and `pnpm exec tsc --noEmit -p .` in `frontend/`. Verify: all pass, and tsc is clean.
-- [ ] 5.4 Run `openspec validate summary-run-integrity --strict`. Verify: valid.
+- [x] 5.1 Run `cargo test -p meetily --lib -- --skip audio::playback_monitor --skip audio::system_audio_commands` from the repo root. Verify: 0 failed, and passed = baseline (0.2) + the new tests.
+  - Note (2026-10-02): 592 passed / 0 failed / 9 ignored = 563 baseline + 29 new (llm_client 8, processor 11, service 5, repositories/summary 5).
+- [x] 5.2 Run `cargo clippy -p meetily --all-targets --message-format=short`. Verify: the warning count is ≤ the 0.2 baseline, and no warning points into a file this change touched.
+  - Note (2026-10-02): 32 `: warning` lines, the same set as the 0.2 baseline (compared by file and message). The only warning in a touched file is the pre-existing `llm_client.rs` `from_str` (line 94 → 174).
+- [x] 5.3 Run `bun test tests/` and `pnpm exec tsc --noEmit -p .` in `frontend/`. Verify: all pass, and tsc is clean.
+  - Note (2026-10-02): `bun test tests/` 117 pass / 0 fail across 15 files (99 + 18 new); `tsc --noEmit` clean.
+- [x] 5.4 Run `openspec validate summary-run-integrity --strict`. Verify: valid.
+  - Note (2026-10-02): the first run failed: the archived `port-upstream-041-quick-fixes` had added four chunk-boundary scenarios and a coverage sentence to the main `summary-service` "Transcript chunking for large inputs" requirement, and this MODIFIED block (written before that archive) would have dropped them. Copied the sentence and the four scenarios into the delta unchanged; now valid.
 - [ ] 5.5 Manual check in the dev app (`frontend/dev-gpu.bat`) with Ollama and a reasoning model (e.g. `qwen3`) on a long meeting that produces several chunks. Record each item below with timings in this task's note, including total run duration against the ~16.5 min client poll timeout (design Risks):
   - the summary contains no reasoning text, and the per-call debug logs show either `reasoning_effort` accepted or exactly one compatibility re-send;
   - leaving for another meeting mid-run and returning shows generation in progress, then the completed summary;
   - Stop after returning cancels the run (status `cancelled`, previous summary restored);
   - quitting the app mid-run and restarting shows the meeting's summary as failed with the interrupted message, and a new run can be started.
-- [ ] 5.6 Run `graphify update .` from the repo root. Verify: the command succeeds.
+  - Note (2026-10-02): open; needs the desktop app with Ollama.
+- [x] 5.6 Run `graphify update .` from the repo root. Verify: the command succeeds.
+  - Note (2026-10-02): `graphify update .` succeeded (11288 nodes, 26156 edges, 467 communities); `graphify-out/` is gitignored.

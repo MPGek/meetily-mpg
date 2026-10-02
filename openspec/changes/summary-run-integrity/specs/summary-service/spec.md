@@ -1,11 +1,27 @@
 ## MODIFIED Requirements
 
 ### Requirement: Transcript chunking for large inputs
-The system SHALL split transcripts into chunks that fit within the model's token threshold when the full text exceeds available context. Each chunk's output SHALL be cleaned of model reasoning before it is combined. A chunk that fails SHALL be retried once; if it fails again, the whole summary run SHALL fail with a user-visible error and no partial summary SHALL be published.
+The system SHALL split transcripts into chunks that fit within the model's token threshold when the full text exceeds available context. Every character of the transcript SHALL appear in at least one chunk, including when a chunk is shortened to end at a sentence or word boundary, and chunking SHALL always make forward progress so it terminates for any chunk size and overlap. Each chunk's output SHALL be cleaned of model reasoning before it is combined. A chunk that fails SHALL be retried once; if it fails again, the whole summary run SHALL fail with a user-visible error and no partial summary SHALL be published.
 
 #### Scenario: Chunk 50K-word transcript for Ollama
 - **WHEN** transcript text exceeds the available token budget (context_size - 300)
 - **THEN** system splits into sequential chunks and processes each, combining results
+
+#### Scenario: Boundary snap-back longer than the overlap loses no text
+- **WHEN** a chunk's last sentence boundary (". ") lies further back from the chunk's size limit than the configured overlap
+- **THEN** the text between that boundary and the size limit SHALL appear at the start of the next chunk rather than being skipped
+
+#### Scenario: Boundary inside the overlap is not used
+- **WHEN** the only sentence or word boundary in a chunk lies within the overlap length from the chunk's start
+- **THEN** the system SHALL end the chunk at its size limit instead of at that boundary, so the next chunk still starts after the current one
+
+#### Scenario: Overlap equal to the chunk size still terminates
+- **WHEN** the configured overlap is equal to or larger than the chunk size
+- **THEN** each new chunk SHALL start at least one character after the previous chunk's start, and chunking SHALL finish with the final chunk ending at the end of the text
+
+#### Scenario: Multi-byte text is split on character boundaries
+- **WHEN** the transcript contains multi-byte (non-ASCII) characters near a chunk boundary
+- **THEN** every chunk SHALL be valid text that starts and ends on a character boundary
 
 #### Scenario: Chunk reasoning never reaches the combine step
 - **WHEN** a chunk's model output contains a `<think>…</think>` block followed by visible summary text
