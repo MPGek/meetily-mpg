@@ -110,10 +110,12 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 - [ ] 8.4 After pushing, trigger `build-windows.yml` (workflow_dispatch) once; verify: the "Verified Windows Whisper CPU portability before bundling." line appears in the tauri-action log, and the run produces the MSI/NSIS artifacts. If CI cannot be run before archive, note this task as open.
   - Note (2026-10-02): open. Nothing has been pushed; needs a push and a `workflow_dispatch` run of `build-windows.yml`.
 
-## 9. CI: pnpm 9 with a frozen lockfile
+## 9. CI: pnpm 11 with a frozen lockfile
 
-- [ ] 9.1 Locally, in `frontend/`, run `npx -y pnpm@9.15.9 install --frozen-lockfile`. If it fails because the lockfile is out of date, run `npx -y pnpm@9.15.9 install` and include the regenerated `pnpm-lock.yaml` in this group's commit; verify: `npx -y pnpm@9.15.9 install --frozen-lockfile` exits 0.
-- [ ] 9.2 Change `version: 8` to `version: 9.15.9` in the `pnpm/action-setup@v4` block of each of the six workflows:
+- [x] 9.1 Locally, in `frontend/`, run `npx -y pnpm@9.15.9 install --frozen-lockfile`. If it fails because the lockfile is out of date, run `npx -y pnpm@9.15.9 install` and include the regenerated `pnpm-lock.yaml` in this group's commit; verify: `npx -y pnpm@9.15.9 install --frozen-lockfile` exits 0.
+  - Note (2026-10-02, revised by user decision; see design D8): `npx -y pnpm@9.15.9 install --frozen-lockfile` fails with `packages field missing or empty`, since pnpm 9 rejects the pnpm 10+ `pnpm-workspace.yaml`. Instead, the ProseMirror overrides moved from `package.json` into `pnpm-workspace.yaml`, and `pnpm install` on the local pnpm 11.20.0 regenerated the lockfile, adding only the `overrides` block. `pnpm install --frozen-lockfile` (11.20.0) then exits 0, the `pnpm.overrides` warning is gone, and `bun test` (96 pass) and `tsc` stay clean.
+- [x] 9.2 Change `version: 8` to `version: 9.15.9` in the `pnpm/action-setup@v4` block of each of the six workflows:
+  - Note (2026-10-02): done with `version: 11.20.0` instead of 9.15.9, plus `node-version: '22'` (was `'20'`) in the same six workflows, because pnpm 11.20.0 declares `engines.node >=22.13`. The six install sites use `--frozen-lockfile`, and all six workflows parse with js-yaml. The `pr-main-check` run on a PR is still to be observed.
   - `build-devtest.yml:70`
   - `build-linux.yml:111`
   - `build-macos.yml:72`

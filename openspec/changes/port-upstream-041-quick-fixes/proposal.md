@@ -27,7 +27,7 @@ This change ports those fixes, plus small UI, accessibility and CI fixes from th
 - **CI builds portable Windows Whisper and uses the locked frontend dependencies** (ideas from upstream commits `41daaa5` and `9a3193d`; no spec).
   - Set `GGML_NATIVE=OFF` for every Windows build, so whisper.cpp is not tuned to the CI runner's CPU (for example AVX-512). `whisper-rs-sys` 0.15.0 forwards every `GGML_*` env var to CMake (its `build.rs:279-287`) but declares no `rerun-if-env-changed` for them, so the Windows `rust-cache` keys must be bumped as well.
   - Fail the build before bundling unless whisper's `CMakeCache.txt` shows `GGML_NATIVE` and the `GGML_AVX512*` flags OFF.
-  - Move the CI pnpm from 8 to 9.15.9 and run `pnpm install --frozen-lockfile`, since `frontend/pnpm-lock.yaml` is `lockfileVersion: '9.0'`.
+  - Move the CI pnpm from 8 to 11.20.0 (the version that produces `frontend/pnpm-lock.yaml` locally) on Node 22, and run `pnpm install --frozen-lockfile`. The ProseMirror overrides move from `package.json` to `pnpm-workspace.yaml`, where pnpm 10+ reads them. (Revised during apply; see design D8.)
 
 ## Capabilities
 

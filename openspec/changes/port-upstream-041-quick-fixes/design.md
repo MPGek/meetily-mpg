@@ -136,7 +136,7 @@ Port upstream's change: `let session = { self.current_session.lock().await.take(
 - **Homepage wrapper.** `app/page.tsx` replaces `<motion.div initial/animate/transition className=...>` with `<div className="flex flex-col h-screen bg-gray-50">` and drops the `framer-motion` import. Nine other components still use `framer-motion`, so the dependency stays.
 - **Logo.** In `Logo.tsx`, the expanded trigger becomes `<button type="button" aria-label="About Meetily" className="... w-full">`, keeping the current classes. `w-full` is needed because a block-level `<button>` shrinks to its content, unlike the `block` `<span>` it replaces. The collapsed button gets the same `type`/`aria-label`.
 
-### D8: CI — env var plus cache-key bump plus a pre-bundle CMakeCache check; pnpm 9.15.9 with `--frozen-lockfile`
+### D8: CI — env var plus cache-key bump plus a pre-bundle CMakeCache check; pnpm 11.20.0 with `--frozen-lockfile`
 
 - **`GGML_NATIVE`.** Set `GGML_NATIVE: "OFF"` at job `env:` level in `build-windows.yml`, and as a Windows-only `$GITHUB_ENV` write in `build.yml` and `build-devtest.yml`, whose jobs are cross-platform matrices.
 
@@ -147,9 +147,9 @@ Port upstream's change: `let session = { self.current_session.lock().await.take(
   The check runs through tauri-action's bundle hook (a `--config` override that sets `beforeBundleCommand`, as upstream does) or as a step after the build. A post-build step is simpler, but a failure there only flags the run; it does not stop a bad artifact from being uploaded.
 
   Decision: use the `beforeBundleCommand` override in `build-windows.yml` and `build.yml` (the release path). `build-devtest.yml` gets only the env var and the key bump, since its artifacts are not released.
-- **pnpm.** Set `version: 9.15.9` (same as upstream) in all six `pnpm/action-setup` blocks, and use `pnpm install --frozen-lockfile` at all six install sites.
+- **pnpm.** Set `version: 11.20.0` in all six `pnpm/action-setup` blocks, raise `node-version` from `'20'` to `'22'` in the same six workflows (pnpm 11 requires Node >= 22.13), and use `pnpm install --frozen-lockfile` at all six install sites.
 
-  Before committing, verify locally with pnpm 9 that the lockfile matches `package.json`: `npx -y pnpm@9.15.9 install --frozen-lockfile` in `frontend/`. The local pnpm is 11.x, so pnpm 9 is invoked explicitly. If it fails, regenerate the lockfile with pnpm 9.15.9 in the same commit.
+  *Revised during apply (2026-10-02, user decision).* The plan was upstream's pnpm 9.15.9, but it cannot install this fork: `frontend/pnpm-workspace.yaml` holds only pnpm 10+ settings (`allowBuilds`), and pnpm 9 rejects a workspace file with no `packages` field. The lockfile is also produced by the local pnpm 11.20.0, which ignores `package.json`'s `pnpm.overrides`, so the lockfile had no `overrides` section and a pnpm 9 frozen install would fail on the mismatch anyway. So CI uses the local pnpm version, and the five ProseMirror overrides move from `package.json` to `pnpm-workspace.yaml`. Regenerating the lockfile then adds only the `overrides` block; every resolution was already at the pinned versions.
 
 ## Risks / Trade-offs
 
@@ -162,7 +162,7 @@ Port upstream's change: `let session = { self.current_session.lock().await.take(
 - **[Risk] The fixture is a binary file fetched from upstream during apply.** If upstream rewrites history, it could change.
   → Fetch it from the immutable `v0.4.1` tag and check its size (32,131 bytes) in the task's `verify:` clause.
 - **[Risk] `--frozen-lockfile` fails CI if `package.json` and `pnpm-lock.yaml` have drifted.**
-  → Verified locally with pnpm 9.15.9 before the CI commit (D8). Upstream's commit had to regenerate its lockfile; the fork's may not need to.
+  → Verified locally with `pnpm install --frozen-lockfile` on pnpm 11.20.0 before the CI commit (D8).
 - **[Risk] With `GGML_NATIVE` OFF, whisper.cpp loses AVX-512 kernels on CPUs that have them,** so Whisper may be slightly slower on those machines.
   → Accepted: portability matters more than peak speed. The AVX2 baseline is kept, and the Vulkan GPU path, which is the Windows release feature, is unaffected.
 - **[Trade-off] Claude `max_tokens` 8192 caps very long single-chunk summaries** when the model also spends tokens on thinking.
