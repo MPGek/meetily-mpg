@@ -72,8 +72,9 @@ Each group from 1 to 9 is one commit (`fix(...)`/`ci: ... (openspec port-upstrea
 
 ## 6. Ending an analytics session does not deadlock (#784)
 
-- [ ] 6.1 In `analytics/analytics.rs` `end_session` (`:208-224`), replace the held `session_guard` with `let session = { let mut g = self.current_session.lock().await; g.take() };`, then `if let Some(session) = session { ... self.track_event(...).await?; }`. This is upstream's change; leave the PostHog key (`analytics/commands.rs`), event dedupe and consent untouched. verify: `git diff --stat` touches only `analytics/analytics.rs`.
-- [ ] 6.2 Port upstream's `ending_session_completes_and_emits_an_event` tokio test and its `tokio::{io, net::TcpListener, time}` imports into `analytics.rs`'s `mod tests` (`:561`) (`git -C $UP diff c7bdb3b^1 c7bdb3b -- frontend/src-tauri/src/analytics/analytics.rs`); verify: `cargo test -p meetily --lib analytics::analytics` passes, and the new test fails with the "must not wait on its own session mutex" timeout when 6.1 is reverted locally.
+- [x] 6.1 In `analytics/analytics.rs` `end_session` (`:208-224`), replace the held `session_guard` with `let session = { let mut g = self.current_session.lock().await; g.take() };`, then `if let Some(session) = session { ... self.track_event(...).await?; }`. This is upstream's change; leave the PostHog key (`analytics/commands.rs`), event dedupe and consent untouched. verify: `git diff --stat` touches only `analytics/analytics.rs`.
+- [x] 6.2 Port upstream's `ending_session_completes_and_emits_an_event` tokio test and its `tokio::{io, net::TcpListener, time}` imports into `analytics.rs`'s `mod tests` (`:561`) (`git -C $UP diff c7bdb3b^1 c7bdb3b -- frontend/src-tauri/src/analytics/analytics.rs`); verify: `cargo test -p meetily --lib analytics::analytics` passes, and the new test fails with the "must not wait on its own session mutex" timeout when 6.1 is reverted locally.
+  - Note (2026-10-02): with the 6.1 change reverted locally the test fails with `ending a session must not wait on its own session mutex: Elapsed(())`; with it, it passes.
 
 ## 7. Recording start errors show their cause; Record button stops jumping; logo is a button (#779 UI, #794)
 
