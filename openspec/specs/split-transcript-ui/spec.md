@@ -207,7 +207,7 @@ The live transcription view SHALL follow the bottom with new segments only while
 
 #### Scenario: Scroll-to-bottom button appears when not pinned
 - **WHEN** the live transcript view is not pinned to the bottom
-- **THEN** a circular overlay button with a downward arrow SHALL be shown at the bottom-right of the transcript panel, vertically aligned with the recording controls
+- **THEN** a circular overlay button with a downward arrow SHALL be shown at the bottom-right of the transcript panel, just above the docked recording footer, and SHALL NOT overlap the footer
 
 #### Scenario: Button click returns to live bottom
 - **WHEN** the user clicks the scroll-to-bottom button

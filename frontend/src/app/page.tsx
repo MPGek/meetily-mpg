@@ -7,7 +7,6 @@ import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useConfig } from '@/contexts/ConfigContext';
-import { StatusOverlays } from '@/app/_components/StatusOverlays';
 import Analytics from '@/lib/analytics';
 import { SettingsModals } from './_components/SettingsModal';
 import { TranscriptPanel } from './_components/TranscriptPanel';
@@ -44,7 +43,7 @@ export default function Home() {
 
   // Hooks
   const { hasMicrophone } = usePermissionCheck();
-  const { setIsMeetingActive, isCollapsed: sidebarCollapsed, refetchMeetings } = useSidebar();
+  const { setIsMeetingActive, refetchMeetings } = useSidebar();
   const { modals, messages, showModal, hideModal } = useModalState(transcriptModelConfig);
   const { isRecordingDisabled, setIsRecordingDisabled } = useRecordingStateSync(isRecording, setIsRecordingState, setIsMeetingActive);
   const { handleRecordingStart } = useRecordingStart(isRecording, setIsRecordingState, showModal);
@@ -206,6 +205,12 @@ export default function Home() {
 
   // Computed values using global status
   const isProcessingStop = status === RecordingStatus.PROCESSING_TRANSCRIPTS || isProcessing;
+  // After stop, the footer shows this status in place of the controls and tag picker.
+  const stopStatusMessage =
+    status === RecordingStatus.SAVING ? 'Saving transcript...'
+      : status === RecordingStatus.PROCESSING_TRANSCRIPTS ? 'Finalizing transcription...'
+        : null;
+  const showFooter = hasMicrophone || isRecording || stopStatusMessage !== null;
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
@@ -225,62 +230,57 @@ export default function Home() {
         onDelete={deleteRecoverableMeeting}
         onLoadPreview={loadMeetingTranscripts}
       />
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         <TranscriptPanel
           isProcessingStop={isProcessingStop}
           isStopping={isStopping}
           showModal={showModal}
         />
-
-        {/* Recording controls - only show when permissions are granted or already recording and not showing status messages */}
-        {(hasMicrophone || isRecording) &&
-          status !== RecordingStatus.PROCESSING_TRANSCRIPTS &&
-          status !== RecordingStatus.SAVING && (
-            <div className="fixed bottom-12 left-0 right-0 z-10">
-              <div
-                className="flex flex-col items-center gap-2 pl-8 transition-[margin] duration-300"
-                style={{
-                  marginLeft: sidebarCollapsed ? '4rem' : '16rem'
-                }}
-              >
-                <PendingTagsPicker
-                  pending={pendingTags.pending}
-                  onToggle={pendingTags.toggle}
-                  onCreate={pendingTags.create}
-                  onRemove={pendingTags.remove}
-                  label={isRecording ? 'Tags for this recording' : 'Tag this recording'}
-                />
-                <div className="w-2/3 max-w-[750px] flex justify-center">
-                  <div className="bg-white rounded-full shadow-lg flex items-center">
-                    <RecordingControls
-                      isRecording={recordingState.isRecording}
-                      onRecordingStop={(callApi = true) => handleRecordingStop(callApi)}
-                      onRecordingStart={handleRecordingStart}
-                      onTranscriptReceived={() => { }} // Not actually used by RecordingControls
-                      onStopInitiated={() => setIsStopping(true)}
-                      barHeights={barHeights}
-                      recordingTelemetry={recordingTelemetry}
-                      onTranscriptionError={(message) => {
-                        showModal('errorAlert', message);
-                      }}
-                      isRecordingDisabled={isRecordingDisabled}
-                      isParentProcessing={isProcessingStop}
-                      selectedDevices={selectedDevices}
-                      meetingName={meetingTitle}
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-        {/* Status Overlays - Processing and Saving */}
-        <StatusOverlays
-          isProcessing={status === RecordingStatus.PROCESSING_TRANSCRIPTS && !recordingState.isRecording}
-          isSaving={status === RecordingStatus.SAVING}
-          sidebarCollapsed={sidebarCollapsed}
-        />
       </div>
+
+      {/* Recording footer - docked below the transcript so it never covers it */}
+      {showFooter && (
+        <footer className="shrink-0 border-t border-gray-200 bg-white">
+          <div className="mx-auto flex w-full max-w-[750px] min-h-14 items-start justify-center gap-3 px-4 py-1">
+            {stopStatusMessage ? (
+              <div className="flex h-12 items-center space-x-2">
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-900"></div>
+                <span className="text-sm text-gray-700">{stopStatusMessage}</span>
+              </div>
+            ) : (
+              <>
+                <div className="shrink-0">
+                  <RecordingControls
+                    isRecording={recordingState.isRecording}
+                    onRecordingStop={(callApi = true) => handleRecordingStop(callApi)}
+                    onRecordingStart={handleRecordingStart}
+                    onTranscriptReceived={() => { }} // Not actually used by RecordingControls
+                    onStopInitiated={() => setIsStopping(true)}
+                    barHeights={barHeights}
+                    recordingTelemetry={recordingTelemetry}
+                    onTranscriptionError={(message) => {
+                      showModal('errorAlert', message);
+                    }}
+                    isRecordingDisabled={isRecordingDisabled}
+                    isParentProcessing={isProcessingStop}
+                    selectedDevices={selectedDevices}
+                    meetingName={meetingTitle}
+                  />
+                </div>
+                {/* Same height as the controls line, so tags stay on it when an alert appears below */}
+                <div className="flex h-12 min-w-0 items-center">
+                  <PendingTagsPicker
+                    pending={pendingTags.pending}
+                    onToggle={pendingTags.toggle}
+                    onCreate={pendingTags.create}
+                    onRemove={pendingTags.remove}
+                  />
+                </div>
+              </>
+            )}
+          </div>
+        </footer>
+      )}
     </div>
   );
 }

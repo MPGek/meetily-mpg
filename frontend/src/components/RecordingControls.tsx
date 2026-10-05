@@ -348,7 +348,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   return (
     <TooltipProvider>
       <div className="flex flex-col space-y-2">
-        <div className="flex items-center space-x-2 bg-white rounded-full shadow-lg px-4 py-2">
+        <div className="flex min-h-12 items-center space-x-2">
           {isProcessing && !isParentProcessing ? (
             <div className="flex items-center space-x-2">
               <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900"></div>
@@ -433,21 +433,19 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               }
                             }}
                             disabled={isPausing || isResuming || isStopping}
+                            aria-label={isPausing ? 'Pausing...' : isResuming ? 'Resuming...' : isPaused ? 'Resume recording' : 'Pause recording'}
                             className={`w-10 h-10 flex items-center justify-center ${isPausing || isResuming || isStopping
                               ? 'bg-gray-200 border-2 border-gray-300 text-gray-400'
                               : 'bg-white border-2 border-gray-300 text-gray-600 hover:border-gray-400 hover:bg-gray-50'
                               } rounded-full transition-colors relative`}
                           >
-                            {isPaused ? <Play size={16} /> : <Pause size={16} />}
-                            {(isPausing || isResuming) && (
-                              <div className="absolute -top-8 text-gray-600 font-medium text-xs">
-                                {isPausing ? 'Pausing...' : 'Resuming...'}
-                              </div>
-                            )}
+                            {isPausing || isResuming ? (
+                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-500"></div>
+                            ) : isPaused ? <Play size={16} /> : <Pause size={16} />}
                           </button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>{isPaused ? 'Resume recording' : 'Pause recording'}</p>
+                          <p>{isPausing ? 'Pausing...' : isResuming ? 'Resuming...' : isPaused ? 'Resume recording' : 'Pause recording'}</p>
                         </TooltipContent>
                       </Tooltip>
 
@@ -459,19 +457,19 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               handleStopRecording();
                             }}
                             disabled={isStopping || isPausing || isResuming}
+                            aria-label={isStopping ? 'Stopping...' : 'Stop recording'}
                             className={`w-10 h-10 flex items-center justify-center ${isStopping || isPausing || isResuming ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
                               } rounded-full text-white transition-colors relative`}
                           >
-                            <Square size={16} />
-                            {isStopping && (
-                              <div className="absolute -top-8 text-gray-600 font-medium text-xs">
-                                Stopping...
-                              </div>
+                            {isStopping ? (
+                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                            ) : (
+                              <Square size={16} />
                             )}
                           </button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>Stop recording</p>
+                          <p>{isStopping ? 'Stopping...' : 'Stop recording'}</p>
                         </TooltipContent>
                       </Tooltip>
                     </>

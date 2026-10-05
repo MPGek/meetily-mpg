@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Plus, Tag as TagIcon, X } from 'lucide-react';
 import { listTags } from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
@@ -8,6 +8,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import {
   MeetingTag,
   MeetingTagWithUsage,
+  splitVisibleTags,
   tagPillClass,
 } from '@/lib/meeting-tags';
 
@@ -16,27 +17,29 @@ interface PendingTagsPickerProps {
   onToggle: (tag: MeetingTag) => void;
   onCreate: (name: string) => Promise<void>;
   onRemove: (tagId: string) => void;
-  label: string;
 }
 
 /**
  * Editor for the pending tag set of the upcoming / in-progress recording
  * (change: tags-before-during-recording). Same interaction pattern as the
  * sidebar tag editor, but operates on the pending set instead of a meeting.
+ * Always one line high (change: dock-recording-controls-footer): at most three
+ * pills, the rest collapse into a "+N" chip; the popover lists every tag.
  */
 export const PendingTagsPicker: React.FC<PendingTagsPickerProps> = ({
   pending,
   onToggle,
   onCreate,
   onRemove,
-  label,
 }) => {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [allTags, setAllTags] = useState<MeetingTagWithUsage[]>([]);
   const [busy, setBusy] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
 
   const pendingIds = useMemo(() => new Set(pending.map((t) => t.id)), [pending]);
+  const { visible, hiddenCount } = splitVisibleTags(pending);
 
   useEffect(() => {
     if (!open) return;
@@ -73,36 +76,28 @@ export const PendingTagsPicker: React.FC<PendingTagsPickerProps> = ({
   };
 
   return (
-    <div className="flex items-center gap-1.5 rounded-full bg-white px-3 py-1.5 shadow-lg">
-      <span className="text-[11px] text-gray-500">{label}</span>
-      <div className="flex max-w-[280px] flex-wrap items-center gap-1">
-        {pending.map((tag) => (
-          <span
-            key={tag.id}
-            className={`inline-flex items-center gap-0.5 rounded-full border px-1.5 py-px text-[10px] leading-4 ${tagPillClass(tag.color)}`}
-          >
-            <span className="max-w-[80px] truncate">{tag.name}</span>
-            <button
-              onClick={() => onRemove(tag.id)}
-              className="rounded-full p-px hover:bg-black/10"
-              aria-label={`Remove ${tag.name}`}
-            >
-              <X className="h-3 w-3" />
-            </button>
-          </span>
-        ))}
-      </div>
+    <div ref={rootRef} className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
-            className="rounded-full p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+            className="flex shrink-0 items-center gap-1 rounded-full p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
             aria-label="Pick tags for this recording"
             title="Pick tags for this recording"
           >
             <TagIcon className="h-4 w-4" />
+            {pending.length === 0 && (
+              <span className="whitespace-nowrap pr-1 text-[11px]">Tag this recording</span>
+            )}
           </button>
         </PopoverTrigger>
-        <PopoverContent align="center" sideOffset={8} className="w-60 p-2">
+        <PopoverContent
+          align="center"
+          sideOffset={8}
+          className="w-60 p-2"
+          onInteractOutside={(e) => {
+            if (rootRef.current?.contains(e.target as Node)) e.preventDefault();
+          }}
+        >
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -146,6 +141,31 @@ export const PendingTagsPicker: React.FC<PendingTagsPickerProps> = ({
           )}
         </PopoverContent>
       </Popover>
+      {visible.map((tag) => (
+        <span
+          key={tag.id}
+          className={`inline-flex min-w-0 items-center gap-0.5 rounded-full border px-1.5 py-px text-[10px] leading-4 ${tagPillClass(tag.color)}`}
+        >
+          <span className="max-w-[80px] truncate">{tag.name}</span>
+          <button
+            onClick={() => onRemove(tag.id)}
+            className="shrink-0 rounded-full p-px hover:bg-black/10"
+            aria-label={`Remove ${tag.name}`}
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </span>
+      ))}
+      {hiddenCount > 0 && (
+        <button
+          onClick={() => setOpen(true)}
+          className="shrink-0 rounded-full border border-gray-200 bg-gray-50 px-1.5 py-px text-[10px] leading-4 text-gray-600 hover:bg-gray-100"
+          aria-label={`${hiddenCount} more tags`}
+          title={pending.slice(visible.length).map((t) => t.name).join(', ')}
+        >
+          +{hiddenCount}
+        </button>
+      )}
     </div>
   );
 };

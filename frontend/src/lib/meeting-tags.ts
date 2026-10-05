@@ -73,6 +73,14 @@ export function nextColor(color: string): string {
 }
 
 /**
+ * Split a pending tag set for the single-line picker: the first `max` tags are
+ * shown as pills, the rest collapse into a "+N" chip.
+ */
+export function splitVisibleTags<T>(tags: T[], max = 3): { visible: T[]; hiddenCount: number } {
+  return { visible: tags.slice(0, max), hiddenCount: Math.max(0, tags.length - max) };
+}
+
+/**
  * Format an RFC3339/ISO timestamp as `yyyy-mm-dd hh:mm` in the user's local
  * timezone (24h). Returns `--` for missing/unparsable input so the list row
  * never breaks.

@@ -3,6 +3,7 @@ import {
   TAG_PALETTE_KEYS,
   TAG_PILL_STYLES,
   nextColor,
+  splitVisibleTags,
   tagPillClass,
 } from "../../src/lib/meeting-tags";
 import paletteManifest from "../../src/lib/tag-palette.json";
@@ -35,5 +36,25 @@ describe("tag palette", () => {
     expect(nextColor(TAG_PALETTE_KEYS[TAG_PALETTE_KEYS.length - 1])).toBe(
       TAG_PALETTE_KEYS[0],
     );
+  });
+});
+
+describe("splitVisibleTags", () => {
+  test("empty set shows nothing and hides nothing", () => {
+    expect(splitVisibleTags([])).toEqual({ visible: [], hiddenCount: 0 });
+  });
+
+  test("three tags all fit", () => {
+    expect(splitVisibleTags(["Work", "Q3", "Client"])).toEqual({
+      visible: ["Work", "Q3", "Client"],
+      hiddenCount: 0,
+    });
+  });
+
+  test("five tags show three and collapse two", () => {
+    expect(splitVisibleTags(["Work", "Q3", "Client", "Urgent", "Demo"])).toEqual({
+      visible: ["Work", "Q3", "Client"],
+      hiddenCount: 2,
+    });
   });
 });

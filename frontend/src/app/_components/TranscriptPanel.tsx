@@ -116,7 +116,7 @@ export function TranscriptPanel({
         )}
 
         {/* Transcript content */}
-        <div className="pb-20">
+        <div className="pb-4">
           <div className="flex justify-center">
             <div className="w-full max-w-[750px]">
               <VirtualizedTranscriptView
@@ -141,7 +141,7 @@ export function TranscriptPanel({
         <Button
           variant="outline"
           size="icon"
-          className="absolute bottom-12 right-4 z-20 rounded-full bg-white shadow-md"
+          className="absolute bottom-4 right-4 z-20 rounded-full bg-white shadow-md"
           onClick={scrollToBottom}
           title="Scroll to bottom"
         >
