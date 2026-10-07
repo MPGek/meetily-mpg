@@ -390,12 +390,11 @@ pub async fn stop_recording<R: Runtime>(
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
-            manager.save_recording_only(&app),
-        )
-        .await
-        {
+        // The audio merge encodes the whole recording, so the bound grows
+        // with it (never below the former 5 minutes for file I/O).
+        let finalize_budget = manager.finalize_budget();
+        let timeout = save_timeout(finalize_budget.await);
+        match tokio::time::timeout(timeout, manager.save_recording_only(&app)).await {
             Ok(Ok(_)) => {
                 info!("✅ Recording data saved successfully during cleanup");
             }
@@ -407,7 +406,10 @@ pub async fn stop_recording<R: Runtime>(
                 // Don't fail shutdown - transcripts are already preserved
             }
             Err(_) => {
-                warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
+                warn!(
+                    "⏱️ File I/O timeout ({}s) reached during save, continuing shutdown",
+                    timeout.as_secs()
+                );
                 // Don't fail shutdown - transcripts are already preserved
             }
         }
@@ -471,4 +473,32 @@ pub async fn stop_recording<R: Runtime>(
 
     info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
     Ok(())
+}
+
+/// Bound on saving a stopped recording: the saver's finalize budget plus a
+/// margin for transcripts and metadata, and never below 5 minutes.
+fn save_timeout(finalize_budget: Option<std::time::Duration>) -> std::time::Duration {
+    const FLOOR: std::time::Duration = std::time::Duration::from_secs(300);
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+    finalize_budget.map_or(FLOOR, |budget| (budget + MARGIN).max(FLOOR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::encode::{merge_timeout, ENCODE_TIMEOUT};
+
+    #[test]
+    fn save_timeout_covers_the_merge_of_a_long_recording() {
+        let three_hours = ENCODE_TIMEOUT + merge_timeout(3.0 * 3600.0);
+        assert_eq!(
+            save_timeout(Some(three_hours)),
+            std::time::Duration::from_secs(60 + 1470 + 60)
+        );
+        assert_eq!(save_timeout(None), std::time::Duration::from_secs(300));
+        assert_eq!(
+            save_timeout(Some(ENCODE_TIMEOUT + merge_timeout(60.0))),
+            std::time::Duration::from_secs(300)
+        );
+    }
 }

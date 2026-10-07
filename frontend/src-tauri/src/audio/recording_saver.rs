@@ -453,6 +453,16 @@ impl RecordingSaver {
         }
     }
 
+    /// Upper bound on finalizing the audio file, which grows with the
+    /// recording (None when audio is not being saved). The future does not
+    /// borrow `self`.
+    pub fn finalize_budget(
+        &self,
+    ) -> impl std::future::Future<Output = Option<std::time::Duration>> + Send + 'static {
+        let saver = self.incremental_saver.clone();
+        async move { Some(saver?.lock().await.finalize_budget()) }
+    }
+
     /// Stop and save using incremental saving approach
     ///
     /// # Arguments

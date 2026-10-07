@@ -317,6 +317,15 @@ impl RecordingManager {
         Ok(())
     }
 
+    /// Upper bound on finalizing the saved audio file (None when audio is not
+    /// being saved). It grows with the recording, since the merge encodes it.
+    /// The future does not borrow the manager.
+    pub fn finalize_budget(
+        &self,
+    ) -> impl std::future::Future<Output = Option<std::time::Duration>> + Send + 'static {
+        self.recording_saver.finalize_budget()
+    }
+
     /// Save recording after transcription is complete
     pub async fn save_recording_only<R: tauri::Runtime>(
         &mut self,
