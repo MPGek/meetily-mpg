@@ -25,8 +25,16 @@ const AAC_VBR_QUALITY: &str = "0.7";
 /// Upper bound on a single checkpoint encode. 60 s is far above the measured
 /// <0.3 s idle encode for 30 s of audio; only a pathological hang reaches it.
 pub const ENCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Upper bound on a checkpoint merge during finalize (~2 min).
+/// Upper bound on a stream-copy merge of legacy AAC checkpoints (~2 min).
 pub const MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Upper bound on merging `audio_secs` of checkpoints into the final file.
+/// The merge encodes the whole recording, so the bound grows with it: 120 s
+/// plus 1 s per 8 s of audio tolerates encoders down to about 8x real time
+/// (the native AAC encoder measured ~170x).
+pub fn merge_timeout(audio_secs: f64) -> std::time::Duration {
+    MERGE_TIMEOUT + std::time::Duration::from_secs_f64(audio_secs.max(0.0) / 8.0)
+}
 
 /// Spawn an FFmpeg process, optionally write PCM to its stdin, and wait for it
 /// to exit within `timeout`. On expiry the child is killed and a timed-out
@@ -108,11 +116,56 @@ pub fn run_ffmpeg_with_timeout(
     })
 }
 
+/// Output arguments of a saved recording (AAC-LC in MP4). The checkpoint
+/// merge uses the same ones, so every saved file is encoded alike.
+pub const AAC_OUTPUT_ARGS: [&str; 10] = [
+    "-c:a",
+    "aac",
+    "-q:a",
+    AAC_VBR_QUALITY,
+    "-profile:a",
+    AAC_PROFILE, // Use AAC-LC profile for better compatibility
+    "-movflags",
+    "+faststart", // Optimize for web streaming
+    "-f",
+    "mp4",
+];
+
+/// Output arguments of a recording checkpoint: lossless 24-bit FLAC (s32), so
+/// the saved file is lossy-encoded once, when the checkpoints are merged.
+const FLAC_CHECKPOINT_ARGS: [&str; 6] = ["-c:a", "flac", "-sample_fmt", "s32", "-f", "flac"];
+
 pub fn encode_single_audio(
     data: &[f32],
     sample_rate: u32,
     channels: u16,
     output_path: &Path,
+) -> anyhow::Result<()> {
+    encode_pcm(data, sample_rate, channels, output_path, &AAC_OUTPUT_ARGS)
+}
+
+/// Encode one recording checkpoint losslessly (see `FLAC_CHECKPOINT_ARGS`).
+pub fn encode_checkpoint_flac(
+    data: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    encode_pcm(
+        data,
+        sample_rate,
+        channels,
+        output_path,
+        &FLAC_CHECKPOINT_ARGS,
+    )
+}
+
+fn encode_pcm(
+    data: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    output_path: &Path,
+    output_args: &[&str],
 ) -> anyhow::Result<()> {
     debug!("Starting FFmpeg process for {} audio samples", data.len());
 
@@ -157,18 +210,9 @@ pub fn encode_single_audio(
             &channels.to_string(),
             "-i",
             "pipe:0",
-            "-c:a",
-            "aac",
-            "-q:a",
-            AAC_VBR_QUALITY,
-            "-profile:a",
-            AAC_PROFILE, // Use AAC-LC profile for better compatibility
-            "-movflags",
-            "+faststart", // Optimize for web streaming
-            "-f",
-            "mp4",
-            output_path.to_str().unwrap(),
         ])
+        .args(output_args)
+        .arg(output_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -267,6 +311,77 @@ mod tests {
             result.unwrap_err().to_string().contains("timed out"),
             "expected a timed-out error"
         );
+    }
+
+    /// (codec, sample rate, channels, frames) of the first stream, from the
+    /// ffprobe next to the ffmpeg in use. None when ffprobe is unavailable.
+    fn probe_stream(path: &Path) -> Option<(String, u32, u32, u64)> {
+        let ffprobe = find_ffmpeg_path()?.with_file_name(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        let out = Command::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name,sample_rate,channels,duration_ts",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let fields: Vec<&str> = text.trim().split(',').collect();
+        Some((
+            fields.first()?.to_string(),
+            fields.get(1)?.parse().ok()?,
+            fields.get(2)?.parse().ok()?,
+            fields.get(3)?.parse().ok()?,
+        ))
+    }
+
+    #[test]
+    fn test_merge_timeout_grows_with_the_recording() {
+        assert_eq!(merge_timeout(0.0), std::time::Duration::from_secs(120));
+        assert_eq!(
+            merge_timeout(3.0 * 3600.0),
+            std::time::Duration::from_secs(1470)
+        );
+    }
+
+    #[test]
+    fn test_flac_checkpoint_keeps_every_frame_and_survives_non_finite_samples() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output_path = temp_dir.path().join("checkpoint.flac");
+
+        // 1.5 s of stereo with a few non-finite samples.
+        let mut data = vec![0.25f32; 48000 * 2 * 3 / 2];
+        data[10] = f32::NAN;
+        data[11] = f32::INFINITY;
+        data[12] = f32::NEG_INFINITY;
+
+        match encode_checkpoint_flac(&data, 48000, 2, &output_path) {
+            Ok(()) => {
+                assert!(std::fs::metadata(&output_path).unwrap().len() > 0);
+                if let Some((codec, rate, channels, frames)) = probe_stream(&output_path) {
+                    assert_eq!(codec, "flac");
+                    assert_eq!(rate, 48000);
+                    assert_eq!(channels, 2);
+                    assert_eq!(frames, 72_000, "a lossless checkpoint keeps every frame");
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("FFmpeg not found") || msg.contains("timed out"),
+                    "unexpected encode failure: {}",
+                    msg
+                );
+            }
+        }
     }
 
     #[test]
