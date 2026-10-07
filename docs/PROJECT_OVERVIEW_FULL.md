@@ -197,9 +197,11 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 ### 1. Audio Buffer Management
 
 **Ring Buffer Mixing** (pipeline.rs):
-- Mic and system audio arrive asynchronously at different rates
-- Ring buffer accumulates samples until both streams have aligned windows (50ms)
-- Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
+- Mic and system audio arrive asynchronously, in uneven batches
+- The ring buffer cuts a 600 ms stereo window (L = mic, R = system) only when both sides hold a full window, so the saved file stays on the session timeline. A short side keeps its samples for its next window
+- A side that falls a full window plus 600 ms behind is starved (WASAPI loopback while output is silent, a mic during a switch). It is padded with silence so the live side keeps recording. When it delivers again, it is lined up with the other side's buffered tail
+- What is left in the ring buffer when the pipeline ends is saved as a final shorter chunk
+- The live path interleaves channels and does not duck; the ducking mixer in `ffmpeg_mixer.rs` is not used by the pipeline
 - Uses `VecDeque` for efficient windowed processing
 
 ### 2. Thread Safety and Async Boundaries

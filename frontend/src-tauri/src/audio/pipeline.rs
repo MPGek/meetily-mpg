@@ -31,12 +31,15 @@ const MIC_GAP_FILL_CAP_SECS: f64 = 30.0;
 /// timeline: the gap's length in samples minus the zeros the ring buffer
 /// already padded onto the mic side while system audio drove extraction.
 /// Saturates at 0 (also for a negative gap) and is capped at `cap_secs`.
+/// A remainder below `min_samples` is timestamp jitter, not time without
+/// windows, and is dropped.
 fn mic_gap_fill_samples(
     gap_start: f64,
     first_chunk_start: f64,
     padded: usize,
     sample_rate: u32,
     cap_secs: f64,
+    min_samples: usize,
 ) -> usize {
     let gap_secs = first_chunk_start - gap_start;
     if gap_secs <= 0.0 {
@@ -44,7 +47,11 @@ fn mic_gap_fill_samples(
     }
     let gap_samples = (gap_secs * sample_rate as f64).round() as usize;
     let cap_samples = (cap_secs * sample_rate as f64).round() as usize;
-    gap_samples.saturating_sub(padded).min(cap_samples)
+    let remainder = gap_samples.saturating_sub(padded);
+    if remainder < min_samples {
+        return 0;
+    }
+    remainder.min(cap_samples)
 }
 
 /// Ring buffer for synchronized audio mixing
@@ -56,6 +63,17 @@ struct AudioMixerRingBuffer {
     max_buffer_size: usize,     // Safety limit (e.g., 100ms)
     // While a mic gap is open: zeros padded onto the mic side since it began.
     mic_pad_since_gap: Option<usize>,
+    // Zeros padded onto the mic side since its last real chunk. A gap starts
+    // at that chunk, which can be seconds before the switch marker.
+    mic_pad_since_chunk: usize,
+    // How far beyond a full window one side must be before the other counts
+    // as starved and is padded with silence.
+    starve_slack_samples: usize,
+    // Set when a side was padded at a cut; its next chunk is lined up.
+    mic_starved: bool,
+    system_starved: bool,
+    sample_rate: u32,
+    last_starvation_log: Option<std::time::Instant>,
 }
 
 impl AudioMixerRingBuffer {
@@ -84,14 +102,21 @@ impl AudioMixerRingBuffer {
             window_size_samples,
             max_buffer_size,
             mic_pad_since_gap: None,
+            mic_pad_since_chunk: 0,
+            starve_slack_samples: window_size_samples,
+            mic_starved: false,
+            system_starved: false,
+            sample_rate,
+            last_starvation_log: None,
         }
     }
 
-    /// Start counting mic-side zero padding for a mic gap. A gap that is
-    /// already open keeps its count.
+    /// Start counting mic-side zero padding for a mic gap, from the zeros
+    /// already padded since the last mic chunk (where the gap starts). A gap
+    /// that is already open keeps its count.
     fn begin_mic_gap(&mut self) {
         if self.mic_pad_since_gap.is_none() {
-            self.mic_pad_since_gap = Some(0);
+            self.mic_pad_since_gap = Some(self.mic_pad_since_chunk);
         }
     }
 
@@ -102,9 +127,43 @@ impl AudioMixerRingBuffer {
     }
 
     fn count_mic_padding(&mut self, zeros: usize) {
+        self.mic_pad_since_chunk += zeros;
         if let Some(count) = self.mic_pad_since_gap.as_mut() {
             *count += zeros;
         }
+    }
+
+    /// Before a chunk of `incoming` samples is added to a side that was
+    /// starved, pad that side so the chunk ends where the other side's
+    /// buffered tail ends: those buffered samples are the real time not yet
+    /// written, and the chunk is its last `incoming` samples. Returns the
+    /// zeros added.
+    fn align_resumed(&mut self, device_type: &DeviceType, incoming: usize) -> usize {
+        let (starved, own, other) = match device_type {
+            DeviceType::Microphone => (
+                std::mem::take(&mut self.mic_starved),
+                self.mic_buffer.len(),
+                self.system_buffer.len(),
+            ),
+            DeviceType::System => (
+                std::mem::take(&mut self.system_starved),
+                self.system_buffer.len(),
+                self.mic_buffer.len(),
+            ),
+        };
+        if !starved {
+            return 0;
+        }
+        let pad = other.saturating_sub(own + incoming);
+        let zeros = std::iter::repeat(0.0).take(pad);
+        match device_type {
+            DeviceType::Microphone => {
+                self.mic_buffer.extend(zeros);
+                self.count_mic_padding(pad);
+            }
+            DeviceType::System => self.system_buffer.extend(zeros),
+        }
+        pad
     }
 
     fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
@@ -121,7 +180,12 @@ impl AudioMixerRingBuffer {
 
         // Data is now mono — bulk extend directly into the correct buffer
         match device_type {
-            DeviceType::Microphone => self.mic_buffer.extend(samples),
+            DeviceType::Microphone => {
+                if !samples.is_empty() {
+                    self.mic_pad_since_chunk = 0;
+                }
+                self.mic_buffer.extend(samples)
+            }
             DeviceType::System => self.system_buffer.extend(samples),
         }
 
@@ -150,15 +214,56 @@ impl AudioMixerRingBuffer {
         }
     }
 
+    /// A window is cut when both sides hold a full window, so neither is
+    /// padded and a short side keeps its samples for its next window. A side
+    /// that falls a full window plus the slack behind is starved (it delivers
+    /// nothing: WASAPI loopback while output is silent, a mic during a switch)
+    /// and is padded so the live side keeps recording.
     fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples
-            || self.system_buffer.len() >= self.window_size_samples
+        let mic = self.mic_buffer.len();
+        let sys = self.system_buffer.len();
+        let window = self.window_size_samples;
+        (mic >= window && sys >= window) || mic.max(sys) >= window + self.starve_slack_samples
+    }
+
+    fn log_starvation(&mut self, mic_short: bool) {
+        let now = std::time::Instant::now();
+        if self
+            .last_starvation_log
+            .is_some_and(|last| now.duration_since(last).as_secs() < 10)
+        {
+            return;
+        }
+        self.last_starvation_log = Some(now);
+        let (side, own, other) = if mic_short {
+            (
+                "microphone",
+                self.mic_buffer.len(),
+                self.system_buffer.len(),
+            )
+        } else {
+            ("system", self.system_buffer.len(), self.mic_buffer.len())
+        };
+        let behind_ms = other.saturating_sub(own) as f64 * 1000.0 / self.sample_rate as f64;
+        info!(
+            "🔇 Mixer: {} side delivers nothing ({:.0} ms behind), padding it with silence",
+            side, behind_ms
+        );
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
         if !self.can_mix() {
             return None;
         }
+
+        // Only a starved side can be short here (see can_mix).
+        let mic_short = self.mic_buffer.len() < self.window_size_samples;
+        let sys_short = self.system_buffer.len() < self.window_size_samples;
+        if mic_short || sys_short {
+            self.log_starvation(mic_short);
+        }
+        self.mic_starved |= mic_short;
+        self.system_starved |= sys_short;
 
         // Extract mic window with zero-padding for incomplete buffers
         // Zero-padding (silence) is preferred over last-sample-hold to prevent artifacts
@@ -1079,6 +1184,12 @@ impl AudioPipeline {
                         self.last_summary_time = std::time::Instant::now();
                     }
 
+                    // A side that delivered nothing lines up with the other
+                    // side's tail first; the mic gap fill below then only
+                    // covers time no window was cut for.
+                    self.ring_buffer
+                        .align_resumed(&chunk.device_type, chunk.data.len());
+
                     if chunk.device_type == DeviceType::Microphone {
                         // First chunk from a replacement mic: fill the gap
                         // so the saved mic track stays on the timeline.
@@ -1228,6 +1339,9 @@ impl AudioPipeline {
             }
         }
 
+        // Save the audio still in the ring buffer (less than a full window)
+        self.emit_ring_buffer_tail();
+
         // Flush any remaining VAD segments
         self.flush_remaining_audio()?;
 
@@ -1238,39 +1352,54 @@ impl AudioPipeline {
     /// Interleave every ready ring-buffer window into stereo (L = mic,
     /// R = system) and send it to the recording saver.
     fn emit_ready_windows(&mut self, timestamp: f64) {
-        while self.ring_buffer.can_mix() {
-            if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
-                if let Some(ref sender) = self.recording_sender_for_mixed {
-                    let stereo = interleave_stereo(&mic_window, &sys_window);
-                    let recording_chunk = AudioChunk {
-                        data: stereo,
-                        sample_rate: self.sample_rate,
-                        timestamp,
-                        chunk_id: self.chunk_id_counter,
-                        device_type: DeviceType::Microphone,
-                        channels: 2,
-                    };
-                    match sender.try_send(recording_chunk) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(chunk)) => {
-                            // Bounded channel at capacity: drop and
-                            // log rather than grow memory
-                            // unboundedly while the saver stalls.
-                            warn!(
-                                "recording saver channel full (128 capacity); dropping chunk {}",
-                                chunk.chunk_id
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // The saver channel is closed/unavailable.
-                            // Log and surface (throttled) instead of
-                            // silently discarding the recording chunk.
-                            warn!("Failed to deliver recording chunk to saver (channel closed/unavailable) - audio may be lost");
-                            if !self.recording_save_failure_reported {
-                                self.recording_save_failure_reported = true;
-                                self.state.report_error(AudioError::SaveUnavailable);
-                            }
-                        }
+        while let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+            self.send_recording_window(&mic_window, &sys_window, timestamp);
+        }
+    }
+
+    /// At pipeline end, send what is left in the ring buffer as one final
+    /// chunk as long as the longer side (the shorter one is padded with
+    /// silence), so the last fraction of a second is saved too.
+    fn emit_ring_buffer_tail(&mut self) {
+        let mic: Vec<f32> = self.ring_buffer.mic_buffer.drain(..).collect();
+        let sys: Vec<f32> = self.ring_buffer.system_buffer.drain(..).collect();
+        if mic.is_empty() && sys.is_empty() {
+            return;
+        }
+        let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        self.send_recording_window(&mic, &sys, timestamp);
+    }
+
+    fn send_recording_window(&mut self, mic_window: &[f32], sys_window: &[f32], timestamp: f64) {
+        if let Some(ref sender) = self.recording_sender_for_mixed {
+            let stereo = interleave_stereo(mic_window, sys_window);
+            let recording_chunk = AudioChunk {
+                data: stereo,
+                sample_rate: self.sample_rate,
+                timestamp,
+                chunk_id: self.chunk_id_counter,
+                device_type: DeviceType::Microphone,
+                channels: 2,
+            };
+            match sender.try_send(recording_chunk) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(chunk)) => {
+                    // Bounded channel at capacity: drop and
+                    // log rather than grow memory
+                    // unboundedly while the saver stalls.
+                    warn!(
+                        "recording saver channel full (128 capacity); dropping chunk {}",
+                        chunk.chunk_id
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // The saver channel is closed/unavailable.
+                    // Log and surface (throttled) instead of
+                    // silently discarding the recording chunk.
+                    warn!("Failed to deliver recording chunk to saver (channel closed/unavailable) - audio may be lost");
+                    if !self.recording_save_failure_reported {
+                        self.recording_save_failure_reported = true;
+                        self.state.report_error(AudioError::SaveUnavailable);
                     }
                 }
             }
@@ -1309,6 +1438,7 @@ impl AudioPipeline {
             padded,
             self.sample_rate,
             MIC_GAP_FILL_CAP_SECS,
+            self.ring_buffer.window_size_samples,
         );
         info!(
             "[HOT_SWAP] mic gap: {:.2}s, padded {}, filled {} samples",
@@ -1583,34 +1713,69 @@ mod tests {
 
     const RATE: u32 = 48000;
 
+    /// One 600 ms mixing window at 48 kHz: the dead band of the gap fill.
+    const WINDOW: usize = 28_800;
+
     #[test]
     fn mic_gap_fill_is_zero_when_system_audio_covered_the_gap() {
         // 5 s gap, all of it already padded while system audio flowed.
-        assert_eq!(mic_gap_fill_samples(2.0, 7.0, 240_000, RATE, 30.0), 0);
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 240_000, RATE, 30.0, WINDOW),
+            0
+        );
         // Padding beyond the gap saturates at 0.
-        assert_eq!(mic_gap_fill_samples(2.0, 7.0, 260_000, RATE, 30.0), 0);
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 260_000, RATE, 30.0, WINDOW),
+            0
+        );
     }
 
     #[test]
     fn mic_gap_fill_is_the_full_gap_without_system_audio() {
-        assert_eq!(mic_gap_fill_samples(2.0, 7.0, 0, RATE, 30.0), 240_000);
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 0, RATE, 30.0, WINDOW),
+            240_000
+        );
     }
 
     #[test]
     fn mic_gap_fill_is_the_remainder_after_partial_coverage() {
-        assert_eq!(mic_gap_fill_samples(2.0, 7.0, 220_800, RATE, 30.0), 19_200);
+        // 1 s of the 5 s gap was not covered by cut windows.
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 192_000, RATE, 30.0, WINDOW),
+            48_000
+        );
+        // A remainder of exactly one window is still filled.
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 240_000 - WINDOW, RATE, 30.0, WINDOW),
+            WINDOW
+        );
+    }
+
+    #[test]
+    fn mic_gap_fill_ignores_a_remainder_below_one_window() {
+        // 400 ms left over after the mixer covered the gap is timestamp
+        // jitter, not time without windows.
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 220_800, RATE, 30.0, WINDOW),
+            0
+        );
+        assert_eq!(
+            mic_gap_fill_samples(2.0, 7.0, 240_000 - WINDOW + 1, RATE, 30.0, WINDOW),
+            0
+        );
     }
 
     #[test]
     fn mic_gap_fill_is_zero_for_a_negative_gap() {
-        assert_eq!(mic_gap_fill_samples(7.0, 2.0, 0, RATE, 30.0), 0);
-        assert_eq!(mic_gap_fill_samples(7.0, 7.0, 0, RATE, 30.0), 0);
+        assert_eq!(mic_gap_fill_samples(7.0, 2.0, 0, RATE, 30.0, WINDOW), 0);
+        assert_eq!(mic_gap_fill_samples(7.0, 7.0, 0, RATE, 30.0, WINDOW), 0);
     }
 
     #[test]
     fn mic_gap_fill_is_capped() {
         assert_eq!(
-            mic_gap_fill_samples(0.0, 45.0, 0, RATE, 30.0),
+            mic_gap_fill_samples(0.0, 45.0, 0, RATE, 30.0, WINDOW),
             30 * RATE as usize
         );
     }
@@ -1620,7 +1785,10 @@ mod tests {
         let mut ring = AudioMixerRingBuffer::new(RATE);
         let window = ring.window_size_samples;
 
-        // No gap: padding is not counted.
+        // No gap: padding is not counted. System audio alone is cut only once
+        // it is a full window plus the slack ahead.
+        ring.add_samples(DeviceType::System, vec![0.1; window]);
+        assert!(ring.extract_window().is_none());
         ring.add_samples(DeviceType::System, vec![0.1; window]);
         assert!(ring.extract_window().is_some());
         assert_eq!(ring.take_mic_gap_padding(), 0);
@@ -1638,13 +1806,203 @@ mod tests {
         // Taking closes the gap.
         assert_eq!(ring.take_mic_gap_padding(), 0);
 
-        // Only system samples for 3 windows after begin: 3 x window.
+        // A gap opened after the mic already went silent also counts the
+        // padding since its last chunk (the gap starts there): the 3 windows
+        // above plus 3 more.
         ring.begin_mic_gap();
         for _ in 0..3 {
             ring.add_samples(DeviceType::System, vec![0.1; window]);
             assert!(ring.extract_window().is_some());
         }
-        assert_eq!(ring.take_mic_gap_padding(), 3 * window);
+        assert_eq!(ring.take_mic_gap_padding(), 6 * window - window / 4);
+
+        // A real mic chunk resets that count.
+        ring.add_samples(DeviceType::Microphone, vec![0.2; window / 4]);
+        ring.begin_mic_gap();
+        assert_eq!(ring.take_mic_gap_padding(), 0);
+    }
+
+    /// Feed both sides of a ring buffer in arrival order and cut windows after
+    /// every chunk, as `emit_ready_windows` does. Each event is
+    /// (arrival ms, side, samples). Returns the emitted (mic, system) windows.
+    fn mix_events(
+        ring: &mut AudioMixerRingBuffer,
+        mut events: Vec<(f64, DeviceType, usize)>,
+    ) -> Vec<(Vec<f32>, Vec<f32>)> {
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut windows = Vec::new();
+        for (_, side, samples) in events {
+            let value = match side {
+                DeviceType::Microphone => 0.25,
+                DeviceType::System => 0.5,
+            };
+            ring.align_resumed(&side, samples);
+            ring.add_samples(side, vec![value; samples]);
+            while let Some(window) = ring.extract_window() {
+                windows.push(window);
+            }
+        }
+        windows
+    }
+
+    /// Chunks of `samples` every `samples / 48` ms for `secs`, each arriving
+    /// up to `jitter_ms` late (deterministic LCG).
+    fn arrivals(
+        side: DeviceType,
+        samples: usize,
+        secs: f64,
+        jitter_ms: f64,
+        seed: u64,
+    ) -> Vec<(f64, DeviceType, usize)> {
+        let period_ms = samples as f64 * 1000.0 / RATE as f64;
+        let mut state = seed;
+        let mut out = Vec::new();
+        let mut t = 0.0;
+        while t < secs * 1000.0 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let jitter = (state >> 11) as f64 / (1u64 << 53) as f64 * jitter_ms;
+            out.push((t + jitter, side.clone(), samples));
+            t += period_ms;
+        }
+        out
+    }
+
+    #[test]
+    fn mixer_inserts_no_silence_while_both_sides_deliver() {
+        let mut ring = AudioMixerRingBuffer::new(RATE);
+        let mut events = arrivals(DeviceType::Microphone, 480, 1600.0, 20.0, 1);
+        events.extend(arrivals(DeviceType::System, 960, 1600.0, 20.0, 2));
+        let fed_mic: usize = events
+            .iter()
+            .filter(|e| e.1 == DeviceType::Microphone)
+            .map(|e| e.2)
+            .sum();
+        let fed_sys: usize = events
+            .iter()
+            .filter(|e| e.1 == DeviceType::System)
+            .map(|e| e.2)
+            .sum();
+
+        let windows = mix_events(&mut ring, events);
+
+        let window = ring.window_size_samples;
+        assert!(
+            windows
+                .iter()
+                .all(|(mic, sys)| !mic.contains(&0.0) && !sys.contains(&0.0)),
+            "no padded silence while both sides deliver"
+        );
+        assert_eq!(windows.len() * window + ring.mic_buffer.len(), fed_mic);
+        assert_eq!(windows.len() * window + ring.system_buffer.len(), fed_sys);
+        assert!(!ring.mic_starved && !ring.system_starved);
+    }
+
+    #[test]
+    fn mixer_pads_only_a_starved_side() {
+        let mut ring = AudioMixerRingBuffer::new(RATE);
+        let window = ring.window_size_samples;
+
+        ring.add_samples(DeviceType::System, vec![0.5; window + window / 2]);
+        assert!(
+            ring.extract_window().is_none(),
+            "within the slack nothing is cut"
+        );
+
+        ring.add_samples(DeviceType::System, vec![0.5; window / 2]);
+        let (mic, sys) = ring
+            .extract_window()
+            .expect("a full window plus the slack ahead");
+        assert!(
+            mic.iter().all(|&s| s == 0.0),
+            "the silent mic side is padded"
+        );
+        assert!(sys.iter().all(|&s| s == 0.5));
+        assert!(ring.mic_starved && !ring.system_starved);
+        assert!(ring.extract_window().is_none());
+    }
+
+    #[test]
+    fn resumed_side_lines_up_with_the_other_side() {
+        // 10 ms steps: mic always delivers; system is silent 3 s of every
+        // 20 s and once for 60 s. One step after each resume, both sides
+        // carry a marker value at the same step.
+        const MARK: f32 = 0.9;
+        let silent = |t: f64| {
+            (t < 200.0 && t % 20.0 >= 10.0 && t % 20.0 < 13.0) || (300.0..360.0).contains(&t)
+        };
+        let mut ring = AudioMixerRingBuffer::new(RATE);
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let mut marks = 0;
+        for step in 0..42_000 {
+            let t = step as f64 * 0.01;
+            let mark = step > 0 && !silent(t) && silent(t - 0.01);
+            let value = |base: f32| if mark { MARK } else { base };
+            marks += mark as usize;
+            ring.align_resumed(&DeviceType::Microphone, 480);
+            ring.add_samples(DeviceType::Microphone, vec![value(0.25); 480]);
+            if !silent(t) {
+                ring.align_resumed(&DeviceType::System, 480);
+                ring.add_samples(DeviceType::System, vec![value(0.5); 480]);
+            }
+            while let Some((mic, sys)) = ring.extract_window() {
+                mic_out.extend(mic);
+                sys_out.extend(sys);
+            }
+        }
+
+        let starts = |out: &[f32]| -> Vec<usize> {
+            (0..out.len())
+                .filter(|&i| out[i] == MARK && (i == 0 || out[i - 1] != MARK))
+                .collect()
+        };
+        let (mic_marks, sys_marks) = (starts(&mic_out), starts(&sys_out));
+        assert_eq!(mic_marks.len(), marks);
+        assert_eq!(sys_marks.len(), marks);
+        for (m, s) in mic_marks.iter().zip(&sys_marks) {
+            assert!(
+                m.abs_diff(*s) <= 480,
+                "resumed system audio at sample {s}, mic at {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn alignment_adds_nothing_to_a_side_that_was_never_starved() {
+        let mut ring = AudioMixerRingBuffer::new(RATE);
+        ring.add_samples(DeviceType::Microphone, vec![0.25; 9600]);
+        assert_eq!(ring.align_resumed(&DeviceType::System, 480), 0);
+        assert_eq!(ring.align_resumed(&DeviceType::Microphone, 480), 0);
+        assert!(ring.system_buffer.is_empty());
+    }
+
+    #[test]
+    fn mic_alignment_zeros_count_toward_an_open_gap() {
+        let mut ring = AudioMixerRingBuffer::new(RATE);
+        let window = ring.window_size_samples;
+        ring.begin_mic_gap();
+        ring.add_samples(DeviceType::System, vec![0.5; 2 * window]);
+        assert!(ring.extract_window().is_some()); // mic padded a full window
+        ring.add_samples(DeviceType::System, vec![0.5; 4800]);
+
+        let pad = ring.align_resumed(&DeviceType::Microphone, 480);
+        assert_eq!(pad, window + 4800 - 480);
+        assert_eq!(ring.take_mic_gap_padding(), window + pad);
+    }
+
+    #[test]
+    fn mixer_bursts_of_100_ms_do_not_count_as_starvation() {
+        let mut ring = AudioMixerRingBuffer::new(RATE);
+        let mut events = arrivals(DeviceType::Microphone, 480, 60.0, 5.0, 3);
+        events.extend(arrivals(DeviceType::System, 4800, 60.0, 5.0, 4));
+
+        let windows = mix_events(&mut ring, events);
+
+        assert!(windows
+            .iter()
+            .all(|(mic, sys)| !mic.contains(&0.0) && !sys.contains(&0.0)));
+        assert!(!ring.mic_starved && !ring.system_starved);
     }
 
     #[test]
@@ -1770,11 +2128,12 @@ mod tests {
         let stereo = block_on(run_pipeline(chunks));
         super::super::telemetry::clear_pipeline();
 
-        let window = (RATE as f64 * 0.6) as usize;
+        // No window was cut during the gap, so the timestamp fill covers
+        // all of it.
         let before = frames_before(&stereo, 0, POST_MIC);
         let expected = 7 * RATE as usize;
         assert!(
-            before.abs_diff(expected) <= window,
+            before.abs_diff(expected) <= STEP,
             "post-gap mic audio at frame {before}, expected about {expected}"
         );
     }
@@ -1803,20 +2162,76 @@ mod tests {
         let stereo = block_on(run_pipeline(chunks));
         super::super::telemetry::clear_pipeline();
 
-        let window = (RATE as f64 * 0.6) as usize;
         let mic_at = frames_before(&stereo, 0, POST_MIC);
         let sys_at = frames_before(&stereo, 1, POST_SYS);
-        // The ring buffer zero-pads whichever side is short when the other
-        // completes a window, so the two sides can differ by less than one
-        // window here; a double fill would put the mic about 4.6 s late.
+        // Starved-side padding and the resume alignment cover the gap, so no
+        // timestamp fill is added; a double fill would put the mic about
+        // 4.6 s late.
         assert!(
-            mic_at.abs_diff(sys_at) <= window,
+            mic_at.abs_diff(sys_at) <= STEP,
             "post-gap mic at frame {mic_at} must line up with system audio at {sys_at}"
         );
         let expected = 7 * RATE as usize;
         assert!(
-            mic_at.abs_diff(expected) <= window,
+            mic_at.abs_diff(expected) <= STEP,
             "post-gap mic audio at frame {mic_at}, expected about {expected}"
+        );
+    }
+
+    #[test]
+    fn pipeline_end_saves_the_partial_last_window() {
+        let _guard = super::super::telemetry::TELEMETRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 1.4 s on both sides: two full windows and 0.2 s left over.
+        let mut chunks = Vec::new();
+        for i in 0..14 {
+            let end = (i + 1) as f64 * 0.1;
+            chunks.push(chunk(DeviceType::Microphone, PRE_MIC, STEP, end));
+            chunks.push(chunk(DeviceType::System, PRE_SYS, STEP, end));
+        }
+
+        let stereo = block_on(run_pipeline(chunks));
+        super::super::telemetry::clear_pipeline();
+
+        assert_eq!(stereo.len(), 2 * 14 * STEP, "all 1.4 s reach the saver");
+        assert!(stereo
+            .chunks(2)
+            .all(|frame| frame[0] == PRE_MIC && frame[1] == PRE_SYS));
+    }
+
+    #[test]
+    fn mic_gap_counts_padding_from_the_last_mic_chunk() {
+        let _guard = super::super::telemetry::TELEMETRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // The mic dies at 2.0 s, but the switch marker only comes at 6.0 s
+        // (detection takes seconds). System audio flows the whole time.
+        let mut chunks = Vec::new();
+        for i in 0..80 {
+            let end = (i + 1) as f64 * 0.1;
+            let sys_value = if end > 7.0 + 1e-9 { POST_SYS } else { PRE_SYS };
+            chunks.push(chunk(DeviceType::System, sys_value, STEP, end));
+            if end <= 2.0 + 1e-9 {
+                chunks.push(chunk(DeviceType::Microphone, PRE_MIC, STEP, end));
+            } else if end > 7.0 + 1e-9 {
+                chunks.push(chunk(DeviceType::Microphone, POST_MIC, STEP, end));
+            }
+            if i == 59 {
+                chunks.push(marker(end));
+            }
+        }
+
+        let stereo = block_on(run_pipeline(chunks));
+        super::super::telemetry::clear_pipeline();
+
+        let mic_at = frames_before(&stereo, 0, POST_MIC);
+        let sys_at = frames_before(&stereo, 1, POST_SYS);
+        assert!(
+            mic_at.abs_diff(sys_at) <= STEP,
+            "post-gap mic at frame {mic_at} must line up with system audio at {sys_at}"
         );
     }
 
