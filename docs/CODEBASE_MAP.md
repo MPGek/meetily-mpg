@@ -15,7 +15,7 @@ sub_files:
 Meetily is a **privacy-first AI meeting assistant** desktop application built with Tauri v2 (Rust + Next.js). It captures, transcribes, and summarizes meetings entirely on local infrastructure — no cloud dependency required.
 
 ### Core Capabilities
-- **Audio Capture**: Microphone + system audio (stereo left=mic/right=sys) with per-channel Silero v6 VAD, RNNoise, HPF, adaptive resampling
+- **Audio Capture**: Microphone + system audio (stereo left=mic/right=sys) with per-channel Silero v6 VAD, 80 Hz high-pass filter on the mic, adaptive resampling
 - **Diarization**: Enhanced-only Polyvoice (segmentation-3.0 + TitaNet-Large 192-d + AHC MinClusterSize=2), ffmpeg streaming decode, fixed ONNX pool `min(8, 75% cores)`, offline + online (Efficient/Fast) with `PrototypeStore`; **word-level CTC alignment** (`word_alignment/`, wav2vec2 XLS-R 56 + constrained Viterbi) refines per-token timestamps live at block finalization + as offline/stop-time repair, feeding the token N-way split
 - **Transcription**: Whisper.cpp (local) / Parakeet ONNX streaming / provider abstraction, provider-aware readiness gate, Enhance re-transcription, import pipeline
 - **Speaker Registry**: Global `speakers` + `speaker_embeddings` (voiceprints with provenance, two-owner CHECK, 64-cap), `meeting_speakers` (centroids + exemplars ≤32) + `meeting_expected_speakers` allowlists, cosine matcher τ=0.7, live `assign_live_speaker`/`rematch_meeting_speakers`

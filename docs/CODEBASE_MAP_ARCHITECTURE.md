@@ -121,7 +121,7 @@ Layer-level view; for file- and symbol-level detail use graphify (see [CODEBASE_
 |-------|----------|---------|
 | **Entry Point** | `lib.rs`, `main.rs`, `tray.rs`, `onboarding.rs`, `panic_log.rs` | Tauri builder and command registration (`generate_handler!`), system tray, onboarding, panic hook writing `logs/panic.log` |
 | **Audio Capture & Devices** | `audio/capture/`, `audio/devices/`, `audio/devices/platform/` | Microphone + system audio streams (cpal, WASAPI, CoreAudio), device enumeration, disconnect/reconnect monitoring |
-| **Audio Pipeline** | `audio/` (pipeline, VAD, mixing, processing modules) | Per-channel Silero VAD, stereo mix (left=mic / right=system), RNNoise/HPF, ducking |
+| **Audio Pipeline** | `audio/` (pipeline, VAD, mixing, processing modules) | Per-channel Silero VAD, stereo mix (left=mic / right=system), mic high-pass filter, ducking |
 | **Recording** | `audio/recording/` (lifecycle, devices, device_recovery, stop), `audio/recording_commands.rs` | Recording start/stop/pause orchestration and mid-recording mic recovery (`device_recovery`); `recording_commands.rs` is the thin Tauri command layer over `audio/recording/` |
 | **Saving & Import** | `audio/` (incremental saver, recording saver, retranscription, import) | Checkpoint-based saving for crash recovery, Enhance re-transcription, audio import |
 | **Speaker Diarization** | `audio/diarization/` | Offline (batch) + online (streaming) diarization and speaker identity matching behind one entry point, `DiarizationEngine` |
@@ -270,7 +270,6 @@ Raw Audio (Mic + System)
 | Async Runtime | tokio v1.32+ | Asynchronous runtime |
 | Serialization | serde + serde_json | JSON serialization |
 | Logging | env_logger + tracing | Structured logging with async logger |
-| Noise Suppression | nnnoiseless (RNNoise) | Neural noise suppression |
 | VAD | Silero VAD v6 | Voice Activity Detection |
 | Audio Processing | dasp, rubato, rayon | Resampling, mixing, parallel processing |
 | Buffer Management | VecDeque, custom pool | Efficient audio buffer handling |

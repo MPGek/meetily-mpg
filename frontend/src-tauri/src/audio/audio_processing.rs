@@ -1,9 +1,6 @@
 use anyhow::Result;
 use chrono::{Local, Utc};
-use log::{debug, info, warn};
-use nnnoiseless::DenoiseState;
-use realfft::num_complex::{Complex32, ComplexFloat};
-use realfft::RealFftPlanner;
+use log::{debug, info};
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -99,132 +96,9 @@ pub fn create_meeting_folder(
     Ok(meeting_folder)
 }
 
-/// RNNoise-based noise suppression processor
-///
-/// Uses a recurrent neural network to suppress background noise while preserving speech.
-/// Processes audio at 48kHz in 10ms frames (480 samples per frame).
-///
-/// Benefits:
-/// - 10-15 dB noise reduction in typical office/home environments
-/// - Preserves speech quality and intelligibility
-/// - Low latency (~10ms per frame)
-/// - Cross-platform (works on macOS, Windows, Linux)
-pub struct NoiseSuppressionProcessor {
-    denoiser: DenoiseState<'static>,
-    frame_buffer: Vec<f32>,
-    frame_size: usize, // 480 samples at 48kHz = 10ms
-}
-
-impl NoiseSuppressionProcessor {
-    /// Create a new noise suppression processor
-    ///
-    /// # Arguments
-    /// * `sample_rate` - Must be 48000 Hz (RNNoise requirement)
-    pub fn new(sample_rate: u32) -> Result<Self> {
-        if sample_rate != 48000 {
-            return Err(anyhow::anyhow!(
-                "Noise suppression requires 48kHz sample rate, got {}Hz",
-                sample_rate
-            ));
-        }
-
-        const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
-
-        info!(
-            "Initializing RNNoise noise suppression (frame size: {} samples, 10ms @ 48kHz)",
-            FRAME_SIZE
-        );
-
-        Ok(Self {
-            denoiser: *DenoiseState::new(),
-            frame_buffer: Vec::with_capacity(FRAME_SIZE * 2),
-            frame_size: FRAME_SIZE,
-        })
-    }
-
-    /// Apply noise suppression to audio samples
-    ///
-    /// Processes audio in 480-sample frames (10ms at 48kHz).
-    /// Buffers partial frames for next call.
-    ///
-    /// CRITICAL FIX: Always returns same length as input to prevent latency accumulation
-    ///
-    /// # Arguments
-    /// * `samples` - Input audio samples at 48kHz
-    ///
-    /// # Returns
-    /// Noise-suppressed audio samples (SAME LENGTH as input)
-    pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
-        if samples.is_empty() {
-            return Vec::new();
-        }
-
-        // CRITICAL: Remember original input length
-        let input_len = samples.len();
-
-        // Add new samples to buffer
-        self.frame_buffer.extend_from_slice(samples);
-
-        let mut output = Vec::with_capacity(input_len);
-
-        // Process complete frames
-        while self.frame_buffer.len() >= self.frame_size {
-            // Extract one frame
-            let frame: Vec<f32> = self.frame_buffer.drain(0..self.frame_size).collect();
-
-            // RNNoise processes audio: separate input and output buffers
-            let mut denoised_frame = vec![0.0f32; self.frame_size];
-
-            // Apply noise suppression
-            // process_frame(output: &mut [f32], input: &[f32]) -> f32
-            // Returns VAD probability (0.0-1.0), higher means more likely to be speech
-            let _vad_prob = self.denoiser.process_frame(&mut denoised_frame, &frame);
-
-            output.extend_from_slice(&denoised_frame);
-        }
-
-        // Return processed output without forcing length matching
-        // Frame-based processing naturally creates variable-length output
-        // Downstream pipeline handles this correctly via ring buffer
-        output
-    }
-
-    /// Get the number of buffered samples waiting for processing
-    pub fn buffered_samples(&self) -> usize {
-        self.frame_buffer.len()
-    }
-
-    /// Flush any remaining buffered samples
-    /// Call this at the end of recording to process partial frames
-    pub fn flush(&mut self) -> Vec<f32> {
-        if self.frame_buffer.is_empty() {
-            return Vec::new();
-        }
-
-        // Pad the remaining samples to a full frame with zeros
-        let remaining = self.frame_buffer.len();
-        let mut input_frame = self.frame_buffer.clone();
-        if input_frame.len() < self.frame_size {
-            input_frame.resize(self.frame_size, 0.0);
-        }
-
-        let mut output = vec![0.0f32; self.frame_size];
-        self.denoiser.process_frame(&mut output, &input_frame);
-        self.frame_buffer.clear();
-
-        // Return only the original samples (without padding)
-        output.truncate(remaining);
-        output
-    }
-}
-
 /// High-pass filter to remove low-frequency rumble and noise
 /// Removes frequencies below cutoff_hz (typically 80-100 Hz for speech)
 pub struct HighPassFilter {
-    #[allow(dead_code)]
-    sample_rate: f32,
-    #[allow(dead_code)]
-    cutoff_hz: f32,
     // First-order IIR filter coefficients
     alpha: f32,
     prev_input: f32,
@@ -249,8 +123,6 @@ impl HighPassFilter {
         );
 
         Self {
-            sample_rate: sample_rate_f,
-            cutoff_hz,
             alpha,
             prev_input: 0.0,
             prev_output: 0.0,
@@ -275,89 +147,6 @@ impl HighPassFilter {
 
         output
     }
-
-    /// Reset filter state (call when starting new recording)
-    pub fn reset(&mut self) {
-        self.prev_input = 0.0;
-        self.prev_output = 0.0;
-    }
-}
-
-pub fn spectral_subtraction(audio: &[f32], d: f32) -> Result<Vec<f32>> {
-    let mut real_planner = RealFftPlanner::<f32>::new();
-    let window_size = 1600; // 16k sample rate - 100ms
-
-    // CRITICAL FIX: Handle cases where audio is longer than window size
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // If audio is longer than window size, truncate to prevent overflow
-    let processed_audio = if audio.len() > window_size {
-        warn!(
-            "Audio length {} exceeds window size {}, truncating",
-            audio.len(),
-            window_size
-        );
-        &audio[..window_size]
-    } else {
-        audio
-    };
-
-    let r2c = real_planner.plan_fft_forward(window_size);
-    let mut y = r2c.make_output_vec();
-
-    // Safe padding: only pad if audio is shorter than window size
-    let mut padded_audio = processed_audio.to_vec();
-    if processed_audio.len() < window_size {
-        let padding_needed = window_size - processed_audio.len();
-        padded_audio.extend(vec![0.0f32; padding_needed]);
-    }
-
-    let mut indata = padded_audio;
-    r2c.process(&mut indata, &mut y)?;
-
-    let mut processed_audio = y
-        .iter()
-        .map(|&x| {
-            let magnitude_y = x.abs().powf(2.0);
-
-            let div = 1.0 - (d / magnitude_y);
-
-            let gain = {
-                if div > 0.0 {
-                    f32::sqrt(div)
-                } else {
-                    0.0f32
-                }
-            };
-
-            x * gain
-        })
-        .collect::<Vec<Complex32>>();
-
-    let c2r = real_planner.plan_fft_inverse(window_size);
-
-    let mut outdata = c2r.make_output_vec();
-
-    c2r.process(&mut processed_audio, &mut outdata)?;
-
-    Ok(outdata)
-}
-
-// not an average of non-speech segments, but I don't know how much pause time we
-// get. for now, we will just assume the noise is constant (kinda defeats the purpose)
-// but oh well
-pub fn average_noise_spectrum(audio: &[f32]) -> f32 {
-    let mut total_sum = 0.0f32;
-
-    for sample in audio {
-        let magnitude = sample.abs();
-
-        total_sum += magnitude.powf(2.0);
-    }
-
-    total_sum / audio.len() as f32
 }
 
 pub fn audio_to_mono(audio: &[f32], channels: u16) -> Vec<f32> {
@@ -633,8 +422,28 @@ pub fn write_transcript_json_to_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_meeting_folder, ends_with_timestamp};
+    use super::{create_meeting_folder, ends_with_timestamp, HighPassFilter};
     use std::path::PathBuf;
+
+    /// Gain in dB of the 80 Hz mic high-pass filter for a sine at `freq_hz`,
+    /// measured over 1 s after 0.5 s of settling at 48 kHz.
+    fn hpf_gain_db(freq_hz: f32) -> f32 {
+        let sr = 48_000usize;
+        let input: Vec<f32> = (0..sr * 3 / 2)
+            .map(|n| 0.5 * (2.0 * std::f32::consts::PI * freq_hz * n as f32 / sr as f32).sin())
+            .collect();
+        let output = HighPassFilter::new(sr as u32, 80.0).process(&input);
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        20.0 * (rms(&output[sr / 2..]) / rms(&input[sr / 2..])).log10()
+    }
+
+    #[test]
+    fn high_pass_filter_passes_speech_and_cuts_rumble() {
+        let speech = hpf_gain_db(1_000.0);
+        assert!(speech.abs() <= 0.5, "1 kHz must pass at unity, got {speech:.2} dB");
+        let rumble = hpf_gain_db(20.0);
+        assert!(rumble <= -10.0, "20 Hz must be cut by >= 10 dB, got {rumble:.2} dB");
+    }
 
     #[test]
     fn ends_with_timestamp_matches_expected_format() {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::audio_processing::{audio_to_mono, HighPassFilter, NoiseSuppressionProcessor};
+use super::audio_processing::{audio_to_mono, HighPassFilter};
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, DeviceType, RecordingState};
 use super::vad::{merge_segments, ContinuousVadProcessor, SpeechSegment, VadConfig};
@@ -85,7 +85,7 @@ impl AudioMixerRingBuffer {
         // CRITICAL FIX: Increase max buffer to 400ms for system audio stability
         // System audio (especially Core Audio on macOS) can have significant jitter
         // due to sample-by-sample streaming → batching → channel transmission
-        // Accounts for: RNNoise buffering + Core Audio jitter + processing delays
+        // Accounts for: Core Audio jitter + processing delays
         let max_buffer_size = window_size_samples * 8; // 400ms (was 200ms)
 
         info!(
@@ -343,8 +343,7 @@ pub struct AudioCapture {
     // Buffering for variable-size chunks → fixed-size resampler input
     resampler_input_buffer: Arc<std::sync::Mutex<Vec<f32>>>,
     resampler_chunk_size: usize, // Fixed chunk size for resampler (512 samples)
-    // Audio enhancement processors (microphone only)
-    noise_suppressor: Arc<std::sync::Mutex<Option<NoiseSuppressionProcessor>>>,
+    // Audio enhancement processor (microphone only)
     high_pass_filter: Arc<std::sync::Mutex<Option<HighPassFilter>>>,
     // Note: Using global recording timestamp for synchronization
 }
@@ -400,46 +399,23 @@ impl AudioCapture {
             );
         }
 
-        // Initialize audio enhancement processors for MICROPHONE ONLY
+        // Initialize audio enhancement for MICROPHONE ONLY
         // System audio doesn't need enhancement (already clean)
-        let (noise_suppressor, high_pass_filter) = if matches!(device_type, DeviceType::Microphone)
-        {
-            // Initialize noise suppression (RNNoise) at 48kHz - CONDITIONAL based on flag
-            let ns = if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
-                match NoiseSuppressionProcessor::new(TARGET_SAMPLE_RATE) {
-                    Ok(processor) => {
-                        info!("✅ RNNoise noise suppression ENABLED for microphone '{}' (10-15 dB reduction)", device.name);
-                        Some(processor)
-                    }
-                    Err(e) => {
-                        warn!("⚠️ Failed to create noise suppressor: {}, continuing without noise suppression", e);
-                        None
-                    }
-                }
-            } else {
-                info!("ℹ️ RNNoise noise suppression DISABLED for microphone '{}' (flag: RNNOISE_APPLY_ENABLED=false)", device.name);
-                info!("   Whisper handles noise well internally - RNNoise is optional");
-                None
-            };
-
+        let high_pass_filter = if matches!(device_type, DeviceType::Microphone) {
             // Initialize high-pass filter (removes rumble below 80 Hz)
-            let hpf = {
-                let filter = HighPassFilter::new(TARGET_SAMPLE_RATE, 80.0);
-                info!(
-                    "✅ High-pass filter initialized for microphone '{}' (cutoff: 80 Hz)",
-                    device.name
-                );
-                Some(filter)
-            };
-
-            (ns, hpf)
+            let filter = HighPassFilter::new(TARGET_SAMPLE_RATE, 80.0);
+            info!(
+                "✅ High-pass filter initialized for microphone '{}' (cutoff: 80 Hz)",
+                device.name
+            );
+            Some(filter)
         } else {
             // System audio: no enhancement needed
             info!(
                 "ℹ️ System audio '{}' captured raw (no enhancement)",
                 device.name
             );
-            (None, None)
+            None
         };
 
         // CRITICAL FIX: Initialize persistent resampler to preserve energy across chunks
@@ -512,7 +488,6 @@ impl AudioCapture {
                 RESAMPLER_CHUNK_SIZE * 2,
             ))),
             resampler_chunk_size: RESAMPLER_CHUNK_SIZE,
-            noise_suppressor: Arc::new(std::sync::Mutex::new(noise_suppressor)),
             high_pass_filter: Arc::new(std::sync::Mutex::new(high_pass_filter)),
             // Using global recording time for sync
         }
@@ -643,58 +618,16 @@ impl AudioCapture {
         }
 
         // AUDIO ENHANCEMENT PIPELINE (Microphone Only)
-        // Processing order is critical: high-pass → noise suppression
-        // No automatic gain is applied: the mic signal stays at unity gain so
-        // quiet/non-speech content is never amplified toward a loudness target
+        // High-pass filter only; no noise suppression and no automatic gain.
+        // The mic signal stays at unity gain so quiet/non-speech content is
+        // never amplified toward a loudness target
         if matches!(self.device_type, DeviceType::Microphone) {
-            // STEP 1: Apply high-pass filter to remove low-frequency rumble (< 80 Hz)
+            // Apply high-pass filter to remove low-frequency rumble (< 80 Hz)
             if let Ok(mut hpf_lock) = self.high_pass_filter.lock() {
                 if let Some(ref mut filter) = *hpf_lock {
                     mono_data = filter.process(&mono_data);
                 }
             }
-
-            // STEP 2: Apply RNNoise noise suppression (10-15 dB reduction) - CONDITIONAL
-            if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
-                if let Ok(mut ns_lock) = self.noise_suppressor.lock() {
-                    if let Some(ref mut suppressor) = *ns_lock {
-                        let before_len = mono_data.len();
-                        mono_data = suppressor.process(&mono_data);
-                        let after_len = mono_data.len();
-
-                        // CRITICAL MONITORING: Track buffer health
-                        let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
-                        if chunk_id % 100 == 0 {
-                            let buffered = suppressor.buffered_samples();
-                            let length_delta = (before_len as i32 - after_len as i32).abs();
-
-                            debug!("🔇 Noise suppression health: in={}, out={}, delta={}, buffered={}, RMS={:.4}",
-                                   before_len, after_len, length_delta, buffered,
-                                   if !mono_data.is_empty() {
-                                       (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt()
-                                   } else { 0.0 });
-
-                            // WARN if accumulating samples (potential latency buildup)
-                            if buffered > 1000 {
-                                warn!("⚠️ RNNoise accumulating samples: {} buffered (potential latency issue!)",
-                                      buffered);
-                            }
-
-                            // WARN if significant length mismatch
-                            if length_delta > 50 {
-                                warn!(
-                                    "⚠️ RNNoise length mismatch: input={} output={} (delta={})",
-                                    before_len, after_len, length_delta
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // STEP 3: No automatic gain is applied. The mic signal is intentionally
-            // kept at unity gain so that quiet stretches and ambient noise are never
-            // boosted toward a fixed loudness target during live capture.
         }
 
         // Create audio chunk with stream-specific timestamp (get ID first for logging)

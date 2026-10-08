@@ -16,9 +16,6 @@ use std::time::{Duration, Instant};
 
 use super::device_detection::InputDeviceKind;
 
-/// Configuration flags for audio processing features
-pub const RNNOISE_APPLY_ENABLED: bool = true; // Default: disabled (Whisper handles noise well)
-
 /// Timestamp for audio samples (reserved for future use)
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
