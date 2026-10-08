@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference Editor</title>
+<!-- Edits <meeting>/reference/ref_XX.txt next to ref_XX.mp3 in place, keeping the format score.py reads.
+     Open the transcript_compare folder (or one meeting folder). Precise row times come from the "draft"
+     segments file named in <meeting>/fragments.json; without it, rows play by their whole-second marks.
+     Chrome/Edge (File System Access API) save back into the folder; other browsers download the file. -->
+<style>
+  :root {
+    --bg: #fafaf9; --panel: #fff; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4;
+    --accent: #2563eb; --active: #eff6ff; --playing: #fef9c3; --dirty: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917; --panel: #292524; --fg: #f5f5f4; --muted: #a8a29e; --line: #44403c;
+      --accent: #60a5fa; --active: #1e3a5f; --playing: #3f3a12; --dirty: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+  .top { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); padding: 10px 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .bar + .bar { margin-top: 8px; }
+  button, select { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .tab.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .tab.dirty::after, #save.dirty::after { content: " •"; color: var(--dirty); }
+  audio { flex: 1 1 320px; min-width: 0; height: 36px; }
+  #clock { font-variant-numeric: tabular-nums; min-width: 7ch; }
+  #status { color: var(--muted); font-size: 13px; margin-left: auto; }
+  main { max-width: 980px; margin: 0 auto; padding: 12px 16px 120px; }
+  details { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+  details pre { white-space: pre-wrap; margin: 6px 0 0; font: inherit; }
+  .row { display: grid; grid-template-columns: 64px 1fr 28px; gap: 8px; align-items: start; padding: 6px 8px; border-radius: 6px; border: 1px solid transparent; }
+  .row.active { background: var(--active); border-color: var(--line); }
+  .row.playing .t { background: var(--playing); }
+  .t { padding: 3px 0; font-variant-numeric: tabular-nums; }
+  .t.none, .t.coarse { color: var(--muted); }
+  textarea { width: 100%; resize: none; overflow: hidden; font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; background: var(--panel); }
+  .hint { color: var(--muted); font-size: 13px; padding: 2px 9px 0; white-space: pre-wrap; }
+  .del { padding: 2px 0; color: var(--muted); border-color: transparent; background: none; }
+  .keys { position: fixed; bottom: 0; left: 0; right: 0; background: var(--panel); border-top: 1px solid var(--line); padding: 6px 16px; font-size: 12px; color: var(--muted); }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="bar">
+    <button id="open">Открыть папку…</button>
+    <input id="files" type="file" webkitdirectory hidden>
+    <select id="meeting" hidden title="Встреча"></select>
+    <span id="tabs" class="bar"></span>
+    <button id="save" disabled>Сохранить (Ctrl+S)</button>
+    <span id="status"></span>
+  </div>
+  <div class="bar">
+    <audio id="audio" controls preload="auto"></audio>
+    <span id="clock">--:--.-</span>
+    <select id="rate" title="Скорость">
+      <option>0.6</option><option>0.75</option><option>0.9</option><option selected>1</option><option>1.25</option><option>1.5</option>
+    </select>
+  </div>
+</div>
+<main>
+  <details id="hdr" hidden><summary></summary><pre></pre></details>
+  <div id="rows"><div class="empty">Откройте папку <code>transcript_compare</code> (все встречи) или папку одной встречи.</div></div>
+</main>
+<div class="keys">
+  <kbd>Enter</kbd> след. строка + play ·
+  <kbd>Ctrl+Enter</kbd> повторить строку ·
+  <kbd>Esc</kbd> play/pause ·
+  <kbd>Ctrl+[</kbd>/<kbd>Ctrl+]</kbd> −/+2 с ·
+  <kbd>Alt+↑↓</kbd> строки ·
+  <kbd>Ctrl+I</kbd> новая строка с текущего времени ·
+  <kbd>Alt+T</kbd> метка = текущее время ·
+  <kbd>Alt+N</kbd> [неразб] ·
+  <kbd>Ctrl+S</kbd> сохранить всё ·
+  серая метка = время с точностью до секунды
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const audio = $('#audio');
+const files = new Map();     // path relative to the opened folder -> {handle|File, parent dir handle}
+const meetings = new Map();  // meeting path ("" = the opened folder itself) -> {name, frags: Map(id -> frag), config}
+let cur = null, curMeeting = null, curRow = null, seg = null, audioUrl = null, writable = false;
+
+const PRE_ROLL = 0.2;      // draft starts can land slightly after the first sound
+const POST_ROLL = 0;       // a row plays until the next row starts, which already covers the pause after it
+const MARK = /^\s*\[(\d+):(\d\d)\]\s?(.*)$/;
+
+const mmss = t => { t = Math.max(0, Math.floor(t)); return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`; };
+const isAux = l => /^\s*(#|$)/.test(l);
+const status = s => $('#status').textContent = s;
+const join = (...p) => p.filter(Boolean).join('/');
+const fileOf = e => e.handle.getFile ? e.handle.getFile() : Promise.resolve(e.handle);
+
+function parse(text) {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  const finalNl = lines.at(-1) === '';
+  if (finalNl) lines.pop();
+  let i = 0;
+  const header = [];
+  while (i < lines.length && isAux(lines[i])) header.push(lines[i++]);
+  const rows = [];
+  for (; i < lines.length; i++) {
+    const l = lines[i];
+    if (isAux(l)) { rows.at(-1).extra.push(l); continue; }
+    const m = l.match(MARK);
+    rows.push(m ? { time: +m[1] * 60 + +m[2], text: m[3], extra: [] } : { time: null, text: l.trim(), extra: [] });
+  }
+  const h = header.join('\n').match(/(\d+):(\d\d)\s*[–—-]\s*(\d+):(\d\d)/);
+  return { header, rows, eol, finalNl, offset: h ? +h[1] * 60 + +h[2] : null };
+}
+
+function serialize(s) {
+  const out = [...s.header];
+  for (const r of s.rows) out.push((r.time != null ? `[${mmss(r.time)}] ` : '') + r.text, ...r.extra);
+  return out.join(s.eol) + (s.finalNl ? s.eol : '');
+}
+
+// ---- opening a folder ----
+
+async function walk(dir, prefix, depth) {
+  for await (const [name, h] of dir.entries()) {
+    const p = join(prefix, name);
+    if (h.kind === 'file') files.set(p, { handle: h, parent: dir });
+    else if (depth < 2 && !name.startsWith('.')) await walk(h, p, depth + 1);
+  }
+}
+
+$('#open').onclick = async () => {
+  if (!window.showDirectoryPicker) return $('#files').click();
+  let dir;
+  try { dir = await showDirectoryPicker({ id: 'meetily-ref', mode: 'readwrite' }); } catch { return; }
+  if ([...meetings.values()].some(m => [...m.frags.values()].some(f => f.dirty)) && !confirm('Есть несохранённые правки. Открыть другую папку?')) return;
+  files.clear();
+  writable = true;
+  status('читаю папку…');
+  await walk(dir, '', 0);
+  index(dir.name);
+};
+$('#files').onchange = e => {
+  files.clear();
+  writable = false;
+  for (const f of e.target.files) files.set(f.webkitRelativePath.split('/').slice(1).join('/'), { handle: f });
+  index(e.target.files[0]?.webkitRelativePath.split('/')[0] ?? '');
+};
+
+// Fragments are <meeting>/reference/ref_XX.txt (or ref_XX.txt directly in the opened folder).
+function index(rootName) {
+  meetings.clear();
+  for (const p of files.keys()) {
+    const m = p.match(/^(?:(.+?)\/)??(?:reference\/)?(ref_(\d+))\.txt$/);
+    if (!m) continue;
+    const mp = m[1] ?? '', dirPath = p.slice(0, -m[2].length - 4);
+    if (!meetings.has(mp)) meetings.set(mp, { path: mp, name: mp || rootName, frags: new Map() });
+    meetings.get(mp).frags.set(+m[3], { id: +m[3], key: m[2], txt: files.get(p), mp3: files.get(dirPath + m[2] + '.mp3'), dirty: false, backedUp: false });
+  }
+  const sel = $('#meeting');
+  sel.replaceChildren(...[...meetings.keys()].sort().map(k => new Option(meetings.get(k).name, k)));
+  sel.hidden = meetings.size < 2;
+  if (!meetings.size) { renderTabs(); return status('ref_XX.txt не найдены'); }
+  status(writable ? 'сохранение в папку' : 'сохранение скачиванием файла');
+  selectMeeting(sel.value);
+}
+$('#meeting').onchange = e => selectMeeting(e.target.value);
+
+async function readJson(path) {
+  const e = files.get(path);
+  if (!e) return null;
+  try { return JSON.parse(await (await fileOf(e)).text()); } catch (err) { status(`не прочитан ${path}: ${err.message}`); return null; }
+}
+
+async function selectMeeting(mp) {
+  const m = meetings.get(mp);
+  if (m.config === undefined) {
+    m.config = await readJson(join(mp, 'fragments.json'));
+    const segs = m.config?.draft ? (await readJson(join(mp, m.config.draft)))?.segments ?? [] : [];
+    m.draft = segs.map(s => ({ start: s.start ?? s.audio_start_time, end: s.end ?? s.audio_end_time, source: s.source ?? s.source_device }));
+  }
+  curMeeting = m;
+  $('#meeting').value = mp;
+  await select(Math.min(...m.frags.keys()));
+}
+
+function renderTabs() {
+  const box = $('#tabs');
+  box.replaceChildren();
+  for (const f of [...(curMeeting?.frags.values() ?? [])].sort((a, b) => a.id - b.id)) {
+    const b = document.createElement('button');
+    b.className = 'tab' + (f === cur ? ' on' : '') + (f.dirty ? ' dirty' : '');
+    b.textContent = '#' + String(f.id).padStart(2, '0');
+    b.onclick = () => select(f.id);
+    box.append(b);
+  }
+  for (const o of $('#meeting').options) {
+    const dirty = [...meetings.get(o.value).frags.values()].some(f => f.dirty);
+    o.textContent = meetings.get(o.value).name + (dirty ? ' •' : '');
+  }
+  const anyDirty = [...meetings.values()].some(m => [...m.frags.values()].some(f => f.dirty));
+  $('#save').disabled = !anyDirty;
+  $('#save').classList.toggle('dirty', anyDirty);
+}
+
+async function select(id) {
+  const f = curMeeting.frags.get(id);
+  if (!f.state) {
+    f.original = await (await fileOf(f.txt)).text();
+    f.state = parse(f.original);
+    const spec = curMeeting.config?.fragments?.find(x => x.id === id);
+    f.state.offset = spec?.start ?? f.state.offset ?? 0;
+    f.spec = spec;
+    attachPrecise(f);
+  }
+  cur = f; curRow = null; seg = null;
+  audio.pause();
+  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  audioUrl = f.mp3 ? URL.createObjectURL(await fileOf(f.mp3)) : null;
+  audio.src = audioUrl || '';
+  audio.playbackRate = +$('#rate').value;
+  const n = f.state.rows.filter(r => r.at != null).length;
+  status(!f.mp3 ? `нет ${f.key}.mp3`
+    : !f.spec ? 'нет fragments.json: время по меткам с точностью до секунды'
+    : `точное время у ${n} из ${f.state.rows.length} строк` + (writable ? '' : ' · сохранение скачиванием'));
+  renderTabs();
+  renderRows();
+  if (f.state.rows.length) focusRow(f.state.rows[0]);
+}
+
+// A row's whole-second mark is floor(start) of the draft segment it was made from: match them in order
+// to recover the exact start. Rows added or re-marked by hand keep their whole-second time.
+function attachPrecise(f) {
+  if (!f.spec || !curMeeting.draft.length) return;
+  const { start: a, end: b, channel } = f.spec;
+  const cands = curMeeting.draft.filter(s => s.source === channel && a <= (s.start + s.end) / 2 && (s.start + s.end) / 2 <= b)
+    .sort((x, y) => x.start - y.start);
+  let k = 0;
+  for (const r of f.state.rows) {
+    if (r.time == null) continue;
+    const j = cands.findIndex((s, i) => i >= k && Math.floor(s.start) === r.time);
+    if (j >= 0) { r.at = cands[j].start; k = j + 1; }
+  }
+}
+
+// ---- rows ----
+
+function renderRows() {
+  const s = cur.state;
+  const hdr = $('#hdr');
+  hdr.hidden = !s.header.length;
+  hdr.querySelector('summary').textContent = s.header[0]?.replace(/^\s*#\s*/, '') ?? '';
+  hdr.querySelector('pre').textContent = s.header.slice(1).map(l => l.replace(/^\s*#\s?/, '')).join('\n');
+  const box = $('#rows');
+  box.replaceChildren();
+  for (const r of s.rows) box.append(rowEl(r));
+  if (!s.rows.length) box.innerHTML = '<div class="empty">В файле нет строк текста. Ctrl+I добавит строку.</div>';
+  s.rows.forEach(r => autosize(r.ta));
+}
+
+// Row heights depend on the width, which can change after render (resize, hidden pane).
+new ResizeObserver(() => cur?.state.rows.forEach(r => autosize(r.ta))).observe($('#rows'));
+
+function rowEl(r) {
+  const el = document.createElement('div');
+  el.className = 'row';
+  const t = document.createElement('button');
+  t.className = 't';
+  t.onclick = () => { focusRow(r); playRow(r); };
+  const body = document.createElement('div');
+  const ta = document.createElement('textarea');
+  ta.rows = 1; ta.lang = 'ru'; ta.value = r.text;
+  ta.oninput = () => {
+    if (/[\r\n]/.test(ta.value)) ta.value = ta.value.replace(/\s*[\r\n]+\s*/g, ' ');
+    r.text = ta.value; markDirty(); autosize(ta);
+  };
+  ta.onfocus = () => setActive(r);
+  const hint = document.createElement('div');
+  hint.className = 'hint';
+  hint.textContent = r.extra.filter(l => l.trim()).map(l => l.replace(/^\s*#\s*/, '')).join('\n');
+  body.append(ta, hint);
+  const del = document.createElement('button');
+  del.className = 'del'; del.textContent = '✕'; del.title = 'Удалить строку';
+  del.onclick = () => deleteRow(r);
+  el.append(t, body, del);
+  Object.assign(r, { el, ta, tb: t });
+  paintTime(r);
+  return el;
+}
+
+function paintTime(r) {
+  r.tb.textContent = r.time != null ? mmss(r.time) : '▶';
+  r.tb.classList.toggle('none', r.time == null);
+  r.tb.classList.toggle('coarse', r.time != null && r.at == null);
+  r.tb.title = (r.at != null ? `начало ${mmss(r.at)}.${String(Math.floor((r.at % 1) * 100)).padStart(2, '0')}` : 'время с точностью до секунды')
+    + ' · проиграть (Ctrl+Enter)';
+}
+
+function autosize(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 2 + 'px'; }
+
+function markDirty() { if (!cur.dirty) { cur.dirty = true; renderTabs(); } }
+
+function setActive(r) {
+  if (curRow?.el) curRow.el.classList.remove('active');
+  curRow = r;
+  r.el.classList.add('active');
+}
+
+function focusRow(r) { if (r) { setActive(r); r.ta.focus(); r.el.scrollIntoView({ block: 'nearest' }); } }
+
+const rowStart = r => r.at ?? r.time;
+
+// Effective start of row i: its own time, else the nearest time above, else the fragment start.
+function startOf(i) {
+  const rows = cur.state.rows;
+  for (let j = i; j >= 0; j--) if (rowStart(rows[j]) != null) return rowStart(rows[j]);
+  return cur.state.offset;
+}
+
+function endOf(i) {
+  const rows = cur.state.rows, t0 = startOf(i);
+  for (let j = i + 1; j < rows.length; j++) if (rowStart(rows[j]) != null && rowStart(rows[j]) > t0) return rowStart(rows[j]);
+  return null;
+}
+
+function playRow(r) {
+  if (!r || !audioUrl) return;
+  const i = cur.state.rows.indexOf(r), off = cur.state.offset, end = endOf(i);
+  audio.currentTime = Math.max(0, startOf(i) - off - PRE_ROLL);
+  seg = { end: end == null ? Infinity : end - off + POST_ROLL };
+  audio.play();
+}
+
+function deleteRow(r) {
+  if (r.text.trim() && !confirm(`Удалить строку?\n\n${r.text}`)) return;
+  const rows = cur.state.rows, i = rows.indexOf(r);
+  rows.splice(i, 1);
+  r.el.remove();
+  markDirty();
+  focusRow(rows[Math.min(i, rows.length - 1)]);
+}
+
+function insertRow() {
+  if (!cur) return;
+  const rows = cur.state.rows, at = cur.state.offset + audio.currentTime;
+  const r = { time: Math.floor(at), at, text: '', extra: [] };
+  const i = curRow ? rows.indexOf(curRow) + 1 : rows.length;
+  rows.splice(i, 0, r);
+  const el = rowEl(r);
+  if (i < rows.length - 1) rows[i + 1].el.before(el); else { $('#rows .empty')?.remove(); $('#rows').append(el); }
+  markDirty();
+  focusRow(r);
+}
+
+function setTimeHere() {
+  if (!curRow) return;
+  curRow.at = cur.state.offset + audio.currentTime;
+  curRow.time = Math.floor(curRow.at);
+  paintTime(curRow);
+  markDirty();
+}
+
+function step(d) {
+  const rows = cur?.state.rows;
+  if (!rows?.length) return null;
+  const i = curRow ? rows.indexOf(curRow) : -1;
+  return rows[Math.max(0, Math.min(rows.length - 1, i + d))];
+}
+
+// ---- saving ----
+
+async function saveAll() {
+  for (const m of meetings.values()) for (const f of m.frags.values()) {
+    if (!f.dirty) continue;
+    const text = serialize(f.state);
+    try {
+      if (writable) {
+        if (!f.backedUp) {   // keep the file as it was when this page opened it
+          const w = await (await f.txt.parent.getFileHandle(`${f.key}.txt.bak`, { create: true })).createWritable();
+          await w.write(f.original); await w.close();
+          f.backedUp = true;
+        }
+        const w = await f.txt.handle.createWritable();
+        await w.write(text); await w.close();
+      } else {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+        a.download = `${f.key}.txt`; a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      }
+      f.dirty = false;
+    } catch (e) {
+      status(`ошибка сохранения ${m.name}/${f.key}: ${e.message}`);
+      renderTabs();
+      return;
+    }
+  }
+  renderTabs();
+  status(`сохранено ${new Date().toLocaleTimeString()}`);
+}
+$('#save').onclick = saveAll;
+$('#rate').onchange = e => audio.playbackRate = +e.target.value;
+
+// ---- playback: stop at the end of a row, highlight the row under the playhead, show meeting time ----
+
+function tick() {
+  if (seg && audio.currentTime >= seg.end) { audio.pause(); seg = null; }
+  if (cur) {
+    const abs = cur.state.offset + audio.currentTime;
+    $('#clock').textContent = mmss(abs) + '.' + Math.floor((abs % 1) * 10);
+    let hit = null;
+    cur.state.rows.forEach((r, i) => { if (startOf(i) <= abs) hit = r; });
+    cur.state.rows.forEach(r => r.el.classList.toggle('playing', r === hit && !audio.paused));
+  }
+  if (!audio.paused) requestAnimationFrame(tick);
+}
+audio.addEventListener('play', () => requestAnimationFrame(tick));
+audio.addEventListener('pause', tick);
+audio.addEventListener('seeked', tick);
+audio.addEventListener('seeking', () => { if (seg && audio.currentTime > seg.end) seg = null; });
+
+// e.code, not e.key: shortcuts must work with the Russian layout active.
+document.addEventListener('keydown', e => {
+  const c = e.code, inText = e.target.tagName === 'TEXTAREA';
+  const plain = !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey;
+  let handled = true;
+  if (c === 'Escape') { if (audio.paused) { seg = null; audio.play(); } else audio.pause(); }
+  else if (e.ctrlKey && c === 'KeyS') saveAll();
+  else if (!cur) handled = false;
+  else if (e.ctrlKey && (c === 'Enter' || c === 'NumpadEnter')) playRow(curRow);
+  else if (plain && inText && (c === 'Enter' || c === 'NumpadEnter')) { const n = step(1); if (n !== curRow) { focusRow(n); playRow(n); } }
+  else if (e.altKey && c === 'ArrowUp') focusRow(step(-1));
+  else if (e.altKey && c === 'ArrowDown') focusRow(step(1));
+  else if (e.ctrlKey && c === 'BracketLeft') audio.currentTime = Math.max(0, audio.currentTime - 2);
+  else if (e.ctrlKey && c === 'BracketRight') audio.currentTime += 2;
+  else if (e.ctrlKey && c === 'KeyI') insertRow();
+  else if (e.altKey && c === 'KeyT') setTimeHere();
+  else if (e.altKey && c === 'KeyN' && inText) { e.target.setRangeText('[неразб]', e.target.selectionStart, e.target.selectionEnd, 'end'); e.target.dispatchEvent(new Event('input')); }
+  else handled = false;
+  if (handled) e.preventDefault();
+});
+
+window.addEventListener('beforeunload', e => {
+  if ([...meetings.values()].some(m => [...m.frags.values()].some(f => f.dirty))) e.preventDefault();
+});
+</script>
+</body>
+</html>

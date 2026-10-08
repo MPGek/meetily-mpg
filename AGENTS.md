@@ -43,6 +43,10 @@ When bumping the app version, update **all three** locations:
 
 Tauri ignores `Cargo.toml` for its runtime version; it only reads `tauri.conf.json`.
 
+# Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
@@ -79,8 +83,6 @@ When your changes create orphans:
 - Remove imports/variables/functions that YOUR changes made unused.
 - Don't remove pre-existing dead code unless asked.
 
-Keep Unicode emoji (e.g. 🔧 🚀 ✅) in scripts and other files exactly as they are. When editing or rewriting a file that already contains emoji, preserve every emoji that was there — don't strip, replace, or "clean up" existing emoji, and don't reword content in a way that drops them.
-
 The test: Every changed line should trace directly to the user's request.
 
 ## 4. Goal-Driven Execution
@@ -102,3 +104,5 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 ---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

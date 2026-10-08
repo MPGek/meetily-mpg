@@ -12,8 +12,10 @@ and scored with `pyannote.metrics` DER (Full setup: no collar, overlap counted).
 # 1. Python env (uv-managed; deps: dvc, pyannote-metrics, datasets, soundfile, ...)
 uv sync --project eval
 
-# 2. DVC remote (already configured in eval/.dvc/config; recreate if moving machine)
-uv run --project eval dvc remote add -d storage "C:/Users/vasiliy.kotov/Work/Own/meetily-dvc"
+# 2. DVC remote: committed in eval/.dvc/config (default remote "local-server", a folder
+#    on a network share). A new machine only needs access to that share (office
+#    network / VPN); check that the remote is there:
+uv run --project eval dvc remote list
 
 # 3. Harness binaries (reuse the app's diarization code paths; models must be
 #    installed for the app, or pass --models-dir)
@@ -272,19 +274,28 @@ reports (`eval/reports/`) are not.
 
 ```powershell
 uv run --project eval dvc add data/<dataset>   # after normalize/ingest
-uv run --project eval dvc push                 # blobs -> local remote folder
+uv run --project eval dvc push                 # blobs -> remote folder on the network share
 uv run --project eval dvc pull data/<dataset>  # on another machine
 ```
 
-Commit the generated `data/<dataset>.dvc` files. The blob remote is a plain
-folder; to relocate it, `dvc remote modify storage url <new-path>` and copy the
-old folder's `files/` tree across.
+Commit the generated `data/<dataset>.dvc` files. The blob remote (`local-server`)
+is a folder on a network share; to relocate it,
+`dvc remote modify local-server url <new-path>` and copy the old folder's `files/`
+tree across.
+
+`transcript_compare/` (the ASR benchmark on recorded meetings) is a separate DVC
+project with its own remote folder `meetily-asr` on the same share and
+`cache.type = copy`, so its references stay plain writable files that
+`editor.html` can save in place. It is not part of this project because
+`cache.type` is per project (eval keeps `hardlink,copy` for tens of GB) and
+because `dvc gc --cloud` here would delete the other project's blobs if both
+shared one remote URL. See [transcript_compare/README.md](../transcript_compare/README.md).
 
 ## Disk expectations
 
 - `eval/cache/`: ~4 GB (VoxConverse) + ~7.5 GB (MSDWild) + ~2.3 GB (ru-synthetic) + ~2 GB (ru-youtube)
 - `eval/data/`: canonical WAVs (~1.6× the audio hours at 16 kHz mono s16) — tens of GB total
-- DVC remote (`meetily-dvc/`): roughly mirrors `eval/data/` + gated raw archives
+- DVC remote (`DVC/meetily/` on the network share): roughly mirrors `eval/data/` + gated raw archives
 
 ## Notes
 

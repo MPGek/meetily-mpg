@@ -138,5 +138,5 @@ Workspace members: `frontend/src-tauri`, `llama-helper`; **target dir at repo ro
 
 - Quantitative DER evaluation lives in [`eval/`](../eval/README.md) (uv project, `uv run --project eval <cmd>`).
 - Headless harness binary: `cargo build --release --bin diarize-eval -p meetily` — reuses the production offline diarization path (`diarize_wav_samples`, exported from `audio/diarization/`) plus a standalone model-location fallback.
-- Datasets materialized to canonical `wav/ + rttm/ + uem/` under `eval/data/`, DVC-tracked with a local blob remote; gated corpora (AMI, DIHARD-3) are manual drops into `eval/raw/`.
+- Datasets materialized to canonical `wav/ + rttm/ + uem/` under `eval/data/`, DVC-tracked with a DVC remote on a network share; gated corpora (AMI, DIHARD-3) are manual drops into `eval/raw/`.
 - Fast regression gate: `uv run --project eval subset` (≤10 recordings, ru-synthetic + VoxConverse).

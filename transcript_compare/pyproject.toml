@@ -1,0 +1,14 @@
+[project]
+name = "transcript-compare"
+version = "0.1.0"
+description = "ASR benchmark on recorded meetings: reference fragments, WER scoring, transcript comparison"
+requires-python = ">=3.12"
+dependencies = [
+    "dvc",
+    "jiwer",
+    "num2words",
+    "rapidfuzz",
+]
+
+[tool.uv]
+package = false

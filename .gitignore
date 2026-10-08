@@ -79,3 +79,8 @@ frontend/src-tauri/binaries/
 graphify-out/
 .kilo/
 baseline-oldcore-timing.txt
+
+# transcript_compare/: meeting folders hold audio, transcripts and references of real meetings and live in
+# DVC only (transcript_compare/README.md). Ignored here too, so no `git add` picks them up if DVC breaks.
+transcript_compare/20*/
+transcript_compare/.venv/

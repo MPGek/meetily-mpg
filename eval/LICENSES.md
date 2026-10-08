@@ -15,8 +15,9 @@ forbid training outright), and results are reported only as aggregate metrics.
 
 ## Eval-only usage statement
 
-- Normalized data lives in the local DVC remote and is never committed to git or
-  redistributed beyond machines of this project's authors.
+- Normalized data lives in the project's DVC remote on a network share and is
+  never committed to git or redistributed beyond machines of this project's
+  authors.
 - Gated corpora (AMI, DIHARD-3) must be acquired by each user under their own
   license; only the `.dvc` pointers are shared in the repo.
 - Reports contain aggregate DER metrics only, never transcripts or audio.
