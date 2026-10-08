@@ -144,7 +144,7 @@ The system SHALL accept a replacement microphone whose native sample rate or cha
 - **THEN** recording and transcription SHALL continue correctly on the new device
 
 ### Requirement: A replacement microphone gets the same processing as a start-time microphone
-The replacement microphone SHALL go through the same processing chain as a microphone chosen at recording start: high-pass filter and, when enabled, noise suppression. It SHALL stay at natural (unity) gain with no automatic gain. No per-device gain setting SHALL need to be carried over.
+The replacement microphone SHALL go through the same processing chain as a microphone chosen at recording start: the high-pass filter. It SHALL stay at natural (unity) gain with no automatic gain. No per-device gain setting SHALL need to be carried over.
 
 #### Scenario: Quiet room after the switch
 - **WHEN** the replacement microphone captures only ambient noise

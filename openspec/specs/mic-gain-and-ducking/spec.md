@@ -6,8 +6,8 @@ Defines microphone capture gain behavior and the system-audio ducking decision s
 
 ## Requirements
 
-### Requirement: Live microphone capture does not amplify non-speech content
-The system SHALL NOT apply any automatic level gain to the live microphone signal that raises quiet or non-speech content toward a fixed loudness target. The microphone enhancement chain SHALL keep noise suppression and the high-pass filter, and SHALL NOT include a loudness-normalization step that adapts gain while no speech is present. The captured microphone level SHALL remain at natural (unity) gain, subject only to user-controlled input volume, so ambient noise such as street sound is not boosted.
+### Requirement: Live microphone capture keeps its natural level and noise floor
+The system SHALL NOT apply any automatic level gain to the live microphone signal that raises quiet or non-speech content toward a fixed loudness target. The microphone enhancement chain SHALL consist of the high-pass filter only, SHALL NOT include a noise-suppression stage, and SHALL NOT include a loudness-normalization step. The captured microphone level SHALL remain at natural (unity) gain, subject only to user-controlled input volume, so ambient noise is not boosted.
 
 #### Scenario: No speech, ambient noise stays quiet
 - **WHEN** recording captures only ambient noise on the microphone and no speech occurs
@@ -17,9 +17,9 @@ The system SHALL NOT apply any automatic level gain to the live microphone signa
 - **WHEN** the microphone captures speech interrupted by long quiet gaps
 - **THEN** the quiet gaps SHALL NOT cause gain to rise such that background noise becomes louder when speech resumes
 
-#### Scenario: Noise suppression still applied
+#### Scenario: Only low-frequency rumble is removed
 - **WHEN** recording captures ambient noise alongside speech
-- **THEN** the microphone chain SHALL still apply the high-pass filter and RNNoise-style noise suppression, reducing the noise floor without boosting it
+- **THEN** the microphone chain SHALL apply the high-pass filter, removing content below about 80 Hz, and SHALL otherwise pass the signal at unity gain without noise suppression, so the saved and transcribed microphone audio keeps its natural noise floor
 
 #### Scenario: No live AGC on any capture path
 - **WHEN** microphone audio is processed by any live capture path (current pipeline or future modern recorder)
