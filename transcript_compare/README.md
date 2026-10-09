@@ -111,6 +111,16 @@ in `pyproject.toml`; add them per run with `uv run --with ...`.
 | `compare.py <m>`, `compare2.py <m>` | pairwise WER, hallucinations, domain-term hits |
 | `windows.py <m> <a-b>…` | what each transcript says in given time windows |
 
+`rover.py <m> <source> <source> <source>…` (next to `score.py`) scores a word-level
+majority vote over several sources, the first one breaking ties.
+
+Meetily's own Rust live and offline paths run headless through the `asr-eval`
+dev binary (`frontend/src-tauri/src/bin/asr_eval.rs`); build it in the CUDA
+environment (`scripts/env-cuda.bat` after `vcvars64.bat`) with
+`cargo build --release --features cuda --bin asr-eval`, then
+`asr-eval <m>/audio.mp4 --models-dir <dir with ggml-*.bin> --model large-v3 --out-dir <m>/asr_runs`
+writes `asr_meetily-rs-<model>-{live,offline}.json`.
+
 Names and internal terms are never in the code: the vocabulary prompts
 (`run_wcpp.py … v4domah`, `run_qwen.py … glossary`) and the term counts
 (`compare.py`) read `<m>/glossary.json` and stop with an error if it is missing:

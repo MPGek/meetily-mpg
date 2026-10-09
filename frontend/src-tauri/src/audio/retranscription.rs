@@ -1162,7 +1162,7 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 
 /// Resample a single channel to 16kHz mono format for VAD and transcription.
 /// Reuses the same normalization and resampling logic as DecodedAudio::to_whisper_format.
-fn resample_channel_to_16k(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+pub fn resample_channel_to_16k(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     use crate::audio::audio_processing::resample_audio;
     use crate::audio::decoder::normalize_audio_samples;
 

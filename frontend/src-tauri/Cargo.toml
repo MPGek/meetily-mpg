@@ -27,6 +27,12 @@ path = "src/bin/diarize_eval.rs"
 name = "online-eval"
 path = "src/bin/online_eval.rs"
 
+# Developer-only: transcribes a stereo meeting recording through the live and
+# offline transcription paths for the transcript_compare ASR benchmark.
+[[bin]]
+name = "asr-eval"
+path = "src/bin/asr_eval.rs"
+
 
 # Hardware acceleration features for whisper-rs
 # Cross-platform GPU acceleration with smart defaults

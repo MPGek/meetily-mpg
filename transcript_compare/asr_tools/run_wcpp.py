@@ -27,6 +27,13 @@ CONFIGS = {
     "ah": {"entropy_thold": 2.8, "max_context": 128},
     "t0": {"temperature": 0.0},
     "t0b5": {"temperature": 0.0, "beam_size": 5},
+    # 2026-10-08 ideas: habr 1066528 found language=auto better on code-switching; a filler-laden
+    # Russian prompt should keep а/ну/вот (whisper's main error here is deletions); wider beam;
+    # no_speech_thold 1.0 never drops a window as silence.
+    "auto": {"language": "auto"},
+    "fill": {"prompt": "Ну, вот, а там, значит, мы это... Не, ну да. Короче, смотри, тут такое дело."},
+    "b5": {"beam_size": 5},
+    "nth1": {"no_speech_thold": 1.0},
 }
 
 
