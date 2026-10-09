@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildBufferTank,
   buildChannelLine,
   buildLevelBar,
   buildModelIndicators,
@@ -8,12 +9,14 @@ import {
   LEVEL_STALE_MS,
   MODEL_BLINK_CLASS,
   MODEL_STATE_CLASS,
+  STUCK_SLACK_MS,
 } from "../../src/lib/diarization-status-lines";
 import type {
   AlignmentActivity,
   AsrActivity,
   DiarChannelState,
   DiarizationModelActivity,
+  PendingState,
   VadActivity,
 } from "../../src/services/diarizationStatusService";
 
@@ -295,5 +298,66 @@ describe("state mapping", () => {
     expect(DIAR_STATE_TEXT.deferred).toBe("cluster at stop");
     expect(DIAR_STATE_TEXT.inactive).toBe("mono");
     expect(DIAR_STATE_TEXT.error).toBe("ENGINE OFF");
+  });
+});
+
+describe("buildBufferTank", () => {
+  const pending = (partial: Partial<PendingState> = {}): PendingState => ({
+    segments: 0,
+    buffered_ms: 0,
+    gap_trigger_ms: 500,
+    cap_trigger_ms: 25_000,
+    open_speech_ms: 0,
+    silence_ms: 0,
+    ...partial,
+  });
+
+  test("idle channel is empty without an alert", () => {
+    const tank = buildBufferTank(pending());
+    expect(tank).toMatchObject({ pendingPercent: 0, openPercent: 0, ringFraction: 0, stuck: false });
+    expect(tank.detail).toBe("ASR buffer empty");
+  });
+
+  test("speech in progress grows the tank before any segment closes", () => {
+    const early = buildBufferTank(pending({ open_speech_ms: 2_500 }));
+    const later = buildBufferTank(pending({ open_speech_ms: 5_000 }));
+    expect(early.openPercent).toBe(10);
+    expect(later.openPercent).toBe(20);
+    expect(later.pendingPercent).toBe(0);
+    expect(later.detail).toContain("speech in progress");
+  });
+
+  test("pending speech and silence fill the countdown, clamped at the trigger", () => {
+    const counting = buildBufferTank(pending({ segments: 2, buffered_ms: 5_000, silence_ms: 250 }));
+    expect(counting.pendingPercent).toBe(20);
+    expect(counting.ringFraction).toBe(0.5);
+    expect(counting.stuck).toBe(false);
+    expect(counting.detail).toContain("silence 250/500 ms");
+    const full = buildBufferTank(pending({ segments: 1, buffered_ms: 1_000, silence_ms: 700 }));
+    expect(full.ringFraction).toBe(1);
+  });
+
+  test("dispatched speech empties the tank and the countdown", () => {
+    const tank = buildBufferTank(pending({ segments: 0, buffered_ms: 0, silence_ms: 0 }));
+    expect(tank.pendingPercent + tank.openPercent).toBe(0);
+    expect(tank.ringFraction).toBe(0);
+  });
+
+  test("the tank is measured against the 25 s cap and never overflows", () => {
+    const near = buildBufferTank(pending({ segments: 8, buffered_ms: 22_000, open_speech_ms: 2_000 }));
+    expect(near.pendingPercent).toBe(88);
+    expect(near.openPercent).toBe(8);
+    const over = buildBufferTank(pending({ segments: 9, buffered_ms: 24_000, open_speech_ms: 4_000 }));
+    expect(over.pendingPercent + over.openPercent).toBe(100);
+  });
+
+  test("stuck only once silence passes the trigger by the slack", () => {
+    const atSlack = buildBufferTank(pending({ segments: 1, buffered_ms: 3_000, silence_ms: 500 + STUCK_SLACK_MS }));
+    expect(atSlack.stuck).toBe(false);
+    const stuck = buildBufferTank(pending({ segments: 1, buffered_ms: 3_000, silence_ms: 4_200 }));
+    expect(stuck.stuck).toBe(true);
+    expect(stuck.detail).toContain("waiting for speech");
+    const noPending = buildBufferTank(pending({ segments: 0, silence_ms: 9_000 }));
+    expect(noPending.stuck).toBe(false);
   });
 });

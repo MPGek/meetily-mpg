@@ -82,6 +82,12 @@ pub struct PendingState {
     pub gap_trigger_ms: u64,
     /// Accumulated-duration cap that triggers the flush.
     pub cap_trigger_ms: u64,
+    /// Speech the voice-activity detector is still collecting (not yet a
+    /// segment, so not in `buffered_ms`).
+    pub open_speech_ms: u64,
+    /// Silence after the pending speech, counted the way the dispatch rule
+    /// measures it: the flush fires when this reaches `gap_trigger_ms`.
+    pub silence_ms: u64,
 }
 
 /// Level below which a channel is treated as silent for the level meter.
@@ -149,6 +155,8 @@ pub struct ChannelPipelineStats {
     pending_ms: AtomicU64,
     pending_gap_ms: AtomicU64,
     pending_cap_ms: AtomicU64,
+    pending_open_speech_ms: AtomicU64,
+    pending_silence_ms: AtomicU64,
     /// Samples queued for the recording mix window.
     pub mix: GatedBuffer,
     /// Linear RMS of the last processed chunk (f32 bits).
@@ -183,6 +191,12 @@ impl ChannelPipelineStats {
     pub fn set_pending(&self, segments: u64, buffered_ms: u64) {
         self.pending_segments.store(segments, Ordering::Relaxed);
         self.pending_ms.store(buffered_ms, Ordering::Relaxed);
+    }
+
+    pub fn set_pending_progress(&self, open_speech_ms: u64, silence_ms: u64) {
+        self.pending_open_speech_ms
+            .store(open_speech_ms, Ordering::Relaxed);
+        self.pending_silence_ms.store(silence_ms, Ordering::Relaxed);
     }
 
     pub fn set_pending_triggers(&self, gap_ms: u64, cap_ms: u64) {
@@ -223,6 +237,8 @@ impl ChannelPipelineStats {
                 buffered_ms: self.pending_ms.load(Ordering::Relaxed),
                 gap_trigger_ms: self.pending_gap_ms.load(Ordering::Relaxed),
                 cap_trigger_ms: self.pending_cap_ms.load(Ordering::Relaxed),
+                open_speech_ms: self.pending_open_speech_ms.load(Ordering::Relaxed),
+                silence_ms: self.pending_silence_ms.load(Ordering::Relaxed),
             },
             mix: self.mix.snapshot(),
             level: self.level(),
@@ -617,6 +633,20 @@ mod tests {
         mic.set_pending(1, 25_000);
         let (at_cap, _) = telemetry.snapshots();
         assert!(at_cap.pending.buffered_ms >= at_cap.pending.cap_trigger_ms);
+    }
+
+    #[test]
+    fn pending_reports_speech_in_progress_and_silence() {
+        let telemetry = PipelineTelemetry::new(48000);
+        telemetry
+            .channel(&DeviceType::System)
+            .set_pending_progress(1800, 320);
+
+        let (mic_fill, sys_fill) = telemetry.snapshots();
+        assert_eq!(sys_fill.pending.open_speech_ms, 1800);
+        assert_eq!(sys_fill.pending.silence_ms, 320);
+        assert_eq!(mic_fill.pending.open_speech_ms, 0, "channels are independent");
+        assert_eq!(mic_fill.pending.silence_ms, 0);
     }
 
     #[test]

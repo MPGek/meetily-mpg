@@ -489,10 +489,11 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                     ))}
                   </div>
 
-                  {/* Two per-channel diarization status lines, immediately to
-                      the right of the animated indicator. Hidden when not
-                      recording and when diarization is off. */}
-                  {isRecording && recordingTelemetry?.active && recordingTelemetry.diarization.mode !== 'off' && (
+                  {/* Two per-channel status lines, immediately to the right of
+                      the animated indicator. Shown for every recording: the
+                      level bars and the ASR buffer do not depend on
+                      diarization. Hidden when not recording. */}
+                  {isRecording && recordingTelemetry && recordingTelemetry.pipeline.sample_rate > 0 && (
                     <DiarizationStatusLines telemetry={recordingTelemetry} />
                   )}
                 </>

@@ -10,6 +10,7 @@ import type {
   AudioLevel,
   DiarChannelState,
   DiarizationModelActivity,
+  PendingState,
   VadActivity,
 } from '../services/diarizationStatusService';
 
@@ -83,6 +84,63 @@ export function buildLevelBar(level: AudioLevel): {
     detail: stale
       ? `L: no audio for ${level.age_ms}ms`
       : `L: ${db} (peak ${level.peak.toFixed(2)})${clipping ? ' - clipping' : ''}`,
+  };
+}
+
+/**
+ * Slack past the silence trigger before pending speech reads as stuck: one
+ * 200 ms voice-activity window (the dispatch granularity) plus one 150 ms
+ * status poll.
+ */
+export const STUCK_SLACK_MS = 350;
+
+/** The speech-recognition buffer of one channel, as the tank and ring show it. */
+export interface BufferTank {
+  /** Merged speech waiting to be sent, 0..100 of the 25 s cap. */
+  pendingPercent: number;
+  /** Speech still being collected, stacked after the pending part. */
+  openPercent: number;
+  /** Silence so far out of the dispatch trigger, 0..1. */
+  ringFraction: number;
+  /** Pending speech has outlived the trigger: it is waiting for more speech. */
+  stuck: boolean;
+  /** Tooltip text. */
+  detail: string;
+}
+
+/**
+ * Tank against the 25 s accumulation cap plus the silence countdown to the
+ * 500 ms dispatch trigger (live-asr-dispatch-latency, variant A).
+ */
+export function buildBufferTank(pending: PendingState): BufferTank {
+  const cap = pending.cap_trigger_ms;
+  const gap = pending.gap_trigger_ms;
+  const fraction = (ms: number) => (cap > 0 ? Math.min(1, ms / cap) : 0);
+  const pendingFraction = fraction(pending.buffered_ms);
+  const openFraction = Math.min(1 - pendingFraction, fraction(pending.open_speech_ms));
+  const hasPending = pending.segments > 0;
+  const ringFraction = hasPending && gap > 0 ? Math.min(1, pending.silence_ms / gap) : 0;
+  const stuck = hasPending && gap > 0 && pending.silence_ms > gap + STUCK_SLACK_MS;
+
+  const seconds = (ms: number) => (ms / 1000).toFixed(1);
+  const total = pending.buffered_ms + pending.open_speech_ms;
+  let detail: string;
+  if (stuck) {
+    detail = `ASR buffer ${seconds(pending.buffered_ms)} s: waiting for speech (${seconds(pending.silence_ms)} s silent)`;
+  } else if (pending.open_speech_ms > 0) {
+    detail = `ASR buffer ${seconds(total)}/${seconds(cap)} s: speech in progress`;
+  } else if (hasPending) {
+    detail = `ASR buffer ${seconds(pending.buffered_ms)}/${seconds(cap)} s: silence ${Math.round(pending.silence_ms)}/${gap} ms`;
+  } else {
+    detail = 'ASR buffer empty';
+  }
+
+  return {
+    pendingPercent: Math.round(pendingFraction * 100),
+    openPercent: Math.round(openFraction * 100),
+    ringFraction,
+    stuck,
+    detail,
   };
 }
 

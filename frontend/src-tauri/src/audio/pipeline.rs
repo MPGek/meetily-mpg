@@ -775,6 +775,10 @@ pub struct AudioPipeline {
     // Segment accumulation buffers for merge-before-transcribe
     vad_pending_mic: Vec<SpeechSegment>,
     vad_pending_sys: Vec<SpeechSegment>,
+    // Off only in tests that replay the earlier rule (dispatch when the next
+    // segment arrives) to compare chunk contents.
+    #[cfg(test)]
+    dispatch_on_silence: bool,
     live_vad_config: VadConfig,
     // Real-time anchoring for live transcription timestamps. VAD segments are
     // timestamped in the per-source sample domain; a stream that starts late or
@@ -799,15 +803,32 @@ pub struct AudioPipeline {
 /// dispatched buffer; empty anchors leave the segment unchanged.
 fn remap_segment_times_to_real(anchors: &[(f64, f64)], segments: &mut [SpeechSegment]) {
     for seg in segments.iter_mut() {
-        // Find the latest anchor whose counter is at or before the segment start.
-        let idx = anchors.partition_point(|(counter_ms, _)| *counter_ms <= seg.start_timestamp_ms);
-        if idx > 0 {
-            let (counter_ms, real_sec) = anchors[idx - 1];
-            let shift_ms = (real_sec - counter_ms / 1000.0) * 1000.0;
+        if let Some(shift_ms) = anchor_shift_ms(anchors, seg.start_timestamp_ms) {
             seg.start_timestamp_ms = (seg.start_timestamp_ms + shift_ms).max(0.0);
             seg.end_timestamp_ms = (seg.end_timestamp_ms + shift_ms).max(0.0);
         }
     }
+}
+
+/// Shift (ms) from VAD-counter time to recording time at `counter_ms`: that of
+/// the latest anchor at or before it; None without one.
+fn anchor_shift_ms(anchors: &[(f64, f64)], counter_ms: f64) -> Option<f64> {
+    let idx = anchors.partition_point(|(anchor_ms, _)| *anchor_ms <= counter_ms);
+    (idx > 0).then(|| {
+        let (anchor_ms, real_sec) = anchors[idx - 1];
+        (real_sec - anchor_ms / 1000.0) * 1000.0
+    })
+}
+
+/// How far a later anchor's shift can fall below the current one: the samples
+/// the VAD holds back between frames, at most one 512-sample frame at 16 kHz.
+const ANCHOR_JITTER_MS: f64 = 32.0;
+
+/// The smallest gap (recording ms) between the pending tail and any speech
+/// that could still join it: the start of the speech in progress, or, when the
+/// channel is silent, the earliest start speech beginning now could get.
+fn silence_gap_ms(tail_ms: f64, speech_start_ms: Option<f64>, earliest_start_ms: f64) -> f64 {
+    speech_start_ms.unwrap_or(earliest_start_ms) - tail_ms
 }
 
 impl AudioPipeline {
@@ -932,6 +953,8 @@ impl AudioPipeline {
             vad_dispatch_threshold_samples,
             vad_pending_mic: Vec::new(),
             vad_pending_sys: Vec::new(),
+            #[cfg(test)]
+            dispatch_on_silence: true,
             live_vad_config: vad_config_clone,
             vad_mic_buffer_real_base: None,
             vad_sys_buffer_real_base: None,
@@ -980,6 +1003,14 @@ impl AudioPipeline {
                 })
                 .sum(),
         );
+        // Silence only counts while nothing is being said: speech in progress
+        // either joins the pending speech or has already triggered its flush.
+        let silence_ms = if vad.is_in_speech() {
+            0.0
+        } else {
+            self.pending_silence_gap_ms(device_type).unwrap_or(0.0).max(0.0)
+        };
+        channel.set_pending_progress(vad.current_speech_ms() as u64, silence_ms as u64);
         channel.mix.set_fill(mix_fill as u64);
     }
 
@@ -1044,6 +1075,46 @@ impl AudioPipeline {
             }
         }
         pending.clear();
+    }
+
+    /// Dispatch a channel's pending speech once no speech can join it any more:
+    /// new speech has started >= 500 ms after the pending tail, or the channel
+    /// has been silent long enough that speech starting now, with its
+    /// pre-speech padding, would still begin >= 500 ms after the tail. The same
+    /// 500 ms gap rule groups segments either way, so chunk contents do not
+    /// change; only the speech no longer waits for the next segment to end.
+    fn flush_pending_on_silence(&mut self, device_type: DeviceType) {
+        #[cfg(test)]
+        if !self.dispatch_on_silence {
+            return;
+        }
+        if let Some(gap_ms) = self.pending_silence_gap_ms(&device_type) {
+            if gap_ms >= 500.0 {
+                self.flush_pending_segments(device_type);
+            }
+        }
+    }
+
+    /// `silence_gap_ms` for a channel, in recording time, the clock the gap
+    /// rule compares segments in; None when nothing is pending. Speech that
+    /// begins now starts `pre_pad_ms` before the current position at the
+    /// earliest, and a later anchor may shift it back by up to one VAD frame.
+    fn pending_silence_gap_ms(&self, device_type: &DeviceType) -> Option<f64> {
+        let (vad, pending, anchors) = match device_type {
+            DeviceType::Microphone => {
+                (&self.vad_processor_mic, &self.vad_pending_mic, &self.vad_mic_anchors)
+            }
+            DeviceType::System => {
+                (&self.vad_processor_sys, &self.vad_pending_sys, &self.vad_sys_anchors)
+            }
+        };
+        let tail = pending.last()?.end_timestamp_ms;
+        let to_recording =
+            |counter_ms: f64| (counter_ms + anchor_shift_ms(anchors, counter_ms).unwrap_or(0.0)).max(0.0);
+        let speech_start = vad.current_speech_start_ms().map(to_recording);
+        let earliest = to_recording(vad.processed_ms() - self.live_vad_config.pre_pad_ms as f64)
+            - ANCHOR_JITTER_MS;
+        Some(silence_gap_ms(tail, speech_start, earliest))
     }
 
     /// Run the VAD-driven audio processing pipeline
@@ -1223,14 +1294,19 @@ impl AudioPipeline {
                                 pending_ref.extend(speech_segments);
 
                                 // Flush if accumulated duration would exceed 25s when merged
+                                let pending_ref = match chunk.device_type {
+                                    DeviceType::Microphone => &self.vad_pending_mic,
+                                    DeviceType::System => &self.vad_pending_sys,
+                                };
                                 let total_duration_ms: f64 = pending_ref
                                     .iter()
                                     .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
                                     .sum();
                                 if total_duration_ms > 25_000.0 {
-                                    drop(pending_ref);
                                     self.flush_pending_segments(chunk.device_type.clone());
                                 }
+
+                                self.flush_pending_on_silence(chunk.device_type.clone());
                             }
                             Err(e) => {
                                 warn!("⚠️ VAD error: {}", e);
@@ -2226,5 +2302,286 @@ mod tests {
         remap_segment_times_to_real(&anchors, &mut segments);
         assert_eq!(segments[0].start_timestamp_ms, 0.0);
         assert_eq!(segments[0].end_timestamp_ms, 0.0);
+    }
+
+    // --- Dispatch on silence (live-asr-dispatch-latency) ---
+
+    /// 10 ms capture chunks at 48 kHz, the size device callbacks deliver.
+    const CAPTURE: usize = 480;
+
+    /// A spoken English phrase (Windows TTS, ~2.5 s once its leading and
+    /// trailing silence is cut) that Silero detects as one speech segment;
+    /// synthetic tones are not detected as speech.
+    fn phrase() -> Vec<f32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tts_phrase_48k.wav");
+        let decoded = crate::audio::decoder::decode_audio_file(&path).expect("decode fixture");
+        assert_eq!((decoded.sample_rate, decoded.channels), (RATE, 1));
+        let loud = |x: &f32| x.abs() > 0.01;
+        let first = decoded.samples.iter().position(loud).expect("speech");
+        let last = decoded.samples.iter().rposition(loud).expect("speech");
+        decoded.samples[first..=last].to_vec()
+    }
+
+    fn silence(secs: f64) -> Vec<f32> {
+        vec![0.0; (secs * RATE as f64) as usize]
+    }
+
+    /// Phrases separated by the given silences, with silence before and after.
+    fn speech_with_gaps(gaps: &[f64], tail_secs: f64) -> Vec<f32> {
+        let phrase = phrase();
+        let mut audio = silence(0.3);
+        audio.extend(&phrase);
+        for gap in gaps {
+            audio.extend(silence(*gap));
+            audio.extend(&phrase);
+        }
+        audio.extend(silence(tail_secs));
+        audio
+    }
+
+    /// A live pipeline on its own task: capture chunks in, transcription out.
+    fn spawn_live_with(dispatch_on_silence: bool) -> (
+        mpsc::Sender<AudioChunk>,
+        mpsc::Receiver<AudioChunk>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (audio_tx, audio_rx) = mpsc::channel::<AudioChunk>(20_000);
+        let (transcription_tx, transcription_rx) = mpsc::channel::<AudioChunk>(1024);
+        let (recording_tx, mut recording_rx) = mpsc::channel::<AudioChunk>(1024);
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            None,
+            RecordingState::new(),
+            0,
+            RATE,
+            "mic".to_string(),
+            super::super::device_detection::InputDeviceKind::Unknown,
+            "sys".to_string(),
+            super::super::device_detection::InputDeviceKind::Unknown,
+        )
+        .expect("pipeline");
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+        pipeline.dispatch_on_silence = dispatch_on_silence;
+        let handle = tokio::spawn(async move {
+            let drain = tokio::spawn(async move { while recording_rx.recv().await.is_some() {} });
+            pipeline.run().await.expect("run");
+            drain.await.expect("drain");
+        });
+        (audio_tx, transcription_rx, handle)
+    }
+
+    fn spawn_live() -> (
+        mpsc::Sender<AudioChunk>,
+        mpsc::Receiver<AudioChunk>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_live_with(true)
+    }
+
+    /// Queue `mic` with a silent system channel as interleaved 10 ms chunks
+    /// starting at `t0` seconds of recording time.
+    fn feed_mic(tx: &mpsc::Sender<AudioChunk>, mic: &[f32], t0: f64) {
+        for (i, block) in mic.chunks(CAPTURE).enumerate() {
+            let timestamp = t0 + (i * CAPTURE) as f64 / RATE as f64;
+            for (device, data) in [
+                (DeviceType::Microphone, block.to_vec()),
+                (DeviceType::System, vec![0.0; block.len()]),
+            ] {
+                tx.try_send(AudioChunk {
+                    data,
+                    sample_rate: RATE,
+                    timestamp,
+                    chunk_id: 0,
+                    device_type: device,
+                    channels: 1,
+                })
+                .expect("queue chunk");
+            }
+        }
+    }
+
+    /// The next transcription chunk, or None if none comes within 10 s.
+    async fn next_chunk(rx: &mut mpsc::Receiver<AudioChunk>) -> Option<AudioChunk> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Stop the recording; return the microphone chunks, `collected` first.
+    async fn stop_and_collect(
+        tx: mpsc::Sender<AudioChunk>,
+        mut rx: mpsc::Receiver<AudioChunk>,
+        handle: tokio::task::JoinHandle<()>,
+        mut collected: Vec<AudioChunk>,
+    ) -> Vec<AudioChunk> {
+        drop(tx);
+        handle.await.expect("pipeline task");
+        while let Ok(chunk) = rx.try_recv() {
+            collected.push(chunk);
+        }
+        collected.retain(|c| c.device_type == DeviceType::Microphone);
+        collected
+    }
+
+    #[test]
+    fn silence_gap_is_measured_to_speech_that_could_still_join() {
+        // Speech in progress: the gap is to its padded start.
+        assert_eq!(silence_gap_ms(1000.0, Some(1600.0), 9000.0), 600.0);
+        assert_eq!(silence_gap_ms(1000.0, Some(1400.0), 9000.0), 400.0);
+        // Silent channel: the gap is to the earliest start new speech can get.
+        assert_eq!(silence_gap_ms(1000.0, None, 1500.0), 500.0);
+        assert!(silence_gap_ms(1000.0, None, 1499.0) < 500.0);
+        // Anchor shift: the shift of the latest anchor at or before the time.
+        let anchors = [(0.0, 5.0), (200.0, 5.21)];
+        assert_eq!(anchor_shift_ms(&anchors, 100.0), Some(5000.0));
+        assert!((anchor_shift_ms(&anchors, 300.0).unwrap() - 5010.0).abs() < 1e-6);
+        assert_eq!(anchor_shift_ms(&[], 300.0), None);
+    }
+
+    #[tokio::test]
+    async fn speech_is_dispatched_after_silence_without_waiting_for_more_speech() {
+        let (tx, mut rx, handle) = spawn_live();
+        feed_mic(&tx, &speech_with_gaps(&[], 1.5), 0.0);
+
+        let chunk = next_chunk(&mut rx)
+            .await
+            .expect("dispatched while the recording is still running");
+        assert_eq!(chunk.device_type, DeviceType::Microphone);
+        let chunks = stop_and_collect(tx, rx, handle, vec![chunk]).await;
+        assert_eq!(chunks.len(), 1, "one phrase, one chunk");
+    }
+
+    #[tokio::test]
+    async fn short_silence_keeps_phrases_in_one_chunk() {
+        let (tx, rx, handle) = spawn_live();
+        feed_mic(&tx, &speech_with_gaps(&[0.5], 1.5), 0.0);
+        let chunks = stop_and_collect(tx, rx, handle, Vec::new()).await;
+        assert_eq!(chunks.len(), 1, "a pause shorter than the gap does not split");
+    }
+
+    #[tokio::test]
+    async fn speech_is_dispatched_when_the_next_phrase_starts_not_ends() {
+        let (tx, mut rx, handle) = spawn_live();
+        let mut audio = speech_with_gaps(&[0.85], 0.0);
+        // Stop feeding halfway through the second phrase: it has not ended.
+        audio.truncate(audio.len() - phrase().len() / 2);
+        feed_mic(&tx, &audio, 0.0);
+
+        let first = next_chunk(&mut rx)
+            .await
+            .expect("the first phrase leaves before the second one ends");
+        let chunks = stop_and_collect(tx, rx, handle, vec![first]).await;
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn continuous_speech_is_still_dispatched_at_the_cap() {
+        let (tx, mut rx, handle) = spawn_live();
+        // Eleven phrases 0.5 s apart merge into one run of > 25 s, with no
+        // trailing silence, so only the 25 s cap can dispatch before stop.
+        feed_mic(&tx, &speech_with_gaps(&[0.5; 10], 0.0), 0.0);
+
+        let first = next_chunk(&mut rx)
+            .await
+            .expect("the cap dispatches during continuous speech");
+        let chunks = stop_and_collect(tx, rx, handle, vec![first]).await;
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.data.len() <= 25 * 16000));
+    }
+
+    #[tokio::test]
+    async fn dispatch_on_silence_keeps_chunk_contents() {
+        let audio = speech_with_gaps(&[0.5, 0.85, 1.5, 3.0], 1.5);
+        let mut runs = Vec::new();
+        for dispatch_on_silence in [false, true] {
+            let (tx, rx, handle) = spawn_live_with(dispatch_on_silence);
+            feed_mic(&tx, &audio, 0.0);
+            let chunks = stop_and_collect(tx, rx, handle, Vec::new()).await;
+            runs.push(chunks.into_iter().map(|c| c.data).collect::<Vec<_>>());
+        }
+        let (before, after) = (&runs[0], &runs[1]);
+        assert_eq!(before.len(), 4, "the 0.5 s pause merges, the rest split");
+        let lens = |v: &[Vec<f32>]| v.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(lens(after), lens(before), "chunk lengths");
+        assert!(after == before, "chunk samples differ");
+    }
+
+    #[tokio::test]
+    async fn late_stream_start_does_not_delay_dispatch() {
+        // The first chunk arrives 5 s into the recording, so segment times are
+        // shifted by the anchor while the VAD counter starts at zero.
+        let (tx, mut rx, handle) = spawn_live();
+        feed_mic(&tx, &speech_with_gaps(&[], 1.5), 5.0);
+
+        let chunk = next_chunk(&mut rx)
+            .await
+            .expect("dispatched on silence despite the anchor shift");
+        assert!(chunk.timestamp >= 5.0, "chunk time is recording time");
+        let chunks = stop_and_collect(tx, rx, handle, vec![chunk]).await;
+        assert_eq!(chunks.len(), 1);
+    }
+
+    /// Real-audio check that dispatch on silence leaves chunk contents alone:
+    /// replays a stereo recording (L = mic, R = system) given by
+    /// `MEETILY_REPLAY_AUDIO` through the live pipeline with and without it.
+    #[tokio::test]
+    #[ignore = "needs MEETILY_REPLAY_AUDIO pointing at a recording"]
+    async fn replay_recording_keeps_chunk_contents() {
+        let path = std::env::var("MEETILY_REPLAY_AUDIO").expect("MEETILY_REPLAY_AUDIO");
+        let decoded = crate::audio::decoder::decode_audio_file(std::path::Path::new(&path))
+            .expect("decode recording");
+        assert_eq!((decoded.sample_rate, decoded.channels), (RATE, 2));
+        let (mic, sys) = decoded.extract_channels();
+        let (mic, sys) = (mic.expect("mic"), sys.expect("system"));
+
+        let mut runs = Vec::new();
+        for dispatch_on_silence in [false, true] {
+            let (tx, mut rx, handle) = spawn_live_with(dispatch_on_silence);
+            let (mic, sys) = (mic.clone(), sys.clone());
+            let feeder = tokio::spawn(async move {
+                for (i, (m, s)) in mic.chunks(CAPTURE).zip(sys.chunks(CAPTURE)).enumerate() {
+                    let timestamp = (i * CAPTURE) as f64 / RATE as f64;
+                    for (device, data) in [(DeviceType::Microphone, m), (DeviceType::System, s)] {
+                        tx.send(AudioChunk {
+                            data: data.to_vec(),
+                            sample_rate: RATE,
+                            timestamp,
+                            chunk_id: 0,
+                            device_type: device,
+                            channels: 1,
+                        })
+                        .await
+                        .expect("queue chunk");
+                    }
+                }
+            });
+            let mut chunks = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                chunks.push(chunk);
+            }
+            feeder.await.expect("feeder");
+            handle.await.expect("pipeline task");
+            let by_device = |device: DeviceType| {
+                chunks
+                    .iter()
+                    .filter(|c| c.device_type == device)
+                    .map(|c| c.data.clone())
+                    .collect::<Vec<_>>()
+            };
+            runs.push((by_device(DeviceType::Microphone), by_device(DeviceType::System)));
+        }
+        let ((mic_before, sys_before), (mic_after, sys_after)) = (&runs[0], &runs[1]);
+        println!(
+            "chunks before: mic {} sys {}; after: mic {} sys {}",
+            mic_before.len(),
+            sys_before.len(),
+            mic_after.len(),
+            sys_after.len()
+        );
+        assert!(mic_after == mic_before, "microphone chunks differ");
+        assert!(sys_after == sys_before, "system chunks differ");
     }
 }

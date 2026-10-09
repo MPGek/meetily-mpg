@@ -233,6 +233,10 @@ export interface PendingState {
   buffered_ms: number;
   gap_trigger_ms: number;
   cap_trigger_ms: number;
+  /** Speech still being collected by the voice-activity detector. */
+  open_speech_ms: number;
+  /** Silence after the pending speech; the flush fires at gap_trigger_ms. */
+  silence_ms: number;
 }
 
 /** Level of the last processed chunk, with how old it is. */

@@ -746,6 +746,21 @@ impl ContinuousVadProcessor {
     pub fn is_in_speech(&self) -> bool {
         self.in_speech
     }
+
+    /// Padded start (VAD-counter ms, same clock as `processed_ms`) of the speech
+    /// the detector is still collecting, or `None` outside speech. Read by the
+    /// live pipeline; does not affect detection.
+    pub fn current_speech_start_ms(&self) -> Option<f64> {
+        self.in_speech
+            .then(|| self.speech_start_sample as f64 / 16.0)
+    }
+
+    /// Length of the speech still being collected (not yet a segment), 0
+    /// outside speech.
+    pub fn current_speech_ms(&self) -> f64 {
+        self.current_speech_start_ms()
+            .map_or(0.0, |start| (self.processed_ms() - start).max(0.0))
+    }
 }
 
 /// Legacy function for backward compatibility - now uses the optimized approach
@@ -1469,5 +1484,47 @@ mod tests {
                 "current_speech should contain at least the current chunk even with empty buffer"
             );
         }
+    }
+
+    #[test]
+    fn current_speech_accessors_track_in_progress_speech() {
+        // Threshold 0 starts speech on the first frame; a negative threshold
+        // above 1 counts every frame as silence, so the segment closes as soon
+        // as min_speech and redemption allow. Detection then does not depend
+        // on how Silero scores a synthetic signal.
+        let config = VadConfig {
+            threshold: 0.0,
+            neg_threshold: 1.01,
+            ..VadConfig::live()
+        };
+        let mut vad = ContinuousVadProcessor::new(16000, config).expect("vad");
+        assert_eq!(vad.current_speech_start_ms(), None);
+        assert_eq!(vad.current_speech_ms(), 0.0);
+
+        let frame = vec![0.3f32; 512];
+        let mut lengths = Vec::new();
+        let mut closed = false;
+        for _ in 0..40 {
+            let segments = vad.process_audio(&frame).expect("process");
+            if !segments.is_empty() {
+                assert_eq!(
+                    vad.current_speech_start_ms(),
+                    None,
+                    "no speech in progress right after the segment closes"
+                );
+                assert_eq!(vad.current_speech_ms(), 0.0);
+                closed = true;
+                break;
+            }
+            let start = vad.current_speech_start_ms().expect("speech in progress");
+            assert!(start <= vad.processed_ms());
+            lengths.push(vad.current_speech_ms());
+        }
+        assert!(closed, "the segment closes within 40 frames");
+        assert!(lengths.len() > 2);
+        assert!(
+            lengths.windows(2).all(|w| w[1] > w[0]),
+            "in-progress length grows while speech is collected: {lengths:?}"
+        );
     }
 }
