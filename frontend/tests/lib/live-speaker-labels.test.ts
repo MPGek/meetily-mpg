@@ -6,6 +6,9 @@ import {
   rematchTranscripts,
   upsertLiveBlocks,
   resolveLiveBlocks,
+  mergeLiveBlocks,
+  resolveMergedLiveBlocks,
+  liveAssignmentCalls,
 } from "../../src/lib/live-speaker-labels";
 import type { SpeakerTurn } from "../../src/services/recordingService";
 import type { LiveTranscriptBlock, LiveTranscriptBlocks, Transcript } from "../../src/types";
@@ -271,5 +274,134 @@ describe("resolveLiveBlocks sub-row scope", () => {
     expect(out[0]).toMatchObject({ display_name: "Alice", matched_by: "user" });
     expect(out[1]).toMatchObject({ display_name: "Bob", matched_by: "user" });
     expect(out[2]).toMatchObject({ display_name: "Alice", matched_by: "user" });
+  });
+});
+
+describe("mergeLiveBlocks", () => {
+  const auto = (speaker: string, start: number, end: number, name: string | undefined, score?: number, text = "t") =>
+    block({ speaker, start, end, text, display_name: name, matched_by: name ? "auto" : undefined, match_score: score });
+
+  test("adjacent clusters with one visible name merge into one sub-row", () => {
+    const out = mergeLiveBlocks([
+      auto("SPEAKER_00", 0, 2, "Mikhail", 0.9, "a"),
+      auto("SPEAKER_03", 2, 3, "Mikhail", 0.92, "b"),
+      auto("SPEAKER_05", 3, 4, "Mikhail", 0.7, "c"),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ start: 0, end: 4, text: "a b c", display_name: "Mikhail", matched_by: "auto" });
+    expect(out[0].parts).toEqual([
+      { speaker: "SPEAKER_00", start: 0, end: 2 },
+      { speaker: "SPEAKER_03", start: 2, end: 3 },
+      { speaker: "SPEAKER_05", start: 3, end: 4 },
+    ]);
+  });
+
+  test("keeps the longest part's cluster and the lowest score", () => {
+    const out = mergeLiveBlocks([auto("SPEAKER_00", 0, 1, "Mikhail", 0.9), auto("SPEAKER_03", 1, 5, "Mikhail", 0.7)]);
+    expect(out[0]).toMatchObject({ speaker: "SPEAKER_03", match_score: 0.7 });
+  });
+
+  test("different names stay separate", () => {
+    const rows = [auto("SPEAKER_00", 0, 1, "Mikhail"), auto("SPEAKER_01", 1, 2, "Marina"), auto("SPEAKER_00", 2, 3, "Mikhail")];
+    const out = mergeLiveBlocks(rows);
+    expect(out).toHaveLength(3);
+    out.forEach((b, i) => expect(b).toBe(rows[i]));
+  });
+
+  test("unnamed different clusters stay separate, unnamed same cluster merges", () => {
+    expect(mergeLiveBlocks([auto("SPEAKER_00", 0, 1, undefined), auto("SPEAKER_01", 1, 2, undefined)])).toHaveLength(2);
+    expect(mergeLiveBlocks([auto("SPEAKER_00", 0, 1, undefined), auto("SPEAKER_00", 1, 2, undefined)])).toHaveLength(1);
+  });
+
+  test("user-owned and automatic labels of one name stay separate", () => {
+    const out = mergeLiveBlocks([
+      block({ speaker: "SPEAKER_00", display_name: "Mikhail", matched_by: "user" }),
+      block({ speaker: "SPEAKER_03", display_name: "Mikhail", matched_by: "auto", start: 1, end: 2 }),
+    ]);
+    expect(out).toHaveLength(2);
+  });
+
+  test("parts of already-merged rows are flattened", () => {
+    const once = mergeLiveBlocks([auto("SPEAKER_00", 0, 1, "Mikhail"), auto("SPEAKER_03", 1, 2, "Mikhail")]);
+    const twice = mergeLiveBlocks([...once, auto("SPEAKER_05", 2, 3, "Mikhail")]);
+    expect(twice[0].parts?.map(p => p.speaker)).toEqual(["SPEAKER_00", "SPEAKER_03", "SPEAKER_05"]);
+  });
+});
+
+describe("resolveMergedLiveBlocks", () => {
+  const sys = { sourceDevice: "System" };
+  const ov = (start: number, end: number, name: string, cluster = "SPEAKER_00") =>
+    ({ cluster, sourceDevice: "System", start, end, name });
+  const mik = (speaker: string, start: number, end: number) =>
+    block({ speaker, start, end, display_name: "Mikhail", matched_by: "auto", match_score: 0.9 });
+
+  test("an override made on a merged row renames the whole row on the next revision", () => {
+    const out = resolveMergedLiveBlocks([mik("SPEAKER_00", 0, 2), mik("SPEAKER_03", 2, 4)], {
+      ...sys,
+      windowOverrides: [ov(0, 4, "Bob")],
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ display_name: "Bob", matched_by: "user", start: 0, end: 4 });
+    expect(out[0].parts?.map(p => p.speaker)).toEqual(["SPEAKER_00", "SPEAKER_03"]);
+  });
+
+  test("a rename that equalises neighbours merges them", () => {
+    const raw = [block({ speaker: "SPEAKER_07", start: 0, end: 1 }), mik("SPEAKER_03", 1, 2)];
+    expect(resolveMergedLiveBlocks(raw, sys)).toHaveLength(2);
+    const out = resolveMergedLiveBlocks(raw, { ...sys, windowOverrides: [ov(0, 1, "Mikhail", "SPEAKER_07"), ov(1, 2, "Mikhail", "SPEAKER_03")] });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ display_name: "Mikhail", matched_by: "user" });
+  });
+
+  test("a pin on one cluster does not rename a neighbour that had the same auto name", () => {
+    const out = resolveMergedLiveBlocks([mik("SPEAKER_00", 0, 1), mik("SPEAKER_03", 1, 2)], {
+      ...sys,
+      pinned: { cluster: "SPEAKER_00", name: "Alice" },
+    });
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({ display_name: "Alice", matched_by: "user" });
+    expect(out[1]).toMatchObject({ display_name: "Mikhail", matched_by: "auto" });
+  });
+
+  test("editing one of non-adjacent same-cluster sub-rows leaves the other alone", () => {
+    const aba = [
+      block({ start: 0, end: 1, speaker: "SPEAKER_00", display_name: "Alice", matched_by: "auto" }),
+      block({ start: 1, end: 2, speaker: "SPEAKER_01", display_name: "Carol", matched_by: "auto" }),
+      block({ start: 2, end: 3, speaker: "SPEAKER_00", display_name: "Alice", matched_by: "auto" }),
+    ];
+    const out = resolveMergedLiveBlocks(aba, { ...sys, windowOverrides: [ov(0, 1, "Bob")] });
+    expect(out).toHaveLength(3);
+    expect(out[0]).toMatchObject({ display_name: "Bob", matched_by: "user" });
+    expect(out[2]).toBe(aba[2]);
+  });
+});
+
+describe("liveAssignmentCalls", () => {
+  const parts = [
+    { speaker: "SPEAKER_00", start: 10, end: 14 },
+    { speaker: "SPEAKER_03", start: 14, end: 18 },
+    { speaker: "SPEAKER_00", start: 18, end: 20 },
+  ];
+
+  test("a single-row edit of a merged row sends one block call per part over its window", () => {
+    expect(liveAssignmentCalls(parts, "SPEAKER_00", false, 10, 20)).toEqual([
+      { kind: "block", cluster: "SPEAKER_00", start: 10, end: 14 },
+      { kind: "block", cluster: "SPEAKER_03", start: 14, end: 18 },
+      { kind: "block", cluster: "SPEAKER_00", start: 18, end: 20 },
+    ]);
+  });
+
+  test("an apply-to-all edit of a merged row binds every distinct cluster once", () => {
+    expect(liveAssignmentCalls(parts, "SPEAKER_00", true, 10, 20)).toEqual([
+      { kind: "cluster", cluster: "SPEAKER_00" },
+      { kind: "cluster", cluster: "SPEAKER_03" },
+    ]);
+  });
+
+  test("a plain row sends exactly the call it sends today", () => {
+    expect(liveAssignmentCalls(undefined, "SPEAKER_01", false, 3, 5)).toEqual([
+      { kind: "block", cluster: "SPEAKER_01", start: 3, end: 5 },
+    ]);
+    expect(liveAssignmentCalls(undefined, "SPEAKER_01", true, 3, 5)).toEqual([{ kind: "cluster", cluster: "SPEAKER_01" }]);
   });
 });

@@ -42,20 +42,27 @@ export function TranscriptPanel({
 
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>
-    transcripts.map(t => ({
-      id: t.id,
-      timestamp: t.audio_start_time ?? 0,
-      endTime: t.audio_end_time,
-      text: t.text,
-      confidence: t.confidence,
-      source_device: t.source_device,
-      speaker: t.speaker,
-      speaker_label: t.speaker_label,
-      speaker_matched_by: t.speaker_matched_by,
-      speaker_match_score: t.speaker_match_score,
-      // Live word-level diarization sub-rows (split blocks only).
-      blocks: getLiveBlocksFor(t),
-    })),
+    transcripts.map(t => {
+      // Live word-level diarization sub-rows (split blocks only). A split whose
+      // runs all show one speaker comes back as one run: render the row
+      // unsplit, labelled with that run rather than the segment-level label.
+      const blocks = getLiveBlocksFor(t);
+      const single = blocks?.length === 1 ? blocks[0] : undefined;
+      return {
+        id: t.id,
+        timestamp: t.audio_start_time ?? 0,
+        endTime: t.audio_end_time,
+        text: t.text,
+        confidence: t.confidence,
+        source_device: t.source_device,
+        speaker: single ? single.speaker : t.speaker,
+        speaker_label: single ? single.display_name : t.speaker_label,
+        speaker_matched_by: single ? single.matched_by : t.speaker_matched_by,
+        speaker_match_score: single ? single.match_score : t.speaker_match_score,
+        speaker_parts: single?.parts,
+        blocks: single ? undefined : blocks,
+      };
+    }),
     [transcripts, getLiveBlocksFor]
   );
 

@@ -133,6 +133,9 @@ export interface TranscriptSegmentData {
   // Live word-level diarization: display sub-rows for a split block
   // (live-word-level-diarization). Present only while recording.
   blocks?: LiveTranscriptBlock[];
+  // Live: the clusters a row's label was merged from, when a split block's
+  // runs all show one speaker (the row renders unsplit with that label).
+  speaker_parts?: LiveBlockPart[];
 }
 
 // One display sub-row emitted by live word-level diarization for a transcript
@@ -145,6 +148,15 @@ export interface LiveTranscriptBlock {
   display_name?: string; // recognized/bound name to show instead of the label
   matched_by?: string; // 'user' | 'auto'
   match_score?: number;
+  // Frontend-only: the adjacent same-speaker sub-rows this row was merged
+  // from, so an edit can reach every constituent cluster over its own window.
+  parts?: LiveBlockPart[];
+}
+
+export interface LiveBlockPart {
+  speaker: string; // raw cluster label of the part
+  start: number;
+  end: number;
 }
 
 // Payload of the `live-transcript-blocks` event: the current display revision

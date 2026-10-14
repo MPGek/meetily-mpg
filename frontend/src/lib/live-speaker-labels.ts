@@ -1,5 +1,5 @@
 import type { SpeakerTurn } from '@/services/recordingService';
-import type { LiveTranscriptBlock, LiveTranscriptBlocks, Transcript } from '@/types';
+import type { LiveBlockPart, LiveTranscriptBlock, LiveTranscriptBlocks, Transcript } from '@/types';
 
 /**
  * Pure helpers for live speaker-label re-matching and binding rewrite.
@@ -159,15 +159,35 @@ export interface LiveWindowOverride {
   name: string;
 }
 
+/** A user-named copy of a block, or the block itself when nothing changes. */
+function withUserName(b: LiveTranscriptBlock, name: string | undefined): LiveTranscriptBlock {
+  if (name === undefined) return b;
+  if (name === b.display_name && b.matched_by === 'user') return b;
+  return { ...b, display_name: name, matched_by: 'user' };
+}
+
 /**
- * Apply live user assignments across a block's sub-rows: a window-scoped
- * override lands on the sub-row whose time window it covers on the same
- * channel, whatever cluster that window is now attributed to, and the most
- * recent override wins; a parent pin and a cluster binding apply to every
- * sub-row of that cluster. Returns new block objects only for changed rows,
- * so unchanged rows keep their identity.
+ * Apply the cluster-wide live assignments: a parent pin and a cluster binding
+ * name every sub-row of their cluster; the pin wins over the binding.
  */
-export function resolveLiveBlocks(
+export function applyClusterAssignments(
+  blocks: LiveTranscriptBlock[],
+  ctx: LiveBlockResolution
+): LiveTranscriptBlock[] {
+  return blocks.map(b =>
+    withUserName(
+      b,
+      ctx.pinned && ctx.pinned.cluster === b.speaker ? ctx.pinned.name : ctx.clusterBindings?.get(b.speaker)
+    )
+  );
+}
+
+/**
+ * Apply window-scoped overrides: each lands on the sub-row whose time window
+ * it covers most on the same channel, whatever cluster that window is now
+ * attributed to, and the most recent override wins.
+ */
+export function applyWindowOverrides(
   blocks: LiveTranscriptBlock[],
   ctx: LiveBlockResolution
 ): LiveTranscriptBlock[] {
@@ -188,27 +208,107 @@ export function resolveLiveBlocks(
     });
     if (best >= 0) landed.set(best, o);
   }
-  return blocks.map((b, i) => {
-    const override = landed.get(i);
-    let name: string | undefined;
-    let matchedBy: string | undefined;
-    if (override) {
-      name = override.name;
-      matchedBy = 'user';
-    } else if (ctx.pinned && ctx.pinned.cluster === b.speaker) {
-      name = ctx.pinned.name;
-      matchedBy = 'user';
-    } else {
-      const bound = ctx.clusterBindings?.get(b.speaker);
-      if (bound) {
-        name = bound;
-        matchedBy = 'user';
-      }
-    }
+  return blocks.map((b, i) => withUserName(b, landed.get(i)?.name));
+}
 
-    const displayName = name ?? b.display_name;
-    const nextMatchedBy = matchedBy ?? b.matched_by;
-    if (displayName === b.display_name && nextMatchedBy === b.matched_by) return b;
-    return { ...b, display_name: displayName, matched_by: nextMatchedBy };
-  });
+/**
+ * Apply live user assignments across a block's sub-rows: a window-scoped
+ * override beats a parent pin, which beats a cluster binding. Returns new
+ * block objects only for changed rows, so unchanged rows keep their identity.
+ */
+export function resolveLiveBlocks(
+  blocks: LiveTranscriptBlock[],
+  ctx: LiveBlockResolution
+): LiveTranscriptBlock[] {
+  return applyWindowOverrides(applyClusterAssignments(blocks, ctx), ctx);
+}
+
+/**
+ * The live view of a split block: user assignments applied and adjacent
+ * sub-rows of the same visible speaker merged. Cluster assignments go first
+ * (they are exact per cluster), then the merge, so a window override made on a
+ * merged row lands on the whole merged span; a second merge joins neighbours
+ * that a rename made equal.
+ */
+export function resolveMergedLiveBlocks(
+  blocks: LiveTranscriptBlock[],
+  ctx: LiveBlockResolution
+): LiveTranscriptBlock[] {
+  return mergeLiveBlocks(applyWindowOverrides(mergeLiveBlocks(applyClusterAssignments(blocks, ctx)), ctx));
+}
+
+/** Whether two sub-rows show the same speaker: same visible name, same ownership. */
+function sameVisibleSpeaker(a: LiveTranscriptBlock, b: LiveTranscriptBlock): boolean {
+  return (
+    (a.display_name ?? a.speaker) === (b.display_name ?? b.speaker) &&
+    (a.matched_by === 'user') === (b.matched_by === 'user')
+  );
+}
+
+function partsOf(b: LiveTranscriptBlock): LiveBlockPart[] {
+  return b.parts ?? [{ speaker: b.speaker, start: b.start, end: b.end }];
+}
+
+/**
+ * Merge adjacent sub-rows that show the same speaker (same visible name and
+ * ownership) into one. A merged row spans its first part's start to its last
+ * part's end, joins the text, keeps the longest part's cluster (dot colour)
+ * and the lowest match score, and lists its parts so an edit can reach every
+ * constituent cluster. A row that merges nothing is returned as is.
+ */
+export function mergeLiveBlocks(blocks: LiveTranscriptBlock[]): LiveTranscriptBlock[] {
+  const out: LiveTranscriptBlock[] = [];
+  let group: LiveTranscriptBlock[] = [];
+  const flush = () => {
+    if (group.length === 1) {
+      out.push(group[0]);
+    } else if (group.length > 1) {
+      const parts = group.flatMap(partsOf);
+      const longest = parts.reduce((a, p) => (p.end - p.start > a.end - a.start ? p : a));
+      const scores = group.map(b => b.match_score).filter((s): s is number => s !== undefined);
+      out.push({
+        start: group[0].start,
+        end: group[group.length - 1].end,
+        text: group.map(b => b.text).join(' '),
+        speaker: longest.speaker,
+        display_name: group[0].display_name,
+        matched_by: group[0].matched_by,
+        match_score: scores.length ? Math.min(...scores) : undefined,
+        parts,
+      });
+    }
+    group = [];
+  };
+  for (const b of blocks) {
+    if (group.length && !sameVisibleSpeaker(group[group.length - 1], b)) flush();
+    group.push(b);
+  }
+  flush();
+  return out;
+}
+
+/** One backend live-speaker assignment an edit has to send. */
+export type LiveAssignmentCall =
+  | { kind: 'cluster'; cluster: string }
+  | { kind: 'block'; cluster: string; start: number; end?: number };
+
+/**
+ * The backend assignments for a live label edit. The stop-time persistence
+ * matches per-turn overrides by cluster and window, so a row merged from
+ * several clusters needs one call per part: per distinct cluster for a
+ * cluster-wide edit, per part over its own window for a single-row edit.
+ */
+export function liveAssignmentCalls(
+  parts: LiveBlockPart[] | undefined,
+  cluster: string,
+  clusterWide: boolean,
+  start: number,
+  end?: number
+): LiveAssignmentCall[] {
+  if (clusterWide) {
+    const clusters = parts?.length ? [...new Set(parts.map(p => p.speaker))] : [cluster];
+    return clusters.map(c => ({ kind: 'cluster', cluster: c }));
+  }
+  if (!parts?.length) return [{ kind: 'block', cluster, start, end }];
+  return parts.map(p => ({ kind: 'block', cluster: p.speaker, start: p.start, end: p.end }));
 }

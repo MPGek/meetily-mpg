@@ -10,7 +10,7 @@ import { indexedDBService } from '@/services/indexedDBService';
 import { getMeetingFolderPath } from '@/lib/ipc/meetings';
 import { loadDiarizationSettings } from '@/lib/diarization';
 import { dedupeAndInsertTranscript, formatTranscriptForClipboard } from '@/lib/transcript-formatting';
-import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveLiveBlocks, type LiveWindowOverride } from '@/lib/live-speaker-labels';
+import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveMergedLiveBlocks, type LiveWindowOverride } from '@/lib/live-speaker-labels';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
@@ -18,7 +18,7 @@ interface TranscriptContextType {
   addTranscript: (update: TranscriptUpdate) => void;
   copyTranscript: () => void;
   flushBuffer: () => void;
-  transcriptContainerRef: React.RefObject<HTMLDivElement>;
+  transcriptContainerRef: React.RefCallback<HTMLDivElement>;
   isFollowingBottom: boolean;
   scrollToBottom: () => void;
   meetingTitle: string;
@@ -48,19 +48,24 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
   const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
-  // Mirror of isUserAtBottomRef exposed as state so the scroll-to-bottom
-  // button can render; suppressed while a programmatic smooth scroll runs.
+  // Mirror of isFollowingRef exposed as state so the scroll-to-bottom button
+  // can render.
   const [isFollowingBottom, setIsFollowingBottom] = useState<boolean>(true);
+  // The live transcript scroll container, held in state so the scroll
+  // listeners re-attach when TranscriptPanel remounts (page navigation).
+  const [transcriptContainer, setTranscriptContainer] = useState<HTMLDivElement | null>(null);
 
   // Recording state context - provides backend-synced state
   const recordingState = useRecordingState();
 
   // Refs for transcript management
   const transcriptsRef = useRef<Transcript[]>(transcripts);
-  const isUserAtBottomRef = useRef<boolean>(true);
-  const isProgrammaticScrollRef = useRef<boolean>(false);
-  const programmaticScrollResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const isFollowingRef = useRef<boolean>(true);
+  const transcriptContainerElRef = useRef<HTMLDivElement | null>(null);
+  const transcriptContainerRef = useCallback((el: HTMLDivElement | null) => {
+    transcriptContainerElRef.current = el;
+    setTranscriptContainer(el);
+  }, []);
   const finalFlushRef = useRef<(() => void) | null>(null);
   const turnsRef = useRef<SpeakerTurn[]>([]);
   // Live word-level diarization: latest display revision per parent
@@ -99,137 +104,76 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
 
-  // Smart auto-scroll: Track user scroll position
-  const isContainerAtBottom = useCallback(() => {
-    const container = transcriptContainerRef.current;
-    if (!container) return true;
+  // Live auto-follow. Following changes only on user intent: an upward
+  // scroll pauses it; reaching the bottom or the button resumes it. Where a
+  // programmatic scroll or content growth leaves the view never turns it off,
+  // because content keeps growing (new segments, typewriter text, speaker
+  // labels, sub-rows) after any scroll has been aimed at the old bottom.
+  const isContainerAtBottom = useCallback((container: HTMLDivElement) => {
     const { scrollTop, scrollHeight, clientHeight } = container;
     return scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
   }, []);
 
+  const setFollowing = useCallback((following: boolean) => {
+    isFollowingRef.current = following;
+    setIsFollowingBottom(following);
+  }, []);
+
   useEffect(() => {
-    const container = transcriptContainerRef.current;
+    const container = transcriptContainer;
     if (!container) return;
+
+    // A freshly mounted panel starts at the live bottom.
+    setFollowing(true);
+    container.scrollTop = container.scrollHeight;
+    let lastScrollTop = container.scrollTop;
 
     const handleScroll = () => {
-      const atBottom = isContainerAtBottom();
-      isUserAtBottomRef.current = atBottom;
-      if (atBottom && isProgrammaticScrollRef.current) {
-        // Programmatic smooth scroll reached its target
-        isProgrammaticScrollRef.current = false;
-        if (programmaticScrollResetRef.current) {
-          clearTimeout(programmaticScrollResetRef.current);
-          programmaticScrollResetRef.current = null;
-        }
+      const scrollTop = container.scrollTop;
+      if (isContainerAtBottom(container)) {
+        setFollowing(true);
+      } else if (scrollTop < lastScrollTop - 1) {
+        // Only the user moves the view up: pinning, clamping and content
+        // growth move it down or leave it at the bottom.
+        setFollowing(false);
       }
-      // Ignore intermediate "not at bottom" events of our own smooth scroll
-      // so the button does not flicker while auto-follow/button click animates.
-      if (!isProgrammaticScrollRef.current) {
-        setIsFollowingBottom(atBottom);
-      }
+      lastScrollTop = scrollTop;
     };
 
-    // Abandon our in-flight smooth scroll: an instant scrollTo at the
-    // current position cancels a running smooth animation.
-    const releaseProgrammaticScroll = () => {
-      if (!isProgrammaticScrollRef.current) return;
-      container.scrollTo({ top: container.scrollTop, behavior: 'instant' });
-      isProgrammaticScrollRef.current = false;
-      if (programmaticScrollResetRef.current) {
-        clearTimeout(programmaticScrollResetRef.current);
-        programmaticScrollResetRef.current = null;
+    // The wheel event arrives before the scroll it causes, so a wheel-up is
+    // never undone by a pin from content that grew in the same frame.
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0 && container.scrollTop > 0) {
+        setFollowing(false);
       }
     };
 
-    const syncFollowingFromPosition = () => {
-      const atBottom = isContainerAtBottom();
-      isUserAtBottomRef.current = atBottom;
-      setIsFollowingBottom(atBottom);
-    };
-
-    const SCROLL_KEYS = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '];
-    const handleUserInterrupt = (e: Event) => {
-      if (e.type === 'keydown' && !SCROLL_KEYS.includes((e as KeyboardEvent).key)) {
-        return;
+    // Pin to the bottom whenever the container or its content changes size.
+    const resizeObserver = new ResizeObserver(() => {
+      if (isFollowingRef.current) {
+        container.scrollTop = container.scrollHeight;
       }
-      // User input during our animation is interrupt intent (D8): release the
-      // suppression flag and re-sync state from the current position so the
-      // button reacts immediately instead of waiting for the fallback timer.
-      releaseProgrammaticScroll();
-      syncFollowingFromPosition();
-    };
-
-    const handleScrollEnd = () => {
-      if (!isProgrammaticScrollRef.current) return;
-      releaseProgrammaticScroll();
-      syncFollowingFromPosition();
-    };
-
-    container.addEventListener('scroll', handleScroll);
-    container.addEventListener('wheel', handleUserInterrupt, { passive: true });
-    container.addEventListener('touchstart', handleUserInterrupt, { passive: true });
-    container.addEventListener('keydown', handleUserInterrupt);
-    container.addEventListener('scrollend', handleScrollEnd);
-    return () => {
-      container.removeEventListener('scroll', handleScroll);
-      container.removeEventListener('wheel', handleUserInterrupt);
-      container.removeEventListener('touchstart', handleUserInterrupt);
-      container.removeEventListener('keydown', handleUserInterrupt);
-      container.removeEventListener('scrollend', handleScrollEnd);
-      if (programmaticScrollResetRef.current) {
-        clearTimeout(programmaticScrollResetRef.current);
-        programmaticScrollResetRef.current = null;
-      }
-    };
-  }, [isContainerAtBottom]);
-
-  // Scroll to the bottom and re-enable auto-follow (used by the button and
-  // by the auto-scroll effect below).
-  const scrollToBottom = useCallback(() => {
-    const container = transcriptContainerRef.current;
-    if (!container) return;
-    isUserAtBottomRef.current = true;
-    setIsFollowingBottom(true);
-    if (isContainerAtBottom()) {
-      // Already at bottom: nothing will move, no events will fire -- arming
-      // the flag here would only suppress genuine user scrolls (D8).
-      return;
-    }
-    isProgrammaticScrollRef.current = true;
-    if (programmaticScrollResetRef.current) {
-      clearTimeout(programmaticScrollResetRef.current);
-    }
-    // Last-resort fallback in case neither a bottom-reaching scroll event nor
-    // `scrollend` fires (e.g. the animation is interrupted without events).
-    programmaticScrollResetRef.current = setTimeout(() => {
-      programmaticScrollResetRef.current = null;
-      isProgrammaticScrollRef.current = false;
-      const atBottom = isContainerAtBottom();
-      isUserAtBottomRef.current = atBottom;
-      setIsFollowingBottom(atBottom);
-    }, 500);
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior: 'smooth'
     });
-  }, [isContainerAtBottom]);
+    resizeObserver.observe(container);
+    Array.from(container.children).forEach(child => resizeObserver.observe(child));
 
-  // Auto-scroll when transcripts change (only if user is at bottom)
-  useEffect(() => {
-    // Only auto-scroll if user was at the bottom before new content
-    if (isUserAtBottomRef.current && transcriptContainerRef.current) {
-      // Wait for Framer Motion animation to complete (150ms) before scrolling
-      // This ensures scrollHeight includes the full rendered height of the new transcript
-      const scrollTimeout = setTimeout(() => {
-        // Re-check at-bottom: the user may have scrolled up during the delay
-        if (isUserAtBottomRef.current) {
-          scrollToBottom();
-        }
-      }, 150); // Match Framer Motion transition duration
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    container.addEventListener('wheel', handleWheel, { passive: true });
+    return () => {
+      resizeObserver.disconnect();
+      container.removeEventListener('scroll', handleScroll);
+      container.removeEventListener('wheel', handleWheel);
+    };
+  }, [transcriptContainer, isContainerAtBottom, setFollowing]);
 
-      return () => clearTimeout(scrollTimeout);
+  // Return to the live bottom and resume auto-follow (scroll-to-bottom button).
+  const scrollToBottom = useCallback(() => {
+    setFollowing(true);
+    const container = transcriptContainerElRef.current;
+    if (container) {
+      container.scrollTop = container.scrollHeight;
     }
-  }, [transcripts, scrollToBottom]);
+  }, [setFollowing]);
 
   // Listen for live speaker turns (Fast-mode online diarization) and
   // retroactively assign `speaker` to transcript segments by time overlap.
@@ -821,14 +765,16 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Resolve a transcript's live word-level diarization sub-rows against the
-  // session's live user assignments. Only blocks split into >1 speaker run are
-  // returned, so single-speaker blocks render exactly as before.
+  // session's live user assignments, merging adjacent sub-rows of the same
+  // visible speaker. Only blocks split into >1 speaker run are returned, so
+  // single-speaker blocks render exactly as before; a split whose runs all
+  // merge comes back as one run, which the panel uses as the row's label.
   const getLiveBlocksFor = useCallback((transcript: Transcript): LiveTranscriptBlock[] | undefined => {
     const seq = transcript.sequence_id;
     if (seq === undefined || seq === null) return undefined;
     const payload = liveBlocks.get(seq);
     if (!payload || payload.blocks.length < 2) return undefined;
-    return resolveLiveBlocks(payload.blocks, {
+    return resolveMergedLiveBlocks(payload.blocks, {
       clusterBindings: clusterBindingsRef.current,
       pinned: userAssignmentsRef.current.get(transcript.id),
       windowOverrides: windowOverridesRef.current,

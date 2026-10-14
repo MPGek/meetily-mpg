@@ -13,7 +13,8 @@ import { toast } from "sonner";
 import { Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Pause, Play } from "lucide-react";
-import { TranscriptSegmentData, LiveTranscriptBlock } from "@/types";
+import { TranscriptSegmentData, LiveTranscriptBlock, LiveBlockPart } from "@/types";
+import { liveAssignmentCalls } from "@/lib/live-speaker-labels";
 import { sourceSideLayout } from "@/lib/source-side-layout";
 
 export interface VirtualizedTranscriptViewProps {
@@ -142,6 +143,7 @@ function SpeakerLabel({
     matchedBy,
     matchScore,
     subRow,
+    parts,
 }: {
     speaker: string;
     label?: string;
@@ -155,12 +157,43 @@ function SpeakerLabel({
     matchScore?: number;
     /** A sub-row of a live-split block: single-block edits touch only it. */
     subRow?: boolean;
+    /** Live: the clusters this label was merged from; edits reach each of them. */
+    parts?: LiveBlockPart[];
 }) {
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
     const [registrySpeakers, setRegistrySpeakers] = useState<Array<{ id: string; name: string }>>([]);
     const [loading, setLoading] = useState(false);
     const [scopeAll, setScopeAll] = useState(false);
+
+    // Live recording: one backend assignment per merged part (stop-time
+    // persistence matches overrides by cluster and window), or the single
+    // call a plain row sends.
+    const sendLive = async (speakerId?: string, newName?: string) => {
+        const calls = liveAssignmentCalls(parts, speaker, scopeAll || !transcriptId, startTime ?? 0, endTime);
+        for (const call of calls) {
+            if (call.kind === 'cluster') {
+                await recordingService.assignLiveSpeaker(call.cluster, speakerId, newName);
+            } else {
+                await recordingService.assignLiveSpeakerBlock(call.cluster, call.start, speakerId, newName, call.end);
+            }
+        }
+    };
+
+    // Scope-aware local propagation: apply-to-all passes no transcriptId so
+    // the updater relabels every block of the cluster (each merged cluster);
+    // single-block passes the id (design D11). A merged label edits through the
+    // sub-row path, a window override over the whole row.
+    const applyLocal = async (name: string) => {
+        if (!onUpdate) return;
+        if (scopeAll && parts?.length) {
+            for (const cluster of new Set(parts.map(p => p.speaker))) {
+                await onUpdate(cluster, name, undefined, startTime, endTime, false);
+            }
+            return;
+        }
+        await onUpdate(speaker, name, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && (!!subRow || !!parts?.length));
+    };
 
     const displayName = formatSpeakerDisplay(label || formatSpeakerId(speaker), matchedBy, matchScore);
 
@@ -212,22 +245,9 @@ function SpeakerLabel({
             } else {
                 // Live recording view: cluster-wide via the prototype store,
                 // or a per-turn override on this block when scoped.
-                if (scopeAll || !transcriptId) {
-                    await recordingService.assignLiveSpeaker(speaker, sp.id);
-                } else {
-                    await recordingService.assignLiveSpeakerBlock(
-                        speaker,
-                        startTime ?? 0,
-                        sp.id,
-                        undefined,
-                        endTime
-                    );
-                }
+                await sendLive(sp.id, undefined);
             }
-            // Scope-aware local propagation: apply-to-all passes no
-            // transcriptId so the updater relabels every block of the
-            // cluster; single-block passes the id (design D11).
-            await onUpdate(speaker, sp.name, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && subRow);
+            await applyLocal(sp.name);
         } catch (error) {
             console.error("Failed to assign speaker:", error);
             // Backend write runs before onUpdate, so the local label was never
@@ -248,19 +268,9 @@ function SpeakerLabel({
             } else {
                 // Live: record a binding with the displayed (auto) name so it
                 // persists as a user binding at stop.
-                if (scopeAll || !transcriptId) {
-                    await recordingService.assignLiveSpeaker(speaker, undefined, label);
-                } else {
-                    await recordingService.assignLiveSpeakerBlock(
-                        speaker,
-                        startTime ?? 0,
-                        undefined,
-                        label,
-                        endTime
-                    );
-                }
+                await sendLive(undefined, label);
             }
-            await onUpdate(speaker, label, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && subRow);
+            await applyLocal(label);
             toast.success("Speaker confirmed");
         } catch (error) {
             console.error("Failed to confirm speaker:", error);
@@ -285,19 +295,9 @@ function SpeakerLabel({
                     await recordingService.assignSpeaker(meetingId, speaker, undefined, trimmed);
                 }
             } else {
-                if (scopeAll || !transcriptId) {
-                    await recordingService.assignLiveSpeaker(speaker, undefined, trimmed);
-                } else {
-                    await recordingService.assignLiveSpeakerBlock(
-                        speaker,
-                        startTime ?? 0,
-                        undefined,
-                        trimmed,
-                        endTime
-                    );
-                }
+                await sendLive(undefined, trimmed);
             }
-            await onUpdate(speaker, trimmed, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && subRow);
+            await applyLocal(trimmed);
         } catch (error) {
             console.error("Failed to create speaker:", error);
             toast.error("Failed to assign speaker");
@@ -453,6 +453,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isActive,
     isAudioPlaying,
     blocks,
+    speaker_parts,
 }: {
     id: string;
     timestamp: number;
@@ -481,6 +482,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isAudioPlaying?: boolean;
     /** Live word-level diarization sub-rows (only when a block was split). */
     blocks?: LiveTranscriptBlock[];
+    /** Live: the clusters an unsplit row's label was merged from. */
+    speaker_parts?: LiveBlockPart[];
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -551,6 +554,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                             matchedBy={block.matched_by}
                                             matchScore={block.match_score}
                                             subRow
+                                            parts={block.parts}
                                         />
                                         {side.dotPosition === 'after' && (
                                             <span
@@ -646,6 +650,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     endTime={endTime}
                                     matchedBy={speaker_matched_by}
                                     matchScore={speaker_match_score}
+                                    parts={speaker_parts}
                                 />
                             </div>
                         )}
@@ -700,6 +705,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     endTime={endTime}
                                     matchedBy={speaker_matched_by}
                                     matchScore={speaker_match_score}
+                                    parts={speaker_parts}
                                 />
                             </div>
                         )}
@@ -733,6 +739,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                                     endTime={endTime}
                                     matchedBy={speaker_matched_by}
                                     matchScore={speaker_match_score}
+                                    parts={speaker_parts}
                                 />
                             <span
                                 className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
@@ -969,6 +976,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        speaker_parts={segment.speaker_parts}
                                         speaker_matched_by={segment.speaker_matched_by}
                                         speaker_match_score={segment.speaker_match_score}
                                         hasAudioTime={segment.hasAudioTime ?? false}
@@ -1038,6 +1046,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         source_device={segment.source_device}
                                         speaker={segment.speaker}
                                         speaker_label={segment.speaker_label}
+                                        speaker_parts={segment.speaker_parts}
                                         speaker_matched_by={segment.speaker_matched_by}
                                         speaker_match_score={segment.speaker_match_score}
                                         hasAudioTime={segment.hasAudioTime ?? false}
