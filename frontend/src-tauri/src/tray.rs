@@ -1,8 +1,7 @@
 use tauri::{
-    Emitter,
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
-    tray::TrayIconBuilder,
-    AppHandle, Manager, Runtime,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, Runtime,
 };
 
 #[derive(Debug, Clone)]
@@ -25,7 +24,19 @@ pub fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .menu(&menu)
         .tooltip("Meetily")
         .icon(app.default_window_icon().unwrap().clone())
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()))
+        .on_tray_icon_event(|tray, event| {
+            // Windows sends Click on both press and release; act once, on release
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                focus_main_window(tray.app_handle());
+            }
+        })
         .build(app)?;
 
     // Update tray menu with actual recording state after creation
@@ -92,7 +103,10 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
                     // Trigger frontend post-processing via event (works from any page)
                     // (SQLite save, navigation, analytics)
                     if let Err(e) = app_clone.emit("recording-stop-complete", true) {
-                        log::error!("Tray toggle: Failed to emit recording-stop-complete event: {}", e);
+                        log::error!(
+                            "Tray toggle: Failed to emit recording-stop-complete event: {}",
+                            e
+                        );
                     }
                 }
                 Err(e) => {
@@ -203,9 +217,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 fn check_updates_handler<R: Runtime>(app: &AppHandle<R>) {
     focus_main_window(app);
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.eval(
-            "window.dispatchEvent(new CustomEvent('check-updates-from-tray'))"
-        );
+        let _ = window.eval("window.dispatchEvent(new CustomEvent('check-updates-from-tray'))");
     }
 }
 
@@ -269,7 +281,10 @@ async fn check_can_record<R: Runtime>(app: &AppHandle<R>) -> bool {
     let onboarding_complete = match crate::onboarding::load_onboarding_status(app).await {
         Ok(status) => status.completed,
         Err(e) => {
-            log::warn!("Tray: Failed to load onboarding status: {}, assuming complete", e);
+            log::warn!(
+                "Tray: Failed to load onboarding status: {}, assuming complete",
+                e
+            );
             true // Assume complete if we can't check (safe default)
         }
     };
@@ -281,10 +296,15 @@ async fn check_can_record<R: Runtime>(app: &AppHandle<R>) -> bool {
     }
 
     // During onboarding, check if the active transcription provider's model is ready
-    match crate::audio::transcription::commands::check_active_transcription_model_ready(app.clone()).await {
+    match crate::audio::transcription::commands::check_active_transcription_model_ready(app.clone())
+        .await
+    {
         Ok(status) => status.ready,
         Err(e) => {
-            log::warn!("Tray: Failed to check transcription model readiness: {}, assuming not ready", e);
+            log::warn!(
+                "Tray: Failed to check transcription model readiness: {}, assuming not ready",
+                e
+            );
             false
         }
     }
@@ -330,8 +350,9 @@ fn build_menu<R: Runtime>(
     } else {
         match state {
             RecordingState::Stopped => {
-                builder = builder
-                    .item(&MenuItemBuilder::with_id("toggle_recording", "Start Recording").build(app)?);
+                builder = builder.item(
+                    &MenuItemBuilder::with_id("toggle_recording", "Start Recording").build(app)?,
+                );
             }
             RecordingState::Starting => {
                 builder = builder.item(
@@ -342,8 +363,14 @@ fn build_menu<R: Runtime>(
             }
             RecordingState::Recording => {
                 builder = builder
-                    .item(&MenuItemBuilder::with_id("pause_recording", "⏸ Pause Recording").build(app)?)
-                    .item(&MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording").build(app)?);
+                    .item(
+                        &MenuItemBuilder::with_id("pause_recording", "⏸ Pause Recording")
+                            .build(app)?,
+                    )
+                    .item(
+                        &MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording")
+                            .build(app)?,
+                    );
             }
             RecordingState::Pausing => {
                 builder = builder
@@ -352,7 +379,10 @@ fn build_menu<R: Runtime>(
                             .enabled(false)
                             .build(app)?,
                     )
-                    .item(&MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording").build(app)?);
+                    .item(
+                        &MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording")
+                            .build(app)?,
+                    );
             }
             RecordingState::Paused => {
                 builder = builder
@@ -360,7 +390,10 @@ fn build_menu<R: Runtime>(
                         &MenuItemBuilder::with_id("resume_recording", "▶ Resume Recording")
                             .build(app)?,
                     )
-                    .item(&MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording").build(app)?);
+                    .item(
+                        &MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording")
+                            .build(app)?,
+                    );
             }
             RecordingState::Resuming => {
                 builder = builder
@@ -369,7 +402,10 @@ fn build_menu<R: Runtime>(
                             .enabled(false)
                             .build(app)?,
                     )
-                    .item(&MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording").build(app)?);
+                    .item(
+                        &MenuItemBuilder::with_id("stop_recording", "⏹ Stop Recording")
+                            .build(app)?,
+                    );
             }
             RecordingState::Stopping => {
                 builder = builder.item(

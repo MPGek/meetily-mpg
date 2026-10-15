@@ -1,18 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { Switch } from '@/components/ui/switch';
 import { FolderOpen } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  getDefaultRecordingsFolderPath,
+  getRecordingPreferences,
+  setRecordingPreferences,
+  type RecordingPreferences,
+} from '@/lib/ipc/recording';
+import { openRecordingsFolder } from '@/lib/ipc/settings';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
+import { useConfig } from '@/contexts/ConfigContext';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
-
-export interface RecordingPreferences {
-  save_folder: string;
-  auto_save: boolean;
-  file_format: string;
-  preferred_mic_device: string | null;
-  preferred_system_device: string | null;
-}
 
 interface RecordingSettingsProps {
   onSave?: (preferences: RecordingPreferences) => void;
@@ -29,18 +28,19 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showRecordingNotification, setShowRecordingNotification] = useState(true);
+  const { setSelectedDevices } = useConfig();
 
   // Load recording preferences on component mount
   useEffect(() => {
     const loadPreferences = async () => {
       try {
-        const prefs = await invoke<RecordingPreferences>('get_recording_preferences');
+        const prefs = await getRecordingPreferences();
         setPreferences(prefs);
       } catch (error) {
         console.error('Failed to load recording preferences:', error);
         // If loading fails, get default folder path
         try {
-          const defaultPath = await invoke<string>('get_default_recordings_folder_path');
+          const defaultPath = await getDefaultRecordingsFolderPath();
           setPreferences(prev => ({ ...prev, save_folder: defaultPath }));
         } catch (defaultError) {
           console.error('Failed to get default folder path:', defaultError);
@@ -86,6 +86,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       preferred_system_device: devices.systemDevice
     };
     setPreferences(newPreferences);
+    setSelectedDevices(devices);
     await savePreferences(newPreferences);
 
     // Track default device preference changes
@@ -98,7 +99,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
   const handleOpenFolder = async () => {
     try {
-      await invoke('open_recordings_folder');
+      await openRecordingsFolder();
     } catch (error) {
       console.error('Failed to open recordings folder:', error);
     }
@@ -124,7 +125,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const savePreferences = async (prefs: RecordingPreferences) => {
     setSaving(true);
     try {
-      await invoke('set_recording_preferences', { preferences: prefs });
+      await setRecordingPreferences({ preferences: prefs });
       onSave?.(prefs);
 
       // Show success toast with device details
@@ -208,7 +209,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       {!preferences.auto_save && (
         <div className="p-4 border rounded-lg bg-yellow-50">
           <div className="text-sm text-yellow-800">
-            Audio recording is disabled. Enable "Save Audio Recordings" to automatically save your meeting audio.
+            Audio recording is disabled. Enable &quot;Save Audio Recordings&quot; to automatically save your meeting audio.
           </div>
         </div>
       )}

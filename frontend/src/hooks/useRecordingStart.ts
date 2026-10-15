@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { checkActiveTranscriptionModelReady } from '@/lib/ipc/transcript';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
+import { loadDiarizationSettings } from '@/lib/diarization';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
+import { formatRecordingStartError } from '@/lib/recording-start-error';
 import { toast } from 'sonner';
 
 interface UseRecordingStartReturn {
@@ -19,7 +21,7 @@ interface UseRecordingStartReturn {
  * Handles both manual start (button click) and auto-start (from sidebar navigation).
  *
  * Features:
- * - Meeting title generation (format: Meeting DD_MM_YY_HH_MM_SS)
+ * - Meeting title generation (format: Meeting YYYY-MM-DD_HH-MM)
  * - Transcript clearing on start
  * - Analytics tracking
  * - Recording notification display
@@ -40,21 +42,18 @@ export function useRecordingStart(
   // Generate meeting title with timestamp
   const generateMeetingTitle = useCallback(() => {
     const now = new Date();
-    const day = String(now.getDate()).padStart(2, '0');
+    const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
-    const year = String(now.getFullYear()).slice(-2);
+    const day = String(now.getDate()).padStart(2, '0');
     const hours = String(now.getHours()).padStart(2, '0');
     const minutes = String(now.getMinutes()).padStart(2, '0');
-    const seconds = String(now.getSeconds()).padStart(2, '0');
-    return `Meeting ${day}_${month}_${year}_${hours}_${minutes}_${seconds}`;
+    return `Meeting ${year}-${month}-${day}_${hours}-${minutes}`;
   }, []);
 
   // Check if the active transcription provider's model is ready
   const checkActiveModelReady = useCallback(async (): Promise<{ ready: boolean; downloading: boolean }> => {
     try {
-      const status = await invoke<{ ready: boolean; provider: string; downloading: boolean }>(
-        'check_active_transcription_model_ready'
-      );
+      const status = await checkActiveTranscriptionModelReady();
       return { ready: status.ready, downloading: status.downloading };
     } catch (error) {
       console.error('Failed to check transcription model status:', error);
@@ -98,10 +97,14 @@ export function useRecordingStart(
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
+      const diarizationSettings = loadDiarizationSettings();
+      const diarizationMode = diarizationSettings.enabled ? diarizationSettings.diarizationMode : "off";
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
-        randomTitle
+        randomTitle,
+        diarizationMode,
+        diarizationSettings.maxSpeakers > 0 ? diarizationSettings.maxSpeakers : null
       );
       console.log('Backend recording started successfully');
 
@@ -166,10 +169,13 @@ export function useRecordingStart(
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
             console.log('Auto-starting backend recording with meeting:', generatedMeetingTitle);
+            const diarizationSettings = loadDiarizationSettings();
             const result = await recordingService.startRecordingWithDevices(
               selectedDevices?.micDevice || null,
               selectedDevices?.systemDevice || null,
-              generatedMeetingTitle
+              generatedMeetingTitle,
+              diarizationSettings.enabled ? diarizationSettings.diarizationMode : "off",
+              diarizationSettings.maxSpeakers > 0 ? diarizationSettings.maxSpeakers : null
             );
             console.log('Auto-start backend recording result:', result);
 
@@ -186,7 +192,7 @@ export function useRecordingStart(
           } catch (error) {
             console.error('Failed to auto-start recording:', error);
             setStatus(RecordingStatus.ERROR, error instanceof Error ? error.message : 'Failed to auto-start recording');
-            alert('Failed to start recording. Check console for details.');
+            alert(formatRecordingStartError(error));
             Analytics.trackButtonClick('start_recording_error', 'sidebar_auto');
           } finally {
             setIsAutoStarting(false);
@@ -251,10 +257,13 @@ export function useRecordingStart(
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
         console.log('Starting backend recording with meeting:', generatedMeetingTitle);
+        const diarizationSettings = loadDiarizationSettings();
         const result = await recordingService.startRecordingWithDevices(
           selectedDevices?.micDevice || null,
           selectedDevices?.systemDevice || null,
-          generatedMeetingTitle
+          generatedMeetingTitle,
+          diarizationSettings.enabled ? diarizationSettings.diarizationMode : "off",
+          diarizationSettings.maxSpeakers > 0 ? diarizationSettings.maxSpeakers : null
         );
         console.log('Backend recording result:', result);
 
@@ -271,7 +280,7 @@ export function useRecordingStart(
       } catch (error) {
         console.error('Failed to start recording from sidebar:', error);
         setStatus(RecordingStatus.ERROR, error instanceof Error ? error.message : 'Failed to start recording from sidebar');
-        alert('Failed to start recording. Check console for details.');
+        alert(formatRecordingStartError(error));
         Analytics.trackButtonClick('start_recording_error', 'sidebar_direct');
       } finally {
         setIsAutoStarting(false);

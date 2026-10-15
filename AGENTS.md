@@ -4,23 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Codebase Map
 
-**Full map**: See [docs/CODEBASE_MAP.md](docs/CODEBASE_MAP.md) for the comprehensive codebase index linking to:
-- Architecture — System overview, architecture diagrams, directory structure ([CODEBASE_MAP_ARCHITECTURE.md](docs/CODEBASE_MAP_ARCHITECTURE.md))
-- Modules Index — Module dependency graph and cross-module patterns ([CODEBASE_MAP_MODULES.md](docs/CODEBASE_MAP_MODULES.md))
-- Audio Engine — Deep dive: capture, mixing, VAD, device management ([CODEBASE_MAP_MODULE_AUDIO.md](docs/CODEBASE_MAP_MODULE_AUDIO.md))
-- Whisper Engine — Whisper.cpp integration and model management ([CODEBASE_MAP_MODULE_WHISPER.md](docs/CODEBASE_MAP_MODULE_WHISPER.md))
-- Parakeet Engine — ONNX streaming transcription ([CODEBASE_MAP_MODULE_PARAKEET.md](docs/CODEBASE_MAP_MODULE_PARAKEET.md))
-- Summary Service — AI summarization with multi-provider support ([CODEBASE_MAP_MODULE_SUMMARY.md](docs/CODEBASE_MAP_MODULE_SUMMARY.md))
-- AI Providers — Ollama, OpenAI, Anthropic, Groq, OpenRouter adapters ([CODEBASE_MAP_MODULE_AI_PROVIDERS.md](docs/CODEBASE_MAP_MODULE_AI_PROVIDERS.md))
-- Database — SQLite data layer and repositories ([CODEBASE_MAP_MODULE_DATABASE.md](docs/CODEBASE_MAP_MODULE_DATABASE.md))
-- Notifications — Desktop notification system ([CODEBASE_MAP_MODULE_NOTIFICATIONS.md](docs/CODEBASE_MAP_MODULE_NOTIFICATIONS.md))
-- Analytics — PostHog integration ([CODEBASE_MAP_MODULE_ANALYTICS.md](docs/CODEBASE_MAP_MODULE_ANALYTICS.md))
-- Data Flow — Data pipelines and sequence diagrams ([CODEBASE_MAP_DATA_FLOW.md](docs/CODEBASE_MAP_DATA_FLOW.md))
+**Map**: See [docs/CODEBASE_MAP.md](docs/CODEBASE_MAP.md) for the thin, stable overview (system summary and core capabilities), linking to:
+- Architecture — System overview, architecture diagrams, layer descriptions ([CODEBASE_MAP_ARCHITECTURE.md](docs/CODEBASE_MAP_ARCHITECTURE.md))
 - Conventions — Patterns, naming standards, architectural principles ([CODEBASE_MAP_CONVENTIONS.md](docs/CODEBASE_MAP_CONVENTIONS.md))
-- Operations — Build, deploy, run commands, gotchas ([CODEBASE_MAP_OPERATIONS.md](docs/CODEBASE_MAP_OPERATIONS.md))
-- Navigation — Getting started, common tasks, file quick reference ([CODEBASE_MAP_NAVIGATION.md](docs/CODEBASE_MAP_NAVIGATION.md))
+- Operations — Build, test, lint, CI, crash diagnostics, gotchas ([CODEBASE_MAP_OPERATIONS.md](docs/CODEBASE_MAP_OPERATIONS.md))
 
-**Recent additions** (since last map update, 2026-08-05): mic/system channel separation (stereo, left=mic right=sys; `source_device` on transcripts), VAD rewritten to **Silero v6** with unified `VadConfig` and a rolling buffer (`audio/vad.rs`), transcription provider abstraction (`audio/transcription/`), "Enhance" re-transcription (`audio/retranscription.rs`), audio import (`audio/import.rs`), LLM debug logging (`summary/debug_log.rs` — NEW, uncommitted working-tree file), frontend transcript pagination (`usePaginatedTranscripts.ts`, `VirtualizedTranscriptView.tsx`), and GPU build scripts (`scripts/env-cuda.*`, `frontend/build-gpu.*`/`dev-gpu.*`). The legacy Python `backend/` was removed.
+**File-, module- and symbol-level navigation**: use graphify (see the graphify section below) — `graphify query`/`explain`/`path`, the wiki at `graphify-out/wiki/index.md` (gitignored; generate on demand with `graphify export wiki` after `graphify update .`), or `graphify-out/GRAPH_REPORT.md`.
+
+**Changelog**: for what has shipped, see `openspec/changes/archive/` (browse newest-first).
 
 ## Project Overview
 
@@ -51,6 +42,10 @@ When bumping the app version, update **all three** locations:
 - Any hardcoded version strings in UI components (e.g. `Sidebar/index.tsx`)
 
 Tauri ignores `Cargo.toml` for its runtime version; it only reads `tauri.conf.json`.
+
+# Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
 ## 1. Think Before Coding
 
@@ -88,8 +83,6 @@ When your changes create orphans:
 - Remove imports/variables/functions that YOUR changes made unused.
 - Don't remove pre-existing dead code unless asked.
 
-Keep Unicode emoji (e.g. 🔧 🚀 ✅) in scripts and other files exactly as they are. When editing or rewriting a file that already contains emoji, preserve every emoji that was there — don't strip, replace, or "clean up" existing emoji, and don't reword content in a way that drops them.
-
 The test: Every changed line should trace directly to the user's request.
 
 ## 4. Goal-Driven Execution
@@ -111,3 +104,5 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 ---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

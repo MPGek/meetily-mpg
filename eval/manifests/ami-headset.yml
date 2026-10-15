@@ -1,0 +1,19 @@
+# AMI meeting corpus, headset-mix variant (all close-talk headsets mixed).
+# Audio is license-gated (same drop as ami-sdm). Reference from BUTSpeechFIT.
+name: ami-headset
+license: "CC BY 4.0 (AMI corpus, requires signed EULA)"
+parser: ami_but_speechfit
+gated: true
+channel_policy: headset-mix
+baseline_der: 18.8
+split: test
+raw_files:
+  - ami-headset-audio.zip
+raw_hint: >
+  Obtain the AMI corpus headset audio (amicorpus meetings, *.Headset-XX.flac) from
+  https://groups.inf.ed.ac.uk/ami/corpus/ after agreeing to the EULA, and place the
+  archive here as ami-headset-audio.zip (zip or tar.gz).
+sources:
+  - kind: http
+    url: https://github.com/BUTSpeechFIT/AMI-diarization-setup/archive/refs/heads/master.zip
+    filename: AMI-diarization-setup.zip

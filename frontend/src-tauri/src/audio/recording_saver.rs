@@ -1,15 +1,17 @@
-use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as AsyncMutex;
 use anyhow::Result;
-use log::{info, warn, error};
-use tauri::{AppHandle, Runtime, Emitter};
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::mpsc;
-use serde::{Serialize, Deserialize};
-use std::path::PathBuf;
+use tokio::sync::Mutex as AsyncMutex;
 
-use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
+use super::encode::run_ffmpeg_with_timeout;
+use super::ffmpeg::find_ffmpeg_path;
 use super::incremental_saver::IncrementalAudioSaver;
+use super::recording_state::AudioChunk;
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,11 +20,23 @@ pub struct TranscriptSegment {
     pub text: String,
     pub audio_start_time: f64, // Seconds from recording start
     pub audio_end_time: f64,   // Seconds from recording start
-    pub duration: f64,          // Segment duration in seconds
-    pub display_time: String,   // Formatted time for display like "[02:15]"
+    pub duration: f64,         // Segment duration in seconds
+    pub display_time: String,  // Formatted time for display like "[02:15]"
     pub confidence: f32,
     pub sequence_id: u64,
-    pub source_device: String,  // "Microphone" or "System"
+    pub source_device: String, // "Microphone" or "System"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<crate::audio::token_assignment::Token>>,
+}
+
+/// Structured partial-audio warning recorded in metadata.json and surfaced to
+/// the user via the `recording-audio-warning` event when the saved audio is
+/// known to be incomplete (failed checkpoints or a significant duration gap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWarning {
+    pub saved_duration_seconds: f64,
+    pub expected_duration_seconds: f64,
+    pub failed_checkpoints: u32,
 }
 
 /// Meeting metadata structure
@@ -38,7 +52,8 @@ pub struct MeetingMetadata {
     pub audio_file: String,
     pub transcript_file: String,
     pub sample_rate: u32,
-    pub status: String,  // "recording", "completed", "error"
+    pub status: String,                      // "recording", "completed", "error"
+    pub audio_warning: Option<AudioWarning>, // additive partial-audio flag (absent on clean saves)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +69,7 @@ pub struct RecordingSaver {
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
-    chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
+    chunk_receiver: Option<mpsc::Receiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
 }
 
@@ -97,18 +112,32 @@ impl RecordingSaver {
     pub fn add_transcript_segment(&self, segment: TranscriptSegment) {
         if let Ok(mut segments) = self.transcript_segments.lock() {
             // Check if segment with same sequence_id exists (update it)
-            if let Some(existing) = segments.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+            if let Some(existing) = segments
+                .iter_mut()
+                .find(|s| s.sequence_id == segment.sequence_id)
+            {
                 *existing = segment.clone();
-                info!("Updated transcript segment {} (seq: {}) - total segments: {}",
-                      segment.id, segment.sequence_id, segments.len());
+                info!(
+                    "Updated transcript segment {} (seq: {}) - total segments: {}",
+                    segment.id,
+                    segment.sequence_id,
+                    segments.len()
+                );
             } else {
                 // New segment, add it
                 segments.push(segment.clone());
-                info!("Added new transcript segment {} (seq: {}) - total segments: {}",
-                      segment.id, segment.sequence_id, segments.len());
+                info!(
+                    "Added new transcript segment {} (seq: {}) - total segments: {}",
+                    segment.id,
+                    segment.sequence_id,
+                    segments.len()
+                );
             }
         } else {
-            error!("Failed to lock transcript segments for adding segment {}", segment.id);
+            error!(
+                "Failed to lock transcript segments for adding segment {}",
+                segment.id
+            );
         }
 
         // NEW: Save incrementally to disk
@@ -131,6 +160,7 @@ impl RecordingSaver {
             confidence: 1.0,
             sequence_id: 0,
             source_device: "Microphone".to_string(),
+            tokens: None,
         };
         self.add_transcript_segment(segment);
     }
@@ -139,15 +169,20 @@ impl RecordingSaver {
     ///
     /// # Arguments
     /// * `auto_save` - If true, creates checkpoints and enables saving. If false, audio chunks are discarded.
-    pub fn start_accumulation(&mut self, auto_save: bool) -> mpsc::UnboundedSender<AudioChunk> {
+    pub fn start_accumulation(&mut self, auto_save: bool) -> mpsc::Sender<AudioChunk> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
-            info!("Starting recording without audio saving (auto-save DISABLED - transcripts only)");
+            info!(
+                "Starting recording without audio saving (auto-save DISABLED - transcripts only)"
+            );
         }
 
-        // Create channel for receiving audio chunks
-        let (sender, receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        // Create channel for receiving audio chunks. Bounded: matches
+        // `audio_sender`'s reasoning (recording-save-durability's existing
+        // checkpoint-failure requirements already assume this path can
+        // occasionally drop a segment).
+        let (sender, receiver) = mpsc::channel::<AudioChunk>(128);
         self.chunk_receiver = Some(receiver);
 
         // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
@@ -181,7 +216,10 @@ impl RecordingSaver {
 
         if let Some(mut receiver) = self.chunk_receiver.take() {
             tokio::spawn(async move {
-                info!("Recording saver accumulation task started (save_audio: {})", save_audio);
+                info!(
+                    "Recording saver accumulation task started (save_audio: {})",
+                    save_audio
+                );
 
                 while let Some(chunk) = receiver.recv().await {
                     // Check if we should continue
@@ -229,7 +267,11 @@ impl RecordingSaver {
     /// # Arguments
     /// * `meeting_name` - Name of the meeting
     /// * `create_checkpoints` - Whether to create .checkpoints/ directory and IncrementalAudioSaver
-    fn initialize_meeting_folder(&mut self, meeting_name: &str, create_checkpoints: bool) -> Result<()> {
+    fn initialize_meeting_folder(
+        &mut self,
+        meeting_name: &str,
+        create_checkpoints: bool,
+    ) -> Result<()> {
         // Load preferences to get base recordings folder
         let base_folder = super::recording_preferences::get_default_recordings_folder();
 
@@ -240,7 +282,10 @@ impl RecordingSaver {
         if create_checkpoints {
             let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000)?;
             self.incremental_saver = Some(Arc::new(AsyncMutex::new(incremental_saver)));
-            info!("✅ Incremental audio saver initialized for meeting: {}", meeting_name);
+            info!(
+                "✅ Incremental audio saver initialized for meeting: {}",
+                meeting_name
+            );
         } else {
             info!("⚠️  Skipped incremental audio saver (auto-save disabled)");
         }
@@ -248,23 +293,44 @@ impl RecordingSaver {
         // Create initial metadata
         let metadata = MeetingMetadata {
             version: "1.0".to_string(),
-            meeting_id: None,  // Will be set by backend
+            meeting_id: None, // Will be set by backend
             meeting_name: Some(meeting_name.to_string()),
             created_at: chrono::Utc::now().to_rfc3339(),
             completed_at: None,
             duration_seconds: None,
             devices: DeviceInfo {
-                microphone: None,  // Could be enhanced to store actual device names
+                microphone: None, // Could be enhanced to store actual device names
                 system_audio: None,
             },
-            audio_file: if create_checkpoints { "audio.mp4".to_string() } else { "".to_string() },
+            audio_file: if create_checkpoints {
+                "audio.mp4".to_string()
+            } else {
+                "".to_string()
+            },
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
+            audio_warning: None,
         };
 
         // Write initial metadata.json
         self.write_metadata(&meeting_folder, &metadata)?;
+
+        // Init the pending-tag set for this recording (change:
+        // tags-before-during-recording). Fresh starts — including tray and
+        // auto starts — begin with an empty set; best-effort so a tags
+        // failure can never break recording setup.
+        if let Err(e) = crate::summary::metadata::write_pending_tag_ids_to_metadata(
+            &meeting_folder,
+            &[],
+        ) {
+            warn!("Failed to init pending tags: {}", e);
+        }
+
+        // Remember this folder so save-time tag linking can resolve it even
+        // when the frontend cannot supply `folder_path`
+        // (change: tags-persistence-and-palette).
+        crate::summary::metadata::set_last_recording_folder(Some(meeting_folder.clone()));
 
         self.meeting_folder = Some(meeting_folder);
         self.metadata = Some(metadata);
@@ -272,20 +338,40 @@ impl RecordingSaver {
         Ok(())
     }
 
-    /// Write metadata.json to disk (atomic write with temp file)
-    fn write_metadata(&self, folder: &PathBuf, metadata: &MeetingMetadata) -> Result<()> {
+    /// Write metadata.json to disk (atomic write with temp file).
+    /// Read-modify-merge: keys the `MeetingMetadata` struct does not model
+    /// (e.g. `pending_tag_ids`, change: tags-before-during-recording) survive
+    /// rewrites; struct fields win on overlap. Shares the metadata write
+    /// lock with `summary::metadata` so concurrent field writers never
+    /// interleave a torn replace.
+    fn write_metadata(&self, folder: &Path, metadata: &MeetingMetadata) -> Result<()> {
+        let _guard = crate::summary::metadata::METADATA_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let metadata_path = folder.join("metadata.json");
         let temp_path = folder.join(".metadata.json.tmp");
 
-        let json_string = serde_json::to_string_pretty(metadata)?;
+        let mut root = serde_json::Map::new();
+        if let Ok(raw) = std::fs::read_to_string(&metadata_path) {
+            if let Ok(serde_json::Value::Object(existing)) = serde_json::from_str::<serde_json::Value>(&raw) {
+                root = existing;
+            }
+        }
+        if let serde_json::Value::Object(fields) = serde_json::to_value(metadata)? {
+            for (k, v) in fields {
+                root.insert(k, v);
+            }
+        }
+
+        let json_string = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
         std::fs::write(&temp_path, json_string)?;
-        std::fs::rename(&temp_path, &metadata_path)?;  // Atomic
+        std::fs::rename(&temp_path, &metadata_path)?; // Atomic
 
         Ok(())
     }
 
     /// Write transcripts.json to disk (atomic write with temp file and validation)
-    fn write_transcripts_json(&self, folder: &PathBuf) -> Result<()> {
+    fn write_transcripts_json(&self, folder: &Path) -> Result<()> {
         // Clone segments to avoid holding lock during I/O
         let segments_clone = if let Ok(segments) = self.transcript_segments.lock() {
             segments.clone()
@@ -294,7 +380,10 @@ impl RecordingSaver {
             return Err(anyhow::anyhow!("Failed to lock transcript segments"));
         };
 
-        info!("Writing {} transcript segments to JSON", segments_clone.len());
+        info!(
+            "Writing {} transcript segments to JSON",
+            segments_clone.len()
+        );
 
         let transcript_path = folder.join("transcripts.json");
         let temp_path = folder.join(".transcripts.json.tmp");
@@ -308,48 +397,70 @@ impl RecordingSaver {
         });
 
         // Serialize to pretty JSON string
-        let json_string = serde_json::to_string_pretty(&json)
-            .map_err(|e| {
-                error!("Failed to serialize transcripts to JSON: {}", e);
-                anyhow::anyhow!("JSON serialization failed: {}", e)
-            })?;
+        let json_string = serde_json::to_string_pretty(&json).map_err(|e| {
+            error!("Failed to serialize transcripts to JSON: {}", e);
+            anyhow::anyhow!("JSON serialization failed: {}", e)
+        })?;
 
         // Write to temp file with error handling
-        std::fs::write(&temp_path, &json_string)
-            .map_err(|e| {
-                error!("Failed to write transcript temp file to {}: {}", temp_path.display(), e);
-                anyhow::anyhow!("Failed to write temp file: {}", e)
-            })?;
+        std::fs::write(&temp_path, &json_string).map_err(|e| {
+            error!(
+                "Failed to write transcript temp file to {}: {}",
+                temp_path.display(),
+                e
+            );
+            anyhow::anyhow!("Failed to write temp file: {}", e)
+        })?;
 
         // Verify temp file was written correctly
         if !temp_path.exists() {
-            error!("Temp transcript file does not exist after write: {}", temp_path.display());
+            error!(
+                "Temp transcript file does not exist after write: {}",
+                temp_path.display()
+            );
             return Err(anyhow::anyhow!("Temp file verification failed"));
         }
 
         // Atomic rename
-        std::fs::rename(&temp_path, &transcript_path)
-            .map_err(|e| {
-                error!("Failed to rename transcript file from {} to {}: {}",
-                       temp_path.display(), transcript_path.display(), e);
-                anyhow::anyhow!("Failed to rename transcript file: {}", e)
-            })?;
+        std::fs::rename(&temp_path, &transcript_path).map_err(|e| {
+            error!(
+                "Failed to rename transcript file from {} to {}: {}",
+                temp_path.display(),
+                transcript_path.display(),
+                e
+            );
+            anyhow::anyhow!("Failed to rename transcript file: {}", e)
+        })?;
 
-        info!("✅ Successfully wrote transcripts.json with {} segments", segments_clone.len());
+        info!(
+            "✅ Successfully wrote transcripts.json with {} segments",
+            segments_clone.len()
+        );
         Ok(())
     }
 
     // in frontend/src-tauri/src/audio/recording_saver.rs
-    pub fn get_stats(&self) -> (usize, u32) {
+    pub fn get_stats(&self) -> (usize, u32, usize) {
         if let Some(ref saver) = self.incremental_saver {
             if let Ok(guard) = saver.try_lock() {
-                (guard.get_checkpoint_count() as usize, 48000)
+                let (checkpoints, sample_rate, failed) = guard.get_stats();
+                (checkpoints as usize, sample_rate, failed as usize)
             } else {
-                (0, 48000)
+                (0, 48000, 0)
             }
         } else {
-            (0, 48000)
+            (0, 48000, 0)
         }
+    }
+
+    /// Upper bound on finalizing the audio file, which grows with the
+    /// recording (None when audio is not being saved). The future does not
+    /// borrow `self`.
+    pub fn finalize_budget(
+        &self,
+    ) -> impl std::future::Future<Output = Option<std::time::Duration>> + Send + 'static {
+        let saver = self.incremental_saver.clone();
+        async move { Some(saver?.lock().await.finalize_budget()) }
     }
 
     /// Stop and save using incremental saving approach
@@ -360,7 +471,7 @@ impl RecordingSaver {
     pub async fn stop_and_save<R: Runtime>(
         &mut self,
         app: &AppHandle<R>,
-        recording_duration: Option<f64>
+        recording_duration: Option<f64>,
     ) -> Result<Option<String>, String> {
         info!("Stopping recording saver");
 
@@ -399,6 +510,40 @@ impl RecordingSaver {
             return Err("No incremental saver initialized".to_string());
         };
 
+        // Collect partial-audio signals for the duration validation below.
+        let failed_checkpoints = if let Some(saver_arc) = &self.incremental_saver {
+            let saver = saver_arc.lock().await;
+            saver.get_failed_checkpoints()
+        } else {
+            0
+        };
+
+        // Probe the merged audio duration and compare with the session duration.
+        // A probe failure never fails the save (logged and ignored).
+        let saved_duration = probe_audio_duration(&final_audio_path);
+
+        let audio_warning =
+            build_audio_warning(saved_duration, recording_duration, failed_checkpoints);
+
+        if let Some(ref warning) = audio_warning {
+            warn!(
+                "⚠️ Partial audio save: {:.1}s saved vs {:.1}s expected, {} failed checkpoint(s)",
+                warning.saved_duration_seconds,
+                warning.expected_duration_seconds,
+                warning.failed_checkpoints
+            );
+            if let Err(e) = app.emit(
+                "recording-audio-warning",
+                serde_json::json!({
+                    "saved_duration_seconds": warning.saved_duration_seconds,
+                    "expected_duration_seconds": warning.expected_duration_seconds,
+                    "failed_checkpoints": warning.failed_checkpoints,
+                }),
+            ) {
+                warn!("Failed to emit recording-audio-warning event: {}", e);
+            }
+        }
+
         // Save final transcripts.json with validation
         if let Some(folder) = &self.meeting_folder {
             if let Err(e) = self.write_transcripts_json(folder) {
@@ -409,10 +554,16 @@ impl RecordingSaver {
             // Verify transcripts were written correctly
             let transcript_path = folder.join("transcripts.json");
             if !transcript_path.exists() {
-                error!("❌ Transcript file was not created at: {}", transcript_path.display());
+                error!(
+                    "❌ Transcript file was not created at: {}",
+                    transcript_path.display()
+                );
                 return Err("Transcript file verification failed".to_string());
             }
-            info!("✅ Transcripts saved and verified at: {}", transcript_path.display());
+            info!(
+                "✅ Transcripts saved and verified at: {}",
+                transcript_path.display()
+            );
         }
 
         // Update metadata to completed status with actual recording duration
@@ -430,12 +581,18 @@ impl RecordingSaver {
                 }
             });
 
+            // Annotate a partial save instead of an unqualified "completed".
+            metadata.audio_warning = audio_warning.clone();
+
             if let Err(e) = self.write_metadata(folder, &metadata) {
                 error!("❌ Failed to update metadata to completed: {}", e);
                 return Err(format!("Failed to update metadata: {}", e));
             }
 
-            info!("✅ Metadata updated with duration: {:?}s", metadata.duration_seconds);
+            info!(
+                "✅ Metadata updated with duration: {:?}s",
+                metadata.duration_seconds
+            );
         }
 
         // Emit save event with audio and transcript paths
@@ -474,6 +631,12 @@ impl RecordingSaver {
         }
     }
 
+    /// Get a clone of the shared transcript segments Arc.
+    /// Used by the event listener to write segments without accessing RecordingManager.
+    pub fn shared_segments(&self) -> Arc<Mutex<Vec<TranscriptSegment>>> {
+        self.transcript_segments.clone()
+    }
+
     /// Get meeting name (for reload sync)
     pub fn get_meeting_name(&self) -> Option<String> {
         self.meeting_name.clone()
@@ -483,5 +646,325 @@ impl RecordingSaver {
 impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Compute the partial-audio warning for a completed save.
+///
+/// A warning is emitted when at least one checkpoint failed (audio data was
+/// dropped) or when the merged file's duration differs from the session by
+/// more than 5% and more than 30 s.
+fn build_audio_warning(
+    saved_duration: Option<f64>,
+    expected_duration: Option<f64>,
+    failed_checkpoints: u32,
+) -> Option<AudioWarning> {
+    let saved = saved_duration.unwrap_or(0.0);
+    let expected = expected_duration.unwrap_or(0.0);
+
+    if let Some(expected) = expected_duration {
+        if let Some(saved) = saved_duration {
+            let gap = (expected - saved).abs();
+            if expected > 0.0 && gap > 30.0 && gap / expected > 0.05 {
+                return Some(AudioWarning {
+                    saved_duration_seconds: saved,
+                    expected_duration_seconds: expected,
+                    failed_checkpoints,
+                });
+            }
+        }
+    }
+
+    if failed_checkpoints > 0 {
+        return Some(AudioWarning {
+            saved_duration_seconds: saved,
+            expected_duration_seconds: expected,
+            failed_checkpoints,
+        });
+    }
+
+    None
+}
+
+/// Probe the duration (seconds) of a media file using the bundled ffprobe
+/// (with an ffmpeg `-i` Duration parse as fallback). Never fail the caller:
+/// logs and returns None on any error, timeout, or unparseable output.
+fn probe_audio_duration(file: &Path) -> Option<f64> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let ffmpeg_path = find_ffmpeg_path()?;
+    let ffprobe_path = {
+        let name = if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        ffmpeg_path.with_file_name(name)
+    };
+
+    if ffprobe_path.exists() {
+        let mut command = std::process::Command::new(&ffprobe_path);
+        command
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                file.to_str().unwrap_or(""),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        if let Ok(output) = run_ffmpeg_with_timeout(command, None, PROBE_TIMEOUT) {
+            if output.status.success() {
+                if let Ok(s) = String::from_utf8(output.stdout) {
+                    if let Ok(parsed) = s.trim().parse::<f64>() {
+                        if parsed.is_finite() && parsed > 0.0 {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: parse "Duration: HH:MM:SS.xx" from `ffmpeg -i <file>` stderr.
+    let mut command = std::process::Command::new(&ffmpeg_path);
+    command
+        .args(["-i", file.to_str().unwrap_or("")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = run_ffmpeg_with_timeout(command, None, PROBE_TIMEOUT) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            if let Some(idx) = line.find("Duration: ") {
+                let rest = &line[idx + "Duration: ".len()..];
+                let duration_str = rest.split(',').next().unwrap_or("").trim();
+                let parts: Vec<&str> = duration_str.split(':').collect();
+                if parts.len() == 3 {
+                    if let (Ok(h), Ok(m), Ok(s)) = (
+                        parts[0].parse::<f64>(),
+                        parts[1].parse::<f64>(),
+                        parts[2].parse::<f64>(),
+                    ) {
+                        let total = h * 3600.0 + m * 60.0 + s;
+                        if total.is_finite() && total > 0.0 {
+                            return Some(total);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    warn!(
+        "Failed to probe audio duration for {} (probe failures never fail the save)",
+        file.display()
+    );
+    None
+}
+
+/// Standalone function to write transcript segments to disk.
+/// Used by the event listener to persist transcripts without accessing RecordingManager.
+pub fn write_transcripts_to_disk(
+    folder: &std::path::Path,
+    segments: &Arc<Mutex<Vec<TranscriptSegment>>>,
+) -> Result<()> {
+    let segments_clone = if let Ok(segs) = segments.lock() {
+        segs.clone()
+    } else {
+        return Err(anyhow::anyhow!("Failed to lock transcript segments"));
+    };
+
+    info!(
+        "Writing {} transcript segments to JSON",
+        segments_clone.len()
+    );
+
+    let transcript_path = folder.join("transcripts.json");
+    let temp_path = folder.join(".transcripts.json.tmp");
+
+    let json = serde_json::json!({
+        "version": "1.0",
+        "segments": segments_clone,
+        "last_updated": chrono::Utc::now().to_rfc3339(),
+        "total_segments": segments_clone.len()
+    });
+
+    let json_string = serde_json::to_string_pretty(&json).map_err(|e| {
+        error!("Failed to serialize transcripts to JSON: {}", e);
+        anyhow::anyhow!("JSON serialization failed: {}", e)
+    })?;
+
+    std::fs::write(&temp_path, &json_string).map_err(|e| {
+        error!(
+            "Failed to write transcript temp file to {}: {}",
+            temp_path.display(),
+            e
+        );
+        anyhow::anyhow!("Failed to write temp file: {}", e)
+    })?;
+
+    if !temp_path.exists() {
+        error!(
+            "Temp transcript file does not exist after write: {}",
+            temp_path.display()
+        );
+        return Err(anyhow::anyhow!("Temp file verification failed"));
+    }
+
+    std::fs::rename(&temp_path, &transcript_path).map_err(|e| {
+        error!(
+            "Failed to rename transcript file from {} to {}: {}",
+            temp_path.display(),
+            transcript_path.display(),
+            e
+        );
+        anyhow::anyhow!("Failed to rename transcript file: {}", e)
+    })?;
+
+    info!(
+        "✅ Successfully wrote transcripts.json with {} segments",
+        segments_clone.len()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_audio_warning_none_on_clean_save() {
+        let warning = build_audio_warning(Some(1891.9), Some(1891.9), 0);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_build_audio_warning_on_duration_mismatch() {
+        // ~50% of the session saved: gap > 5% and > 30s -> warning.
+        let warning = build_audio_warning(Some(990.0), Some(1891.9), 0).unwrap();
+        assert_eq!(warning.saved_duration_seconds, 990.0);
+        assert_eq!(warning.expected_duration_seconds, 1891.9);
+        assert_eq!(warning.failed_checkpoints, 0);
+    }
+
+    #[test]
+    fn test_build_audio_warning_ignores_small_gap() {
+        // Sub-5% gap (and under 30s) must not warn.
+        let warning = build_audio_warning(Some(188.0), Some(190.0), 0);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_write_metadata_preserves_unmodeled_keys() {
+        // Stop-time finalize must not erase the pending_tag_ids key written
+        // by summary::metadata (change: tags-before-during-recording).
+        let dir = tempfile::TempDir::new().unwrap();
+        let folder = dir.path().to_path_buf();
+        let saver = RecordingSaver::default();
+        let metadata = MeetingMetadata {
+            version: "1.0".to_string(),
+            meeting_id: None,
+            meeting_name: Some("m".to_string()),
+            created_at: "2026-09-14T00:00:00Z".to_string(),
+            completed_at: None,
+            duration_seconds: None,
+            devices: DeviceInfo {
+                microphone: None,
+                system_audio: None,
+            },
+            audio_file: String::new(),
+            transcript_file: "transcripts.json".to_string(),
+            sample_rate: 48000,
+            status: "recording".to_string(),
+            audio_warning: None,
+        };
+        saver.write_metadata(&folder, &metadata).unwrap();
+        crate::summary::metadata::write_pending_tag_ids_to_metadata(
+            &folder,
+            &["tag-1".to_string()],
+        )
+        .unwrap();
+        saver.write_metadata(&folder, &metadata).unwrap();
+
+        let raw = std::fs::read_to_string(folder.join("metadata.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["pending_tag_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(value["status"], "recording");
+    }
+
+    #[test]
+    fn test_build_audio_warning_on_failed_checkpoints() {
+        // Failed checkpoints warn even when the duration looks fine.
+        let warning = build_audio_warning(Some(120.0), Some(120.0), 2).unwrap();
+        assert_eq!(warning.failed_checkpoints, 2);
+    }
+
+    #[test]
+    fn test_tokens_roundtrip_through_transcripts_json() {
+        // word-level-diarization-alignment 1.2: tokens must survive the
+        // incremental transcripts.json write/read cycle so stop-time finalize
+        // and repair paths see them.
+        let dir = std::env::temp_dir().join(format!(
+            "meetily_transcript_tokens_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let segments = Arc::new(Mutex::new(vec![TranscriptSegment {
+            id: "seg_1".to_string(),
+            text: "hello world".to_string(),
+            audio_start_time: 1.0,
+            audio_end_time: 3.5,
+            duration: 2.5,
+            display_time: "[00:01]".to_string(),
+            confidence: 0.9,
+            sequence_id: 1,
+            source_device: "Microphone".to_string(),
+            tokens: Some(vec![
+                crate::audio::token_assignment::Token {
+                    text: "hello".to_string(),
+                    start: 1.0,
+                    end: 1.8,
+                    refined: false,
+                },
+                crate::audio::token_assignment::Token {
+                    text: "world".to_string(),
+                    start: 1.8,
+                    end: 2.4,
+                    refined: false,
+                },
+            ]),
+        }]));
+
+        write_transcripts_to_disk(&dir, &segments).unwrap();
+        let raw = std::fs::read_to_string(dir.join("transcripts.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let loaded: Vec<TranscriptSegment> =
+            serde_json::from_value(parsed["segments"].clone()).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        let tokens = loaded[0]
+            .tokens
+            .as_ref()
+            .expect("tokens must survive transcripts.json round-trip");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[1].end, 2.4);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

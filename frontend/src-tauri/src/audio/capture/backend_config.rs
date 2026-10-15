@@ -1,8 +1,8 @@
 // Backend configuration for system audio capture
+use log::info;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
-use once_cell::sync::Lazy;
-use log::info;
 
 /// Available audio capture backends
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +51,9 @@ impl AudioCaptureBackend {
         }
     }
 
-    /// Convert to string (lowercase)
+    /// Convert to string (lowercase wire format, intentionally distinct from
+    /// the `Display` human-readable name — `from_string` round-trips this).
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         match self {
             AudioCaptureBackend::ScreenCaptureKit => "screencapturekit".to_string(),
@@ -64,7 +66,10 @@ impl AudioCaptureBackend {
     pub fn available_backends() -> Vec<Self> {
         #[cfg(target_os = "macos")]
         {
-            vec![AudioCaptureBackend::ScreenCaptureKit, AudioCaptureBackend::CoreAudio]
+            vec![
+                AudioCaptureBackend::ScreenCaptureKit,
+                AudioCaptureBackend::CoreAudio,
+            ]
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -130,9 +135,7 @@ impl BackendConfig {
 }
 
 /// Global backend configuration instance
-pub static BACKEND_CONFIG: Lazy<Arc<BackendConfig>> = Lazy::new(|| {
-    Arc::new(BackendConfig::new())
-});
+pub static BACKEND_CONFIG: Lazy<Arc<BackendConfig>> = Lazy::new(|| Arc::new(BackendConfig::new()));
 
 /// Get current backend
 pub fn get_current_backend() -> AudioCaptureBackend {
@@ -155,7 +158,10 @@ mod tests {
 
     #[test]
     fn test_backend_to_string() {
-        assert_eq!(AudioCaptureBackend::ScreenCaptureKit.to_string(), "screencapturekit");
+        assert_eq!(
+            AudioCaptureBackend::ScreenCaptureKit.to_string(),
+            "screencapturekit"
+        );
         #[cfg(target_os = "macos")]
         assert_eq!(AudioCaptureBackend::CoreAudio.to_string(), "coreaudio");
     }
@@ -191,10 +197,16 @@ mod tests {
     #[test]
     fn test_default_backend() {
         #[cfg(target_os = "macos")]
-        assert_eq!(AudioCaptureBackend::default(), AudioCaptureBackend::CoreAudio);
+        assert_eq!(
+            AudioCaptureBackend::default(),
+            AudioCaptureBackend::CoreAudio
+        );
 
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(AudioCaptureBackend::default(), AudioCaptureBackend::ScreenCaptureKit);
+        assert_eq!(
+            AudioCaptureBackend::default(),
+            AudioCaptureBackend::ScreenCaptureKit
+        );
     }
 
     #[test]

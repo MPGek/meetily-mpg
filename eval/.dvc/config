@@ -1,0 +1,6 @@
+[core]
+    remote = local-server
+[cache]
+    type = "hardlink,copy"
+['remote "local-server"']
+    url = \\192.168.17.34\UsersHome\Vasiliy.Kotov\DVC\meetily\

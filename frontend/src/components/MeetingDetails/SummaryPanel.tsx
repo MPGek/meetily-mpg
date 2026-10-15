@@ -1,7 +1,6 @@
 "use client";
 
 import { Summary, SummaryResponse, Transcript } from '@/types';
-import { EditableTitle } from '@/components/EditableTitle';
 import { BlockNoteSummaryView, BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
@@ -65,10 +64,6 @@ interface SummaryPanelProps {
 export function SummaryPanel({
   meeting,
   meetingTitle,
-  onTitleChange,
-  isEditingTitle,
-  onStartEditTitle,
-  onFinishEditTitle,
   isTitleDirty,
   summaryRef,
   isSaving,

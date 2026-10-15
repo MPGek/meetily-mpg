@@ -1,0 +1,325 @@
+# speaker-identity-registry Specification
+
+## Purpose
+A global registry of known speakers with enrolled voiceprint prototypes, per-meeting cluster-to-person mappings, expected-speaker allowlists, and automatic recognition of diarization clusters against stored prototypes, so consistent speaker names and identities appear across meetings and recognition re-runs require no audio re-processing.
+## Requirements
+### Requirement: Global speaker registry
+The system SHALL maintain a global registry of known speakers (`speakers` table: id, name, `is_me` flag, timestamps) independent of any meeting. Speaker names SHALL be unique case-insensitively.
+
+#### Scenario: Person created on first naming
+- **WHEN** a user assigns a name that does not match any existing registry speaker to a transcript speaker cluster
+- **THEN** the system SHALL create a new registry speaker with that name and link the cluster to it
+
+#### Scenario: Rename is global
+- **WHEN** a user renames a registry speaker
+- **THEN** the new name SHALL be displayed for that speaker in every meeting where they are linked, without per-meeting edits
+
+### Requirement: Voiceprint storage
+The system SHALL store speaker voiceprints in a `speaker_embeddings` table where each row holds a 192-dimensional f32 embedding blob from the enhanced TitaNet-Large extractor, a `model` tag identifying the extractor model (always `titanet_large` for new rows), the capture `channel` ('mic' or 'system'), and the source segment duration. Each row SHALL be owned either by a registry speaker (`speaker_id`, enrolled prototype) or by a meeting cluster (`meeting_id` + `cluster_label`, unassigned cache), enforced by a CHECK constraint. Voiceprint rows SHALL be retained indefinitely. Standard-model rows (`resnet34_int8`, 256-d) SHALL remain stored but SHALL NOT participate in recognition, enrollment seeding, or any matching operation.
+
+When persisting exemplar embeddings for a meeting cluster, the system SHALL scope the replacement operation to the same channel: it SHALL delete only rows matching `(meeting_id, cluster_label, channel)` before inserting new rows for that channel. This ensures that cluster caches for different channels are independent and do not overwrite each other.
+
+#### Scenario: Cache written at diarization time
+- **WHEN** any diarization path (offline or online) completes clustering for a meeting using the enhanced model set
+- **THEN** the system SHALL persist per-cluster exemplar embeddings as unassigned cache rows and the cluster centroid, so enrollment later requires no audio re-processing
+
+#### Scenario: Model guard
+- **WHEN** the system matches voiceprints for recognition
+- **THEN** it SHALL compare only embeddings whose `model` tag equals `titanet_large`, the current extractor model; `resnet34_int8` standard-model rows SHALL be ignored entirely
+
+#### Scenario: Channel-scoped cache replacement
+- **WHEN** the system persists exemplar embeddings for a cluster with channel='system'
+- **THEN** it SHALL delete only existing rows matching the same `(meeting_id, cluster_label, channel='system')` before inserting new rows, leaving any rows with channel='mic' for the same cluster label untouched
+
+#### Scenario: Cross-channel cache independence
+- **WHEN** a meeting has cluster caches for both channel='mic' and channel='system' with the same numeric pipeline speaker index (e.g., `SPEAKER_00` for mic and `SPEAKER_00` for system)
+- **THEN** re-persisting one channel's cache SHALL NOT affect the other channel's cache rows
+
+### Requirement: Per-meeting cluster-to-person mapping
+The system SHALL record the link between a meeting's speaker cluster label and a registry speaker in a `meeting_speakers` table (meeting_id, cluster_label, speaker_id, centroid, `matched_by` ('auto' or 'user'), match score). This table SHALL be the source of truth for speaker identity within a meeting; legacy `speaker_names` JSON and `transcripts.speaker_label` SHALL be retained only as display fallback and SHALL NOT be written by new flows.
+
+#### Scenario: User binding wins over auto-match
+- **WHEN** a cluster has `matched_by='user'` binding and recognition re-runs (e.g., after the expected-speaker list changes)
+- **THEN** the system SHALL NOT overwrite the user's binding
+
+### Requirement: Speaker enrollment on assignment
+When a user links a meeting cluster to a registry speaker (existing or newly created) with cluster-wide scope — including the "apply to all blocks of this speaker" option — the system SHALL enroll that cluster's cached exemplar embeddings as prototypes of the speaker by reparenting the best rows (longest duration first, capped at K=8 per enrollment). When a user assigns a speaker to a single transcript block (live or offline), the system SHALL enroll only the embeddings whose time windows overlap that block and whose capture channel matches the block's channel, capped at K=8; it SHALL NOT enroll cluster exemplars outside the block's time window. Every enrolled prototype row SHALL carry full provenance: `meeting_id`, `cluster_label`, `audio_start_time`, and `audio_end_time` of the source audio, so the prototype is playable and navigable in the Voiceprint Browser. Enrollment seeding SHALL be keyed by the underlying pipeline speaker identity and capture channel — embeddings from microphone and system channels SHALL never be mixed into the same seed set. Per-person prototype count SHALL be capped (64), pruning lowest-quality rows.
+
+When a cluster is re-bound to a different speaker with cluster-wide scope, the system SHALL NOT leave prototypes that originated from that same cluster and channel attributed to their previous speaker: those rows SHALL be demoted to unassigned cache (following the voiceprint-rejection rules), except any row whose time window is also covered by a transcript block overridden to its current speaker.
+
+#### Scenario: Naming enrolls voiceprint
+- **WHEN** user assigns the name "Alice" to cluster `SPEAKER_00` of a diarized meeting
+- **THEN** up to 8 of that cluster's cached embeddings SHALL become enrolled prototypes of speaker "Alice"
+
+#### Scenario: Linking existing person enrolls too
+- **WHEN** user links cluster `SPEAKER_01` to existing registry speaker "Bob"
+- **THEN** the cluster's cached embeddings SHALL be added to Bob's prototypes, subject to the per-person cap
+
+#### Scenario: Ground-truth block assignment enrolls its covering embeddings
+- **WHEN** a user assigns "Alice" to a single transcript block whose time window overlaps several session embeddings of its cluster
+- **THEN** only the embeddings whose time windows overlap that block and whose channel matches the block's channel SHALL be enrolled as prototypes of Alice, capped at K=8, at the same time as the block's identity is saved
+
+#### Scenario: Block correction does not enroll sibling speakers
+- **WHEN** a user assigns "Alice" to one block of a mixed cluster whose other blocks are correctly attributed to Bob and Carol
+- **THEN** Bob's and Carol's exemplars outside Alice's block window SHALL NOT be enrolled into Alice
+
+#### Scenario: Ground-truth enrollment preserves provenance
+- **WHEN** a user assigns "Alice" to a single transcript block of meeting M, cluster C
+- **THEN** the enrolled prototype rows SHALL carry `meeting_id` = M, `cluster_label` = C, and the audio timecodes of the source embeddings, so the Voiceprint Browser can display the source meeting and play the audio clip
+
+#### Scenario: Enrollment seeding keeps channels separate
+- **WHEN** a user assigns a microphone-channel block to "Alice" and a system-channel block to "Bob" in the same session
+- **THEN** Alice's enrollment SHALL contain only microphone-channel embeddings and Bob's only system-channel embeddings, even when both channels share the same numeric pipeline speaker index
+
+#### Scenario: Cluster re-binding demotes stale prototypes
+- **WHEN** a cluster previously bound to "Bob" (and whose exemplars were enrolled into Bob) is re-bound cluster-wide to "Carol"
+- **THEN** the prototypes that originated from that cluster and channel and are not covered by a current per-block override SHALL be demoted to unassigned cache, so Bob SHALL NOT retain them and Carol SHALL NOT inherit another speaker's exemplars
+
+### Requirement: Expected-speaker allowlist per meeting
+The system SHALL allow users to select, per meeting, a set of expected speakers from the registry (`meeting_expected_speakers` table). Automatic recognition for that meeting SHALL match only against prototypes of expected speakers. If no expected speakers are selected, recognition SHALL match against ALL registry speakers. The allowlist SHALL NOT restrict manual speaker assignment.
+
+#### Scenario: Restricted matching
+- **WHEN** a meeting has expected speakers {Alice, Bob} and diarization produces a cluster whose centroid best matches registry speaker Carol
+- **THEN** the cluster SHALL remain unidentified even if the Carol score exceeds the threshold
+
+#### Scenario: Empty allowlist matches all
+- **WHEN** a meeting has no expected speakers selected
+- **THEN** recognition SHALL consider every registry speaker's prototypes
+
+#### Scenario: Unexpected guest assigned manually
+- **WHEN** a meeting has expected speakers {Alice, Bob} but Carol also spoke
+- **THEN** the user SHALL still be able to assign Carol (or a new name) to her cluster via the speaker editor
+
+### Requirement: Automatic speaker recognition
+After clustering completes on any diarization path, the system SHALL match each cluster against candidate prototypes (expected speakers, or all if no allowlist) using cosine similarity over 192-d embeddings tagged `titanet_large`: score = maximum similarity over the candidate's prototypes; the best-scoring candidate with score above threshold τ=0.7 SHALL be auto-assigned with `matched_by='auto'` and the score recorded. When both channels' prototypes exist, same-channel prototypes SHALL be preferred. Legacy `resnet34_int8` (256-d) voiceprints and centroids SHALL NOT be loaded as match candidates.
+
+#### Scenario: Known voice auto-labeled
+- **WHEN** offline diarization completes on a meeting whose expected speakers include Alice, and a cluster centroid matches an Alice prototype with score 0.78
+- **THEN** the cluster SHALL be linked to Alice with `matched_by='auto'`, and her name SHALL display on all blocks of that cluster without user action
+
+#### Scenario: Unknown voice stays anonymous
+- **WHEN** no candidate scores above threshold for a cluster
+- **THEN** the cluster SHALL remain unidentified and display its formatted cluster label
+
+#### Scenario: Standard-model voiceprints ignored
+- **WHEN** recognition runs and a registry speaker's only enrolled prototypes are tagged `resnet34_int8` (256-d)
+- **THEN** those prototypes SHALL be treated as absent, and the speaker SHALL NOT be auto-matched until re-enrolled with enhanced embeddings
+
+### Requirement: Per-row automatic speaker recognition
+After clustering completes on any diarization path - a live session's stop-time pass or an offline pass over a saved recording - the system SHALL additionally match each transcript row of that meeting against the same candidate prototypes used for cluster recognition, using only the meeting's stored embeddings (a live session's chunk embeddings, and the exemplar embeddings an offline pass persists) whose time window overlaps that row and whose capture channel matches the row's channel, scored by the same cosine similarity over 192-d `titanet_large` embeddings and the same threshold as cluster recognition. The best-scoring candidate above threshold SHALL be recorded on the row together with its score. A row with no overlapping embedding, or whose best candidate scores below threshold, SHALL record no row-level match and SHALL keep resolving through its cluster. Before a pass records its matches, the row-level matches left by the meeting's earlier runs SHALL be cleared, so a name recorded by an earlier run cannot outrank the result of the run that just finished. Recording a row-level match SHALL NOT alter the row's stored cluster label, the cluster's centroid, the cluster's exemplar cache, or the cluster's own binding.
+
+#### Scenario: Row keeps the speaker its own audio matches
+- **WHEN** a meeting's cluster is auto-bound to Greg, and a row of that cluster has an overlapping stored embedding whose best candidate above threshold is Alex
+- **THEN** that row SHALL record a row-level match to Alex with its score, while the cluster's binding to Greg SHALL remain unchanged for the rows whose own audio matches Greg
+
+#### Scenario: Weak row evidence defers to the cluster
+- **WHEN** a row's overlapping embeddings produce no candidate scoring above threshold
+- **THEN** the row SHALL record no row-level match and SHALL continue to display its cluster's name
+
+#### Scenario: Row without stored embeddings defers to the cluster
+- **WHEN** a row's time window is covered by no stored embedding of the meeting
+- **THEN** the row SHALL record no row-level match and SHALL continue to display its cluster's name
+
+#### Scenario: Offline diarization is unaffected
+- **WHEN** offline (batch) diarization runs on a saved recording
+- **THEN** its clusters, turns, transcript speaker labels, centroids, exemplar caches and cluster bindings SHALL be exactly what they were before row-level recognition existed on that path; the only addition is the row-level matches
+
+#### Scenario: Offline pass names a row its merged cluster would have misnamed
+- **WHEN** an offline pass puts the speech of two people into one cluster whose centroid best matches Vasiliy, and one row of that cluster overlaps embeddings whose best candidate above threshold is Alex
+- **THEN** that row SHALL display Alex, and the rows whose own audio matches Vasiliy SHALL display Vasiliy
+
+#### Scenario: Offline pass names a row whose cluster centroid is below threshold
+- **WHEN** an offline pass produces a cluster whose centroid scores below threshold for every candidate, and a row of that cluster overlaps an embedding scoring above threshold for Marina
+- **THEN** that row SHALL display Marina, and the cluster itself SHALL stay unbound
+
+#### Scenario: A new run replaces the earlier row-level names
+- **WHEN** a meeting whose rows carry row-level matches from a live session is diarized offline
+- **THEN** those earlier matches SHALL be cleared, and each row SHALL carry only what the offline run recorded, so a stale name cannot outrank the new result
+
+#### Scenario: Offline pass preserves user decisions
+- **WHEN** an offline pass runs on a meeting that has a per-block user override and a user-bound cluster
+- **THEN** both SHALL survive unchanged, whatever the row-level matches say
+
+### Requirement: Instant re-match on allowlist change
+Because cluster centroids are cached in `meeting_speakers` and per-cluster exemplar embeddings are cached with their time windows, the system SHALL provide a re-match operation that re-runs recognition for a meeting from cached data only, without reading or processing audio. Re-match SHALL refresh the row-level automatic matches of that meeting from the cached embeddings under the current candidate set, and SHALL clear a row-level match that the current candidate set no longer supports, so a refreshed cluster binding can never be outranked by a stale row-level name. User bindings (`matched_by='user'`) and per-block user overrides SHALL be preserved.
+
+#### Scenario: Allowlist edit resolves pending clusters
+- **WHEN** user adds Dave to a meeting's expected speakers after diarization and triggers re-match
+- **THEN** previously unidentified clusters SHALL be matched against Dave's prototypes and auto-assigned where confident, with no diarization re-run
+
+#### Scenario: Allowlist edit refreshes row-level names
+- **WHEN** a meeting has row-level matches to Greg, the user removes Greg from the expected speakers and triggers re-match
+- **THEN** those row-level matches SHALL be recomputed against the remaining candidates, and any that no longer score above threshold SHALL be cleared so the rows resolve through their cluster again
+
+#### Scenario: Re-match preserves user decisions
+- **WHEN** a meeting has a per-block override and a user-bound cluster, and the user triggers re-match
+- **THEN** both SHALL survive re-match unchanged, regardless of what the refreshed row-level matches say
+
+### Requirement: Speaker display name resolution
+Transcript queries SHALL resolve each transcript's display name by first checking the transcript's per-block speaker override (if any), then the transcript's own row-level automatic match (if any), then joining its meeting's `meeting_speakers` mapping to `speakers`, and finally falling back to legacy `transcripts.speaker_label` and then to the formatted cluster label. A row-level automatic match SHALL NOT take precedence over a per-block user override, nor over a cluster binding the user made (`matched_by='user'`). The cluster label SHALL remain stored on the transcript row unchanged. Transcript queries SHALL also return the provenance of the resolved name (user-assigned, auto-matched, or fallback) and, for auto-matched names, the match score of the level that resolved the name.
+
+#### Scenario: Joined name displayed
+- **WHEN** a transcript's cluster is linked to registry speaker Alice via `meeting_speakers`
+- **THEN** transcript queries SHALL return "Alice" as the display label for that transcript
+
+#### Scenario: Block override takes precedence
+- **WHEN** a transcript has a per-block speaker override to registry speaker Bob even though its cluster is linked to Alice via `meeting_speakers`
+- **THEN** transcript queries SHALL return "Bob" as the display label for that transcript
+
+#### Scenario: Row-level match takes precedence over the cluster binding
+- **WHEN** a transcript has a row-level automatic match to Alex with score 0.74 and its cluster is auto-linked to Greg
+- **THEN** transcript queries SHALL return "Alex" with auto provenance and the 0.74 score
+
+#### Scenario: A user-bound cluster outranks a row-level match
+- **WHEN** a transcript's cluster is linked to Alice with `matched_by='user'` and the transcript also carries a row-level automatic match to Alex
+- **THEN** transcript queries SHALL return "Alice" with user provenance
+
+#### Scenario: Row without a match resolves through its cluster
+- **WHEN** a transcript carries no row-level automatic match and its cluster is auto-linked to Greg with score 0.86
+- **THEN** transcript queries SHALL return "Greg" with auto provenance and the 0.86 score
+
+#### Scenario: Legacy fallback
+- **WHEN** a transcript has a legacy `speaker_label` but no `meeting_speakers` mapping, no row-level match and no per-block override
+- **THEN** transcript queries SHALL return the legacy label
+
+#### Scenario: Auto-matched name carries score
+- **WHEN** a transcript's display name resolves through a `meeting_speakers` row with `matched_by='auto'` and `match_score=0.78`
+- **THEN** transcript queries SHALL return the name together with 'auto' provenance and a 0.78 score
+
+#### Scenario: User-assigned name carries user provenance
+- **WHEN** a transcript's display name resolves through a `meeting_speakers` row with `matched_by='user'`
+- **THEN** transcript queries SHALL return the name together with 'user' provenance and no score
+
+### Requirement: Per-block speaker override
+The system SHALL allow relabeling a single transcript block to a registry speaker (existing or newly created) without affecting the rest of its cluster. Block-level assignment SHALL store a per-transcript override that takes precedence over the cluster mapping at display time, SHALL NOT modify `meeting_speakers`, and SHALL NOT enroll the cluster's exemplars wholesale; it SHALL enroll only the embeddings overlapping the block's time window on the block's channel, per "Speaker enrollment on assignment". Auto-recognition and re-match SHALL NOT overwrite block overrides.
+
+#### Scenario: Single misattributed block relabeled
+- **WHEN** a user assigns "Bob" to a single transcript block whose cluster maps to Alice
+- **THEN** only that block SHALL display "Bob"; the cluster mapping and the other blocks' labels SHALL remain unchanged
+
+#### Scenario: Block override survives re-match
+- **WHEN** user relabels one block of a cluster and then triggers re-match or diarization runs again for the meeting
+- **THEN** the relabeled block SHALL keep "Bob" while other unlinked blocks are re-matched normally
+
+#### Scenario: Block override does not bind the cluster
+- **WHEN** a user assigns "Bob" to a single transcript block with the default single-block scope
+- **THEN** `meeting_speakers` SHALL NOT change for that cluster, and only embeddings overlapping that block's window SHALL be enrolled for Bob
+
+### Requirement: Speaker editing UI with dropdown and free text
+The speaker name editor (offline transcript view and live recording view) SHALL offer both a free-text input and a dropdown of registry speakers. The editor SHALL default to single-block scope: selecting an existing speaker or entering a new name links only the block being edited via a per-block override and enrolls only the embeddings overlapping that block's window on the block's channel. An explicit "apply to all blocks of this speaker" option SHALL instead link the whole cluster and enroll the cluster's cached exemplars; editing SHALL propagate to all transcript blocks sharing the same cluster label in the meeting only when that option is used.
+
+#### Scenario: Assign from dropdown
+- **WHEN** user opens the speaker editor on a transcript block and selects existing speaker "Alice" from the dropdown
+- **THEN** the block SHALL be linked to Alice via a per-block override (default scope), and only the cluster exemplars overlapping the block's time window on the block's channel SHALL be enrolled; the rest of the cluster SHALL NOT be enrolled
+
+#### Scenario: Apply to all blocks of this speaker
+- **WHEN** user selects the "apply to all blocks of this speaker" option and picks "Alice"
+- **THEN** the cluster SHALL be linked to Alice with `matched_by='user'`, the cluster's cached embeddings SHALL enroll to Alice, and every transcript block with that cluster label SHALL display "Alice"
+
+#### Scenario: Propagation within meeting (explicit only)
+- **WHEN** user assigns a name to one block of cluster `SPEAKER_00` using the default single-block scope
+- **THEN** only that block SHALL display the resolved name; other blocks of `SPEAKER_00` SHALL be unchanged
+
+### Requirement: Non-disruptive speaker relabel rendering
+After any speaker relabel (single-block override or apply-to-all), the transcript view SHALL update the affected transcript block(s) in place: the view SHALL NOT re-render the full list, SHALL NOT reset the scroll position, and SHALL NOT show an empty or loading state during the update. Unaffected blocks SHALL NOT re-mount, reorder, or change appearance.
+
+#### Scenario: Scroll position preserved on relabel
+- **WHEN** user relabels a transcript block while the view is scrolled mid-list
+- **THEN** the view SHALL remain scrolled at the same position, with only the relabeled block(s) showing the new name
+
+#### Scenario: No empty/loading flash on assignment
+- **WHEN** user confirms a speaker assignment in the editor
+- **THEN** the panel SHALL NOT show a loading spinner, blank area, or empty state; the affected block(s) SHALL update to the new label in place
+
+### Requirement: Voiceprint storage visibility
+The system SHALL provide voiceprint storage statistics (registry speaker count, enrolled prototype count, unassigned cache count, total embedding bytes) via a command, and SHALL display them in Settings so the user can track growth.
+
+#### Scenario: Stats displayed
+- **WHEN** user opens the speaker/diarization section of Settings
+- **THEN** the UI SHALL show the current voiceprint storage usage (counts and human-readable size)
+
+### Requirement: Audio clip bytes reported separately
+The storage statistics command SHALL additionally report total stored audio-clip bytes and the count of rows carrying a clip, separately from embedding bytes. The Settings display SHALL show audio storage alongside embedding storage using the same human-readable size formatting.
+
+#### Scenario: Audio bytes shown separately
+- **WHEN** the browser loads with embedding bytes and audio-clip bytes present
+- **THEN** the summary SHALL show both sizes distinctly rather than merging them into one number
+
+#### Scenario: Zero audio shows zero
+- **WHEN** no voiceprint row carries an audio clip
+- **THEN** the audio portion of the summary SHALL show zero without error
+
+### Requirement: Confirm an auto-assigned binding as correct
+The system SHALL let the user confirm that an automatically recognized speaker binding is correct without changing the name. Confirming SHALL flip the binding to user provenance: for a cluster-binding share, `meeting_speakers.matched_by` SHALL become `'user'` and `match_score` SHALL be cleared; for a single-block override, the block SHALL be marked overridden so it reads as user provenance. Confirming SHALL NOT re-enroll or duplicate the already-present voiceprint.
+
+#### Scenario: Confirm a recognized cluster binding
+- **WHEN** a cluster is auto-bound to "Alice" with a match score and the user confirms it is correct
+- **THEN** the cluster's `matched_by` SHALL become `'user'` and its match score SHALL be cleared, so the `(auto)` decoration no longer renders
+
+#### Scenario: Confirm a recognized single block
+- **WHEN** a single transcript block is auto-bound to "Alice" with user confirmation
+- **THEN** the block SHALL be marked as user-confirmed and SHALL render with plain "Alice", losing the `(auto)` decoration
+
+#### Scenario: Confirmation does not duplicate prototypes
+- **WHEN** the user confirms an auto-assigned binding whose speaker already has enrolled prototypes
+- **THEN** no new `speaker_embeddings` rows SHALL be created for that confirmation
+
+### Requirement: Enrollment is wired into the single-block correction path
+The system SHALL enroll voiceprints on single-block speaker corrections using only the embeddings whose time windows overlap that block and whose capture channel matches the block's channel, not the whole cluster and not only on cluster-wide assignment. The block's cached cluster exemplars SHALL be enrollable from a block's cluster label so a per-block correction doubles as a teaching signal, without enrolling sibling speakers' audio from a mixed cluster.
+
+#### Scenario: Cached exemplars enrollable from a block
+- **WHEN** an offline meeting has persisted cluster cache rows for a block's cluster and the user corrects that single block
+- **THEN** only the cache exemplars whose time window overlaps the block and whose channel matches SHALL be enrolled for the assigned speaker, while exemplars outside the block's window SHALL remain unassigned
+
+#### Scenario: Correction on a single-speaker cluster still enrolls
+- **WHEN** the corrected block is the only speech in its cluster and the user assigns a speaker to it
+- **THEN** that cluster's overlapping exemplars SHALL be enrolled as the speaker's prototypes, satisfying the "Speaker enrollment on assignment" requirement for the single-block case
+
+### Requirement: Voiceprint browser storage summary is human-readable
+The voiceprint browser's storage summary SHALL display total voiceprint storage as a human-readable size (e.g. megabytes) using the same formatting as the Settings general-tab storage section, rather than a raw byte count. The speaker, prototype, and unconfirmed-cache counts SHALL remain numeric.
+
+#### Scenario: Size shown in megabytes
+- **WHEN** the voiceprint browser loads with 2,258,944 total embedding bytes
+- **THEN** the summary SHALL show a human-readable size (e.g. "2.2 MB") rather than "Bytes: 2258944"
+
+#### Scenario: Empty storage shows zero
+- **WHEN** the voiceprint browser loads with zero total embedding bytes
+- **THEN** the summary SHALL show "0 MB" rather than "Bytes: 0"
+
+#### Scenario: Consistent with the general-tab storage section
+- **WHEN** the voiceprint browser storage summary and the Settings general-tab storage section both render
+- **THEN** both SHALL format embedding size the same way, so the two surfaces agree
+
+### Requirement: Voiceprint browser groups start collapsed
+The voiceprint browser SHALL load with every speaker group and every unconfirmed-meeting group collapsed by default, showing group headers and the expand controls first rather than every voiceprint row expanded. The existing per-group toggles and expand-all / collapse-all controls SHALL continue to work.
+
+#### Scenario: Default state is collapsed
+- **WHEN** the voiceprint browser first loads with voiceprints present
+- **THEN** every speaker group and meeting group SHALL start collapsed with their rows hidden
+
+#### Scenario: Expand-all reveals every group
+- **WHEN** the user activates expand-all
+- **THEN** every speaker and meeting group SHALL become expanded
+
+#### Scenario: Single group expands independently
+- **WHEN** the user expands one collapsed group
+- **THEN** only that group's rows SHALL be shown while the others remain collapsed
+
+### Requirement: A person holds no duplicate voiceprints
+The system SHALL NOT store two voiceprints for the same registry speaker that come from the same meeting, the same capture channel and the same audio window and carry the same embedding. Every enrollment path SHALL skip a candidate that duplicates a voiceprint the speaker already holds, and skipped duplicates SHALL NOT count toward the per-person prototype cap or evict any other prototype. Voiceprints that duplicate each other and are already stored SHALL be reduced to a single row per speaker on upgrade. Where copies differ, the one kept SHALL be verified if any copy was verified, and SHALL carry an audio clip if any copy had one.
+
+#### Scenario: Re-enrolling the same chunk is a no-op
+- **WHEN** a speaker already holds a voiceprint for meeting M, channel `system`, window [1473.4 s, 1493.2 s], and a later enrollment offers that same embedding and window for the same speaker
+- **THEN** no new row SHALL be inserted and the speaker's prototype count SHALL stay unchanged
+
+#### Scenario: The same chunk for a different person is not a duplicate
+- **WHEN** a chunk embedding already enrolled for "Alice" is enrolled for "Bob"
+- **THEN** Bob SHALL gain the prototype; the rule applies per person
+
+#### Scenario: Existing duplicates are collapsed on upgrade
+- **WHEN** the app starts on a database where one speaker holds 13 identical voiceprints for one meeting, channel and window
+- **THEN** after the upgrade that speaker SHALL hold exactly one of them, and voiceprints that are not duplicates SHALL be left untouched
+
+#### Scenario: The kept copy preserves verification and clip
+- **WHEN** duplicates are collapsed and only one copy is verified while a different copy has an audio clip
+- **THEN** the surviving row SHALL be verified and SHALL carry an audio clip

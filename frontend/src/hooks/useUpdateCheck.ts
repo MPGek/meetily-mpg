@@ -55,6 +55,7 @@ export function useUpdateCheck(options: UseUpdateCheckOptions = {}) {
 
       return () => clearTimeout(timer);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only delayed check; checkForUpdates is recreated every render and would reschedule the check
   }, [checkOnMount]);
 
   return {

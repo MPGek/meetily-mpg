@@ -3,8 +3,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Summary, Block } from '@/types';
 import { Section } from './Section';
-import { EditableTitle } from '../EditableTitle';
-import { ExclamationTriangleIcon, CheckCircleIcon, ClipboardDocumentCheckIcon } from '@heroicons/react/24/outline';
+import { ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 
 interface Props {
   summary: Summary | null;
@@ -19,7 +18,7 @@ interface Props {
   };
 }
 
-export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerateSummary, meeting }: Props) => {
+export const AISummary = ({ summary, status, error, onSummaryChange }: Props) => {
   const generateUniqueId = (sectionKey: string) => {
     return `${sectionKey}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   };
@@ -60,6 +59,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
       };
     }
     return ensureUniqueBlockIds(summary);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- ensureUniqueBlockIds is recreated every render; adding it would recompute the summary on every render
   }, [summary]);
 
   const [selectedBlocks, setSelectedBlocks] = useState<string[]>([]);
@@ -82,6 +82,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
       setCurrentHistoryIndex(newHistory.length - 1);
     }
     setIsUndoRedoing(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- history must only grow when the summary changes; adding history/currentHistoryIndex/isUndoRedoing would re-push entries in a loop
   }, [summary]);
 
   const handleUndo = useCallback(() => {
@@ -110,16 +111,6 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
       });
     });
     return allBlocks;
-  };
-
-  const findBlockAndSection = (blockId: string) => {
-    for (const [sectionKey, section] of Object.entries(currentSummary)) {
-      const block = section.blocks.find(b => b.id === blockId);
-      if (block) {
-        return { block, sectionKey };
-      }
-    }
-    return null;
   };
 
   const handleBlockNavigate = (blockId: string, direction: 'up' | 'down') => {
@@ -164,7 +155,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
     setIsDragging(true);
   };
 
-  const handleBlockMouseEnter = (blockId: string, sectionKey: keyof Summary) => {
+  const handleBlockMouseEnter = (blockId: string) => {
     if (isDragging && dragStartBlock) {
       const range = getBlockRange(dragStartBlock, blockId);
       setSelectedBlocks(range);
@@ -227,7 +218,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
     onSummaryChange(updatedSummary);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent, blockId: string) => {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
     if ((e.key === 'Delete' || e.key === 'Backspace') && selectedBlocks.length > 1) {
       // Handle multi-block deletion
       e.preventDefault();
@@ -378,7 +369,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
   const getSelectedBlocksContent = useCallback(() => {
     return selectedBlocks
       .map(blockId => {
-        for (const [sectionKey, section] of Object.entries(currentSummary)) {
+        for (const [, section] of Object.entries(currentSummary)) {
           const block = section.blocks.find(b => b.id === blockId);
           if (block) {
             return block.content;
@@ -414,7 +405,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
           }
         } else if (e.key === 'c') {
           const blockContents = selectedBlocks.map(blockId => {
-            for (const [sectionKey, section] of Object.entries(currentSummary)) {
+            for (const [, section] of Object.entries(currentSummary)) {
               const block = section.blocks.find(b => b.id === blockId);
               if (block) {
                 return block.content;
@@ -437,6 +428,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
       document.removeEventListener('mouseup', handleMouseUp);
       document.removeEventListener('keydown', handleKeyDown);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- handleDeleteSelectedBlocks is recreated every render; adding it would re-register the document listeners on every render
   }, [selectedBlocks, currentSummary, handleUndo, handleRedo]);
 
   const handleDeleteSelectedBlocks = () => {
@@ -533,76 +525,6 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
     const newSummary = { ...currentSummary };
     delete newSummary[sectionKey];
     onSummaryChange(newSummary);
-  };
-
-  const handleAddSection = () => {
-    const newSectionKey = `section${Object.keys(currentSummary).length + 1}`;
-    const newBlockId = Date.now().toString();
-    const newSummary: Summary = {
-      ...currentSummary,
-      [newSectionKey]: {
-        title: 'New Section',
-        blocks: [{
-          id: newBlockId,
-          type: 'text' as const,
-          content: '',
-          color: 'default' as const
-        }]
-      }
-    };
-    onSummaryChange(newSummary);
-    
-    // Select the new block
-    setSelectedBlocks([newBlockId]);
-    setLastSelectedBlock(newBlockId);
-  };
-
-  const convertToMarkdown = () => {
-    let markdown = `# AI Generated Summary of Meeting: ${meeting?.id || 'Unknown'} - ${meeting?.title || 'Untitled Meeting'}\n\n`;
-    markdown += `## Date: ${meeting?.created_at ? new Date(meeting.created_at).toLocaleDateString() : new Date().toLocaleDateString()}\n\n`;
-    
-    Object.entries(currentSummary).forEach(([key, section]) => {
-      if (key === 'title') {
-        markdown = `# ${section.title || 'AI Enhanced Summary'}\n\n`;
-      } else {
-        markdown += `## ${section.title || key}\n\n`;
-        section.blocks.forEach(block => {
-          switch (block.type) {
-            case 'heading1':
-              markdown += `### ${block.content}\n\n`;
-              break;
-            case 'heading2':
-              markdown += `#### ${block.content}\n\n`;
-              break;
-            case 'bullet':
-              markdown += `- ${block.content}\n`;
-              break;
-            case 'text':
-            default:
-              markdown += `${block.content}\n\n`;
-          }
-        });
-        // Add an extra newline after bullet lists
-        if (section.blocks.some(block => block.type === 'bullet')) {
-          markdown += '\n';
-        }
-      }
-    });
-    
-    return markdown;
-  };
-
-  const handleExport = () => {
-    const markdown = convertToMarkdown();
-    const blob = new Blob([markdown], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${currentSummary.title || 'ai-summary'}.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   const renderErrorState = () => (
@@ -803,7 +725,7 @@ export const AISummary = ({ summary, status, error, onSummaryChange, onRegenerat
               onBlockTypeChange={handleBlockTypeChange}
               onBlockChange={(blockId, content) => handleBlockChange(key, blockId, content)}
               onBlockMouseDown={(blockId, e) => handleBlockMouseDown(blockId, key, e)}
-              onBlockMouseEnter={(blockId) => handleBlockMouseEnter(blockId, key)}
+              onBlockMouseEnter={(blockId) => handleBlockMouseEnter(blockId)}
               onBlockMouseUp={(blockId, e) => handleBlockMouseUp(blockId, key, e)}
               onKeyDown={handleKeyDown}
               onTitleChange={handleTitleChange}

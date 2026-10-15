@@ -1,7 +1,11 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import {
+  listenOllamaModelDownloadProgress,
+  listenOllamaModelDownloadComplete,
+  listenOllamaModelDownloadError,
+} from '@/lib/ipc/models';
 import { toast } from 'sonner';
 
 /**
@@ -48,8 +52,7 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
     const setupListeners = async () => {
       try {
         // Download progress
-        const unlistenProgress = await listen<{ modelName: string; progress: number }>(
-          'ollama-model-download-progress',
+        const unlistenProgress = await listenOllamaModelDownloadProgress(
           (event) => {
             const { modelName, progress } = event.payload;
             console.log(`🔵 [OllamaDownloadContext] Progress for ${modelName}: ${progress}%`);
@@ -72,8 +75,7 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
         unsubscribers.push(unlistenProgress);
 
         // Download complete
-        const unlistenComplete = await listen<{ modelName: string }>(
-          'ollama-model-download-complete',
+        const unlistenComplete = await listenOllamaModelDownloadComplete(
           (event) => {
             const { modelName } = event.payload;
             console.log(`✅ [OllamaDownloadContext] Download complete for ${modelName}`);
@@ -100,8 +102,7 @@ export function OllamaDownloadProvider({ children }: { children: React.ReactNode
         unsubscribers.push(unlistenComplete);
 
         // Download error
-        const unlistenError = await listen<{ modelName: string; error: string }>(
-          'ollama-model-download-error',
+        const unlistenError = await listenOllamaModelDownloadError(
           (event) => {
             const { modelName, error } = event.payload;
             console.error(`❌ [OllamaDownloadContext] Download error for ${modelName}:`, error);

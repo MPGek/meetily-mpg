@@ -25,11 +25,27 @@ The system SHALL store transcript segments associated with meetings, including a
 - **THEN** system stores the segment in `transcripts` table linked to the meeting_id with start/end timestamps
 
 ### Requirement: Summary process tracking
-The system SHALL track summary generation jobs per meeting with status, result JSON, and timing metadata.
+The system SHALL track summary generation jobs per meeting with status, result JSON, and timing metadata. Each run SHALL be identified by its recorded start time. A completed, failed, or cancelled update SHALL apply only while the row is still pending with that run's start time, and SHALL report whether it applied. Rows left pending by a previous app process SHALL be marked failed at startup.
 
 #### Scenario: Record summary completion
 - **WHEN** a summary finishes generating via LLM provider
 - **THEN** system updates the `summary_processes` table with completed status, result JSON, chunk count, and processing duration
+
+#### Scenario: Terminal update for a stale run is rejected
+- **WHEN** a completed, failed, or cancelled update arrives for a meeting with a start time that differs from the row's current start time
+- **THEN** the row is unchanged and the update reports that it did not apply
+
+#### Scenario: First terminal update wins
+- **WHEN** a run's row has already been marked cancelled and a completed update for the same run arrives
+- **THEN** the row stays cancelled with the restored previous result, and the completed update reports that it did not apply
+
+#### Scenario: Run identity survives the round trip
+- **WHEN** a run is started and the meeting's summary status is read back
+- **THEN** the status response's start value equals the run id returned when the run was started
+
+#### Scenario: Interrupted run is failed at startup
+- **WHEN** the app starts and a `summary_processes` row is still pending from a previous process
+- **THEN** the row is marked failed with an error saying generation was interrupted, and the backed-up previous result, if any, is restored as the row's result
 
 ### Requirement: Settings storage for API keys and configs
 The system SHALL persist provider configurations (API keys, endpoints, model selections) in the settings table.
@@ -52,3 +68,68 @@ The system SHALL manage the database file location within the app's data directo
 - **WHEN** user clicks "Open Database Folder" in settings
 - **THEN** system opens the OS file explorer at the directory containing the SQLite database file
 
+### Requirement: Speaker columns on transcripts
+The `transcripts` table SHALL include `speaker TEXT` and `speaker_label TEXT` columns for storing speaker diarization results.
+
+#### Scenario: Store speaker ID on transcript
+- **WHEN** diarization assigns a speaker to a transcript segment
+- **THEN** the `speaker` column SHALL contain the speaker ID (e.g., "SPEAKER_00")
+
+#### Scenario: Store user-assigned speaker label
+- **WHEN** user renames a speaker in the UI
+- **THEN** the `speaker_label` column SHALL be updated with the human-readable name (e.g., "Alice")
+
+#### Scenario: Legacy transcripts have null speaker
+- **WHEN** existing transcripts without diarization are queried
+- **THEN** `speaker` and `speaker_label` SHALL be NULL
+
+### Requirement: Diarization metadata on meetings
+The `meetings` table SHALL include `diarization_status TEXT` and `speaker_names TEXT` columns for tracking diarization state and speaker name mappings.
+
+#### Scenario: Track diarization status
+- **WHEN** diarization is running, succeeded, or failed for a meeting
+- **THEN** `diarization_status` SHALL be set to "processing", "complete", or "failed" respectively
+
+#### Scenario: Persist speaker name mappings
+- **WHEN** user assigns names to speakers in a meeting
+- **THEN** the `speaker_names` column SHALL store a JSON map of speaker IDs to labels (e.g., `{"SPEAKER_00": "Alice", "SPEAKER_01": "Bob"}`)
+
+### Requirement: Meeting tag tables with cascade cleanup
+The system SHALL persist meeting tags in `meeting_tags` (`id`, `name`, `color`, timestamps) and links in `meeting_tag_links` (`meeting_id`, `tag_id`), with a case-insensitive unique index on tag name, a composite primary key on the link, foreign keys to `meetings` and `meeting_tags`, and deletion of a meeting SHALL delete its link rows while leaving dictionary entries intact.
+
+#### Scenario: Migration creates tables
+- **WHEN** the app launches on a database without tag tables
+- **THEN** migration creates `meeting_tags` and `meeting_tag_links` with the unique name index and link primary key, and existing meetings remain readable with zero tags.
+
+#### Scenario: Meeting delete cascades links only
+- **WHEN** a meeting with two tag links is deleted via the meeting deletion path
+- **THEN** its rows in `meeting_tag_links` are removed, the `meeting_tags` rows survive, and no orphan link rows remain.
+
+#### Scenario: Duplicate link impossible
+- **WHEN** the same (`meeting_id`, `tag_id`) pair is inserted twice
+- **THEN** the database rejects the second insert via the composite primary key.
+
+### Requirement: Meetings list query returns timestamps and tags
+The meetings list read path SHALL return each meeting's `created_at` timestamp and its assigned tags (id, name, color) alongside `id` and `title`, ordered by `created_at` descending.
+
+#### Scenario: List includes new fields
+- **WHEN** the frontend requests the meetings list
+- **THEN** each entry includes `created_at` and a `tags` array (possibly empty) without dropping `id` or `title`.
+
+#### Scenario: Legacy rows without tags
+- **WHEN** a meeting created before the tags feature is listed
+- **THEN** it returns an empty `tags` array and a valid `created_at` instead of an error.
+
+### Requirement: Meetings table stores recording start time
+
+The `meetings` table SHALL include a nullable `started_at TEXT` column holding the recording's start moment (UTC RFC3339). Existing rows SHALL be backfilled with `started_at = created_at` at migration time (documented approximation: for pre-feature rows this is the stop time). The `created_at`/`updated_at` semantics and the `created_at DESC` list ordering SHALL remain unchanged.
+
+#### Scenario: Migration backfills legacy rows
+
+- **WHEN** the app launches on a database without `started_at`
+- **THEN** migration adds the column, sets `started_at = created_at` for all existing rows, and no meeting loses its list position.
+
+#### Scenario: New inserts always set start time
+
+- **WHEN** a meeting is created via the transcript-save path or the audio-import path
+- **THEN** its row stores a non-empty `started_at` (from folder metadata / file mtime, or the documented fallbacks).

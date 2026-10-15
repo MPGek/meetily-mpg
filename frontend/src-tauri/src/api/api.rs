@@ -1,15 +1,15 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
     database::{
-        models::MeetingModel,
+        models::{MeetingModel, MeetingTag},
         repositories::{
             meeting::MeetingsRepository, setting::SettingsRepository,
-            transcript::TranscriptsRepository,
+            tags::TagsRepository, transcript::TranscriptsRepository,
         },
     },
     state::AppState,
@@ -30,6 +30,14 @@ pub struct ApiResponse<T> {
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub created_at: String,
+    /// When the recording began (change: recording-start-time). Optional for
+    /// backward compatibility; readers fall back to `created_at`.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<MeetingTag>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +131,10 @@ pub struct MeetingDetails {
     pub created_at: String,
     pub updated_at: String,
     pub transcripts: Vec<MeetingTranscript>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarization_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_names: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +151,14 @@ pub struct MeetingTranscript {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_matched_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_match_score: Option<f64>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -183,7 +203,6 @@ pub struct TranscriptSegment {
     pub id: String,
     pub text: String,
     pub timestamp: String,
-    // NEW: Recording-relative timestamps for playback synchronization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_start_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +211,12 @@ pub struct TranscriptSegment {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -340,11 +365,22 @@ pub async fn api_get_meetings<R: Runtime>(
         Ok(meeting_models) => {
             log_info!("Successfully got {} meetings", meeting_models.len());
 
+            let ids: Vec<String> = meeting_models.iter().map(|m| m.id.clone()).collect();
+            let tags_by_meeting = TagsRepository::tags_for_meetings(pool, &ids)
+                .await
+                .unwrap_or_default();
+
             let result: Vec<Meeting> = meeting_models
                 .into_iter()
-                .map(|m| Meeting {
-                    id: m.id,
-                    title: m.title,
+                .map(|m| {
+                    let tags = tags_by_meeting.get(&m.id).cloned().unwrap_or_default();
+                    Meeting {
+                        id: m.id.clone(),
+                        title: m.title.clone(),
+                        created_at: m.created_at.0.to_rfc3339(),
+                        started_at: m.started_at.map(|s| s.0.to_rfc3339()),
+                        tags,
+                    }
                 })
                 .collect();
             Ok(result)
@@ -480,10 +516,10 @@ pub async fn api_get_model_config<R: Runtime>(
         Ok(Some(config)) => {
             log_info!(
                 "✅ Found model config in database: provider={}, model={}, whisperModel={}, ollamaEndpoint={:?}",
-                &config.provider,
-                &config.model,
-                &config.whisper_model,
-                &config.ollama_endpoint
+                config.provider,
+                config.model,
+                config.whisper_model,
+                config.ollama_endpoint
             );
             match SettingsRepository::get_api_key(pool, &config.provider).await {
                 Ok(api_key) => {
@@ -499,7 +535,7 @@ pub async fn api_get_model_config<R: Runtime>(
                 Err(e) => {
                     log_error!(
                         "Failed to get API key for provider {}: {}",
-                        &config.provider,
+                        config.provider,
                         e
                     );
                     Err(e.to_string())
@@ -517,6 +553,7 @@ pub async fn api_get_model_config<R: Runtime>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // 8 params; Tauri command: each param is a separate IPC argument from the frontend
 #[tauri::command]
 pub async fn api_save_model_config<R: Runtime>(
     _app: AppHandle<R>,
@@ -530,10 +567,10 @@ pub async fn api_save_model_config<R: Runtime>(
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "💾 api_save_model_config called (native): provider='{}', model='{}', whisperModel='{}', ollamaEndpoint={:?}",
-        &provider,
-        &model,
-        &whisper_model,
-        &ollama_endpoint
+        provider,
+        model,
+        whisper_model,
+        ollama_endpoint
     );
     let pool = state.db_manager.pool();
 
@@ -583,18 +620,18 @@ pub async fn api_get_api_key<R: Runtime>(
 ) -> Result<String, String> {
     log_info!(
         "api_get_api_key called (native) for provider '{}'",
-        &provider
+        provider
     );
-    match SettingsRepository::get_api_key(&state.db_manager.pool(), &provider).await {
+    match SettingsRepository::get_api_key(state.db_manager.pool(), &provider).await {
         Ok(key) => {
             log_info!(
                 "Successfully retrieved API key for provider '{}'.",
-                &provider
+                provider
             );
             Ok(key.unwrap_or_default())
         }
         Err(e) => {
-            log_error!("Failed to get API key for provider '{}': {}", &provider, e);
+            log_error!("Failed to get API key for provider '{}': {}", provider, e);
             Err(e.to_string())
         }
     }
@@ -613,8 +650,8 @@ pub async fn api_get_transcript_config<R: Runtime>(
         Ok(Some(config)) => {
             log_info!(
                 "Found transcript config: provider={}, model={}",
-                &config.provider,
-                &config.model
+                config.provider,
+                config.model
             );
             match SettingsRepository::get_transcript_api_key(pool, &config.provider).await {
                 Ok(api_key) => {
@@ -628,7 +665,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                 Err(e) => {
                     log_error!(
                         "Failed to get transcript API key for provider {}: {}",
-                        &config.provider,
+                        config.provider,
                         e
                     );
                     Err(e.to_string())
@@ -661,7 +698,7 @@ pub async fn api_save_transcript_config<R: Runtime>(
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "api_save_transcript_config called (native) for provider '{}'",
-        &provider
+        provider
     );
     let pool = state.db_manager.pool();
 
@@ -696,20 +733,20 @@ pub async fn api_get_transcript_api_key<R: Runtime>(
 ) -> Result<String, String> {
     log_info!(
         "api_get_transcript_api_key called (native) for provider '{}'",
-        &provider
+        provider
     );
-    match SettingsRepository::get_transcript_api_key(&state.db_manager.pool(), &provider).await {
+    match SettingsRepository::get_transcript_api_key(state.db_manager.pool(), &provider).await {
         Ok(key) => {
             log_info!(
                 "Successfully retrieved transcript API key for provider '{}'.",
-                &provider
+                provider
             );
             Ok(key.unwrap_or_default())
         }
         Err(e) => {
             log_error!(
                 "Failed to get transcript API key for provider '{}': {}",
-                &provider,
+                provider,
                 e
             );
             Err(e.to_string())
@@ -726,17 +763,17 @@ pub async fn api_delete_api_key<R: Runtime>(
 ) -> Result<(), String> {
     log_info!(
         "log_api_delete_api_key called (native) for provider '{}'",
-        &provider
+        provider
     );
-    match SettingsRepository::delete_api_key(&state.db_manager.pool(), &provider).await {
+    match SettingsRepository::delete_api_key(state.db_manager.pool(), &provider).await {
         Ok(_) => {
-            log_info!("Successfully deleted API key for provider '{}'.", &provider);
+            log_info!("Successfully deleted API key for provider '{}'.", provider);
             Ok(())
         }
         Err(e) => {
             log_error!(
                 "Failed to delete API key for provider '{}': {}",
-                &provider,
+                provider,
                 e
             );
             Err(e.to_string())
@@ -819,7 +856,10 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
     meeting_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<MeetingMetadata, String> {
-    log_info!("api_get_meeting_metadata called for meeting_id: {}", meeting_id);
+    log_info!(
+        "api_get_meeting_metadata called for meeting_id: {}",
+        meeting_id
+    );
 
     let pool = state.db_manager.pool();
 
@@ -845,6 +885,67 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
     }
 }
 
+/// Get the audio file path for a meeting (for playback on the meeting notes page)
+#[tauri::command]
+pub async fn get_meeting_audio_path<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    log_info!(
+        "get_meeting_audio_path called for meeting_id: {}",
+        meeting_id
+    );
+
+    let pool = state.db_manager.pool();
+
+    match MeetingsRepository::get_meeting_metadata(pool, &meeting_id).await {
+        Ok(Some(meeting)) => match meeting.folder_path {
+            Some(folder) => {
+                match crate::audio::audio_file::find_audio_file(std::path::Path::new(&folder)) {
+                    Ok(path) => {
+                        // Register in the asset protocol runtime scope so the
+                        // webview can stream it via convertFileSrc (recordings
+                        // live outside the configured $APPDATA/** scope)
+                        if let Err(e) = app.asset_protocol_scope().allow_file(&path) {
+                            log_warn!("Failed to allow audio file in asset scope: {}", e);
+                        }
+                        Ok(Some(path.to_string_lossy().to_string()))
+                    }
+                    Err(e) => {
+                        log_warn!("No audio file for meeting {}: {}", meeting_id, e);
+                        Ok(None)
+                    }
+                }
+            }
+            None => {
+                log_warn!("Meeting {} has no folder path", meeting_id);
+                Ok(None)
+            }
+        },
+        Ok(None) => {
+            log_warn!("Meeting not found: {}", meeting_id);
+            Err(format!("Meeting not found: {}", meeting_id))
+        }
+        Err(e) => {
+            log_error!("Error retrieving meeting metadata {}: {}", meeting_id, e);
+            Err(format!("Failed to retrieve meeting metadata: {}", e))
+        }
+    }
+}
+
+/// Transcode an audio file to WAV for webview playback (cached in temp dir)
+#[tauri::command]
+pub async fn prepare_audio_for_playback(file_path: String) -> Result<String, String> {
+    log_info!("prepare_audio_for_playback called for: {}", file_path);
+
+    tokio::task::spawn_blocking(move || {
+        crate::audio::audio_file::prepare_audio_for_playback(&file_path)
+    })
+    .await
+    .map_err(|e| format!("Transcode task failed: {}", e))?
+}
+
 /// Get paginated transcripts for a meeting
 #[tauri::command]
 pub async fn api_get_meeting_transcripts<R: Runtime>(
@@ -863,7 +964,9 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
 
     let pool = state.db_manager.pool();
 
-    match MeetingsRepository::get_meeting_transcripts_paginated(pool, &meeting_id, limit, offset).await {
+    match MeetingsRepository::get_meeting_transcripts_paginated(pool, &meeting_id, limit, offset)
+        .await
+    {
         Ok((transcripts, total_count)) => {
             log_info!(
                 "Successfully retrieved {} transcripts for meeting {} (total: {})",
@@ -883,6 +986,10 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
                     source_device: t.source_device,
+                    speaker: t.speaker,
+                    speaker_label: t.speaker_label,
+                    speaker_matched_by: t.speaker_matched_by,
+                    speaker_match_score: t.speaker_match_score,
                 })
                 .collect::<Vec<_>>();
 
@@ -895,7 +1002,11 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
             })
         }
         Err(e) => {
-            log_error!("Error retrieving transcripts for meeting {}: {}", meeting_id, e);
+            log_error!(
+                "Error retrieving transcripts for meeting {}: {}",
+                meeting_id,
+                e
+            );
             Err(format!("Failed to retrieve transcripts: {}", e))
         }
     }
@@ -931,9 +1042,80 @@ pub async fn api_save_meeting_title<R: Runtime>(
     }
 }
 
+/// Link the recording's pending tag ids (from the meeting folder's
+/// `metadata.json`) to a newly saved meeting. Best-effort per tag: returns
+/// human-readable warnings for skipped/failed ids, never errors — the meeting
+/// save must not fail because of tags (change: tags-before-during-recording).
+/// Resolve the folder whose `metadata.json` holds the pending tag ids: prefer
+/// the frontend-provided path when it exists, otherwise fall back to the
+/// recorder's last folder (change: tags-persistence-and-palette).
+fn resolve_recording_folder(provided: Option<&str>) -> Option<std::path::PathBuf> {
+    if let Some(path) = provided {
+        let candidate = std::path::PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    crate::summary::metadata::take_last_recording_folder()
+}
+
+async fn link_recording_pending_tags(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    folder: Option<&std::path::Path>,
+) -> Vec<String> {
+    let Some(folder) = folder else {
+        return Vec::new();
+    };
+    if !folder.exists() {
+        log_warn!(
+            "Recording folder not found for {} ({}); pending tags were not linked",
+            meeting_id,
+            folder.display()
+        );
+        return vec![
+            "Recording folder was not found, so tags for this recording were not linked."
+                .to_string(),
+        ];
+    }
+    let pending = match crate::summary::metadata::read_pending_tag_ids_from_metadata(folder) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log_warn!("Failed to read pending tags for {}: {}", meeting_id, e);
+            return vec!["Could not read pending tags for this recording.".to_string()];
+        }
+    };
+    let mut warnings = Vec::new();
+    for tag_id in pending {
+        match TagsRepository::assign_tag(pool, meeting_id, &tag_id).await {
+            Ok(_) => {}
+            Err(sqlx::Error::RowNotFound) => {
+                log_warn!(
+                    "Pending tag {} no longer exists, skipping for meeting {}",
+                    tag_id,
+                    meeting_id
+                );
+                warnings.push(format!(
+                    "Tag no longer exists and was skipped: {}",
+                    tag_id
+                ));
+            }
+            Err(e) => {
+                log_warn!(
+                    "Failed to link pending tag {} to meeting {}: {}",
+                    tag_id,
+                    meeting_id,
+                    e
+                );
+                warnings.push(format!("Could not assign tag: {}", tag_id));
+            }
+        }
+    }
+    warnings
+}
+
 #[tauri::command]
-pub async fn api_save_transcript<R: Runtime>(
-    _app: AppHandle<R>,
+pub async fn api_save_transcript<R: Runtime>(    _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
@@ -963,7 +1145,10 @@ pub async fn api_save_transcript<R: Runtime>(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             log_error!("Failed to parse transcript segments: {}", e);
-            format!("Invalid transcript data format: {}. Please check the data structure.", e)
+            format!(
+                "Invalid transcript data format: {}. Please check the data structure.",
+                e
+            )
         })?;
 
     // Log parsed segments count and first segment details
@@ -976,6 +1161,10 @@ pub async fn api_save_transcript<R: Runtime>(
     }
 
     let pool = state.db_manager.pool();
+
+    // Cloned before the save call below moves `folder_path`; needed for
+    // pending-tag linking after the meeting row exists.
+    let pending_tags_folder = folder_path.clone();
 
     // Now, call the repository with the correctly typed data.
     match TranscriptsRepository::save_transcript(
@@ -991,10 +1180,18 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            // Link pending recording tags (change:
+            // tags-before-during-recording). Best-effort per tag: stale ids
+            // (tag deleted mid-recording) are skipped with a warning, and a
+            // tag failure never fails the meeting save.
+            let resolved_folder = resolve_recording_folder(pending_tags_folder.as_deref());
+            let tag_warnings =
+                link_recording_pending_tags(pool, &meeting_id, resolved_folder.as_deref()).await;
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",
-                "meeting_id": meeting_id
+                "meeting_id": meeting_id,
+                "tag_warnings": tag_warnings,
             }))
         }
         Err(e) => {
@@ -1092,7 +1289,7 @@ pub async fn test_backend_connection<R: Runtime>(
 
     log_debug!("Testing connection to: {}", server_url);
 
-    let mut request = client.get(&format!("{}/docs", server_url));
+    let mut request = client.get(format!("{}/docs", server_url));
 
     if let Some(token) = auth_token {
         request = request.header("Authorization", format!("Bearer {}", token));
@@ -1155,7 +1352,7 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
     use std::process::Command;
 
     let result = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(&["/C", "start", &url]).output()
+        Command::new("cmd").args(["/C", "start", &url]).output()
     } else if cfg!(target_os = "macos") {
         Command::new("open").arg(&url).output()
     } else {
@@ -1173,6 +1370,7 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
 
 /// Saves the custom OpenAI configuration
 /// This configuration is stored as JSON and includes endpoint, apiKey, model, and optional parameters
+#[allow(clippy::too_many_arguments)] // 8 params; Tauri command: each param is a separate IPC argument from the frontend
 #[tauri::command]
 pub async fn api_save_custom_openai_config<R: Runtime>(
     _app: AppHandle<R>,
@@ -1186,8 +1384,8 @@ pub async fn api_save_custom_openai_config<R: Runtime>(
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "api_save_custom_openai_config called: endpoint='{}', model='{}'",
-        &endpoint,
-        &model
+        endpoint,
+        model
     );
 
     // Validate required fields
@@ -1233,7 +1431,10 @@ pub async fn api_save_custom_openai_config<R: Runtime>(
 
     match SettingsRepository::save_custom_openai_config(pool, &config).await {
         Ok(()) => {
-            log_info!("✅ Successfully saved custom OpenAI config for endpoint: {}", config.endpoint);
+            log_info!(
+                "✅ Successfully saved custom OpenAI config for endpoint: {}",
+                config.endpoint
+            );
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Custom OpenAI configuration saved successfully"
@@ -1259,8 +1460,11 @@ pub async fn api_get_custom_openai_config<R: Runtime>(
     match SettingsRepository::get_custom_openai_config(pool).await {
         Ok(config) => {
             if let Some(ref c) = config {
-                log_info!("✅ Found custom OpenAI config: endpoint='{}', model='{}'",
-                    c.endpoint, c.model);
+                log_info!(
+                    "✅ Found custom OpenAI config: endpoint='{}', model='{}'",
+                    c.endpoint,
+                    c.model
+                );
             } else {
                 log_info!("No custom OpenAI config found");
             }
@@ -1284,8 +1488,8 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "api_test_custom_openai_connection called: endpoint='{}', model='{}'",
-        &endpoint,
-        &model
+        endpoint,
+        model
     );
 
     // Validate endpoint URL format
@@ -1337,13 +1541,13 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                             if let Some(choices_array) = choices.as_array() {
                                 if !choices_array.is_empty() {
                                     // Verify the first choice has the required message structure
-                                    if let Some(first_choice) = choices_array.get(0) {
+                                    if let Some(first_choice) = choices_array.first() {
                                         // Check if message.content field exists (can be empty string)
                                         let has_message_structure = first_choice
                                             .get("message")
                                             .and_then(|m| {
                                                 m.get("content")
-                                                .or_else(|| m.get("reasoning_content"))
+                                                    .or_else(|| m.get("reasoning_content"))
                                             })
                                             .is_some();
 
@@ -1361,17 +1565,33 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                         }
 
                         // Response was 200 but doesn't match OpenAI format
-                        log_warn!("⚠️ Endpoint returned 200 but response doesn't match OpenAI format: {}", response_text);
+                        log_warn!(
+                            "⚠️ Endpoint returned 200 but response doesn't match OpenAI format: {}",
+                            response_text
+                        );
                         Err("Endpoint is reachable but doesn't appear to be OpenAI-compatible. Response is missing 'choices' array or 'message.content' / 'message.reasoning_content' field.".to_string())
                     }
                     Err(e) => {
-                        log_warn!("⚠️ Endpoint returned 200 but response is not valid JSON: {}", e);
-                        Err(format!("Endpoint is reachable but returned invalid JSON: {}. Response: {}", e, response_text))
+                        log_warn!(
+                            "⚠️ Endpoint returned 200 but response is not valid JSON: {}",
+                            e
+                        );
+                        Err(format!(
+                            "Endpoint is reachable but returned invalid JSON: {}. Response: {}",
+                            e, response_text
+                        ))
                     }
                 }
             } else {
-                log_warn!("⚠️ Custom OpenAI connection test failed with status {}: {}", status, response_text);
-                Err(format!("Connection failed with status {}: {}", status, response_text))
+                log_warn!(
+                    "⚠️ Custom OpenAI connection test failed with status {}: {}",
+                    status,
+                    response_text
+                );
+                Err(format!(
+                    "Connection failed with status {}: {}",
+                    status, response_text
+                ))
             }
         }
         Err(e) => {
@@ -1384,5 +1604,141 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                 Err(format!("Connection failed: {}", e))
             }
         }
+    }
+}
+#[cfg(test)]
+mod pending_tags_tests {
+    use super::*;
+    use crate::database::repositories::tags::TagsRepository;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn setup_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn pending_tags_link_to_new_meeting() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("meeting-1")
+            .bind("M")
+            .bind("2026-09-11T15:30:00Z")
+            .bind("2026-09-11T15:30:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let work = TagsRepository::create_tag(&pool, "Work", None).await.unwrap();
+        let q3 = TagsRepository::create_tag(&pool, "Q3", None).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::json!({ "pending_tag_ids": [&work.id, &q3.id] }).to_string(),
+        )
+        .unwrap();
+
+        let warnings =
+            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path())).await;
+        assert!(warnings.is_empty(), "unexpected warnings");
+
+        let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
+            .await
+            .unwrap();
+        let ids: Vec<&str> = linked["meeting-1"].iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&work.id.as_str()));
+        assert!(ids.contains(&q3.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn stale_pending_id_warns_without_failing() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("meeting-1")
+            .bind("M")
+            .bind("2026-09-11T15:30:00Z")
+            .bind("2026-09-11T15:30:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let work = TagsRepository::create_tag(&pool, "Work", None).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::json!({ "pending_tag_ids": [&work.id, "tag-deleted-mid-recording"] })
+                .to_string(),
+        )
+        .unwrap();
+
+        let warnings =
+            link_recording_pending_tags(&pool, "meeting-1", Some(dir.path())).await;
+        assert_eq!(warnings.len(), 1);
+
+        let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(linked["meeting-1"].len(), 1);
+        assert_eq!(linked["meeting-1"][0].id, work.id);
+    }
+
+    #[tokio::test]
+    async fn no_folder_means_no_warnings() {
+        let pool = setup_pool().await;
+        let warnings = link_recording_pending_tags(&pool, "meeting-1", None).await;
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_folder_warns_instead_of_dropping_tags() {
+        let pool = setup_pool().await;
+        let missing = std::path::Path::new("does-not-exist-anywhere");
+        let warnings = link_recording_pending_tags(&pool, "meeting-1", Some(missing)).await;
+        assert_eq!(warnings.len(), 1, "missing folder must warn, not silently drop");
+    }
+
+    #[tokio::test]
+    async fn pending_tags_link_via_last_recording_folder_fallback() {
+        let pool = setup_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("meeting-1")
+            .bind("M")
+            .bind("2026-09-11T15:30:00Z")
+            .bind("2026-09-11T15:30:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let work = TagsRepository::create_tag(&pool, "Fallback", None).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::json!({ "pending_tag_ids": [&work.id] }).to_string(),
+        )
+        .unwrap();
+
+        crate::summary::metadata::set_last_recording_folder(Some(dir.path().to_path_buf()));
+        let resolved = resolve_recording_folder(None);
+        assert_eq!(resolved.as_deref(), Some(dir.path()));
+
+        let warnings = link_recording_pending_tags(&pool, "meeting-1", resolved.as_deref()).await;
+        assert!(warnings.is_empty(), "unexpected warnings");
+
+        let linked = TagsRepository::tags_for_meetings(&pool, &["meeting-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(linked["meeting-1"].len(), 1);
+        assert_eq!(linked["meeting-1"][0].id, work.id);
     }
 }

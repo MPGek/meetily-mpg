@@ -5,12 +5,47 @@ use regex::Regex;
 use reqwest::Client;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // Compile regex once and reuse (significant performance improvement for repeated calls)
-static THINKING_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?s)<think(?:ing)?>.*?</think(?:ing)?>").unwrap()
-});
+/// A closed `<think>`/`<thinking>` envelope, any case, optional attributes.
+static THINKING_ENVELOPE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<think(?:ing)?(?:\s[^>]*)?>.*?</think(?:ing)?\s*>").unwrap());
+
+/// Any opening or closing reasoning marker left after envelope removal.
+static THINKING_MARKER_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)</?think(?:ing)?(?:\s[^>]*)?>").unwrap());
+
+/// One stage's cleaned output, and whether a reasoning envelope was removed.
+#[derive(Debug, PartialEq)]
+struct StageOutput {
+    markdown: String,
+    reasoning_stripped: bool,
+}
+
+/// Cleans a stage's raw LLM output strictly: an unterminated or stray
+/// reasoning marker, or nothing visible after cleaning, fails the stage.
+fn clean_stage_output(stage: &str, raw: &str) -> Result<StageOutput, String> {
+    let reasoning_stripped = THINKING_ENVELOPE_REGEX.is_match(raw);
+    let markdown = clean_llm_markdown_output(raw);
+    if THINKING_MARKER_REGEX.is_match(&markdown) {
+        return Err(format!(
+            "{stage} contained an unterminated reasoning marker"
+        ));
+    }
+    if markdown.is_empty() {
+        return Err(format!(
+            "{stage} returned no visible summary content after reasoning removal"
+        ));
+    }
+    Ok(StageOutput {
+        markdown,
+        reasoning_stripped,
+    })
+}
+
+/// A failed chunk is retried once; a second failure fails the whole run.
+const MAX_CHUNK_ATTEMPTS: usize = 2;
 
 const ENGLISH_BASE_SUMMARY_INSTRUCTION: &str =
     "**Write the summary/report in English regardless of transcript language; non-English prose is invalid.**";
@@ -23,7 +58,11 @@ fn resolve_cached_english<'a>(
     let target_is_translation = summary_language
         .and_then(language_name_from_code)
         .is_some_and(|n| n != "English");
-    if target_is_translation { Some(cached_clean) } else { None }
+    if target_is_translation {
+        Some(cached_clean)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,11 +253,10 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
 
     let mut chunks = Vec::new();
     let mut start_char = 0;
-    // Step is the size of the non-overlapping part of the window
-    let step = chunk_size_chars.saturating_sub(overlap_chars).max(1);
 
     while start_char < total_chars {
         let end_char = (start_char + chunk_size_chars).min(total_chars);
+        let mut emitted_end_char = end_char;
 
         // Convert character indices to byte indices for string slicing
         let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
@@ -227,24 +265,30 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
         // Try to break at sentence or word boundary for cleaner chunks
         if end_char < total_chars {
             let slice = &text[start_byte..end_byte];
-            // Look for sentence boundary (period followed by space)
-            if let Some(last_period) = slice.rfind(". ") {
-                end_byte = start_byte + last_period + 2;
-            } else if let Some(last_space) = slice.rfind(' ') {
-                // Fall back to word boundary (space)
-                end_byte = start_byte + last_space + 1;
+            let sentence_boundary = slice.rfind(". ").map(|index| index + 2);
+            let word_boundary = slice.rfind(' ').map(|index| index + 1);
+            let boundary = sentence_boundary
+                .filter(|end| slice[..*end].chars().count() > overlap_chars)
+                .or_else(|| {
+                    word_boundary.filter(|end| slice[..*end].chars().count() > overlap_chars)
+                });
+
+            if let Some(boundary) = boundary {
+                end_byte = start_byte + boundary;
+                emitted_end_char = start_char + slice[..boundary].chars().count();
             }
         }
 
         // Extract chunk
         chunks.push(text[start_byte..end_byte].to_string());
 
-        if end_char >= total_chars {
+        if emitted_end_char >= total_chars {
             break;
         }
 
-        // Move to next chunk with overlap (in character units)
-        start_char += step;
+        start_char = emitted_end_char
+            .saturating_sub(overlap_chars)
+            .max(start_char + 1);
     }
 
     info!("Created {} chunks from text", chunks.len());
@@ -260,7 +304,7 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
 /// Cleaned markdown string
 pub fn clean_llm_markdown_output(markdown: &str) -> String {
     // Remove <think>...</think> or <thinking>...</thinking> blocks using cached regex
-    let without_thinking = THINKING_TAG_REGEX.replace_all(markdown, "");
+    let without_thinking = THINKING_ENVELOPE_REGEX.replace_all(markdown, "");
 
     let trimmed = without_thinking.trim();
 
@@ -320,6 +364,7 @@ pub fn extract_meeting_name_from_markdown(markdown: &str) -> Option<String> {
 /// Tuple of (final_summary_markdown, english_summary_markdown, number_of_chunks_processed)
 /// where english_summary_markdown is the canonical AI-generated English summary
 /// (equals final_summary_markdown when target language is English)
+#[allow(clippy::too_many_arguments)] // 20 params; a real smell, but a params struct would change every call site; no owning change yet
 pub async fn generate_meeting_summary(
     client: &Client,
     provider: &LLMProvider,
@@ -355,10 +400,16 @@ pub async fn generate_meeting_summary(
     let total_tokens = rough_token_count(text);
     info!("Transcript length: {} tokens", total_tokens);
 
+    // Whether any stage removed a reasoning envelope; logged once, not persisted.
+    let mut reasoning_stripped = false;
+
     let (mut english_markdown, successful_chunk_count) = if let Some(cached) =
         resolve_cached_english(cached_english, summary_language)
     {
-        info!("✓ Using cached English summary ({} chars), skipping pass 1", cached.len());
+        info!(
+            "✓ Using cached English summary ({} chars), skipping pass 1",
+            cached.len()
+        );
         (cached.to_string(), 1_i64)
     } else {
         let content_to_summarize: String;
@@ -367,7 +418,9 @@ pub async fn generate_meeting_summary(
         // Strategy: Use single-pass for cloud providers or short transcripts
         // Use multi-level chunking for Ollama/BuiltInAI with long transcripts
         // Note: CustomOpenAI is treated like cloud providers (unlimited context)
-        if (provider != &LLMProvider::Ollama && provider != &LLMProvider::BuiltInAI) || total_tokens < token_threshold {
+        if (provider != &LLMProvider::Ollama && provider != &LLMProvider::BuiltInAI)
+            || total_tokens < token_threshold
+        {
             info!(
                 "Using single-pass summarization (tokens: {}, threshold: {})",
                 total_tokens, token_threshold
@@ -384,6 +437,13 @@ pub async fn generate_meeting_summary(
             let chunks = chunk_text(text, token_threshold - 300, 100);
             let num_chunks = chunks.len();
             info!("Split transcript into {} chunks", num_chunks);
+            if chunks.is_empty() {
+                // Only when the chunk budget is zero (token_threshold == 300).
+                return Err(
+                    "Multi-level summarization failed: the transcript produced no chunks."
+                        .to_string(),
+                );
+            }
 
             let mut chunk_summaries = Vec::new();
             let system_prompt_chunk = "You are an expert meeting summarizer.";
@@ -392,7 +452,11 @@ pub async fn generate_meeting_summary(
                 // Check for cancellation before processing each chunk
                 if let Some(token) = cancellation_token {
                     if token.is_cancelled() {
-                        info!("Summary generation cancelled during chunk {}/{}", i + 1, num_chunks);
+                        info!(
+                            "Summary generation cancelled during chunk {}/{}",
+                            i + 1,
+                            num_chunks
+                        );
                         return Err("Summary generation was cancelled".to_string());
                     }
                 }
@@ -400,43 +464,63 @@ pub async fn generate_meeting_summary(
                 info!("Processing chunk {}/{}", i + 1, num_chunks);
                 let user_prompt_chunk = build_chunk_summary_user_prompt(chunk);
 
-                match generate_summary(
-                    client,
-                    provider,
-                    model_name,
-                    api_key,
-                    system_prompt_chunk,
-                    &user_prompt_chunk,
-                    ollama_endpoint,
-                    custom_openai_endpoint,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    app_data_dir,
-                    debug_log_dir.clone(),
-                    cancellation_token,
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        chunk_summaries.push(summary);
-                        info!("✓ Chunk {}/{} processed successfully", i + 1, num_chunks);
-                    }
-                    Err(e) => {
-                        // Check if error is due to cancellation
-                        if e.contains("cancelled") {
-                            return Err(e);
-                        }
-                        error!("Failed processing chunk {}/{}: {}", i + 1, num_chunks, e);
-                    }
-                }
-            }
+                let mut attempt = 1;
+                let chunk_output = loop {
+                    let result = generate_summary(
+                        client,
+                        provider,
+                        model_name,
+                        api_key,
+                        system_prompt_chunk,
+                        &user_prompt_chunk,
+                        ollama_endpoint,
+                        custom_openai_endpoint,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        app_data_dir,
+                        debug_log_dir.clone(),
+                        cancellation_token,
+                    )
+                    .await
+                    .and_then(|raw| clean_stage_output("Summary chunk", &raw));
 
-            if chunk_summaries.is_empty() {
-                return Err(
-                    "Multi-level summarization failed: No chunks were processed successfully."
-                        .to_string(),
-                );
+                    match result {
+                        Ok(output) => break output,
+                        Err(_) if cancellation_token.is_some_and(|t| t.is_cancelled()) => {
+                            info!(
+                                "Summary generation cancelled during chunk {}/{}",
+                                i + 1,
+                                num_chunks
+                            );
+                            return Err("Summary generation was cancelled".to_string());
+                        }
+                        Err(e) if attempt < MAX_CHUNK_ATTEMPTS => {
+                            warn!(
+                                "Chunk {}/{} failed on attempt {}; retrying: {}",
+                                i + 1,
+                                num_chunks,
+                                attempt,
+                                e
+                            );
+                            attempt += 1;
+                        }
+                        Err(e) => {
+                            error!("Failed processing chunk {}/{}: {}", i + 1, num_chunks, e);
+                            return Err(format!(
+                                "Summary generation could not complete because transcript section {} of {} failed after {} attempts: {}. Please retry.",
+                                i + 1,
+                                num_chunks,
+                                MAX_CHUNK_ATTEMPTS,
+                                e
+                            ));
+                        }
+                    }
+                };
+
+                reasoning_stripped |= chunk_output.reasoning_stripped;
+                chunk_summaries.push(chunk_output.markdown);
+                info!("✓ Chunk {}/{} processed successfully", i + 1, num_chunks);
             }
 
             successful_chunk_count = chunk_summaries.len() as i64;
@@ -454,7 +538,7 @@ pub async fn generate_meeting_summary(
                 let combined_text = chunk_summaries.join("\n---\n");
                 let system_prompt_combine = "You are an expert at synthesizing meeting summaries.";
                 let user_prompt_combine = build_combine_summary_user_prompt(&combined_text);
-                generate_summary(
+                let raw_combined = generate_summary(
                     client,
                     provider,
                     model_name,
@@ -470,13 +554,19 @@ pub async fn generate_meeting_summary(
                     debug_log_dir.clone(),
                     cancellation_token,
                 )
-                .await?
+                .await?;
+                let combined = clean_stage_output("Combined summary", &raw_combined)?;
+                reasoning_stripped |= combined.reasoning_stripped;
+                combined.markdown
             } else {
                 chunk_summaries.remove(0)
             };
         }
 
-        info!("Generating final markdown report with template: {}", template_id);
+        info!(
+            "Generating final markdown report with template: {}",
+            template_id
+        );
 
         // Generate markdown structure and section instructions using template methods
         let clean_template_markdown = template.to_markdown_structure();
@@ -485,9 +575,8 @@ pub async fn generate_meeting_summary(
         let final_system_prompt =
             build_final_report_system_prompt(&section_instructions, &clean_template_markdown);
 
-        let mut final_user_prompt = format!(
-            "<transcript_chunks>\n{content_to_summarize}\n</transcript_chunks>\n"
-        );
+        let mut final_user_prompt =
+            format!("<transcript_chunks>\n{content_to_summarize}\n</transcript_chunks>\n");
 
         if !custom_prompt.is_empty() {
             final_user_prompt.push_str("\n\nUser Provided Context:\n\n<user_context>\n");
@@ -521,13 +610,18 @@ pub async fn generate_meeting_summary(
         )
         .await?;
 
-        let english_markdown = clean_llm_markdown_output(&raw_markdown);
+        let final_report = clean_stage_output("Final summary", &raw_markdown)?;
+        reasoning_stripped |= final_report.reasoning_stripped;
+        let english_markdown = final_report.markdown;
         info!("Summary pass completed ({} chars)", english_markdown.len());
 
         (english_markdown, successful_chunk_count)
     };
 
-    let final_markdown = match resolve_final_language_action(summary_language, detected_transcript_language) {
+    let final_markdown = match resolve_final_language_action(
+        summary_language,
+        detected_transcript_language,
+    ) {
         FinalLanguageAction::Translate(name) => {
             match translate_markdown(
                 client,
@@ -547,7 +641,10 @@ pub async fn generate_meeting_summary(
             )
             .await
             {
-                Ok(translated) => translated,
+                Ok(translated) => {
+                    reasoning_stripped |= translated.reasoning_stripped;
+                    translated.markdown
+                }
                 Err(e) => return Err(format!("Translation to {} failed: {}", name, e)),
             }
         }
@@ -556,32 +653,38 @@ pub async fn generate_meeting_summary(
                 "English target with detected transcript language {:?}; running soft English normalization",
                 detected_transcript_language
             );
-            let normalized = english_markdown_after_normalization_result(
+            let normalization = normalize_markdown_to_english(
+                client,
+                provider,
+                model_name,
+                api_key,
                 &english_markdown,
-                normalize_markdown_to_english(
-                    client,
-                    provider,
-                    model_name,
-                    api_key,
-                    &english_markdown,
-                    ollama_endpoint,
-                    custom_openai_endpoint,
-                    max_tokens,
-                    temperature,
-                    top_p,
-                    app_data_dir,
-                    cancellation_token,
-                    debug_log_dir.clone(),
-                )
-                .await,
-            )?;
+                ollama_endpoint,
+                custom_openai_endpoint,
+                max_tokens,
+                temperature,
+                top_p,
+                app_data_dir,
+                cancellation_token,
+                debug_log_dir.clone(),
+            )
+            .await
+            .map(|output| {
+                reasoning_stripped |= output.reasoning_stripped;
+                output.markdown
+            });
+            let normalized =
+                english_markdown_after_normalization_result(&english_markdown, normalization)?;
             english_markdown = normalized.clone();
             normalized
         }
         FinalLanguageAction::ReturnEnglish => english_markdown.clone(),
     };
 
-    info!("Summary generation completed successfully");
+    info!(
+        "Summary generation completed successfully (reasoning_stripped: {})",
+        reasoning_stripped
+    );
     Ok((final_markdown, english_markdown, successful_chunk_count))
 }
 
@@ -602,7 +705,7 @@ async fn run_markdown_transform(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
     debug_log_dir: Option<PathBuf>,
-) -> Result<String, String> {
+) -> Result<StageOutput, String> {
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
             return Err("Summary generation was cancelled".to_string());
@@ -628,7 +731,7 @@ async fn run_markdown_transform(
     .await
     .map_err(|e| format!("{failure_label} failed: {e}"))?;
 
-    Ok(clean_llm_markdown_output(&raw))
+    clean_stage_output(failure_label, &raw)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -647,7 +750,7 @@ async fn translate_markdown(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
     debug_log_dir: Option<PathBuf>,
-) -> Result<String, String> {
+) -> Result<StageOutput, String> {
     info!("Translation pass: target language = {}", target_language);
 
     let system_prompt = translation_system_prompt(target_language);
@@ -690,7 +793,7 @@ async fn normalize_markdown_to_english(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
     debug_log_dir: Option<PathBuf>,
-) -> Result<String, String> {
+) -> Result<StageOutput, String> {
     info!("English normalization pass: preserving Markdown structure");
 
     let user_prompt = format!(
@@ -720,6 +823,66 @@ async fn normalize_markdown_to_english(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_text_preserves_content_after_early_sentence_boundary() {
+        let marker = "LOST_MARKER";
+        let text = format!("Intro. {marker} trailing content ensures chunking");
+
+        let chunks = chunk_text(&text, 10, 1);
+
+        assert!(
+            chunks.iter().any(|chunk| chunk.contains(marker)),
+            "marker was omitted from all chunks: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_text_keeps_unicode_boundaries() {
+        assert_eq!(chunk_text("é ab", 1, 0), vec!["é ", "ab"]);
+    }
+
+    #[test]
+    fn chunk_text_progresses_when_overlap_matches_window() {
+        assert_eq!(chunk_text("abcd", 1, 1), vec!["abc", "bcd"]);
+    }
+
+    #[test]
+    fn chunk_text_covers_every_character() {
+        // Sentences are 303 chars, longer than the 286-char window (100
+        // tokens), so the first window's only ". " sits right after "a." and
+        // snapping back to it would be far longer than the 29-char (10-token)
+        // overlap. Words are unique so every chunk can be located in the
+        // source text.
+        let mut text = String::new();
+        let mut word = 0;
+        while text.len() < 5_000 {
+            text.push_str("a. ");
+            for _ in 0..50 {
+                word += 1;
+                text.push_str(&format!("w{word:04} "));
+            }
+        }
+
+        let chunks = chunk_text(&text, 100, 10);
+
+        let mut covered_end = 0;
+        let mut search_from = 0;
+        for chunk in &chunks {
+            let start = search_from
+                + text[search_from..]
+                    .find(chunk.as_str())
+                    .expect("chunk must be a slice of the input");
+            assert!(
+                start <= covered_end,
+                "gap of {} chars before chunk at {start}",
+                start - covered_end
+            );
+            covered_end = covered_end.max(start + chunk.len());
+            search_from = start + 1;
+        }
+        assert_eq!(covered_end, text.len(), "tail of the text was not chunked");
+    }
 
     #[test]
     fn chunk_summary_prompt_forces_english_base_output() {
@@ -797,13 +960,263 @@ mod tests {
 
     #[test]
     fn cancelled_english_normalization_is_not_swallowed() {
-        assert!(
-            english_markdown_after_normalization_result(
-                "# Original",
-                Err("Summary generation was cancelled".to_string())
-            )
-            .is_err()
+        assert!(english_markdown_after_normalization_result(
+            "# Original",
+            Err("Summary generation was cancelled".to_string())
+        )
+        .is_err());
+    }
+
+    // reasoning cleaning ------------------------------------------------------
+
+    #[test]
+    fn envelope_with_attributes_and_mixed_case_is_removed() {
+        let cleaned = clean_llm_markdown_output(
+            r#"Intro <THINKING class="internal">private</THINKING> # Meeting"#,
         );
+        assert!(cleaned.contains("Intro"));
+        assert!(cleaned.contains("# Meeting"));
+        assert!(!cleaned.contains("private"));
+    }
+
+    #[test]
+    fn envelopes_anywhere_are_removed_including_inside_a_fence() {
+        let raw = "<think>a</think>\n```markdown\n<Think >b\nc</think >\n# Title\nBody\n```\n<thinking>d</thinking>";
+        let out = clean_stage_output("Final summary", raw).unwrap();
+        assert_eq!(out.markdown, "# Title\nBody");
+        assert!(out.reasoning_stripped);
+    }
+
+    #[test]
+    fn lookalike_thinker_tag_is_kept() {
+        let out = clean_stage_output("Final summary", "<thinker>Visible</thinker>").unwrap();
+        assert_eq!(out.markdown, "<thinker>Visible</thinker>");
+        assert!(!out.reasoning_stripped);
+    }
+
+    #[test]
+    fn unclosed_or_stray_markers_fail_the_stage() {
+        for raw in [
+            "Visible text\n<think>private",
+            "Visible</thinking> text",
+            "Visible <think reason=\"x\">private",
+        ] {
+            assert_eq!(
+                clean_stage_output("Final summary", raw).unwrap_err(),
+                "Final summary contained an unterminated reasoning marker",
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_only_or_empty_fence_output_fails_the_stage() {
+        for raw in ["<think>only reasoning</think>", "```markdown\n```", "  "] {
+            assert_eq!(
+                clean_stage_output("Summary chunk", raw).unwrap_err(),
+                "Summary chunk returned no visible summary content after reasoning removal",
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_normalization_output_falls_back_to_pass_one_markdown() {
+        let stage = clean_stage_output("English normalization pass", "<think>x</think>")
+            .map(|output| output.markdown);
+        assert_eq!(
+            english_markdown_after_normalization_result("# Original", stage).unwrap(),
+            "# Original"
+        );
+    }
+
+    // chunk loop, end to end against wiremock ---------------------------------
+
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// 300 unique words, 1800 chars: with `token_threshold = 600` this is
+    /// 630 tokens and splits into 3 chunks; `w0160` is only in chunk 2.
+    fn three_chunk_transcript() -> String {
+        (1..=300).map(|n| format!("w{n:04} ")).collect()
+    }
+
+    const CHUNK_2_MARKER: &str = "w0160";
+
+    fn chat_ok(text: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"choices": [{"message": {"content": text}}]}))
+    }
+
+    async fn mount(
+        server: &MockServer,
+        needle: &str,
+        response: ResponseTemplate,
+        times: Option<u64>,
+    ) {
+        let mock = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(needle))
+            .respond_with(response);
+        match times {
+            Some(n) => mock.up_to_n_times(n).mount(server).await,
+            None => mock.mount(server).await,
+        }
+    }
+
+    /// Generic responses for every stage after any scenario-specific mocks.
+    async fn mount_defaults(server: &MockServer, chunk_text: &str) {
+        mount(server, "<transcript_chunk>", chat_ok(chunk_text), None).await;
+        mount(server, "<summaries>", chat_ok("Combined notes"), None).await;
+        mount(
+            server,
+            "<transcript_chunks>",
+            chat_ok("# Title\nBody"),
+            None,
+        )
+        .await;
+    }
+
+    async fn run(
+        server: &MockServer,
+        token: Option<&CancellationToken>,
+    ) -> Result<(String, String, i64), String> {
+        let endpoint = server.uri();
+        let template = Template {
+            name: "Test".to_string(),
+            description: "Test template".to_string(),
+            sections: vec![crate::summary::templates::TemplateSection {
+                title: "Summary".to_string(),
+                instruction: "Summarize".to_string(),
+                format: "paragraph".to_string(),
+                item_format: None,
+                example_item_format: None,
+            }],
+        };
+        generate_meeting_summary(
+            crate::llm::shared_client(),
+            &LLMProvider::Ollama,
+            "m",
+            "",
+            &three_chunk_transcript(),
+            "",
+            "test",
+            &template,
+            600,
+            Some(&endpoint),
+            None,
+            None,
+            None,
+            None,
+            None,
+            token,
+            None,
+            None,
+            Some("en"),
+            None,
+        )
+        .await
+    }
+
+    async fn bodies(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn count_containing(bodies: &[String], needle: &str) -> usize {
+        bodies.iter().filter(|b| b.contains(needle)).count()
+    }
+
+    #[test]
+    fn test_transcript_splits_into_three_chunks_with_unique_chunk_2_marker() {
+        let chunks = chunk_text(&three_chunk_transcript(), 300, 100);
+        assert_eq!(chunks.len(), 3);
+        let with_marker: Vec<usize> = (0..3)
+            .filter(|&i| chunks[i].contains(CHUNK_2_MARKER))
+            .collect();
+        assert_eq!(with_marker, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_succeeds_on_retry() {
+        let server = MockServer::start().await;
+        mount(&server, CHUNK_2_MARKER, chat_ok(""), Some(1)).await;
+        mount_defaults(&server, "Chunk notes").await;
+
+        let (_, _, chunks) = run(&server, None).await.expect("retry should recover");
+
+        assert_eq!(chunks, 3);
+        let bodies = bodies(&server).await;
+        assert_eq!(count_containing(&bodies, CHUNK_2_MARKER), 2);
+        assert_eq!(count_containing(&bodies, "<summaries>"), 1);
+    }
+
+    #[tokio::test]
+    async fn chunk_failing_twice_fails_the_run_before_combine() {
+        let server = MockServer::start().await;
+        mount(&server, CHUNK_2_MARKER, chat_ok(""), None).await;
+        mount_defaults(&server, "Chunk notes").await;
+
+        let err = run(&server, None).await.unwrap_err();
+
+        assert!(err.contains("transcript section 2 of 3"), "{err}");
+        assert!(err.contains("Please retry"), "{err}");
+        let bodies = bodies(&server).await;
+        assert_eq!(count_containing(&bodies, CHUNK_2_MARKER), 2);
+        assert_eq!(count_containing(&bodies, "<summaries>"), 0);
+        assert_eq!(count_containing(&bodies, "<transcript_chunks>"), 0);
+    }
+
+    #[tokio::test]
+    async fn chunk_reasoning_never_reaches_the_combine_request() {
+        let server = MockServer::start().await;
+        mount_defaults(&server, "<think>SECRET_THOUGHT</think>Chunk notes").await;
+
+        run(&server, None).await.expect("run should complete");
+
+        let bodies = bodies(&server).await;
+        let combine: Vec<&String> = bodies
+            .iter()
+            .filter(|b| b.contains("<summaries>"))
+            .collect();
+        assert_eq!(combine.len(), 1);
+        assert!(combine[0].contains("Chunk notes"));
+        assert!(!combine[0].contains("SECRET_THOUGHT"));
+    }
+
+    /// Cancels the run's token while serving the request, then fails it.
+    struct CancelWhileServing(CancellationToken);
+
+    impl Respond for CancelWhileServing {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            self.0.cancel();
+            chat_ok("")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_chunk_is_not_retried() {
+        let server = MockServer::start().await;
+        let token = CancellationToken::new();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(CHUNK_2_MARKER))
+            .respond_with(CancelWhileServing(token.clone()))
+            .mount(&server)
+            .await;
+        mount_defaults(&server, "Chunk notes").await;
+
+        let err = run(&server, Some(&token)).await.unwrap_err();
+
+        assert!(err.contains("cancelled"), "{err}");
+        let bodies = bodies(&server).await;
+        assert_eq!(count_containing(&bodies, CHUNK_2_MARKER), 1);
+        assert_eq!(count_containing(&bodies, "<summaries>"), 0);
     }
 
     // resolve_cached_english matrix -------------------------------------------
@@ -841,18 +1254,27 @@ mod tests {
 
     #[test]
     fn valid_cache_french_target_returns_cache() {
-        assert_eq!(resolve_cached_english(Some("body"), Some("fr")), Some("body"));
+        assert_eq!(
+            resolve_cached_english(Some("body"), Some("fr")),
+            Some("body")
+        );
     }
 
     #[test]
     fn valid_cache_unknown_language_returns_none() {
         // Unknown code -> language_name_from_code returns None -> not a translation
-        assert_eq!(resolve_cached_english(Some("body"), Some("zz-unknown")), None);
+        assert_eq!(
+            resolve_cached_english(Some("body"), Some("zz-unknown")),
+            None
+        );
     }
 
     #[test]
     fn uppercase_translation_code_returns_cache() {
-        assert_eq!(resolve_cached_english(Some("body"), Some("FR")), Some("body"));
+        assert_eq!(
+            resolve_cached_english(Some("body"), Some("FR")),
+            Some("body")
+        );
     }
 
     #[test]

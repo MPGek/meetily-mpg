@@ -10,7 +10,7 @@ import { Toaster, toast } from 'sonner'
 import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback } from 'react'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
-import { invoke } from '@tauri-apps/api/core'
+import { getOnboardingStatus } from '@/lib/ipc/onboarding'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { RecordingStateProvider } from '@/contexts/RecordingStateContext'
 import { OllamaDownloadProvider } from '@/contexts/OllamaDownloadContext'
@@ -69,7 +69,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   const [showOnboarding, setShowOnboarding] = useState(false)
-  const [onboardingCompleted, setOnboardingCompleted] = useState(false)
+  const [, setOnboardingCompleted] = useState(false)
 
   // Import audio state
   const [showDropOverlay, setShowDropOverlay] = useState(false)
@@ -78,7 +78,7 @@ export default function RootLayout({
 
   useEffect(() => {
     // Check onboarding status first
-    invoke<{ completed: boolean } | null>('get_onboarding_status')
+    getOnboardingStatus()
       .then((status) => {
         const isComplete = status?.completed ?? false
         setOnboardingCompleted(isComplete)
@@ -276,7 +276,7 @@ export default function RootLayout({
           </RecordingStateProvider>
         </AnalyticsProvider>
 
-        <Toaster position="bottom-center" richColors closeButton />
+        <Toaster position="top-right" richColors closeButton />
       </body>
     </html>
   )

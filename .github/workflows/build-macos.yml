@@ -69,13 +69,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          version: 11.20.0
           run_install: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Get pnpm store directory
         shell: bash
@@ -104,7 +104,7 @@ jobs:
       - name: Install frontend dependencies
         run: |
           cd frontend
-          pnpm install
+          pnpm install --frozen-lockfile
 
       - name: Import Apple Developer Certificate
         if: ${{ github.event.inputs.sign-build == 'true' }}
@@ -194,6 +194,31 @@ jobs:
         with:
           projectPath: frontend
           args: --target aarch64-apple-darwin ${{ steps.build-profile.outputs.args }}
+
+      - name: Verify bundled diarization models
+        run: |
+          echo "Verifying bundled enhanced diarization models..."
+          if [ -f "frontend/src-tauri/models/segmentation-3.0.onnx" ] && [ -f "frontend/src-tauri/models/titanet_large.onnx" ]; then
+            seg_size=$(wc -c < frontend/src-tauri/models/segmentation-3.0.onnx | tr -d ' ')
+            emb_size=$(wc -c < frontend/src-tauri/models/titanet_large.onnx | tr -d ' ')
+            echo "✅ segmentation-3.0.onnx ($seg_size bytes)"
+            echo "✅ titanet_large.onnx ($emb_size bytes)"
+            if [ "$seg_size" -le 1024 ] || [ "$emb_size" -le 1024 ]; then
+              echo "Bundled models too small — expected >1KB" >&2
+              exit 1
+            fi
+          else
+            echo "⚠️ Enhanced models not found in frontend/src-tauri/models/"
+            if [ "${{ steps.build-profile.outputs.profile }}" = "release" ]; then
+              echo "Release build requires bundled enhanced models (segmentation-3.0 + TitaNet-Large). Diarization will fail at runtime." >&2
+              exit 1
+            else
+              echo "Debug build — skipping strict bundling check"
+            fi
+          fi
+          if [ -f "scripts/verify-bundled-models.sh" ]; then
+            bash scripts/verify-bundled-models.sh
+          fi
 
       - name: Verify build artifacts
         run: |

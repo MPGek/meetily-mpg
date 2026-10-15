@@ -14,10 +14,12 @@ lazy_static! {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[derive(Default)]
 pub enum AudioTranscriptionEngine {
     Deepgram,
     WhisperTiny,
     WhisperDistilLargeV3,
+    #[default]
     WhisperLargeV3Turbo,
     WhisperLargeV3,
 }
@@ -34,11 +36,6 @@ impl fmt::Display for AudioTranscriptionEngine {
     }
 }
 
-impl Default for AudioTranscriptionEngine {
-    fn default() -> Self {
-        AudioTranscriptionEngine::WhisperLargeV3Turbo
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct DeviceControl {
@@ -113,7 +110,7 @@ pub async fn get_device_and_config(
 ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     #[cfg(target_os = "windows")]
     {
-        return super::platform::get_windows_device(audio_device);
+        super::platform::get_windows_device(audio_device)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -127,9 +124,9 @@ pub async fn get_device_and_config(
                 for device in host.input_devices()? {
                     if let Ok(name) = device.name() {
                         if name == audio_device.name {
-                            let default_config = device
-                                .default_input_config()
-                                .map_err(|e| anyhow!("Failed to get default input config: {}", e))?;
+                            let default_config = device.default_input_config().map_err(|e| {
+                                anyhow!("Failed to get default input config: {}", e)
+                            })?;
                             return Ok((device, default_config));
                         }
                     }
@@ -159,9 +156,10 @@ pub async fn get_device_and_config(
                         for device in pulse_host.input_devices()? {
                             if let Ok(name) = device.name() {
                                 if name == audio_device.name {
-                                    let default_config = device
-                                        .default_input_config()
-                                        .map_err(|e| anyhow!("Failed to get default input config: {}", e))?;
+                                    let default_config =
+                                        device.default_input_config().map_err(|e| {
+                                            anyhow!("Failed to get default input config: {}", e)
+                                        })?;
                                     return Ok((device, default_config));
                                 }
                             }

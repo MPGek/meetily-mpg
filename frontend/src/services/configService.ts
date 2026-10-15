@@ -5,41 +5,20 @@
  * Pure 1-to-1 wrapper - no error handling changes, exact same behavior as direct invoke calls.
  */
 
-import { invoke } from '@tauri-apps/api/core';
-import { TranscriptModelProps } from '@/components/TranscriptSettings';
+import {
+  getCustomOpenaiConfig,
+  getModelConfig,
+  getTranscriptConfig,
+  saveCustomOpenaiConfig,
+  testCustomOpenaiConnection,
+  type CustomOpenAIConfig,
+  type ModelConfig,
+  type TranscriptModelProps,
+} from '@/lib/ipc/settings';
+import { getRecordingPreferences, type RecordingPreferences } from '@/lib/ipc/recording';
 
-export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openrouter' | 'openai' | 'builtin-ai' | 'custom-openai';
-  model: string;
-  whisperModel: string;
-  /**
-   * @deprecated Use providerApiKeys from ConfigContext instead.
-   * This field may contain stale data when provider changes without saving.
-   */
-  apiKey?: string | null;
-  ollamaEndpoint?: string | null;
-  // Custom OpenAI fields (only populated when provider is 'custom-openai')
-  customOpenAIEndpoint?: string | null;
-  customOpenAIModel?: string | null;
-  customOpenAIApiKey?: string | null;
-  maxTokens?: number | null;
-  temperature?: number | null;
-  topP?: number | null;
-}
-
-export interface CustomOpenAIConfig {
-  endpoint: string;
-  apiKey: string | null;
-  model: string;
-  maxTokens: number | null;
-  temperature: number | null;
-  topP: number | null;
-}
-
-export interface RecordingPreferences {
-  preferred_mic_device: string | null;
-  preferred_system_device: string | null;
-}
+export type { CustomOpenAIConfig, ModelConfig } from '@/lib/ipc/settings';
+export type { RecordingPreferences } from '@/lib/ipc/recording';
 
 /**
  * Configuration Service
@@ -50,16 +29,16 @@ export class ConfigService {
    * Get saved transcript model configuration
    * @returns Promise with { provider, model, apiKey }
    */
-  async getTranscriptConfig(): Promise<TranscriptModelProps> {
-    return invoke<TranscriptModelProps>('api_get_transcript_config');
+  async getTranscriptConfig(): Promise<TranscriptModelProps | null> {
+    return getTranscriptConfig();
   }
 
   /**
    * Get saved summary model configuration
    * @returns Promise with { provider, model, whisperModel }
    */
-  async getModelConfig(): Promise<ModelConfig> {
-    return invoke<ModelConfig>('api_get_model_config');
+  async getModelConfig(): Promise<ModelConfig | null> {
+    return getModelConfig();
   }
 
   /**
@@ -67,7 +46,7 @@ export class ConfigService {
    * @returns Promise with { preferred_mic_device, preferred_system_device }
    */
   async getRecordingPreferences(): Promise<RecordingPreferences> {
-    return invoke<RecordingPreferences>('get_recording_preferences');
+    return getRecordingPreferences();
   }
 
   /**
@@ -75,7 +54,7 @@ export class ConfigService {
    * @returns Promise with CustomOpenAIConfig or null if not configured
    */
   async getCustomOpenAIConfig(): Promise<CustomOpenAIConfig | null> {
-    return invoke<CustomOpenAIConfig | null>('api_get_custom_openai_config');
+    return getCustomOpenaiConfig();
   }
 
   /**
@@ -84,7 +63,7 @@ export class ConfigService {
    * @returns Promise with result status
    */
   async saveCustomOpenAIConfig(config: CustomOpenAIConfig): Promise<{ status: string; message: string }> {
-    return invoke<{ status: string; message: string }>('api_save_custom_openai_config', {
+    return saveCustomOpenaiConfig({
       endpoint: config.endpoint,
       apiKey: config.apiKey,
       model: config.model,
@@ -106,7 +85,7 @@ export class ConfigService {
     apiKey: string | null,
     model: string
   ): Promise<{ status: string; message: string; http_status?: number }> {
-    return invoke<{ status: string; message: string; http_status?: number }>('api_test_custom_openai_connection', {
+    return testCustomOpenaiConnection({
       endpoint,
       apiKey,
       model,

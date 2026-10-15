@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ModelConfig } from '@/components/ModelSettingsModal';
-import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import {
+  emitModelConfigUpdated,
+  getApiKey,
+  getCustomOpenaiConfig,
+  getModelConfig,
+  listenModelConfigUpdated,
+  saveModelConfig,
+  type CustomOpenAIConfig,
+} from '@/lib/ipc/settings';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 
@@ -24,7 +32,8 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
       setIsLoading(true);
       try {
         console.log('🔄 Fetching model configuration from database...');
-        const data = await invokeTauri('api_get_model_config', {}) as any;
+        // `customOpenAIDisplayName`/`displayName` are not sent by Rust (always null here); kept as-is.
+        const data: (ModelConfig & { customOpenAIDisplayName?: string | null }) | null = await getModelConfig();
         if (data && data.provider !== null) {
           console.log('✅ Loaded model config from database:', {
             provider: data.provider,
@@ -36,9 +45,9 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
           // Fetch API key if not included and provider requires it
           if (data.provider !== 'ollama' && data.provider !== 'custom-openai' && !data.apiKey) {
             try {
-              const apiKeyData = await invokeTauri('api_get_api_key', {
+              const apiKeyData = await getApiKey({
                 provider: data.provider
-              }) as string;
+              });
               data.apiKey = apiKeyData;
             } catch (err) {
               console.error('Failed to fetch API key:', err);
@@ -48,7 +57,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
           // Fetch custom OpenAI config if provider is custom-openai
           if (data.provider === 'custom-openai') {
             try {
-              const customConfig = await invokeTauri('api_get_custom_openai_config') as any;
+              const customConfig: (CustomOpenAIConfig & { displayName?: string }) | null = await getCustomOpenaiConfig();
               if (customConfig) {
                 data.customOpenAIDisplayName = customConfig.displayName || null;
                 data.customOpenAIEndpoint = customConfig.endpoint || null;
@@ -88,8 +97,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
   // Listen for model config updates from other components
   useEffect(() => {
     const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
+      const unlisten = await listenModelConfigUpdated((event) => {
         console.log('Meeting details received model-config-updated event:', event.payload);
         setModelConfig(event.payload);
       });
@@ -131,7 +139,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
         );
       }
 
-      await invokeTauri('api_save_model_config', {
+      await saveModelConfig({
         provider: payload.provider,
         model: payload.model,
         whisperModel: payload.whisperModel,
@@ -143,8 +151,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
       setModelConfig(payload);
 
       // Emit event to sync other components
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('model-config-updated', payload);
+      await emitModelConfigUpdated(payload);
 
       toast.success("Summary settings Saved successfully");
 

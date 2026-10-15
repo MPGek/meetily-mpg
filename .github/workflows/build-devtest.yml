@@ -67,13 +67,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          version: 11.20.0
           run_install: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Get pnpm store directory
         shell: bash
@@ -93,11 +93,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Configure portable Windows Whisper build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Build whisper.cpp for a portable x64 baseline, not the runner's
+          # CPU (e.g. AVX-512); whisper-rs-sys forwards GGML_* env to CMake.
+          "GGML_NATIVE=OFF" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: ${{ matrix.platform }}-${{ matrix.target }}
+          key: ${{ matrix.platform }}-${{ matrix.target }}${{ runner.os == 'Windows' && '-portable-v1' || '' }}
 
       # Platform-specific dependencies
       - name: Install dependencies (Ubuntu 24.04)
@@ -147,7 +155,7 @@ jobs:
       - name: Install frontend dependencies
         run: |
           cd frontend
-          pnpm install
+          pnpm install --frozen-lockfile
 
       # macOS signing setup
       - name: Import Apple Developer Certificate

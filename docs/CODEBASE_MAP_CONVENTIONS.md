@@ -1,6 +1,5 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-07-13T14:38:00Z
 section: conventions
 ---
 
@@ -15,7 +14,7 @@ section: conventions
 | Aspect | Convention | Tool |
 |--------|------------|------|
 | Formatter | `rustfmt` | Default rustfmt.toml |
-| Linter | `clippy` | `cargo clippy -- -D warnings` |
+| Linter | `clippy` | `cargo clippy -p meetily --all-targets` (run locally; not enforced in CI, see Operations) |
 | Edition | Rust 2021 | Cargo.toml |
 | Line width | 100 chars | rustfmt default |
 
@@ -208,8 +207,8 @@ feat(audio): add device selection dialog
 
 | Context | Pattern | Example |
 |---------|---------|---------|
-| Rust modules | `snake_case.rs` | `whisper_engine.rs` |
-| TypeScript components | `PascalCase.tsx` | `RecordingControls.tsx` |
+| Rust modules | `snake_case` + `.rs` | `whisper_engine.rs` |
+| TypeScript components | `PascalCase` + `.tsx` | `RecordingControls.tsx` |
 | Python modules | `snake_case.py` | `audio_processor.py` |
 | Config files | `kebab-case` or `.env` | `.env.example`, `tsconfig.json` |
 

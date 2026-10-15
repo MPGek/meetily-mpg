@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { listen } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  listenModelDownloadProgress,
+  listenModelDownloadComplete,
+  listenModelDownloadError,
+} from '@/lib/ipc/models';
+import { saveTranscriptConfig } from '@/lib/ipc/settings';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import {
@@ -33,7 +37,9 @@ export function ModelManager({
   const [error, setError] = useState<string | null>(null);
   const [initialized, setInitialized] = useState(false);
   const [downloadingModels, setDownloadingModels] = useState<Set<string>>(new Set());
-  const [hasUserSelection, setHasUserSelection] = useState(false);
+  // Models whose cancel was requested; cleared only by a terminal backend event.
+  const [cancellingModels, setCancellingModels] = useState<Set<string>>(new Set());
+  const [, setHasUserSelection] = useState(false);
 
   // Refs for stable callbacks
   const onModelSelectRef = useRef(onModelSelect);
@@ -41,6 +47,14 @@ export function ModelManager({
 
   // Progress throttle map to prevent rapid updates
   const progressThrottleRef = useRef<Map<string, { progress: number; timestamp: number }>>(new Map());
+
+  const clearCancellingModel = (modelName: string) => {
+    setCancellingModels(prev => {
+      const next = new Set(prev);
+      next.delete(modelName);
+      return next;
+    });
+  };
 
   // Update refs when props change
   useEffect(() => {
@@ -96,7 +110,7 @@ export function ModelManager({
               });
               return model;
             } else {
-              return { ...model, status: { Downloading: 0 } as ModelStatus };
+              return { ...model, status: { Downloading: { progress: 0 } } as ModelStatus };
             }
           }
           return model;
@@ -129,10 +143,31 @@ export function ModelManager({
       console.log('[ModelManager] Setting up event listeners...');
 
       // Download progress with throttling
-      unlistenProgress = await listen<{ modelName: string; progress: number }>(
-        'model-download-progress',
+      unlistenProgress = await listenModelDownloadProgress(
         (event) => {
-          const { modelName, progress } = event.payload;
+          const { modelName, progress, status } = event.payload;
+          if (status === 'cancelled') {
+            // Single source of cancel state (design D4): no polling, no timers.
+            clearCancellingModel(modelName);
+            updateDownloadingModels(prev => {
+              const next = new Set(prev);
+              next.delete(modelName);
+              return next;
+            });
+            progressThrottleRef.current.delete(modelName);
+            setModels(prevModels =>
+              prevModels.map(model =>
+                model.name === modelName
+                  ? { ...model, status: 'Missing' as ModelStatus }
+                  : model
+              )
+            );
+            toast.info(`${getDisplayName(modelName)} download cancelled`, {
+              duration: 3000
+            });
+            return;
+          }
+
           const now = Date.now();
           const throttleData = progressThrottleRef.current.get(modelName);
 
@@ -148,7 +183,7 @@ export function ModelManager({
             setModels(prevModels =>
               prevModels.map(model =>
                 model.name === modelName
-                  ? { ...model, status: { Downloading: progress } as ModelStatus }
+                  ? { ...model, status: { Downloading: { progress } } as ModelStatus }
                   : model
               )
             );
@@ -157,12 +192,13 @@ export function ModelManager({
       );
 
       // Download complete
-      unlistenComplete = await listen<{ modelName: string }>(
-        'model-download-complete',
+      unlistenComplete = await listenModelDownloadComplete(
         (event) => {
           const { modelName } = event.payload;
           const model = models.find(m => m.name === modelName);
           const displayName = getDisplayName(modelName);
+
+          clearCancellingModel(modelName);
 
           setModels(prevModels =>
             prevModels.map(model =>
@@ -172,7 +208,7 @@ export function ModelManager({
             )
           );
 
-          setDownloadingModels(prev => {
+          updateDownloadingModels(prev => {
             const newSet = new Set(prev);
             newSet.delete(modelName);
             return newSet;
@@ -197,11 +233,12 @@ export function ModelManager({
       );
 
       // Download error
-      unlistenError = await listen<{ modelName: string; error: string }>(
-        'model-download-error',
+      unlistenError = await listenModelDownloadError(
         (event) => {
           const { modelName, error } = event.payload;
           const displayName = getDisplayName(modelName);
+
+          clearCancellingModel(modelName);
 
           setModels(prevModels =>
             prevModels.map(model =>
@@ -211,7 +248,7 @@ export function ModelManager({
             )
           );
 
-          setDownloadingModels(prev => {
+          updateDownloadingModels(prev => {
             const newSet = new Set(prev);
             newSet.delete(modelName);
             return newSet;
@@ -240,11 +277,12 @@ export function ModelManager({
       if (unlistenComplete) unlistenComplete();
       if (unlistenError) unlistenError();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event listeners; downloadModel and models change every render and the listeners use refs for current values
   }, []); // Empty dependency array - listeners use refs for stable callbacks
 
   const saveModelSelection = async (modelName: string) => {
     try {
-      await invoke('api_save_transcript_config', {
+      await saveTranscriptConfig({
         provider: 'localWhisper',
         model: modelName,
         apiKey: null
@@ -257,30 +295,18 @@ export function ModelManager({
   const cancelDownload = async (modelName: string) => {
     const displayName = getDisplayName(modelName);
 
+    // The backend `cancelled` progress event clears this and resets the card.
+    setCancellingModels(prev => new Set([...prev, modelName]));
     try {
-      await WhisperAPI.cancelDownload(modelName);
-
-      updateDownloadingModels(prev => {
-        const newSet = new Set(prev);
-        newSet.delete(modelName);
-        return newSet;
-      });
-
-      setModels(prevModels =>
-        prevModels.map(model =>
-          model.name === modelName
-            ? { ...model, status: 'Missing' as ModelStatus }
-            : model
-        )
-      );
-
-      // Clean up throttle data
-      progressThrottleRef.current.delete(modelName);
-
-      toast.info(`${displayName} download cancelled`, {
-        duration: 3000
-      });
+      const outcome = await WhisperAPI.cancelDownload(modelName);
+      if (outcome === 'pending') {
+        toast.info(`Cancelling ${displayName}...`, {
+          description: 'The download is still shutting down. Retry will be available when cleanup completes.',
+          duration: 4000
+        });
+      }
     } catch (err) {
+      clearCancellingModel(modelName);
       console.error('Failed to cancel download:', err);
       toast.error('Failed to cancel download', {
         description: err instanceof Error ? err.message : 'Unknown error',
@@ -290,7 +316,7 @@ export function ModelManager({
   };
 
   const downloadModel = async (modelName: string) => {
-    if (downloadingModels.has(modelName)) return;
+    if (downloadingModels.has(modelName) || cancellingModels.has(modelName)) return;
 
     const displayName = getDisplayName(modelName);
 
@@ -300,7 +326,7 @@ export function ModelManager({
       setModels(prevModels =>
         prevModels.map(model =>
           model.name === modelName
-            ? { ...model, status: { Downloading: 0 } as ModelStatus }
+            ? { ...model, status: { Downloading: { progress: 0 } } as ModelStatus }
             : model
         )
       );
@@ -436,6 +462,7 @@ export function ModelManager({
               onCancel={() => cancelDownload(model.name)}
               onDelete={() => deleteModel(model.name)}
               isDownloading={downloadingModels.has(model.name)}
+              isCancelling={cancellingModels.has(model.name)}
               displayName={getDisplayName(model.name)}
             />
           );
@@ -466,6 +493,7 @@ export function ModelManager({
                     onCancel={() => cancelDownload(model.name)}
                     onDelete={() => deleteModel(model.name)}
                     isDownloading={downloadingModels.has(model.name)}
+                    isCancelling={cancellingModels.has(model.name)}
                     displayName={getDisplayName(model.name)}
                   />
                 ))}
@@ -499,6 +527,7 @@ interface ModelCardProps {
   onCancel: () => void;
   onDelete: () => void;
   isDownloading: boolean;
+  isCancelling: boolean;
   displayName: string;
 }
 
@@ -510,7 +539,7 @@ function ModelCard({
   onDownload,
   onCancel,
   onDelete,
-  isDownloading,
+  isCancelling,
   displayName
 }: ModelCardProps) {
   const [isHovered, setIsHovered] = useState(false);
@@ -521,8 +550,9 @@ function ModelCard({
   const isCorrupted = typeof model.status === 'object' && 'Corrupted' in model.status;
   const downloadProgress =
     typeof model.status === 'object' && 'Downloading' in model.status
-      ? model.status.Downloading
+      ? model.status.Downloading.progress
       : null;
+  const displayedProgress = downloadProgress ?? 0;
 
   return (
     <motion.div
@@ -601,7 +631,7 @@ function ModelCard({
 
           {/* Status/Action */}
           <div className="ml-4 flex items-center gap-2">
-            {isAvailable && (
+            {isAvailable && !isCancelling && (
               <>
                 <div className="flex items-center gap-1.5 text-green-600">
                   <div className="w-2 h-2 bg-green-500 rounded-full"></div>
@@ -630,7 +660,7 @@ function ModelCard({
               </>
             )}
 
-            {isMissing && (
+            {isMissing && !isCancelling && (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -642,7 +672,7 @@ function ModelCard({
               </button>
             )}
 
-            {downloadProgress === null && isError && (
+            {downloadProgress === null && isError && !isCancelling && (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -654,7 +684,7 @@ function ModelCard({
               </button>
             )}
 
-            {isCorrupted && (
+            {isCorrupted && !isCancelling && (
               <div className="flex gap-2">
                 <button
                   onClick={(e) => {
@@ -680,7 +710,7 @@ function ModelCard({
         </div>
 
         {/* Full-width Download Progress Bar - PROMINENT */}
-        {downloadProgress !== null && (
+        {(downloadProgress !== null || isCancelling) && (
           <motion.div
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
@@ -689,32 +719,44 @@ function ModelCard({
           >
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
-                <span className="text-sm font-medium text-blue-600">Downloading...</span>
-                <span className="text-sm font-semibold text-blue-600">{Math.round(downloadProgress)}%</span>
+                <span className="text-sm font-medium text-blue-600">
+                  {isCancelling ? 'Cancelling…' : 'Downloading...'}
+                </span>
+                {!isCancelling && (
+                  <span className="text-sm font-semibold text-blue-600">
+                    {Math.round(displayedProgress)}%
+                  </span>
+                )}
               </div>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCancel();
-                }}
-                className="text-xs text-gray-600 hover:text-red-600 font-medium transition-colors px-2 py-1 rounded hover:bg-red-50"
-                title="Cancel download"
-              >
-                Cancel
-              </button>
+              {isCancelling ? (
+                <span className="text-xs text-gray-500 font-medium px-2 py-1">
+                  Cancellation requested
+                </span>
+              ) : (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCancel();
+                  }}
+                  className="text-xs text-gray-600 hover:text-red-600 font-medium transition-colors px-2 py-1 rounded hover:bg-red-50"
+                  title="Cancel download"
+                >
+                  Cancel
+                </button>
+              )}
             </div>
             <div className="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
               <motion.div
                 className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full"
                 initial={{ width: 0 }}
-                animate={{ width: `${downloadProgress}%` }}
+                animate={{ width: `${displayedProgress}%` }}
                 transition={{ duration: 0.3, ease: 'easeOut' }}
               />
             </div>
             <p className="text-xs text-gray-500 mt-1">
               {model.size_mb ? (
                 <>
-                  {formatFileSize(model.size_mb * downloadProgress / 100)} / {formatFileSize(model.size_mb)}
+                  {formatFileSize(model.size_mb * displayedProgress / 100)} / {formatFileSize(model.size_mb)}
                 </>
               ) : (
                 'Downloading...'

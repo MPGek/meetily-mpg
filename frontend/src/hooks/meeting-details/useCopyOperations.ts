@@ -1,12 +1,12 @@
 import { useCallback, RefObject } from 'react';
-import { Transcript, Summary } from '@/types';
+import { Transcript, Summary, MeetingMetadata } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
-import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import { getMeetingTranscripts } from '@/lib/ipc/transcript';
 
 interface UseCopyOperationsProps {
-  meeting: any;
+  meeting: MeetingMetadata;
   transcripts: Transcript[];
   meetingTitle: string;
   aiSummary: Summary | null;
@@ -15,7 +15,6 @@ interface UseCopyOperationsProps {
 
 export function useCopyOperations({
   meeting,
-  transcripts,
   meetingTitle,
   aiSummary,
   blockNoteSummaryRef,
@@ -27,11 +26,11 @@ export function useCopyOperations({
       console.log('📊 Fetching all transcripts for copying:', meetingId);
 
       // First, get total count by fetching first page
-      const firstPage = await invokeTauri('api_get_meeting_transcripts', {
+      const firstPage = await getMeetingTranscripts({
         meetingId,
         limit: 1,
         offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
+      });
 
       const totalCount = firstPage.total_count;
       console.log(`📊 Total transcripts in database: ${totalCount}`);
@@ -41,11 +40,11 @@ export function useCopyOperations({
       }
 
       // Fetch all transcripts in one call
-      const allData = await invokeTauri('api_get_meeting_transcripts', {
+      const allData = await getMeetingTranscripts({
         meetingId,
         limit: totalCount,
         offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
+      });
 
       console.log(`✅ Fetched ${allData.transcripts.length} transcripts from database for copying`);
       return allData.transcripts;
@@ -121,7 +120,7 @@ export function useCopyOperations({
       // Fallback: Check if aiSummary has markdown property
       if (!summaryMarkdown && aiSummary && 'markdown' in aiSummary) {
         console.log('📝 Using markdown from aiSummary');
-        summaryMarkdown = (aiSummary as any).markdown || '';
+        summaryMarkdown = (aiSummary as { markdown?: string }).markdown || '';
         console.log('📝 Markdown from aiSummary, length:', summaryMarkdown.length);
       }
 
@@ -137,7 +136,7 @@ export function useCopyOperations({
             if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
               const sectionTitle = `## ${section.title}\n\n`;
               const sectionContent = section.blocks
-                .map((block: any) => `- ${block.content}`)
+                .map((block) => `- ${block.content}`)
                 .join('\n');
               return sectionTitle + sectionContent;
             }

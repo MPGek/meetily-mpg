@@ -1,25 +1,17 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import { listTemplates, type TemplateInfo } from '@/lib/ipc/summary';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 
 export function useTemplates() {
-  const [availableTemplates, setAvailableTemplates] = useState<Array<{
-    id: string;
-    name: string;
-    description: string;
-  }>>([]);
+  const [availableTemplates, setAvailableTemplates] = useState<TemplateInfo[]>([]);
   const [selectedTemplate, setSelectedTemplate] = useState<string>('standard_meeting');
 
   // Fetch available templates on mount
   useEffect(() => {
     const fetchTemplates = async () => {
       try {
-        const templates = await invokeTauri('api_list_templates') as Array<{
-          id: string;
-          name: string;
-          description: string;
-        }>;
+        const templates = await listTemplates();
         console.log('Available templates:', templates);
         setAvailableTemplates(templates);
       } catch (error) {

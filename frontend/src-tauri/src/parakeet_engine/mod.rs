@@ -17,10 +17,15 @@
 //! - `model`: ONNX model wrapper and inference logic
 //! - `commands`: Tauri command interface for frontend integration
 
-pub mod parakeet_engine;
-pub mod model;
 pub mod commands;
+pub mod model;
+// Named after its parent directory by convention; renaming would touch every call site.
+#[allow(clippy::module_inception)]
+pub mod parakeet_engine;
 
-pub use parakeet_engine::{ParakeetEngine, ParakeetEngineError, QuantizationType, ModelInfo, ModelStatus, DownloadProgress};
-pub use model::{ParakeetModel, ParakeetError, TimestampedResult};
+pub use crate::model_download::{is_download_cancelled, CancelDownloadOutcome};
 pub use commands::*;
+pub use model::{ParakeetError, ParakeetModel, TimestampedResult};
+pub use parakeet_engine::{
+    DownloadProgress, ModelInfo, ModelStatus, ParakeetEngine, ParakeetEngineError, QuantizationType,
+};

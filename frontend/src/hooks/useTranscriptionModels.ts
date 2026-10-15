@@ -1,11 +1,11 @@
 import { useState, useCallback, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  whisperGetAvailableModels,
+  parakeetGetAvailableModels,
+  type ModelInfo,
+} from '@/lib/ipc/models';
 
-export interface RawModelInfo {
-  name: string;
-  size_mb: number;
-  status: 'Available' | 'Missing' | { Downloading: { progress: number } } | { Error: string };
-}
+export type RawModelInfo = Pick<ModelInfo, 'name' | 'size_mb' | 'status'>;
 
 export interface ModelOption {
   provider: 'whisper' | 'parakeet';
@@ -47,7 +47,7 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
 
     // Fetch Whisper models
     try {
-      const whisperModels = await invoke<RawModelInfo[]>('whisper_get_available_models');
+      const whisperModels: RawModelInfo[] = await whisperGetAvailableModels();
       const availableWhisper = whisperModels
         .filter((m) => m.status === 'Available')
         .map((m) => ({
@@ -63,7 +63,7 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
 
     // Fetch Parakeet models
     try {
-      const parakeetModels = await invoke<RawModelInfo[]>('parakeet_get_available_models');
+      const parakeetModels: RawModelInfo[] = await parakeetGetAvailableModels();
       const availableParakeet = parakeetModels
         .filter((m) => m.status === 'Available')
         .map((m) => ({

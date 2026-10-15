@@ -6,19 +6,17 @@
  */
 
 import { useState, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  cleanupCheckpoints,
+  hasAudioCheckpoints,
+  recoverAudioFromCheckpoints,
+  type AudioRecoveryStatus,
+} from '@/lib/ipc/recording';
+import { getMeetingFolderPath } from '@/lib/ipc/meetings';
 import { indexedDBService, MeetingMetadata, StoredTranscript } from '@/services/indexedDBService';
 import { storageService } from '@/services/storageService';
 import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-preferences';
 import { toast } from 'sonner';
-
-interface AudioRecoveryStatus {
-  status: string; // "success" | "partial" | "failed" | "none"
-  chunk_count: number;
-  estimated_duration_seconds: number;
-  audio_file_path?: string;
-  message: string;
-}
 
 export interface UseTranscriptRecoveryReturn {
   recoverableMeetings: MeetingMetadata[];
@@ -60,7 +58,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         recentMeetings.map(async (meeting) => {
           if (meeting.folderPath) {
             try {
-              const hasAudio = await invoke<boolean>('has_audio_checkpoints', {
+              const hasAudio = await hasAudioCheckpoints({
                 meetingFolder: meeting.folderPath
               });
 
@@ -129,8 +127,8 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       if (!folderPath) {
         // Try to get from backend (might exist if only app crashed, not system)
         try {
-          folderPath = await invoke<string>('get_meeting_folder_path');
-        } catch (error) {
+          folderPath = (await getMeetingFolderPath()) ?? undefined;
+        } catch {
           folderPath = undefined;
         }
       }
@@ -139,8 +137,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       let audioRecoveryStatus: AudioRecoveryStatus | null = null;
       if (folderPath) {
         try {
-          audioRecoveryStatus = await invoke<AudioRecoveryStatus>(
-            'recover_audio_from_checkpoints',
+          audioRecoveryStatus = await recoverAudioFromCheckpoints(
             { meetingFolder: folderPath, sampleRate: 48000 }
           );
         } catch (error) {
@@ -167,12 +164,12 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         text: t.text,
         timestamp: t.timestamp,
         sequence_id: t.sequenceId || index,
-        chunk_start_time: (t as any).chunk_start_time,
-        is_partial: (t as any).is_partial || false,
+        chunk_start_time: t.chunk_start_time,
+        is_partial: t.is_partial || false,
         confidence: t.confidence,
-        audio_start_time: (t as any).audio_start_time,
-        audio_end_time: (t as any).audio_end_time,
-        duration: (t as any).duration,
+        audio_start_time: t.audio_start_time,
+        audio_end_time: t.audio_end_time,
+        duration: t.duration,
       }));
 
       // 6. Save to backend database using existing save utilities
@@ -200,7 +197,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       // 8. Clean up checkpoint files
       if (folderPath) {
         try {
-          await invoke('cleanup_checkpoints', { meetingFolder: folderPath });
+          await cleanupCheckpoints({ meetingFolder: folderPath });
         } catch (error) {
           // Non-fatal - don't fail recovery if cleanup fails
           console.warn('Checkpoint cleanup failed (non-fatal):', error);

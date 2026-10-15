@@ -84,22 +84,30 @@ pub async fn get_groq_models(api_key: Option<String>) -> Result<Vec<GroqModel>, 
         let cache = MODELS_CACHE.read().map_err(|e| e.to_string())?;
         if let Some(entry) = cache.as_ref() {
             if entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
-                log::info!("Returning cached Groq models ({} models)", entry.models.len());
+                log::info!(
+                    "Returning cached Groq models ({} models)",
+                    entry.models.len()
+                );
                 return Ok(entry.models.clone());
             }
         }
     }
 
-    // Fetch from API
+    // Fetch from API (bounded retry on transient failures via the shared
+    // HTTP layer; any resulting error falls back to the hardcoded list
+    // exactly as a single failed attempt did before).
     log::info!("Fetching Groq models from API...");
-    let client = reqwest::Client::new();
-
-    let response = match client
-        .get("https://api.groq.com/openai/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
+    let policy = crate::llm::RetryPolicy::short();
+    let response = match crate::llm::send_with_retry(
+        || {
+            crate::llm::shared_client()
+                .get("https://api.groq.com/openai/v1/models")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .timeout(Duration::from_secs(5))
+        },
+        &policy,
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
@@ -107,15 +115,6 @@ pub async fn get_groq_models(api_key: Option<String>) -> Result<Vec<GroqModel>, 
             return Ok(get_fallback_models());
         }
     };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        log::warn!(
-            "Groq API returned status {}. Using fallback models.",
-            status
-        );
-        return Ok(get_fallback_models());
-    }
 
     let api_response: GroqApiResponse = match response.json().await {
         Ok(data) => data,

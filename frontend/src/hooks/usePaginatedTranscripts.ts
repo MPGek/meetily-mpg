@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSegmentData } from "@/types";
+import { getMeetingMetadata } from "@/lib/ipc/meetings";
+import { getMeetingTranscripts } from "@/lib/ipc/transcript";
+import { Transcript, MeetingMetadata, TranscriptSegmentData } from "@/types";
 
 const DEFAULT_PAGE_SIZE = 100;
 
@@ -25,6 +26,13 @@ interface UsePaginatedTranscriptsReturn {
     loadMore: () => Promise<void>;
     reset: () => void;
     refetch: () => Promise<void>;
+    /**
+     * Apply a speaker relabel to local state only (design D11): with a
+     * transcriptId only that block updates; without one, every block of the
+     * cluster updates. No refetch — the scroll container stays mounted and
+     * the list does not re-render or blank.
+     */
+    updateSpeakerLabel: (speaker: string, label: string, transcriptId?: string) => void;
 }
 
 /**
@@ -35,15 +43,19 @@ function convertTranscriptsToSegments(transcripts: Transcript[]): TranscriptSegm
         id: t.id,
         timestamp: t.audio_start_time ?? 0,
         endTime: t.audio_end_time,
+        hasAudioTime: t.audio_start_time !== undefined && t.audio_start_time !== null,
         text: t.text,
         confidence: t.confidence,
         source_device: t.source_device,
+        speaker: t.speaker,
+        speaker_label: t.speaker_label,
+        speaker_matched_by: t.speaker_matched_by,
+        speaker_match_score: t.speaker_match_score,
     }));
 }
 
 export function usePaginatedTranscripts({
     meetingId,
-    initialTimestamp,
 }: UsePaginatedTranscriptsProps): UsePaginatedTranscriptsReturn {
     const [metadata, setMetadata] = useState<MeetingMetadata | null>(null);
     const [transcripts, setTranscripts] = useState<Transcript[]>([]);
@@ -75,7 +87,7 @@ export function usePaginatedTranscripts({
         if (!meetingId) return null;
 
         try {
-            const data = await invoke<MeetingMetadata>('api_get_meeting_metadata', {
+            const data = await getMeetingMetadata({
                 meetingId,
             });
             setMetadata(data);
@@ -95,8 +107,7 @@ export function usePaginatedTranscripts({
         if (!meetingId) return [];
 
         try {
-            const response = await invoke<PaginatedTranscriptsResponse>(
-                'api_get_meeting_transcripts',
+            const response = await getMeetingTranscripts(
                 {
                     meetingId,
                     limit: DEFAULT_PAGE_SIZE,
@@ -167,6 +178,26 @@ export function usePaginatedTranscripts({
         }
     }, [meetingId, reset, loadMetadata, loadTranscriptsAtOffset]);
 
+    // In-place speaker relabel (design D11): mutate only the affected
+    // transcript(s) in local state. With a transcriptId, only that block;
+    // otherwise every block sharing the cluster label (apply-to-all). Mirrors
+    // the live updater by setting user provenance + clearing the match score so
+    // the `(auto) xx%` suffix drops immediately without a refetch. Re-selecting
+    // the already-displayed name is still applied (user confirmation), never a
+    // silent no-op.
+    const updateSpeakerLabel = useCallback((speaker: string, label: string, transcriptId?: string) => {
+        setTranscripts(prev =>
+            prev.map(t => {
+                if (transcriptId !== undefined) {
+                    if (t.id !== transcriptId) return t;
+                    return { ...t, speaker_label: label, speaker_matched_by: 'user', speaker_match_score: undefined };
+                }
+                if (t.speaker !== speaker) return t;
+                return { ...t, speaker_label: label, speaker_matched_by: 'user', speaker_match_score: undefined };
+            })
+        );
+    }, []);
+
     // Initial load
     useEffect(() => {
         if (!meetingId) {
@@ -212,5 +243,6 @@ export function usePaginatedTranscripts({
         loadMore,
         reset,
         refetch,
+        updateSpeakerLabel,
     };
 }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu } from 'lucide-react';
+import { RefreshCw, Globe, Loader2, AlertCircle, X, Cpu } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -16,8 +16,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../ui/select';
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@/lib/ipc/core';
+import {
+  cancelRetranscriptionCommand,
+  listenRetranscriptionComplete,
+  listenRetranscriptionError,
+  listenRetranscriptionProgress,
+  startRetranscriptionCommand,
+  type RetranscriptionProgress,
+} from '@/lib/ipc/transcript';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
@@ -30,25 +37,7 @@ interface RetranscribeDialogProps {
   meetingId: string;
   meetingFolderPath: string | null;
   onComplete?: () => void;
-}
-
-interface RetranscriptionProgress {
-  meeting_id: string;
-  stage: string;
-  progress_percentage: number;
-  message: string;
-}
-
-interface RetranscriptionResult {
-  meeting_id: string;
-  segments_count: number;
-  duration_seconds: number;
-  language: string | null;
-}
-
-interface RetranscriptionError {
-  meeting_id: string;
-  error: string;
+  onProcessingChange?: (processing: boolean) => void;
 }
 
 export function RetranscribeDialog({
@@ -57,6 +46,7 @@ export function RetranscribeDialog({
   meetingId,
   meetingFolderPath,
   onComplete,
+  onProcessingChange,
 }: RetranscribeDialogProps) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
   const [isProcessing, setIsProcessing] = useState(false);
@@ -82,6 +72,12 @@ export function RetranscribeDialog({
 
   // Track previous open state to only reset on closed→open transition
   const prevOpenRef = useRef(false);
+
+  // Surface processing state so sibling controls (Speakers) can disable while
+  // retranscription is writing.
+  useEffect(() => {
+    onProcessingChange?.(isProcessing);
+  }, [isProcessing, onProcessingChange]);
 
   // Helper to get selected model details (memoized)
   const selectedModelDetails = useMemo((): ModelOption | undefined => {
@@ -116,6 +112,7 @@ export function RetranscribeDialog({
       // Fetch available models using centralized hook
       fetchModels();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- resetSelection is recreated every render; adding it would reset the selection on every render while open
   }, [open, selectedLanguage, transcriptModelConfig, fetchModels]);
 
   // Listen for retranscription events
@@ -127,8 +124,7 @@ export function RetranscribeDialog({
 
     const setupListeners = async () => {
       // Progress events
-      const unlistenProgress = await listen<RetranscriptionProgress>(
-        'retranscription-progress',
+      const unlistenProgress = await listenRetranscriptionProgress(
         (event) => {
           if (event.payload.meeting_id === meetingId) {
             setProgress(event.payload);
@@ -142,8 +138,7 @@ export function RetranscribeDialog({
       unlisteners.push(unlistenProgress);
 
       // Completion event
-      const unlistenComplete = await listen<RetranscriptionResult>(
-        'retranscription-complete',
+      const unlistenComplete = await listenRetranscriptionComplete(
         async (event) => {
           if (event.payload.meeting_id === meetingId) {
             await Analytics.track('enhance_transcript_completed', {
@@ -169,8 +164,7 @@ export function RetranscribeDialog({
       unlisteners.push(unlistenComplete);
 
       // Error event
-      const unlistenError = await listen<RetranscriptionError>(
-        'retranscription-error',
+      const unlistenError = await listenRetranscriptionError(
         async (event) => {
           if (event.payload.meeting_id === meetingId) {
             await Analytics.trackError('enhance_transcript_failed', event.payload.error);
@@ -214,7 +208,7 @@ export function RetranscribeDialog({
         model_name: selectedModelDetails?.name || ''
       });
 
-      await invoke('start_retranscription_command', {
+      await startRetranscriptionCommand({
         meetingId,
         meetingFolderPath,
         language: languageToSend,
@@ -233,7 +227,7 @@ export function RetranscribeDialog({
   const handleCancel = async () => {
     if (isProcessing) {
       try {
-        await invoke('cancel_retranscription_command');
+        await cancelRetranscriptionCommand();
         setIsProcessing(false);
         setProgress(null);
         toast.info('Retranscription cancelled');
@@ -330,7 +324,7 @@ export function RetranscribeDialog({
                   <span className="text-sm font-medium">Language</span>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Language selection isn't supported for Parakeet. It always uses automatic detection.
+                  Language selection isn&apos;t supported for Parakeet. It always uses automatic detection.
                 </p>
               </div>
             )

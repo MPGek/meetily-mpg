@@ -1,6 +1,5 @@
 ---
 parent: CODEBASE_MAP.md
-last_mapped: 2026-07-13T15:05:00Z
 ---
 
 > Part of [Codebase Map](CODEBASE_MAP.md)
@@ -40,6 +39,8 @@ graph TB
                 Mixer[Stereo Mix<br/>left=mic right=system]
                 DeviceMgmt[Device Management<br/>Detection + Reconnection]
                 Record[Recording<br/>Enhance/Re-transcribe/Import]
+                Diar[Speaker Diarization<br/>DiarizationEngine: offline + online]
+                Playback[Streaming Audio Player<br/>FFmpeg WAV transcode]
             end
             
             subgraph TranscriptionEngines["Transcription Engines"]
@@ -80,6 +81,9 @@ graph TB
     ProviderAbstraction --> Parakeet
     Capture --> Mixer
     Mixer --> Record
+    Capture --> Diar
+    Diar --> DB
+    Capture --> Playback
     Record --> DB
     Whisper --> SummaryService
     Parakeet --> SummaryService
@@ -111,95 +115,64 @@ graph TB
 
 ### Backend (Rust — Tauri App)
 
-The backend has evolved significantly with modular audio processing:
+Layer-level view; for file- and symbol-level detail use graphify (see [CODEBASE_MAP.md](CODEBASE_MAP.md)). Paths are relative to `frontend/src-tauri/src/`.
 
-| Module | Files | Purpose |
-|--------|-------|---------|
-| **Entry Point** | `lib.rs`, `main.rs`, `tray.rs`, `onboarding.rs` | Tauri builder, command registration, system tray, onboarding flow |
-| **Audio Capture** | `audio/capture/`, `audio/stream.rs`, `audio/system_audio_*.rs` | Microphone + system audio stream creation (cpal, CoreAudio, WASAPI) |
-| **Audio Mixing** | `audio/pipeline.rs`, `audio/ffmpeg_mixer.rs` | Professional RMS-based mixing, buffer synchronization, clipping prevention |
-| **VAD Processing** | `audio/vad.rs` | Voice Activity Detection, speech segment extraction (16kHz mono) |
-| **Device Management** | `audio/devices/`, `audio/device_detection.rs`, `audio/device_monitor.rs` | Device enumeration, platform-specific detection, disconnect/reconnect monitoring |
-| **Recording Manager** | `audio/recording_manager.rs`, `audio/recording_state.rs`, `audio/recording_commands.rs` | High-level recording orchestration, state management, Tauri commands |
-| **Audio Processing** | `audio/audio_processing.rs`, `audio/post_processor.rs` | Normalization, noise suppression (RNNOISE), spectral subtraction, filters |
-| **Buffer Management** | `audio/buffer_pool.rs`, `audio/batch_processor.rs` | Audio buffer pooling for memory efficiency, batched metrics collection |
-| **Incremental Saving** | `audio/incremental_saver.rs` | Checkpoint-based audio saving for crash recovery |
-| **Transcription Provider** | `audio/transcription/` | Abstract STT provider interface, engine lifecycle management |
-| **Whisper Engine** | `whisper_engine/`, `whisper_engine/parallel_processor.rs` | Whisper.cpp bindings with GPU acceleration (Metal/CUDA/Vulkan), parallel chunk processing |
-| **Parakeet Engine** | `parakeet_engine/` | ONNX Runtime inference for Parakeet streaming model |
-| **Summary Service** | `summary/service.rs`, `summary/processor.rs`, `summary/language_detection.rs`, `summary/metadata.rs` | Multi-provider AI summarization with chunked processing, language detection, caching |
-| **Template System** | `summary/template_commands.rs`, `summary/templates/` | Customizable summary templates with validation |
-| **AI Providers** | `ollama/`, `openai/`, `anthropic/`, `groq/`, `openrouter/` | Provider-specific LLM API clients and configuration |
-| **Database Layer** | `database/manager.rs`, `database/models.rs`, `database/repositories/` | SQLite via sqlx, meeting/transcript/summary data models with repository pattern |
-| **Notifications** | `notifications/manager.rs`, `notifications/commands.rs` | System notifications with DND awareness and user preferences |
-| **Analytics** | `analytics/analytics.rs` | PostHog integration for product analytics (opt-in) |
-| **Hardware Detection** | `audio/hardware_detector.rs` | Auto-detects CPU cores, GPU type (Metal/CUDA/Vulkan), memory → recommends Whisper config |
+| Layer | Location | Purpose |
+|-------|----------|---------|
+| **Entry Point** | `lib.rs`, `main.rs`, `tray.rs`, `onboarding.rs`, `panic_log.rs` | Tauri builder and command registration (`generate_handler!`), system tray, onboarding, panic hook writing `logs/panic.log` |
+| **Audio Capture & Devices** | `audio/capture/`, `audio/devices/`, `audio/devices/platform/` | Microphone + system audio streams (cpal, WASAPI, CoreAudio), device enumeration, disconnect/reconnect monitoring |
+| **Audio Pipeline** | `audio/` (pipeline, VAD, mixing, processing modules) | Per-channel Silero VAD, stereo mix (left=mic / right=system), mic high-pass filter, ducking; live speech merged across pauses < 500 ms and sent to ASR once 500 ms of silence follow it (plus the 150 ms pre-speech pad), after 25 s of speech, or at stop |
+| **Recording** | `audio/recording/` (lifecycle, devices, device_recovery, stop), `audio/recording_commands.rs` | Recording start/stop/pause orchestration and mid-recording mic recovery (`device_recovery`); `recording_commands.rs` is the thin Tauri command layer over `audio/recording/` |
+| **Saving & Import** | `audio/` (incremental saver, recording saver, retranscription, import) | Checkpoint-based saving for crash recovery, Enhance re-transcription, audio import |
+| **Speaker Diarization** | `audio/diarization/` | Offline (batch) + online (streaming) diarization and speaker identity matching behind one entry point, `DiarizationEngine` |
+| **Word Alignment** | `audio/word_alignment/` | Post-ASR CTC forced alignment refining per-token timestamps |
+| **Audio Playback** | `audio/audio_file.rs` | Meeting recording discovery + FFmpeg WAV transcode for webview streaming |
+| **Transcription Provider** | `audio/transcription/` | STT provider abstraction (Whisper, Parakeet), engine lifecycle, provider-aware model-readiness gate |
+| **Whisper / Parakeet Engines** | `whisper_engine/`, `parakeet_engine/` | Whisper.cpp bindings with GPU acceleration; ONNX Runtime Parakeet streaming |
+| **Summary Service** | `summary/` | Chunked summarization, templates, language detection, provider dispatch |
+| **LLM Transport** | `llm/` | Shared pooled HTTP client, bounded retry, provider-agnostic `LlmError` for outbound LLM calls |
+| **AI Provider Metadata** | `ollama/`, `openai/`, `anthropic/`, `groq/`, `openrouter/` | Provider-specific model listing and configuration |
+| **Database Layer** | `database/`, `database/repositories/` | SQLite via sqlx with a repository pattern; the speaker registry repository is a directory module (`database/repositories/speaker/`) |
+| **Notifications** | `notifications/` | System notifications with DND awareness and user preferences |
+| **Analytics** | `analytics/` | PostHog integration for product analytics (opt-in) |
 
 ### Python Backend Archive
 
-**Removed.** The `backend/` FastAPI + Pydantic-AI server was deleted (commit "Remove old backend project"). No Python runtime is required for the app; the only optional Python use is `uv` for the Silero VAD model during build.
+**Removed.** The `backend/` FastAPI + Pydantic-AI server was deleted. No Python runtime is required for the app.
 
 ## Directory Structure
 
 ```
 meetily/
 ├── docs/                             # Documentation and architecture maps
-│   └── CODEBASE_MAP_*.md             # Auto-generated codebase documentation
 ├── frontend/                         # Tauri app (Rust + Next.js)
 │   ├── src/                          # Next.js frontend application
 │   │   ├── app/                      # Next.js pages and layouts
 │   │   ├── components/               # React UI components
 │   │   ├── hooks/                    # Custom React hooks
 │   │   ├── contexts/                 # React context providers
-│   │   ├── services/                 # Browser-side API services (IndexedDB)
+│   │   ├── lib/                      # Shared helpers
+│   │   │   └── ipc/                  # Typed Tauri IPC layer (the only place that calls invoke/listen)
+│   │   ├── services/                 # Browser-side services (IndexedDB recovery)
 │   │   └── types/                    # TypeScript type definitions
+│   ├── tests/                        # Frontend unit tests (bun test)
 │   └── src-tauri/                    # Rust backend for Tauri
 │       ├── src/                      # Rust source code
-│       │   ├── audio/                # Audio capture and processing engine
-│       │   │   ├── capture/          # Microphone + system stream creation
-│       │   │   ├── devices/          # Device enumeration and config
-│       │   │   │   └── platform/     # Windows WASAPI, macOS CoreAudio, Linux ALSA
-│       │   │   ├── transcription/    # STT provider abstraction layer
-│       │   │   ├── audio_v2/         # ORPHANED/dead next-gen audio pipeline (NOT declared)
-│       │   │   ├── pipeline.rs       # Per-channel VAD + stereo mixing
-│       │   │   ├── stream.rs         # Audio stream management
-│       │   │   ├── recording_*.rs    # Recording state, commands, preferences, saver
-│       │   │   ├── device_detection.rs  # Input device kind detection (BT/wired/virtual)
-│       │   │   ├── device_monitor.rs    # Device disconnect/reconnect monitoring
-│       │   │   ├── hardware_detector.rs # CPU/GPU/memory profiling for Whisper config
-│       │   │   ├── vad.rs            # Silero VAD v6 (streaming + batch + rolling buffer)
-│       │   │   ├── decoder.rs        # Audio file decoding (ffmpeg fallback)
-│       │   │   ├── incremental_saver.rs # Checkpoint-based saving for crash recovery
-│       │   │   ├── retranscription.rs   # "Enhance" re-transcribe stored audio (stereo split)
-│       │   │   ├── import.rs         # Import external audio files as meetings
-│       │   │   ├── post_processor.rs # Text cleanup and normalization
-│       │   │   ├── buffer_pool.rs    # Memory-efficient audio buffer pooling
-│       │   │   ├── batch_processor.rs # Batch processing with metrics
-│       │   │   ├── async_logger.rs   # Async logging infrastructure
-│       │   │   └── system_audio_*.rs # System audio detection and monitoring
+│       │   ├── audio/                # Capture, pipeline, recording, diarization, playback
 │       │   ├── whisper_engine/       # Whisper.cpp integration
 │       │   ├── parakeet_engine/      # Parakeet ONNX model integration
-│       │   ├── summary/              # AI summarization engine
-│       │   │   └── templates/        # Customizable summary templates
-│       │   ├── database/             # SQLite data layer
-│       │   │   └── repositories/     # Repository pattern implementations
+│       │   ├── summary/              # AI summarization engine + templates
+│       │   ├── llm/                  # Shared LLM HTTP transport
+│       │   ├── database/             # SQLite data layer + repositories
 │       │   ├── notifications/        # System notification system
 │       │   ├── analytics/            # PostHog analytics
-│       │   ├── api/                  # IPC + legacy HTTP client + shared DTOs
-│       │   ├── ollama/               # Ollama LLM provider (metadata)
-│       │   ├── openai/               # OpenAI LLM provider
-│       │   ├── anthropic/            # Anthropic (Claude) LLM provider
-│       │   ├── groq/                 # Groq LLM provider
-│       │   ├── openrouter/           # OpenRouter LLM provider
-│       │   ├── main.rs               # Application entry point
-│       │   ├── lib.rs                # Tauri builder + command registration
-│       │   ├── tray.rs               # System tray management
-│       │   └── onboarding.rs         # First-launch setup flow
-│       ├── Cargo.toml               # Rust dependencies
-│       └── tauri.conf.json          # Tauri configuration
+│       │   ├── api/                  # IPC + shared DTOs
+│       │   └── ollama/, openai/, anthropic/, groq/, openrouter/  # LLM provider metadata
+│       ├── Cargo.toml                # Rust dependencies
+│       └── tauri.conf.json           # Tauri configuration
 ├── llama-helper/                     # Sidecar Rust crate (built-in AI LLM)
-├── openspec/                         # OpenSpec change management workflow
-├── scripts/                          # Build and utility scripts (env-cuda, etc.)
+├── openspec/                         # OpenSpec change management (specs + archived changes)
+├── scripts/                          # Build and utility scripts
 └── .agents/skills/                   # Agent skills
 ```
 
@@ -240,11 +213,12 @@ graph LR
     Whisper --> Summary
     Parakeet --> Summary
     
-    Summary --> Ollama[Ollama Provider]
-    Summary --> OpenAI[OpenAI Provider]
-    Summary --> Anthropic[Anthropic Provider]
-    Summary --> Groq[Groq Provider]
-    Summary --> OpenRouter[OpenRouter Provider]
+    Summary --> LLM[LLM Transport - llm/]
+    LLM --> Ollama[Ollama]
+    LLM --> OpenAI[OpenAI / Custom OpenAI]
+    LLM --> Anthropic[Anthropic]
+    LLM --> Groq[Groq]
+    LLM --> OpenRouter[OpenRouter]
     
     DB --> Repos[Repositories]
     
@@ -258,11 +232,11 @@ graph LR
 
 The frontend communicates with the Rust backend through Tauri's command/event system:
 
-1. **Command (Frontend → Rust)**: `invoke('command_name', { args })` triggers a Rust function
-2. **Tauri Routing**: `#[tauri::command]` handlers in `lib.rs` route to module functions
+1. **Command (Frontend → Rust)**: a typed wrapper in `frontend/src/lib/ipc/` (built on `invokeTyped` in `core.ts`) calls `invoke('command_name', { args })`; components and hooks never call `invoke`/`listen` directly (enforced by ESLint `no-restricted-imports`)
+2. **Tauri Routing**: `#[tauri::command]` handlers registered via `generate_handler!` in `lib.rs` route to module functions
 3. **Native Operation**: Rust executes the operation (audio capture, transcription, DB query)
 4. **Event (Rust → Frontend)**: `app.emit("event-name", payload)` pushes updates to React
-5. **Result**: Responses returned as JSON or via event payloads
+5. **Result**: Responses returned as JSON or via event payloads; a rejected command surfaces in the frontend as an `IpcError` (extends `Error`)
 
 ### Audio Pipeline Architecture
 
@@ -290,14 +264,13 @@ Raw Audio (Mic + System)
 |----------|---------|---------|
 | Desktop Framework | tauri v2.x | Cross-platform desktop app framework |
 | Audio Capture | cpal + cidre (macOS) | Microphone and system audio capture |
-| Transcription | whisper-rs v0.13.x | Whisper.cpp Rust bindings |
+| Transcription | whisper-rs v0.16.x | Whisper.cpp Rust bindings |
 | ONNX Runtime | ort v2.0.x | Parakeet model inference |
 | Database | sqlx v0.8 | Compile-time checked SQLite queries |
 | Async Runtime | tokio v1.32+ | Asynchronous runtime |
 | Serialization | serde + serde_json | JSON serialization |
 | Logging | env_logger + tracing | Structured logging with async logger |
-| Noise Suppression | nnnoiseless (RNNoise) | Neural noise suppression |
-| VAD | Custom implementation | Voice Activity Detection |
+| VAD | Silero VAD v6 | Voice Activity Detection |
 | Audio Processing | dasp, rubato, rayon | Resampling, mixing, parallel processing |
 | Buffer Management | VecDeque, custom pool | Efficient audio buffer handling |
 
@@ -312,15 +285,6 @@ Raw Audio (Mic + System)
 | State Management | react-hook-form + zod | Form handling and validation |
 | Desktop API | @tauri-apps/api v2.x | Tauri IPC bridge |
 
-### Python Backend Dependencies (Legacy)
-
-| Library | Purpose |
-|---------|---------|
-| fastapi + uvicorn | REST API framework and ASGI server |
-| pydantic-ai v0.2.x | LLM orchestration framework |
-| aiosqlite | Async SQLite access |
-| ollama | Ollama Python client |
-
 ## Concurrency Model
 
 The Rust backend uses **tokio async runtime** extensively:
@@ -329,9 +293,10 @@ The Rust backend uses **tokio async runtime** extensively:
 - Transcription chunks are processed via parallel processor with rayon thread pool
 - Database operations use sqlx's async interface
 - Recording state is managed through `Arc<RwLock<T>>` and `Arc<AtomicBool>` for shared mutable state
-- Device monitoring uses mpsc channels for event-driven reconnection
+- Device monitoring feeds an mpsc channel consumed by a per-session backend processor (`audio/recording/device_recovery.rs`) that switches a disconnected mic to the system default input
 - Post-processing uses unbounded channels for decoupled pipeline stages
 - Summary cancellation uses `CancellationToken` for graceful shutdown
+- Model downloads (Parakeet, Whisper, word alignment) share `model_download::DownloadOwners`: one owner per model with its own `CancellationToken`, a cancel that returns `cancelled` or `pending` (after 5 s), and an owner released only by its worker after cleanup, so a retry cannot start a second writer. Parakeet and alignment use the exact-size resumable `model_download::transfer` (skip only on exact size, `Range` resume validated against `Content-Range`, partials kept on cancel or error)
 
 ## Build Features (GPU Acceleration)
 
@@ -351,20 +316,3 @@ The Rust backend uses **tokio async runtime** extensively:
 - **No telemetry by default**: Application works fully offline without any cloud services
 - **GDPR-ready**: Data export and deletion support through database layer
 - **Privacy-by-design**: No data leaves the machine unless user explicitly configures cloud AI
-
-## Recent Changes (since 2026-07-13 mapping)
-
-Highlights of what changed since the previous map:
-
-| Area | Change |
-|------|--------|
-| **Mic/System channel separation** | Recording now captures mic + system as separate channels, recorded stereo (left=mic, right=system), stored via `source_device` on transcripts, displayed distinctly in the UI, and split again in re-transcription. |
-| **VAD rewritten** | `vad.rs` now uses **Silero VAD v6** (ONNX), a **unified `VadConfig`** (`live()`/`batch()`), and a **rolling buffer** for speech-onset recovery. |
-| **Transcription provider abstraction** | New `audio/transcription/` subpackage (`engine.rs`, `provider.rs`, `worker.rs`, `whisper_provider.rs`, `parakeet_provider.rs`) wraps the engines for live transcription. |
-| **Enhance / Re-transcription** | `audio/retranscription.rs` re-processes stored audio per-channel, cancellable, with atomic DB replacement. |
-| **Audio Import** | `audio/import.rs` imports external audio as meetings (beta-gated). |
-| **LLM debug logging** | New `summary/debug_log.rs` writes a file per LLM call into the meeting folder. |
-| **Frontend** | Paginated transcripts (`usePaginatedTranscripts` + `VirtualizedTranscriptView` infinite scroll); mic/sys visual separation in transcript UI. |
-| **Build/GPU** | New `scripts/env-cuda.*` and `frontend/build-gpu.*`/`dev-gpu.*`; `llama-helper` sidecar built by GPU scripts. |
-| **Python backend removed** | `backend/` deleted; all summarization/transcription is native Rust. |
-| **DB schema** | `transcripts.source_device` column added (2026-07); paginated transcript queries. |

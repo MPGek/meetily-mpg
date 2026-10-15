@@ -1,6 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import {
+  getAudioDevices,
+  listenAudioLevels,
+  stopAudioLevelMonitoring as stopAudioLevelMonitoringCommand,
+  type AudioDevice,
+  type AudioLevelData,
+} from '@/lib/ipc/recording';
 import { RefreshCw, Mic, Speaker } from 'lucide-react';
 import { AudioLevelMeter, CompactAudioLevelMeter } from './AudioLevelMeter';
 import { AudioBackendSelector } from './AudioBackendSelector';
@@ -8,27 +13,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Label } from '@/components/ui/label';
 import Analytics from '@/lib/analytics';
 
-export interface AudioDevice {
-  name: string;
-  device_type: 'Input' | 'Output';
-}
-
 export interface SelectedDevices {
   micDevice: string | null;
   systemDevice: string | null;
-}
-
-export interface AudioLevelData {
-  device_name: string;
-  device_type: string;
-  rms_level: number;
-  peak_level: number;
-  is_active: boolean;
-}
-
-export interface AudioLevelUpdate {
-  timestamp: number;
-  levels: AudioLevelData[];
 }
 
 interface DeviceSelectionProps {
@@ -44,7 +31,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   const [refreshing, setRefreshing] = useState(false);
   const [audioLevels, setAudioLevels] = useState<Map<string, AudioLevelData>>(new Map());
   const [isMonitoring, setIsMonitoring] = useState(false);
-  const [showLevels, setShowLevels] = useState(false);
+  const [showLevels] = useState(false);
 
   // Filter devices by type
   const inputDevices = devices.filter(device => device.device_type === 'Input');
@@ -54,7 +41,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   const fetchDevices = async () => {
     try {
       setError(null);
-      const result = await invoke<AudioDevice[]>('get_audio_devices');
+      const result = await getAudioDevices();
       setDevices(result);
       console.log('Fetched audio devices:', result);
     } catch (err) {
@@ -77,7 +64,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
 
     const setupAudioLevelListener = async () => {
       try {
-        unlisten = await listen<AudioLevelUpdate>('audio-levels', (event) => {
+        unlisten = await listenAudioLevels((event) => {
           const levelUpdate = event.payload;
           const newLevels = new Map<string, AudioLevelData>();
 
@@ -170,44 +157,15 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
     }).catch(err => console.error('Failed to track system audio selection:', err));
   };
 
-  // Start audio level monitoring
-  const startAudioLevelMonitoring = async () => {
-    try {
-      // Only monitor input devices for now (microphones)
-      const deviceNames = inputDevices.map(device => device.name);
-      if (deviceNames.length === 0) {
-        setError('No microphone devices found to monitor');
-        return;
-      }
-
-      await invoke('start_audio_level_monitoring', { deviceNames });
-      setIsMonitoring(true);
-      setShowLevels(true);
-      console.log('Started audio level monitoring for input devices:', deviceNames);
-    } catch (err) {
-      console.error('Failed to start audio level monitoring:', err);
-      setError('Failed to start audio level monitoring');
-    }
-  };
-
   // Stop audio level monitoring
   const stopAudioLevelMonitoring = async () => {
     try {
-      await invoke('stop_audio_level_monitoring');
+      await stopAudioLevelMonitoringCommand();
       setIsMonitoring(false);
       setAudioLevels(new Map());
       console.log('Stopped audio level monitoring');
     } catch (err) {
       console.error('Failed to stop audio level monitoring:', err);
-    }
-  };
-
-  // Toggle audio level monitoring
-  const toggleAudioLevelMonitoring = async () => {
-    if (isMonitoring) {
-      await stopAudioLevelMonitoring();
-    } else {
-      await startAudioLevelMonitoring();
     }
   };
 
@@ -377,7 +335,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
           <p>• <strong>Mic Levels:</strong> Green = good, Yellow = loud, Red = too loud</p>
         )}
         {!isMonitoring && inputDevices.length > 0 && (
-          <p>• <strong>Tip:</strong> Click "Test Mic" to check if your microphone is working</p>
+          <p>• <strong>Tip:</strong> Click &quot;Test Mic&quot; to check if your microphone is working</p>
         )}
       </div>
     </div>

@@ -1,0 +1,314 @@
+# Diarization evaluation harness
+
+Quantitative DER evaluation for Meetily's offline speaker diarization against
+public benchmarks. Everything lives under `eval/`. Datasets are materialized in
+a canonical layout (`wav/` 16 kHz mono PCM + `rttm/ref.rttm` + `uem/ref.uem`),
+diarized by the headless `diarize-eval` binary built from the app's own pipeline,
+and scored with `pyannote.metrics` DER (Full setup: no collar, overlap counted).
+
+## One-time setup
+
+```powershell
+# 1. Python env (uv-managed; deps: dvc, pyannote-metrics, datasets, soundfile, ...)
+uv sync --project eval
+
+# 2. DVC remote: committed in eval/.dvc/config (default remote "local-server", a folder
+#    on a network share). A new machine only needs access to that share (office
+#    network / VPN); check that the remote is there:
+uv run --project eval dvc remote list
+
+# 3. Harness binaries (reuse the app's diarization code paths; models must be
+#    installed for the app, or pass --models-dir)
+cargo build --release --bin diarize-eval -p meetily   # offline batch path
+cargo build --release --bin online-eval  -p meetily   # live (Fast-mode) path
+```
+
+## Per-dataset commands
+
+Open datasets (download → normalize → diarize → score → report):
+
+```powershell
+uv run --project eval download  --dataset voxconverse
+uv run --project eval normalize --dataset voxconverse
+uv run --project eval run       --dataset voxconverse
+uv run --project eval score     --dataset voxconverse
+uv run --project eval report
+
+uv run --project eval download  --dataset msdwild      # audio via Google Drive
+uv run --project eval normalize --dataset msdwild
+# ... same run/score/report
+uv run --project eval download  --dataset ru-synthetic # HF, MIT
+uv run --project eval normalize --dataset ru-synthetic
+uv run --project eval download  --dataset ru-youtube   # HF, Apache-2.0
+uv run --project eval normalize --dataset ru-youtube
+```
+
+## Online mode: measuring the live path (add-online-diarization-eval)
+
+The live path is a second, independently addressable mode of the same
+commands. It replays a recording through the production VAD/merge chunking and
+the real `OnlineDiarizationProcessor` in Fast mode, then writes the finalized
+RTTM *and* a streaming event sidecar (`<uri>.events.jsonl`) plus a timing file
+(`<uri>.timing.json`) per recording:
+
+```powershell
+# Run and score the live path; artifacts land in eval/out/<dataset>/online/<run-id>
+uv run --project eval run   --dataset voxconverse --mode online
+uv run --project eval score --dataset voxconverse --mode online
+
+# One recording, straight from the binary (what the runner calls per file)
+./target/release/online-eval eval/data/voxconverse/wav/abjxc.wav `
+  --out-dir eval/out/voxconverse/online/manual --uri abjxc
+
+# The report shows both modes with the online-minus-offline delta
+uv run --project eval report
+
+# A baseline pair is named per mode (base-offline / base-online), so the report
+# is told which offline run to put beside the online one
+uv run --project eval report --datasets voxconverse ru-synthetic `
+  --run-id base-online --offline-run-id base-offline
+```
+
+Rules that keep the numbers meaningful:
+
+- **Chunking policy.** The default `production` policy is the recording
+  pipeline's own recipe (200 ms VAD dispatch window, 500 ms gap and 25 s
+  accumulation flush triggers, `merge_segments(.., 500 ms, 25 s)`, the
+  `VadConfig::live()` minimum length). `--chunking fixed:<secs>` exists only
+  as an ablation: it changes the segmentation the pipeline sees, it is
+  labelled as such in the sidecar header and the report, and **a parity claim
+  or a gate may only ever be based on the production policy**.
+- **Modes are never mixed.** A run directory records its mode, and scoring
+  refuses to attribute a run to the other mode, so an online hypothesis can
+  never land in the calibrated offline baseline.
+- **Real-time factor is reported, never gated.** It measures the machine, not
+  the pipeline; the manifest loader rejects a bound on it. Lag is measured in
+  audio time (from a reference turn's start to the first emission covering
+  it), and a turn no emission covered is counted as uncovered rather than
+  scored as zero.
+- **Efficient mode is not scored.** Only Fast mode emits an observable turn
+  stream; see the change's design D3.
+
+Online gate bounds are declared per dataset as `online_gate:` in the
+manifests, alongside the offline `subset_gate:`, and `subset` evaluates both.
+
+### The stop-time pass, and what the online numbers mean (05b)
+
+`online-eval` stops a replay the way the app stops a recording: it calls the
+processor's `finalize`, and the finalized RTTM is the timeline that call
+publishes. With the stop-time refinement on (the app's default) that is the
+session's buffered chunk embeddings re-clustered; with it off it is the
+identities the session showed live. Two flags exist for measuring exactly that
+difference; neither is a persisted setting:
+
+```powershell
+# The A/B arm: the identities shown live, no refinement
+./target/release/online-eval <wav> --out-dir <dir> --no-final-recluster
+
+# A sweep arm: the refinement at another merge threshold (default: the app's)
+./target/release/online-eval <wav> --out-dir <dir> --final-recluster-threshold 0.70
+```
+
+The run header records `final_recluster` and `final_recluster_threshold`, so a
+result can always be attributed. Reported beside the DER:
+
+- **`live_final_flip`** - the share of the finalized speech whose label differs
+  from the one shown live. `L(t)` is the label of the latest *stable* emission
+  covering `t` (a provisional emission never reaches a user, so it is not
+  counted), `F(t)` the finalized label; both are mapped into reference-label
+  space through their own optimal mapping, so a pure cluster renaming is not a
+  disagreement, and it is scored over the finalized speech inside the
+  annotated regions, duration-weighted across recordings.
+- **`live_uncovered`** - the share of that speech no live emission ever
+  labelled. Reported separately and never folded into the flip.
+- **Stop-time cost** (`finalize_secs_per_audio_hour`) - the refinement pass on
+  its own, from `<uri>.timing.json`. It is paid exactly when the user waits for
+  the meeting to save. Like the real-time factor it measures the machine, is
+  reported and is never gated.
+
+**Tuning discipline.** `voxconverse-dev` is the tuning set and never a gate: a
+parameter of the stop-time pass is chosen on a sample of it, then validated on
+the held-out `voxconverse` and `ru-synthetic` full sets before it ships. The
+refinement's merge threshold (0.75) was selected that way; the two held-out
+sets disagree about it (see the manifests), which is recorded rather than
+tuned away.
+
+**Reading the gate table.** The 5-file regression subsets are a *smoke* test,
+not the quality record: about three minutes of speech, and each `voxconverse`
+file yields only 2-3 buffered chunks, too few for the refinement to cluster (it
+collapses each to one speaker). The gate bounds therefore stop the numbers
+getting worse; the design's targets are stated beside them, and the quality
+record is the full sets.
+
+Online gate (`online_gate:` in the manifests; measured 2026-09-30 on the
+production-faithful subset runs, refinement on at 0.75):
+
+| Dataset (5 files) | Gated metric | Measured | Gate max | Design target |
+| --- | --- | ---: | ---: | ---: |
+| voxconverse | DER | 24.75 | 31.0 | - |
+| voxconverse | `der_delta` (online - offline) | +16.35 | 22.0 | <= +3.0 |
+| voxconverse | `live_final_flip` | 33.5 % | 40.0 | 5.0 % |
+| ru-synthetic | DER (artifact-inflated) | 54.76 | 60.0 | - |
+| ru-synthetic | `conf_delta` (online - offline) | +11.02 | 16.0 | <= +3.0 |
+| ru-synthetic | `live_final_flip` | 20.4 % | 26.0 | 5.0 % |
+| both | lag p90 / flip rate / final runs per speaker / switches per speaker-minute | see manifests | see manifests | - |
+
+The quality record, full sets, online DER (Conf for `ru-synthetic`) before the
+stop-time pass, with it at the offline merge threshold 0.60, and as shipped at
+0.75:
+
+| Dataset | Offline | Before | 0.60 | 0.75 (shipped) |
+| --- | ---: | ---: | ---: | ---: |
+| voxconverse, 232 files, 40.22 h - DER | 26.95 | 41.54 | 33.93 | **26.69** |
+| voxconverse - `live_final_flip` | - | 0.00 % | 44.51 % | 38.45 % |
+| ru-synthetic, 2000 files, 26.16 h - Conf | 9.82 | 21.73 | **14.13** | 20.65 |
+| ru-synthetic - `live_final_flip` | - | 0.00 % | 28.32 % | 36.39 % |
+
+Fast regression gate (<=10 recordings, ru-synthetic + voxconverse, end-to-end):
+
+```powershell
+uv run --project eval subset
+```
+
+## Clustering parameter sweep (diarization-param-tuning)
+
+The offline clustering parameters are runtime values shared by app and harness.
+Built-in defaults (numeric values sweep-selected 2026-09-04, extended grid +
+held-out validation; kind selected 2026-09-07 by the pipeline-v2 6.2 sweep):
+clusterer kind **ahc** (fixed threshold 0.60; `nmesc` selectable but
+under-clusters dense TitaNet windows — dev Conf 37.27 vs AHC 14.80; `vbx`
+gated to an actionable error on the 192-d enhanced family), speaker-count
+ceiling **128**, same-speaker gap-merge **0.3 s**. Dense embedding windows
+(`embed_window_secs=5.0`, w/2 hop) and calibrated hysteresis binarization
+(`onset=0.5, offset=0.4, min_on=0.2, min_off=0.2`) are compiled-in constants,
+harness-sweepable only.
+Harness overrides need no rebuild:
+
+```powershell
+uv run --project eval run --dataset ru-youtube --run-id cand1 `
+  --harness-arg=--cluster-threshold=0.35   # also: --max-clusters=N, --gap-merge=SECS, --clusterer=nmesc|ahc|vbx, --embed-window=5.0, --binarization=0.5,0.4,0.2,0.2 (or 'off')
+```
+
+Sweep a grid over the tuning pools (voxconverse-dev, ru-youtube, ru-synthetic —
+the latter read Conf-only; see Notes) and score the top-2 on held-out
+validation (voxconverse test, msdwild):
+
+```powershell
+uv run --project eval sweep --grid cluster_threshold=0.55,0.60 `
+  --grid cluster_ceiling=64,128 --grid gap_merge_secs=0.0,0.3 --run-prefix sweepext
+uv run --project eval sweep --grid clusterer=nmesc,ahc `
+  --grid embed_window=3.0,5.0 --grid binarization="0.5,0.4,0.2,0.2" --run-prefix v2kind
+```
+
+Per-candidate hypotheses land under `eval/out/<dataset>/sweep-NNN-.../`; the
+report is `eval/reports/sweep-<date>-<gitrev>.md` with tuning and validation
+columns kept separate. Selection rule: minimize held-out DER among candidates
+whose tuning components never regress >2 pp from their best.
+
+The grid history lives in `eval/reports/`: grid-1 (thr 0.35–0.55 × ceil 12/20)
+winner failed held-out validation — tight ceilings force below-threshold merges
+once active clusters exceed the cap — so the extended grid (thr 0.55/0.60 ×
+ceil 64/128 × gap 0.0/0.3) selected the shipped defaults
+(thr 0.60 / ceil 128 / gap 0.3).
+
+**Behavior change note:** meetings diarized before this tuning will produce
+different speaker labels when re-diarized (higher merge threshold, always-on
+ceiling, gap-merge on; pipeline-v2 adds dense embedding windows, hysteresis
+binarization, and overlap-aware two-speaker output). Rollback to pre-adoption
+AHC behavior without a code revert: store overrides
+`diarizationClusterThreshold=0.52`, `diarizationGapMergeSecs=0.0` (the
+default kind is already `ahc`; the ceiling can also be raised via
+`diarizationClusterCeiling`).
+
+### App settings keys (persisted, optional)
+
+Power users can override the defaults without a rebuild; unset keys fall back
+to the built-in defaults. Keys live in the browser settings store (localStorage)
+and are mirrored to the backend via `set_diarization_clustering_settings` on
+startup:
+
+| Key | Type | Built-in default | Effect |
+| --- | --- | --- | --- |
+| `diarizationClusterer` | vbx\|nmesc\|ahc | ahc | Clusterer kind: fixed-threshold AHC (default, 6.2 sweep) or automatic-count NME-SC / VBx. `vbx` fails actionably on the bundled 192-d family (vendored PLDA is 256-d-locked); threshold override is inert under automatic count. |
+| `diarizationClusterThreshold` | float | 0.60 | AHC merge criterion (AHC only): minimum cosine similarity to merge two clusters. Lower → more merging, fewer speakers. |
+| `diarizationClusterCeiling` | int | 128 | Hard cap on distinct speaker labels per channel per pass. User `max_speakers` wins when smaller; the ceiling is always enforced (clamped to 255). |
+| `diarizationGapMergeSecs` | float | 0.3 | Merge consecutive same-speaker output segments whose silence gap ≤ this window (0 = off; cross-speaker boundaries and overlaps untouched). |
+
+### Subset regression gate ranges (re-baselined 2026-09-07, pipeline-v2 core + AHC default)
+
+`uv run --project eval subset` enforces the recorded ranges (declared as
+`subset_gate:` in the manifests) and exits non-zero with a regressed-source
+message when a metric exceeds its bound:
+
+| Dataset | Gated metric | Measured | Gate max |
+| --- | --- | ---: | ---: |
+| voxconverse (5 files) | DER | 8.40 | 12.0 |
+| voxconverse (5 files) | Conf | 3.89 | 7.0 |
+| ru-synthetic (5 files) | Conf (DER is artifact-inflated, see Notes) | 12.66 | 16.0 |
+
+(ru-synthetic Conf rose vs the 2026-09-05 4.00 from short-TTS-blip
+fragmentation under dense window-mean aggregates — full-set Conf moved only
+8.59 → 9.82, within noise on this artifact set. The gate still guards
+relative regressions from the new baseline.)
+
+## Gated datasets (manual data drop)
+
+AMI and DIHARD-3 audio cannot be scripted. Place the archives, then ingest:
+
+| Dataset | Drop location | Expected file | Obtained from |
+| --- | --- | --- | --- |
+| `ami-sdm` | `eval/raw/ami-sdm/` | `ami-sdm-audio.zip` | https://groups.inf.ed.ac.uk/ami/corpus/ (EULA) |
+| `ami-headset` | `eval/raw/ami-headset/` | `ami-headset-audio.zip` | same |
+| `dihard3` | `eval/raw/dihard3/` | `LDCCeRC2022S03.tar.gz` | https://www.ldc.upenn.edu/ (LDC account) |
+
+```powershell
+uv run --project eval ingest --dataset ami-sdm
+uv run --project eval run --dataset ami-sdm; uv run --project eval score --dataset ami-sdm
+```
+
+## DVC: sharing normalized datasets
+
+Normalized datasets (`eval/data/`) and gated raw archives are DVC-tracked;
+re-fetchable open downloads (`eval/cache/`), harness outputs (`eval/out/`) and
+reports (`eval/reports/`) are not.
+
+```powershell
+uv run --project eval dvc add data/<dataset>   # after normalize/ingest
+uv run --project eval dvc push                 # blobs -> remote folder on the network share
+uv run --project eval dvc pull data/<dataset>  # on another machine
+```
+
+Commit the generated `data/<dataset>.dvc` files. The blob remote (`local-server`)
+is a folder on a network share; to relocate it,
+`dvc remote modify local-server url <new-path>` and copy the old folder's `files/`
+tree across.
+
+`transcript_compare/` (the ASR benchmark on recorded meetings) is a separate DVC
+project with its own remote folder `meetily-asr` on the same share and
+`cache.type = copy`, so its references stay plain writable files that
+`editor.html` can save in place. It is not part of this project because
+`cache.type` is per project (eval keeps `hardlink,copy` for tens of GB) and
+because `dvc gc --cloud` here would delete the other project's blobs if both
+shared one remote URL. See [transcript_compare/README.md](../transcript_compare/README.md).
+
+## Disk expectations
+
+- `eval/cache/`: ~4 GB (VoxConverse) + ~7.5 GB (MSDWild) + ~2.3 GB (ru-synthetic) + ~2 GB (ru-youtube)
+- `eval/data/`: canonical WAVs (~1.6× the audio hours at 16 kHz mono s16) — tens of GB total
+- DVC remote (`DVC/meetily/` on the network share): roughly mirrors `eval/data/` + gated raw archives
+
+## Notes
+
+- Baseline DERs (pyannote 3.1 "Full") are declared per dataset in
+  `eval/manifests/*.yml`; the report compares against them.
+- ru-synthetic uses TTS voices: treat it as a *relative* regression gate only.
+- **ru-synthetic annotation-timeline artifact** (measured 2026-09-02): its
+  `speakers[]` segments tile the file contiguously while the mixed audio has
+  inter-clip silence — 73.6% of reference-"speech" frames measure < -35 dBFS
+  (Silero v6 and segmentation-3.0 agree within 2pp on coverage). The resulting
+  ~43pp Miss is a dataset artifact, not a model failure: **read ru-synthetic
+  Conf-only** as a relative gate; absolute DER numbers come from real-data sets
+  (voxconverse, msdwild, ru-youtube). The subset gate composition stays
+  spec-mandated (ru-synthetic + voxconverse, ≤10 files).
+- Licenses and eval-only usage terms: see `LICENSES.md`.
+- The harness binary is dev-only and never shipped in the app bundle.

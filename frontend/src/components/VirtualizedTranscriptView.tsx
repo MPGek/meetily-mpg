@@ -1,14 +1,21 @@
 'use client';
 
-import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
+import { useRef, useReducer, startTransition, useEffect, useState, memo, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
 import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import { recordingService } from "@/services/recordingService";
+import { toast } from "sonner";
+import { Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { TranscriptSegmentData } from "@/types";
+import { Pause, Play } from "lucide-react";
+import { TranscriptSegmentData, LiveTranscriptBlock, LiveBlockPart } from "@/types";
+import { liveAssignmentCalls } from "@/lib/live-speaker-labels";
+import { sourceSideLayout } from "@/lib/source-side-layout";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -34,6 +41,28 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    // Speaker label editing. Third arg is the transcript id for single-block
+    // updates (used by the live view to relabel just that segment); the
+    // optional time window scopes a live sub-row override.
+    onUpdateSpeakerLabel?: (
+        speaker: string,
+        label: string,
+        transcriptId?: string,
+        startTime?: number,
+        endTime?: number,
+        subRow?: boolean
+    ) => Promise<void>;
+
+    // Meeting ID for speaker registry operations
+    meetingId?: string;
+
+    // Audio playback from a segment's start time (meeting details page)
+    onPlayFrom?: (startTime: number) => void;
+    /** Whether the meeting audio player is currently playing */
+    isAudioPlaying?: boolean;
+    /** Id of the transcript segment currently being played */
+    activeSegmentId?: string | null;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -48,6 +77,346 @@ function formatRecordingTime(seconds: number | undefined): string {
     const secs = totalSeconds % 60;
 
     return `[${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
+}
+
+// Speaker color palette — 8 distinct colors
+const SPEAKER_COLORS = [
+    "#3B82F6", // blue
+    "#10B981", // emerald
+    "#F59E0B", // amber
+    "#8B5CF6", // violet
+    "#F43F5E", // rose
+    "#06B6D4", // cyan
+    "#F97316", // orange
+    "#14B8A6", // teal
+];
+
+// Stable color for IDs without a numeric index (e.g. legacy "SystemAudio")
+const FALLBACK_SPEAKER_COLOR = "#6B7280"; // gray
+
+function getSpeakerColor(speaker: string): string {
+    const idx = parseInt(speaker.replace("MIC_SPEAKER_", "").replace("SPEAKER_", ""), 10);
+    if (isNaN(idx)) return FALLBACK_SPEAKER_COLOR;
+    return SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
+}
+
+function formatSpeakerId(speaker: string): string {
+    if (speaker === "SystemAudio") return "System Audio";
+    if (speaker.startsWith("MIC_SPEAKER_")) {
+        const idx = parseInt(speaker.replace("MIC_SPEAKER_", ""), 10);
+        return `Mic Speaker ${idx + 1}`;
+    }
+    const idx = parseInt(speaker.replace("SPEAKER_", ""), 10);
+    return isNaN(idx) ? speaker : `Speaker ${idx + 1}`;
+}
+
+/**
+ * Resolve the display text for a speaker identity. Auto-matched names render
+ * with an `(auto)` suffix and the similarity as a percentage (trustworthy at a
+ * glance); user-assigned names render plain; fallback (unlinked cluster) uses
+ * the formatted cluster label with no decoration.
+ */
+function formatSpeakerDisplay(
+    baseName: string,
+    matchedBy?: string,
+    matchScore?: number
+): string {
+    if (matchedBy === 'auto') {
+        const pct = matchScore !== undefined ? `${Math.round(matchScore * 100)}%` : '';
+        return `${baseName} (auto)${pct ? ` ${pct}` : ''}`;
+    }
+    return baseName;
+}
+
+// Inline editable speaker label — combobox with registry dropdown + free text.
+// Default scope is "this block" (per-transcript override); an explicit
+// "apply to all blocks of this speaker" option links the whole cluster.
+function SpeakerLabel({
+    speaker,
+    label,
+    color,
+    onUpdate,
+    meetingId,
+    transcriptId,
+    startTime,
+    endTime,
+    matchedBy,
+    matchScore,
+    subRow,
+    parts,
+}: {
+    speaker: string;
+    label?: string;
+    color: string;
+    onUpdate?: (speaker: string, label: string, transcriptId?: string, startTime?: number, endTime?: number, subRow?: boolean) => Promise<void>;
+    meetingId?: string;
+    transcriptId?: string;
+    startTime?: number;
+    endTime?: number;
+    matchedBy?: string;
+    matchScore?: number;
+    /** A sub-row of a live-split block: single-block edits touch only it. */
+    subRow?: boolean;
+    /** Live: the clusters this label was merged from; edits reach each of them. */
+    parts?: LiveBlockPart[];
+}) {
+    const [open, setOpen] = useState(false);
+    const [query, setQuery] = useState("");
+    const [registrySpeakers, setRegistrySpeakers] = useState<Array<{ id: string; name: string }>>([]);
+    const [loading, setLoading] = useState(false);
+    const [scopeAll, setScopeAll] = useState(false);
+
+    // Live recording: one backend assignment per merged part (stop-time
+    // persistence matches overrides by cluster and window), or the single
+    // call a plain row sends.
+    const sendLive = async (speakerId?: string, newName?: string) => {
+        const calls = liveAssignmentCalls(parts, speaker, scopeAll || !transcriptId, startTime ?? 0, endTime);
+        for (const call of calls) {
+            if (call.kind === 'cluster') {
+                await recordingService.assignLiveSpeaker(call.cluster, speakerId, newName);
+            } else {
+                await recordingService.assignLiveSpeakerBlock(call.cluster, call.start, speakerId, newName, call.end);
+            }
+        }
+    };
+
+    // Scope-aware local propagation: apply-to-all passes no transcriptId so
+    // the updater relabels every block of the cluster (each merged cluster);
+    // single-block passes the id (design D11). A merged label edits through the
+    // sub-row path, a window override over the whole row.
+    const applyLocal = async (name: string) => {
+        if (!onUpdate) return;
+        if (scopeAll && parts?.length) {
+            for (const cluster of new Set(parts.map(p => p.speaker))) {
+                await onUpdate(cluster, name, undefined, startTime, endTime, false);
+            }
+            return;
+        }
+        await onUpdate(speaker, name, scopeAll ? undefined : transcriptId, startTime, endTime, !scopeAll && (!!subRow || !!parts?.length));
+    };
+
+    const displayName = formatSpeakerDisplay(label || formatSpeakerId(speaker), matchedBy, matchScore);
+
+    // Load registry speakers when popover opens
+    useEffect(() => {
+        if (!open) return;
+        let cancelled = false;
+        setLoading(true);
+        recordingService.listSpeakers().then((speakers) => {
+            if (!cancelled) {
+                setRegistrySpeakers(speakers);
+                setLoading(false);
+            }
+        }).catch(() => {
+            if (!cancelled) setLoading(false);
+        });
+        return () => { cancelled = true; };
+    }, [open]);
+
+    const filtered = useMemo(() => {
+        if (!query.trim()) return registrySpeakers;
+        const q = query.toLowerCase();
+        return registrySpeakers.filter((s) => s.name.toLowerCase().includes(q));
+    }, [registrySpeakers, query]);
+
+    const handleAssign = async (sp: { id: string; name: string }) => {
+        setOpen(false);
+        setQuery("");
+        setScopeAll(false);
+        if (!onUpdate) return;
+        try {
+            // Re-selecting the already-displayed name on an auto-matched label is
+            // a confirmation, not a silent no-op: mark it user-owned and clear
+            // the `(auto)` suffix. Offline persists via the confirm command;
+            // live records the binding so it persists as a user binding at stop.
+            const isConfirm = matchedBy === 'auto' && label !== undefined && sp.name === label;
+            if (meetingId) {
+                if (isConfirm) {
+                    await recordingService.confirmBlockSpeaker(transcriptId ?? '', scopeAll);
+                } else if (scopeAll) {
+                    // Link the whole cluster (matched_by='user' + enrollment).
+                    await recordingService.assignSpeaker(meetingId, speaker, sp.id);
+                } else if (transcriptId) {
+                    // Default: relabel only this block via a per-transcript override.
+                    await recordingService.assignBlockSpeaker(transcriptId, sp.id);
+                } else {
+                    await recordingService.assignSpeaker(meetingId, speaker, sp.id);
+                }
+            } else {
+                // Live recording view: cluster-wide via the prototype store,
+                // or a per-turn override on this block when scoped.
+                await sendLive(sp.id, undefined);
+            }
+            await applyLocal(sp.name);
+        } catch (error) {
+            console.error("Failed to assign speaker:", error);
+            // Backend write runs before onUpdate, so the local label was never
+            // applied — the list is undisturbed. Surface the failure (9.3).
+            toast.error("Failed to assign speaker");
+        }
+    };
+
+    // Explicit "confirm this prediction is correct" affordance shown on
+    // auto-matched labels. Marks the block/cluster user-owned without
+    // re-enrolling and clears the `(auto)` suffix, with visible feedback.
+    const handleConfirm = async () => {
+        setOpen(false);
+        if (!onUpdate || label === undefined) return;
+        try {
+            if (meetingId) {
+                await recordingService.confirmBlockSpeaker(transcriptId ?? '', scopeAll);
+            } else {
+                // Live: record a binding with the displayed (auto) name so it
+                // persists as a user binding at stop.
+                await sendLive(undefined, label);
+            }
+            await applyLocal(label);
+            toast.success("Speaker confirmed");
+        } catch (error) {
+            console.error("Failed to confirm speaker:", error);
+            toast.error("Failed to confirm speaker");
+        }
+    };
+
+    const handleCreateNew = async (name: string) => {
+        const trimmed = name.trim();
+        if (!trimmed) return;
+        setOpen(false);
+        setQuery("");
+        setScopeAll(false);
+        if (!onUpdate) return;
+        try {
+            if (meetingId) {
+                if (scopeAll) {
+                    await recordingService.assignSpeaker(meetingId, speaker, undefined, trimmed);
+                } else if (transcriptId) {
+                    await recordingService.assignBlockSpeaker(transcriptId, undefined, trimmed);
+                } else {
+                    await recordingService.assignSpeaker(meetingId, speaker, undefined, trimmed);
+                }
+            } else {
+                await sendLive(undefined, trimmed);
+            }
+            await applyLocal(trimmed);
+        } catch (error) {
+            console.error("Failed to create speaker:", error);
+            toast.error("Failed to assign speaker");
+        }
+    };
+
+    const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            const val = query.trim();
+            if (val) {
+                // Check if exact match exists
+                const exact = registrySpeakers.find(
+                    (s) => s.name.toLowerCase() === val.toLowerCase()
+                );
+                if (exact) {
+                    handleAssign(exact);
+                } else {
+                    handleCreateNew(val);
+                }
+            }
+        } else if (e.key === "Escape") {
+            setOpen(false);
+            setQuery("");
+        }
+    };
+
+    if (!onUpdate) {
+        return (
+            <span
+                className="text-xs font-medium text-gray-600"
+                style={{ color }}
+            >
+                {displayName}
+            </span>
+        );
+    }
+
+    return (
+        <Popover open={open} onOpenChange={setOpen}>
+            <PopoverTrigger asChild>
+                <span className="inline-flex items-center gap-1">
+                    <span
+                        className="text-xs font-medium text-gray-600 cursor-pointer hover:underline"
+                        style={{ color }}
+                        title="Click to rename speaker"
+                    >
+                        {displayName}
+                    </span>
+                    {matchedBy === 'auto' && (
+                        <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); handleConfirm(); }}
+                            title="Confirm this speaker is correct"
+                            className="text-xs text-green-600 hover:text-green-700 shrink-0"
+                        >
+                            <Check className="h-3 w-3" />
+                        </button>
+                    )}
+                </span>
+            </PopoverTrigger>
+            <PopoverContent className="w-64 p-0" align="start">
+                <div className="border-b px-3 py-2">
+                    <input
+                        autoFocus
+                        placeholder="Search or type name..."
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        onKeyDown={handleKeyDown}
+                        className="w-full text-xs bg-transparent outline-none placeholder:text-gray-400"
+                    />
+                </div>
+                <div className="max-h-48 overflow-y-auto">
+                    {loading ? (
+                        <div className="px-3 py-2 text-xs text-gray-400">Loading...</div>
+                    ) : filtered.length > 0 ? (
+                        filtered.map((sp) => (
+                            <button
+                                key={sp.id}
+                                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-100 text-left"
+                                onClick={() => handleAssign(sp)}
+                            >
+                                <Check className="h-3 w-3 shrink-0 opacity-0" />
+                                <span className="truncate">{sp.name}</span>
+                            </button>
+                        ))
+                    ) : (
+                        <div className="px-3 py-2 text-xs text-gray-400">
+                            {query.trim()
+                                ? `Press Enter to create "${query.trim()}"`
+                                : "No speakers yet"}
+                        </div>
+                    )}
+                </div>
+                {query.trim() && !registrySpeakers.some(
+                    (s) => s.name.toLowerCase() === query.trim().toLowerCase()
+                ) && (
+                    <div className="border-t px-3 py-2">
+                        <button
+                            className="w-full text-xs text-left text-blue-600 hover:underline"
+                            onClick={() => handleCreateNew(query)}
+                        >
+                            Create &quot;{query.trim()}&quot;
+                        </button>
+                    </div>
+                )}
+                <div className="border-t px-3 py-2 flex items-center gap-2">
+                    <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={scopeAll}
+                            onChange={(e) => setScopeAll(e.target.checked)}
+                        />
+                        Apply to all blocks of this speaker
+                    </label>
+                </div>
+            </PopoverContent>
+        </Popover>
+    );
 }
 
 // Helper function to remove filler words and repetitions
@@ -67,31 +436,188 @@ function cleanStopWords(text: string): string {
 const TranscriptSegment = memo(function TranscriptSegment({
     id,
     timestamp,
+    endTime,
     text,
     confidence,
     isStreaming,
     showConfidence,
     source_device,
+    speaker,
+    speaker_label,
+    speaker_matched_by,
+    speaker_match_score,
+    hasAudioTime,
+    onUpdateSpeakerLabel,
+    meetingId,
+    onPlayFrom,
+    isActive,
+    isAudioPlaying,
+    blocks,
+    speaker_parts,
 }: {
     id: string;
     timestamp: number;
+    endTime?: number;
     text: string;
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
     source_device?: string;
+    speaker?: string;
+    speaker_label?: string;
+    speaker_matched_by?: string;
+    speaker_match_score?: number;
+    hasAudioTime?: boolean;
+    onUpdateSpeakerLabel?: (
+        speaker: string,
+        label: string,
+        transcriptId?: string,
+        startTime?: number,
+        endTime?: number,
+        subRow?: boolean
+    ) => Promise<void>;
+    meetingId?: string;
+    onPlayFrom?: (startTime: number) => void;
+    isActive?: boolean;
+    isAudioPlaying?: boolean;
+    /** Live word-level diarization sub-rows (only when a block was split). */
+    blocks?: LiveTranscriptBlock[];
+    /** Live: the clusters an unsplit row's label was merged from. */
+    speaker_parts?: LiveBlockPart[];
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
-    // Determine layout based on source_device
     const isMic = source_device === 'Microphone';
     const isSystem = source_device === 'System';
     const isLegacy = !isMic && !isSystem;
+    const hasSpeaker = !!speaker;
+
+    const showPlayButton = !!onPlayFrom && !!hasAudioTime;
+    const isActivePlaying = !!isActive && !!isAudioPlaying;
+
+    const playButton = showPlayButton ? (
+        <button
+            type="button"
+            onClick={(e) => {
+                e.stopPropagation();
+                onPlayFrom?.(timestamp);
+            }}
+            aria-label={`Play from ${formatRecordingTime(timestamp)}`}
+            title={`Play from ${formatRecordingTime(timestamp)}`}
+            className={`flex-shrink-0 w-5 h-5 flex items-center justify-center rounded-full mt-1 transition-colors ${
+                isActivePlaying
+                    ? 'text-blue-600 bg-blue-100'
+                    : isActive
+                    ? 'text-blue-500 bg-blue-50'
+                    : 'text-gray-400 hover:text-blue-600 hover:bg-blue-50'
+            }`}
+        >
+            {isActivePlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+        </button>
+    ) : null;
+
+    const speakerColor = hasSpeaker ? getSpeakerColor(speaker) : undefined;
+
+    // Live word-level diarization: a split block renders as one block surface
+    // for its channel, with one labeled sub-row per speaker run inside it. Only
+    // present for blocks that were actually split (>1 run); single-speaker
+    // blocks render exactly as before.
+    if (blocks && blocks.length > 1) {
+        const side = sourceSideLayout(source_device);
+        const surface = (
+            <div className="flex-1 max-w-[90%]">
+                <div
+                    className={`rounded-lg px-3 py-2 ${side.bubbleClass} ${isActive ? `ring-2 ${side.activeRingColor}` : ''}`}
+                    style={hasSpeaker ? (side.isSystem ? { borderRightColor: speakerColor, borderRightWidth: 3 } : { borderLeftColor: speakerColor, borderLeftWidth: 3 }) : undefined}
+                >
+                    <div className="space-y-2">
+                        {blocks.map((block, index) => {
+                            const blockColor = getSpeakerColor(block.speaker);
+                            return (
+                                <div key={`${block.speaker}-${block.start}-${index}`}>
+                                    <div className={side.labelRowClass}>
+                                        {side.dotPosition === 'before' && (
+                                            <span
+                                                className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                                style={{ backgroundColor: blockColor }}
+                                            />
+                                        )}
+                                        <SpeakerLabel
+                                            speaker={block.speaker}
+                                            label={block.display_name}
+                                            color={blockColor}
+                                            onUpdate={onUpdateSpeakerLabel}
+                                            meetingId={meetingId}
+                                            transcriptId={id}
+                                            startTime={block.start}
+                                            endTime={block.end}
+                                            matchedBy={block.matched_by}
+                                            matchScore={block.match_score}
+                                            subRow
+                                            parts={block.parts}
+                                        />
+                                        {side.dotPosition === 'after' && (
+                                            <span
+                                                className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                                style={{ backgroundColor: blockColor }}
+                                            />
+                                        )}
+                                    </div>
+                                    <div className={side.textClass}>
+                                        {cleanStopWords(block.text) || block.text}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            </div>
+        );
+        const timestampLabel = (
+            <Tooltip>
+                <TooltipTrigger>
+                    <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                        {formatRecordingTime(timestamp)}
+                    </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                    {confidence !== undefined && showConfidence && (
+                        <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
+                    )}
+                </TooltipContent>
+            </Tooltip>
+        );
+
+        if (side.isSystem) {
+            return (
+                <div id={`segment-${id}`} className="mb-3">
+                    <div className="flex items-start gap-2 justify-end">
+                        {surface}
+                        {playButton}
+                        {timestampLabel}
+                    </div>
+                </div>
+            );
+        }
+
+        return (
+            <div id={`segment-${id}`} className="mb-3">
+                <div className="flex items-start gap-2">
+                    {timestampLabel}
+                    {playButton}
+                    {surface}
+                </div>
+            </div>
+        );
+    }
 
     if (isLegacy) {
         // Legacy neutral style - left-aligned, no bubble
         return (
-            <div id={`segment-${id}`} className="mb-3">
+            <div
+                id={`segment-${id}`}
+                className={isActive ? 'mb-3 bg-blue-50/70 rounded-lg ring-1 ring-blue-300' : 'mb-3'}
+            >
                 <div className="flex items-start gap-2">
                     <Tooltip>
                         <TooltipTrigger>
@@ -105,9 +631,34 @@ const TranscriptSegment = memo(function TranscriptSegment({
                             )}
                         </TooltipContent>
                     </Tooltip>
+                    {playButton}
                     <div className="flex-1">
+                        {hasSpeaker && (
+                            <div className="flex items-center gap-1.5 mb-1 ml-1">
+                                <span
+                                    className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                    style={{ backgroundColor: speakerColor }}
+                                />
+                                <SpeakerLabel
+                                    speaker={speaker}
+                                    label={speaker_label}
+                                    color={speakerColor!}
+                                    onUpdate={onUpdateSpeakerLabel}
+                                    meetingId={meetingId}
+                                    transcriptId={id}
+                                    startTime={timestamp}
+                                    endTime={endTime}
+                                    matchedBy={speaker_matched_by}
+                                    matchScore={speaker_match_score}
+                                    parts={speaker_parts}
+                                />
+                            </div>
+                        )}
                         {isStreaming ? (
-                            <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
+                            <div
+                                className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2"
+                                style={hasSpeaker ? { borderLeftColor: speakerColor, borderLeftWidth: 3 } : undefined}
+                            >
                                 <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                             </div>
                         ) : (
@@ -120,7 +671,6 @@ const TranscriptSegment = memo(function TranscriptSegment({
     }
 
     if (isMic) {
-        // Microphone: left-aligned, timestamp on left, blue bubble
         return (
             <div id={`segment-${id}`} className="mb-3">
                 <div className="flex items-start gap-2">
@@ -136,16 +686,35 @@ const TranscriptSegment = memo(function TranscriptSegment({
                             )}
                         </TooltipContent>
                     </Tooltip>
-                    <div className="flex-1 max-w-[80%]">
-                        {isStreaming ? (
-                            <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
-                            </div>
-                        ) : (
-                            <div className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-                                <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                    {playButton}
+                    <div className="flex-1 max-w-[90%]">
+                        {hasSpeaker && (
+                            <div className="flex items-center gap-1.5 mb-1 ml-1">
+                                <span
+                                    className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                    style={{ backgroundColor: speakerColor }}
+                                />
+                                <SpeakerLabel
+                                    speaker={speaker}
+                                    label={speaker_label}
+                                    color={speakerColor!}
+                                    onUpdate={onUpdateSpeakerLabel}
+                                    meetingId={meetingId}
+                                    transcriptId={id}
+                                    startTime={timestamp}
+                                    endTime={endTime}
+                                    matchedBy={speaker_matched_by}
+                                    matchScore={speaker_match_score}
+                                    parts={speaker_parts}
+                                />
                             </div>
                         )}
+                        <div
+                            className={`bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 ${isActive ? 'ring-2 ring-blue-400' : ''}`}
+                            style={hasSpeaker ? { borderLeftColor: speakerColor, borderLeftWidth: 3 } : undefined}
+                        >
+                            <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -156,17 +725,45 @@ const TranscriptSegment = memo(function TranscriptSegment({
     return (
         <div id={`segment-${id}`} className="mb-3">
             <div className="flex items-start gap-2 justify-end">
-                <div className="flex-1 max-w-[80%]">
+                <div className="flex-1 max-w-[90%]">
+                    {hasSpeaker && (
+                        <div className="flex items-center gap-1.5 mb-1 mr-1 justify-end">
+                                <SpeakerLabel
+                                    speaker={speaker}
+                                    label={speaker_label}
+                                    color={speakerColor!}
+                                    onUpdate={onUpdateSpeakerLabel}
+                                    meetingId={meetingId}
+                                    transcriptId={id}
+                                    startTime={timestamp}
+                                    endTime={endTime}
+                                    matchedBy={speaker_matched_by}
+                                    matchScore={speaker_match_score}
+                                    parts={speaker_parts}
+                                />
+                            <span
+                                className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                style={{ backgroundColor: speakerColor }}
+                            />
+                        </div>
+                    )}
                     {isStreaming ? (
-                        <div className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                        <div
+                            className={`bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2 ${isActive ? 'ring-2 ring-emerald-400' : ''}`}
+                            style={hasSpeaker ? { borderRightColor: speakerColor, borderRightWidth: 3 } : undefined}
+                        >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                         </div>
                     ) : (
-                        <div className="bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2">
+                        <div
+                            className={`bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2 ${isActive ? 'ring-2 ring-emerald-400' : ''}`}
+                            style={hasSpeaker ? { borderRightColor: speakerColor, borderRightWidth: 3 } : undefined}
+                        >
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                         </div>
                     )}
                 </div>
+                {playButton}
                 <Tooltip>
                     <TooltipTrigger>
                         <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
@@ -198,6 +795,11 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onUpdateSpeakerLabel,
+    meetingId,
+    onPlayFrom,
+    isAudioPlaying = false,
+    activeSegmentId = null,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -366,11 +968,24 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                     <TranscriptSegment
                                         id={segment.id}
                                         timestamp={segment.timestamp}
+                                        endTime={segment.endTime}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         source_device={segment.source_device}
+                                        speaker={segment.speaker}
+                                        speaker_label={segment.speaker_label}
+                                        speaker_parts={segment.speaker_parts}
+                                        speaker_matched_by={segment.speaker_matched_by}
+                                        speaker_match_score={segment.speaker_match_score}
+                                        hasAudioTime={segment.hasAudioTime ?? false}
+                                        onUpdateSpeakerLabel={onUpdateSpeakerLabel}
+                                        meetingId={meetingId}
+                                        onPlayFrom={onPlayFrom}
+                                        isActive={activeSegmentId === segment.id}
+                                        isAudioPlaying={isAudioPlaying}
+                                        blocks={segment.blocks}
                                     />
                                 </div>
                             );
@@ -423,11 +1038,24 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                     <TranscriptSegment
                                         id={segment.id}
                                         timestamp={segment.timestamp}
+                                        endTime={segment.endTime}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         source_device={segment.source_device}
+                                        speaker={segment.speaker}
+                                        speaker_label={segment.speaker_label}
+                                        speaker_parts={segment.speaker_parts}
+                                        speaker_matched_by={segment.speaker_matched_by}
+                                        speaker_match_score={segment.speaker_match_score}
+                                        hasAudioTime={segment.hasAudioTime ?? false}
+                                        onUpdateSpeakerLabel={onUpdateSpeakerLabel}
+                                        meetingId={meetingId}
+                                        onPlayFrom={onPlayFrom}
+                                        isActive={activeSegmentId === segment.id}
+                                        isAudioPlaying={isAudioPlaying}
+                                        blocks={segment.blocks}
                                     />
                                 </motion.div>
                             );

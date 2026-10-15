@@ -1,6 +1,14 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import {
+  parakeetRetryDownload,
+  parakeetInit,
+  parakeetHasAvailableModels,
+  builtinAiDownloadModel,
+  listenParakeetModelDownloadProgress,
+  listenParakeetModelDownloadComplete,
+  listenParakeetModelDownloadError,
+  listenBuiltinAiDownloadProgress,
+} from '@/lib/ipc/models';
 import { Mic, Sparkles, Check, Loader2, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { OnboardingContainer } from '../OnboardingContainer';
@@ -11,7 +19,7 @@ import { getSummaryModelSizeLabel, getSummaryModelSizeMb } from '@/lib/onboardin
 
 const PARAKEET_MODEL = 'parakeet-tdt-0.6b-v3-int8';
 
-type DownloadStatus = 'waiting' | 'downloading' | 'completed' | 'error';
+type DownloadStatus = 'waiting' | 'downloading' | 'completed' | 'cancelled' | 'error';
 
 interface DownloadState {
   status: DownloadStatus;
@@ -81,7 +89,7 @@ export function DownloadProgressStep() {
     }));
 
     try {
-      await invoke('parakeet_retry_download', { modelName: PARAKEET_MODEL });
+      await parakeetRetryDownload({ modelName: PARAKEET_MODEL });
       // Progress events will update state
     } catch (error) {
       console.error('[DownloadProgressStep] Retry failed:', error);
@@ -130,7 +138,7 @@ export function DownloadProgressStep() {
       if (!modelName) {
         throw new Error('Summary model recommendation is not ready yet');
       }
-      await invoke('builtin_ai_download_model', { modelName });
+      await builtinAiDownloadModel({ modelName });
     } catch (error) {
       console.error('[DownloadProgressStep] Summary retry failed:', error);
       setSummaryState((prev) => ({
@@ -156,7 +164,7 @@ export function DownloadProgressStep() {
       try {
         const { platform } = await import('@tauri-apps/plugin-os');
         setIsMac(platform() === 'macos');
-      } catch (e) {
+      } catch {
         setIsMac(navigator.userAgent.includes('Mac'));
       }
     };
@@ -182,6 +190,7 @@ export function DownloadProgressStep() {
         setParakeetState((prev) => ({ ...prev, status: 'error', error: String(error) }));
       }
     });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only download kickoff; startBackgroundDownloads is recreated every render and parakeetDownloaded must not restart it
   }, []);
 
   // Start the selected summary model only after the backend recommendation is known.
@@ -191,37 +200,43 @@ export function DownloadProgressStep() {
     summaryDownloadStartedRef.current = true;
 
     startSummaryDownload();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- startSummaryDownload is recreated every render; the start is guarded by summaryDownloadStartedRef and keyed on the selected model
   }, [selectedSummaryModel]);
 
   // Listen to Parakeet download progress
   useEffect(() => {
-    const unlistenProgress = listen<{
-      modelName: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status?: string;
-    }>('parakeet-model-download-progress', (event) => {
+    const unlistenProgress = listenParakeetModelDownloadProgress((event) => {
       const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
-      if (modelName === PARAKEET_MODEL) {
+      if (modelName !== PARAKEET_MODEL) return;
+
+      if (status === 'cancelled') {
         setParakeetState((prev) => ({
           ...prev,
-          status: status === 'completed' ? 'completed' : 'downloading',
-          progress,
-          downloadedMb: downloaded_mb ?? prev.downloadedMb,
-          totalMb: total_mb ?? prev.totalMb,
-          speedMbps: speed_mbps ?? prev.speedMbps,
+          status: 'cancelled',
+          progress: 0,
+          downloadedMb: 0,
+          speedMbps: 0,
         }));
+        setParakeetDownloaded(false);
+        return;
+      }
 
-        if (status === 'completed' || progress >= 100) {
-          setParakeetDownloaded(true);
-        }
+      setParakeetState((prev) => ({
+        ...prev,
+        status: status === 'completed' ? 'completed' : 'downloading',
+        progress,
+        downloadedMb: downloaded_mb ?? prev.downloadedMb,
+        totalMb: total_mb ?? prev.totalMb,
+        speedMbps: speed_mbps ?? prev.speedMbps,
+      }));
+
+      // Only the backend's post-commit `completed` event marks the model ready.
+      if (status === 'completed') {
+        setParakeetDownloaded(true);
       }
     });
 
-    const unlistenComplete = listen<{ modelName: string }>(
-      'parakeet-model-download-complete',
+    const unlistenComplete = listenParakeetModelDownloadComplete(
       (event) => {
         if (event.payload.modelName === PARAKEET_MODEL) {
           setParakeetState((prev) => ({ ...prev, status: 'completed', progress: 100 }));
@@ -230,8 +245,7 @@ export function DownloadProgressStep() {
       }
     );
 
-    const unlistenError = listen<{ modelName: string; error: string }>(
-      'parakeet-model-download-error',
+    const unlistenError = listenParakeetModelDownloadError(
       (event) => {
         if (event.payload.modelName === PARAKEET_MODEL) {
           setParakeetState((prev) => ({
@@ -248,19 +262,11 @@ export function DownloadProgressStep() {
       unlistenComplete.then((fn) => fn());
       unlistenError.then((fn) => fn());
     };
-  }, []);
+  }, [setParakeetDownloaded]);
 
   // Listen to Summary Model download progress (always downloading for builtin-ai)
   useEffect(() => {
-    const unlisten = listen<{
-      model: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status: string;
-      error?: string;
-    }>('builtin-ai-download-progress', (event) => {
+    const unlisten = listenBuiltinAiDownloadProgress((event) => {
       const { model, progress, downloaded_mb, total_mb, speed_mbps, status, error } = event.payload;
       if (selectedSummaryModel && model === selectedSummaryModel) {
         setSummaryState((prev) => ({
@@ -286,7 +292,7 @@ export function DownloadProgressStep() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [selectedSummaryModel]);
+  }, [selectedSummaryModel, setSummaryModelDownloaded]);
 
   useEffect(() => {
     const modelForSize = selectedSummaryModel || recommendedSummaryModel;
@@ -331,8 +337,8 @@ export function DownloadProgressStep() {
   const handleContinue = async () => {
     // Verify actual model availability (catches state drift)
     try {
-      await invoke('parakeet_init');
-      const actuallyAvailable = await invoke<boolean>('parakeet_has_available_models');
+      await parakeetInit();
+      const actuallyAvailable = await parakeetHasAvailableModels();
 
       if (actuallyAvailable && !parakeetDownloaded) {
         console.log('[DownloadProgressStep] Model available but state not updated');
@@ -342,7 +348,10 @@ export function DownloadProgressStep() {
           status: 'completed',
           progress: 100,
         }));
-      } else if (!actuallyAvailable && parakeetState.status === 'error') {
+      } else if (
+        !actuallyAvailable &&
+        (parakeetState.status === 'error' || parakeetState.status === 'cancelled')
+      ) {
         toast.error('Transcription engine required', {
           description: 'Please retry the download before continuing.',
         });
@@ -420,6 +429,9 @@ export function DownloadProgressStep() {
           {state.status === 'error' && (
             <span className="text-sm text-red-500">Failed</span>
           )}
+          {state.status === 'cancelled' && (
+            <span className="text-sm text-gray-500">Cancelled</span>
+          )}
         </div>
       </div>
 
@@ -450,10 +462,12 @@ export function DownloadProgressStep() {
         </div>
       )}
 
-      {state.status === 'error' && state.error && (
+      {(state.status === 'error' || state.status === 'cancelled') && (
         <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-md">
-          <p className="text-sm text-red-600 font-medium">Download Error</p>
-          <p className="text-xs text-red-500 mt-1">{state.error}</p>
+          <p className="text-sm text-red-600 font-medium">
+            {state.status === 'cancelled' ? 'Download cancelled' : 'Download Error'}
+          </p>
+          {state.error && <p className="text-xs text-red-500 mt-1">{state.error}</p>}
           {(title === 'Transcription Engine' || title === 'Summary Engine') && (
             <button
               onClick={title === 'Transcription Engine' ? handleRetryDownload : handleRetrySummaryDownload}

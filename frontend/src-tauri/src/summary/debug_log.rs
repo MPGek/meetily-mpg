@@ -47,11 +47,7 @@ pub fn debug_log_path(folder: &Path, start_time: &DateTime<Local>, iteration: u6
     folder.join(format!("{ts}_it_{iteration}.log"))
 }
 
-pub fn write_debug_log(
-    log_dir: &Path,
-    entry: &DebugLogEntry,
-    result: &DebugLogResult,
-) {
+pub fn write_debug_log(log_dir: &Path, entry: &DebugLogEntry, result: &DebugLogResult) {
     if !DEBUG {
         return;
     }

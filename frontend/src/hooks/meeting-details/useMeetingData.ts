@@ -1,17 +1,18 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { Transcript, Summary } from '@/types';
+import { Summary, SummaryDataResponse, BlockNoteBlock, MeetingMetadata, Transcript } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
-import { invoke as invokeTauri } from '@tauri-apps/api/core';
+import { saveMeetingTitle } from '@/lib/ipc/meetings';
+import { saveMeetingSummary } from '@/lib/ipc/summary';
 import { toast } from 'sonner';
 
 interface UseMeetingDataProps {
-  meeting: any;
+  meeting: MeetingMetadata & { transcripts: Transcript[] };
   summaryData: Summary | null;
   onMeetingUpdated?: () => Promise<void>;
 }
 
-export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMeetingDataProps) {
+export function useMeetingData({ meeting, summaryData }: UseMeetingDataProps) {
   // State
   // Use prop directly since summary generation fetches transcripts independently
   const transcripts = meeting.transcripts;
@@ -47,7 +48,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
 
   const handleSaveMeetingTitle = useCallback(async () => {
     try {
-      await invokeTauri('api_save_meeting_title', {
+      await saveMeetingTitle({
         meetingId: meeting.id,
         title: meetingTitle,
       });
@@ -57,7 +58,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
 
       // Update meetings with new title
       const updatedMeetings = sidebarMeetings.map((m: CurrentMeeting) =>
-        m.id === meeting.id ? { id: m.id, title: meetingTitle } : m
+        m.id === meeting.id ? { ...m, id: m.id, title: meetingTitle } : m
       );
       setMeetings(updatedMeetings);
       setCurrentMeeting({ id: meeting.id, title: meetingTitle });
@@ -73,7 +74,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     }
   }, [meeting.id, meetingTitle, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
-  const handleSaveSummary = useCallback(async (summary: Summary | { markdown?: string; summary_json?: any[] }) => {
+  const handleSaveSummary = useCallback(async (summary: Summary | { markdown?: string; summary_json?: BlockNoteBlock[] }) => {
     console.log('📄 handleSaveSummary called with:', {
       hasMarkdown: 'markdown' in summary,
       hasSummaryJson: 'summary_json' in summary,
@@ -81,7 +82,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     });
 
     try {
-      let formattedSummary: any;
+      let formattedSummary: SummaryDataResponse;
 
       // Check if it's the new BlockNote format
       if ('markdown' in summary || 'summary_json' in summary) {
@@ -100,7 +101,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
         };
       }
 
-      await invokeTauri('api_save_meeting_summary', {
+      await saveMeetingSummary({
         meetingId: meeting.id,
         summary: formattedSummary,
       });
@@ -146,7 +147,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     console.log('📝 Updating meeting title to:', newTitle);
     setMeetingTitle(newTitle);
     const updatedMeetings = sidebarMeetings.map((m: CurrentMeeting) =>
-      m.id === meeting.id ? { id: m.id, title: newTitle } : m
+      m.id === meeting.id ? { ...m, id: m.id, title: newTitle } : m
     );
     setMeetings(updatedMeetings);
     setCurrentMeeting({ id: meeting.id, title: newTitle });

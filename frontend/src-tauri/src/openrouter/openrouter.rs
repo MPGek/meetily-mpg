@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use tauri::command;
-use reqwest::blocking::Client;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenRouterModel {
@@ -39,19 +38,21 @@ struct OpenRouterResponse {
 }
 
 #[command]
-pub fn get_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
-    let client = Client::new();
-    let response = client
-        .get("https://openrouter.ai/api/v1/models")
-        .send()
-        .map_err(|e| format!("Failed to make HTTP request: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP request failed with status: {}", response.status()));
-    }
+pub async fn get_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
+    let policy = crate::llm::RetryPolicy::short();
+    let response = crate::llm::send_with_retry(
+        || {
+            crate::llm::shared_client()
+                .get("https://openrouter.ai/api/v1/models")
+        },
+        &policy,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let api_response: OpenRouterResponse = response
         .json()
+        .await
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
     let models = api_response
@@ -60,7 +61,8 @@ pub fn get_openrouter_models() -> Result<Vec<OpenRouterModel>, String> {
         .map(|m| OpenRouterModel {
             id: m.id,
             name: m.name.unwrap_or_else(|| "Unknown".to_string()),
-            context_length: m.top_provider
+            context_length: m
+                .top_provider
                 .as_ref()
                 .and_then(|tp| tp.context_length)
                 .or(m.context_length),

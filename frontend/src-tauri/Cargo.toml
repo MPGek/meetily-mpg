@@ -1,18 +1,37 @@
 [package]
 name = "meetily"
-version = "0.5.0"
+version = "0.7.1"
 description = "A Tauri App for meeting minutes"
 authors = ["Sujith S"]
 license = "MIT"
 repository = "https://github.com/Zackriya-Solutions/meeting-minutes"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.80"
+default-run = "meetily"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "app_lib"
 crate-type = ["cdylib", "rlib"]
+
+# Developer-only headless diarization harness for the eval pipeline
+# (openspec: add-diarization-eval-harness). Not shipped in the app bundle.
+[[bin]]
+name = "diarize-eval"
+path = "src/bin/diarize_eval.rs"
+
+# Developer-only: replays a WAV through the live (Fast-mode) diarization path
+# and writes RTTM + a streaming event sidecar (add-online-diarization-eval).
+[[bin]]
+name = "online-eval"
+path = "src/bin/online_eval.rs"
+
+# Developer-only: transcribes a stereo meeting recording through the live and
+# offline transcription paths for the transcript_compare ASR benchmark.
+[[bin]]
+name = "asr-eval"
+path = "src/bin/asr_eval.rs"
 
 
 # Hardware acceleration features for whisper-rs
@@ -68,6 +87,7 @@ anyhow = "1.0"
 once_cell = "1.17.1"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 posthog-rs = "0.3.7"
+fastrand = "2"
 
 # Cross-platform audio capture
 cpal = "0.15.3"
@@ -90,12 +110,6 @@ which = "6.0.1"
 # Bytes
 bytemuck = "1.16.1"
 
-# EBU R128 loudness normalization (professional broadcast standard)
-ebur128 = "0.1"
-
-# Noise suppression - RNNoise-based neural network noise reduction
-nnnoiseless = "0.5"
-
 # Speech recognition and async utilities
 # NOTE: whisper-rs is declared in platform-specific sections below (macOS/Windows/Linux)
 # to ensure correct GPU features are enabled per platform
@@ -103,8 +117,18 @@ futures-util = "0.3"
 # VAD engine: replaced with direct ort integration (Silero VAD v6)
 # silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", package = "silero" }
 
+# Speaker diarization via polyvoice (Rust-native, MIT): powerset segmentation,
+# ONNX embedding, and clustering for both offline and online paths.
+# The `onnx` feature pins ort to >= 2.0.0-rc.12 (see ort below).
+# pipeline-v2 adoption adds: `vbx` (VBx HMM+PLDA auto-count clusterer),
+# `resegmentation` (overlap-aware resegmentation stage), and `spectral`
+# (NME-SC auto-count clusterer, faer-backed).
+polyvoice = { version = "=0.17.0", default-features = false, features = ["onnx", "download", "segmentation", "embedder", "clusterer", "resegmentation", "vbx", "spectral"] }
+
 # Parakeet (ONNX-based fast transcription) dependencies
-ort = { version = "2.0.0-rc.10" }  # ONNX Runtime for Parakeet models
+# ort pinned to exactly 2.0.0-rc.12 (polyvoice's tested version; rc.13+ breaks the rc.10 API usage)
+ort = { version = "=2.0.0-rc.12", features = ["half"] }  # ONNX Runtime for Parakeet models
+half = "2"                          # f16 tensor extraction (word alignment posteriors)
 thiserror = "2.0.16"                # Error handling for Parakeet
 
 # Async
@@ -129,9 +153,8 @@ url = "2.5.0"
 sysinfo = "0.32"
 
 lazy_static = { version = "1.4.0" }
-realfft = "3.4.0"
 regex = "1.11.0"
-ndarray = "0.16"
+ndarray = "0.17"
 bytes = { version = "1.9.0", features = ["serde"] }
 
 esaxx-rs = "0.1.10"
@@ -143,7 +166,10 @@ ringbuf = "0.4.8"
 tempfile = "3.3.0"
 whatlang = "0.16.4"
 
-ffmpeg-sidecar = { git = "https://github.com/nathanbabcock/ffmpeg-sidecar", branch = "main" }
+ffmpeg-sidecar = { git = "https://github.com/nathanbabcock/ffmpeg-sidecar", rev = "b0f48a514235d1278d860f4a0af66aa9d6e1618d" }
+
+sha2 = "0.10"
+hex = "0.4"
 
 sqlx = { version = "0.8", features = [ "runtime-tokio", "sqlite", "chrono"] }
 
@@ -207,7 +233,4 @@ memory-stats = "1.0"
 strsim = "0.10.0"
 futures = "0.3.31"
 tracing-subscriber = "0.3.16"
-
-[patch.crates-io]
-cpal = { git = "https://github.com/RustAudio/cpal", rev = "51c3b43" }
-esaxx-rs = { git = "https://github.com/thewh1teagle/esaxx-rs.git", branch = "feat/dynamic-msvc-link" }
+wiremock = "0.5"

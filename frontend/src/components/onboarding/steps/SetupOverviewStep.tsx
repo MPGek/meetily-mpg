@@ -19,7 +19,7 @@ export function SetupOverviewStep() {
       try {
         const { platform } = await import('@tauri-apps/plugin-os');
         setIsMac(platform() === 'macos');
-      } catch (e) {
+      } catch {
         setIsMac(navigator.userAgent.includes('Mac'));
       }
     };
@@ -54,7 +54,7 @@ export function SetupOverviewStep() {
         {/* Steps Card */}
         <div className="w-full max-w-md bg-white rounded-lg border border-gray-200 p-4">
           <div className="space-y-4">
-            {steps.map((step, idx) => {
+            {steps.map((step) => {
               return (
                 <div
                   key={step.number}
@@ -94,7 +94,7 @@ export function SetupOverviewStep() {
             onClick={handleContinue}
             className="w-full h-11 bg-gray-900 hover:bg-gray-800 text-white"
           >
-            Let's Go
+            Let&apos;s Go
           </Button>
           <div className="text-center">
             <a

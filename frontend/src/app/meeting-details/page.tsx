@@ -5,10 +5,13 @@ import { Transcript, Summary } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
-import { invoke } from "@tauri-apps/api/core";
+import { getOllamaModels } from "@/lib/ipc/models";
+import { getModelConfig, saveModelConfig } from "@/lib/ipc/settings";
+import { getSummary, type SummaryStatusResponse } from "@/lib/ipc/summary";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { useDiarizationProgress } from "@/hooks/useDiarizationProgress";
 
 interface MeetingDetailsResponse {
   id: string;
@@ -23,11 +26,13 @@ function MeetingDetailsContent() {
   const searchParams = useSearchParams();
   const meetingId = searchParams.get('id');
   const source = searchParams.get('source'); // Check if navigated from recording
-  const { setCurrentMeeting, refetchMeetings, stopSummaryPolling } = useSidebar();
+  const { setCurrentMeeting, refetchMeetings } = useSidebar();
   const { isAutoSummary } = useConfig(); // Get auto-summary toggle state
   const router = useRouter();
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
   const [meetingSummary, setMeetingSummary] = useState<Summary | null>(null);
+  // Raw stored summary status; hands an in-progress or failed run to the view.
+  const [summaryResponse, setSummaryResponse] = useState<SummaryStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
@@ -45,13 +50,25 @@ function MeetingDetailsContent() {
     loadedCount,
     loadMore,
     refetch,
+    updateSpeakerLabel,
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
+
+  // Track diarization progress for this meeting
+  const handleDiarizationComplete = useCallback(() => {
+    refetch();
+  }, [refetch]);
+
+  const diarizationProgress = useDiarizationProgress({
+    meetingId: meetingId || '',
+    onComplete: handleDiarizationComplete,
+    onError: handleDiarizationComplete,
+  });
 
   // Check if gemma3:1b model is available in Ollama
   const checkForGemmaModel = useCallback(async (): Promise<boolean> => {
     try {
-      const models = await invoke('get_ollama_models', { endpoint: null }) as any[];
+      const models = await getOllamaModels({ endpoint: null });
       const hasGemma = models.some((m: any) => m.name === 'gemma3:1b');
       console.log('🔍 Checked for gemma3:1b:', hasGemma);
       return hasGemma;
@@ -81,7 +98,7 @@ function MeetingDetailsContent() {
 
     try {
       // Check what's currently in database
-      const currentConfig = await invoke('api_get_model_config') as any;
+      const currentConfig = await getModelConfig();
 
       // If DB already has a model, use it (never override!)
       if (currentConfig && currentConfig.model) {
@@ -97,7 +114,7 @@ function MeetingDetailsContent() {
       if (hasGemma) {
         console.log('💾 DB empty, using gemma3:1b as initial default');
 
-        await invoke('api_save_model_config', {
+        await saveModelConfig({
           provider: 'ollama',
           model: '',
           whisperModel: 'large-v3',
@@ -164,22 +181,13 @@ function MeetingDetailsContent() {
   useEffect(() => {
     setMeetingDetails(null);
     setMeetingSummary(null);
+    setSummaryResponse(null);
     setError(null);
     setIsLoading(true);
     // Reset auto-generation state to allow new meeting to be checked
     setHasCheckedAutoGen(false);
     setShouldAutoGenerate(false);
   }, [meetingId]);
-
-  // Cleanup: Stop polling when navigating away from a meeting
-  useEffect(() => {
-    return () => {
-      if (meetingId) {
-        console.log('Cleaning up: Stopping summary polling for meeting:', meetingId);
-        stopSummaryPolling(meetingId);
-      }
-    };
-  }, [meetingId, stopSummaryPolling]);
 
   useEffect(() => {
     console.log('MeetingDetails useEffect triggered - meetingId:', meetingId);
@@ -196,16 +204,22 @@ function MeetingDetailsContent() {
 
     setMeetingDetails(null);
     setMeetingSummary(null);
+    setSummaryResponse(null);
     setError(null);
     setIsLoading(true);
 
+    // A slow response for the previous meeting must not land on this one.
+    let cancelled = false;
+
     const fetchMeetingSummary = async () => {
       try {
-        const summary = await invoke('api_get_summary', {
+        const summary = await getSummary({
           meetingId: meetingId,
         }) as any;
+        if (cancelled) return;
 
         console.log('FETCH SUMMARY: Raw response:', summary);
+        setSummaryResponse(summary);
 
         // Check if the summary request failed with 404 or error status, or if no summary exists yet (idle)
         // Note: 'cancelled' and 'failed' statuses can still have data if backup was restored
@@ -222,7 +236,7 @@ function MeetingDetailsContent() {
         if (typeof summaryData === 'string') {
           try {
             parsedData = JSON.parse(summaryData);
-          } catch (e) {
+          } catch {
             parsedData = {};
           }
         }
@@ -244,6 +258,7 @@ function MeetingDetailsContent() {
         // Legacy format - apply formatting
         console.log('LEGACY FORMAT: Detected legacy format, applying section formatting');
 
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
         const { MeetingName, _section_order, ...restSummaryData } = parsedData;
 
         // Format the summary data with consistent styling - PRESERVE ORDER
@@ -295,6 +310,7 @@ function MeetingDetailsContent() {
         console.log('LEGACY FORMAT: Formatted summary:', formattedSummary);
         setMeetingSummary(formattedSummary);
       } catch (error) {
+        if (cancelled) return;
         console.error('FETCH SUMMARY: Error fetching meeting summary:', error);
         // Don't set error state for summary fetch failure, set to null to show generate button
         setMeetingSummary(null);
@@ -305,11 +321,17 @@ function MeetingDetailsContent() {
       try {
         await fetchMeetingSummary();
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     loadData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [meetingId]);
 
   // Auto-generation check: runs when meeting is loaded with no summary
@@ -320,7 +342,10 @@ function MeetingDetailsContent() {
       // 2. No summary exists
       // 3. Meeting has transcripts
       // 4. Haven't checked yet
+      // 5. The stored summary status is idle (no run pending, finished or failed)
       if (
+        !isLoading &&
+        summaryResponse?.status === 'idle' &&
         meetingDetails &&
         meetingSummary === null &&
         meetingDetails.transcripts &&
@@ -333,7 +358,7 @@ function MeetingDetailsContent() {
     };
 
     checkAutoGen();
-  }, [meetingDetails, meetingSummary, hasCheckedAutoGen, setupAutoGeneration]);
+  }, [isLoading, summaryResponse, meetingDetails, meetingSummary, hasCheckedAutoGen, setupAutoGeneration]);
 
   if (error) {
     return (
@@ -359,8 +384,10 @@ function MeetingDetailsContent() {
   }
 
   return <PageContent
+    key={meetingId}
     meeting={meetingDetails}
     summaryData={meetingSummary}
+    initialSummary={summaryResponse}
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {
@@ -370,6 +397,7 @@ function MeetingDetailsContent() {
       await refetchMeetings();
     }}
     onRefetchTranscripts={refetch}
+    onUpdateSpeakerLabelLocal={updateSpeakerLabel}
     // Pagination props for efficient transcript loading
     segments={segments}
     hasMore={hasMore}
@@ -377,6 +405,7 @@ function MeetingDetailsContent() {
     totalCount={totalCount}
     loadedCount={loadedCount}
     onLoadMore={loadMore}
+    diarizationProgress={diarizationProgress}
   />;
 }
 

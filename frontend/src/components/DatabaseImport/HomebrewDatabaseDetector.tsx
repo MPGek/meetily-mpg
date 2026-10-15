@@ -1,7 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  checkHomebrewDatabase as checkHomebrewDatabaseCommand,
+  importAndInitializeDatabase,
+} from '@/lib/ipc/meetings';
 import { toast } from 'sonner';
 import { Database, AlertCircle, Loader2, CheckCircle2 } from 'lucide-react';
 
@@ -16,7 +19,7 @@ const HOMEBREW_PATHS = [
   '/usr/local/var/meetily/meeting_minutes.db',      // Intel Macs
 ];
 
-export function HomebrewDatabaseDetector({ onImportSuccess, onDecline }: HomebrewDatabaseDetectorProps) {
+export function HomebrewDatabaseDetector({ onDecline }: HomebrewDatabaseDetectorProps) {
   const [isChecking, setIsChecking] = useState(true);
   const [isImporting, setIsImporting] = useState(false);
   const [homebrewDbExists, setHomebrewDbExists] = useState(false);
@@ -34,7 +37,7 @@ export function HomebrewDatabaseDetector({ onImportSuccess, onDecline }: Homebre
 
       // Check all possible Homebrew locations
       for (const path of HOMEBREW_PATHS) {
-        const result = await invoke<{ exists: boolean; size: number } | null>('check_homebrew_database', {
+        const result = await checkHomebrewDatabaseCommand({
           path,
         });
 
@@ -57,7 +60,7 @@ export function HomebrewDatabaseDetector({ onImportSuccess, onDecline }: Homebre
     try {
       setIsImporting(true);
 
-      await invoke('import_and_initialize_database', {
+      await importAndInitializeDatabase({
         legacyDbPath: detectedPath,
       });
 

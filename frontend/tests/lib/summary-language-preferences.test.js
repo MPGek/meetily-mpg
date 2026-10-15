@@ -6,6 +6,11 @@ mock.module("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
 }));
 
+mock.module("@tauri-apps/api/event", () => ({
+  listen: mock(async () => () => {}),
+  emit: mock(async () => {}),
+}));
+
 function installLocalStorage() {
   const values = new Map();
 

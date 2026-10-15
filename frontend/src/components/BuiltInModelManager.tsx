@@ -1,27 +1,20 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import {
+  builtinAiListModels,
+  builtinAiDownloadModel,
+  builtinAiCancelDownload,
+  builtinAiDeleteModel,
+  listenBuiltinAiDownloadProgress,
+  type BuiltInModelInfo,
+} from '@/lib/ipc/models';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { cn } from '@/lib/utils';
 import { Download, RefreshCw, BadgeAlert, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { formatSummaryModelSizeLabelFromMb } from '@/lib/onboarding-summary-model';
-
-interface ModelInfo {
-  name: string;
-  display_name: string;
-  status: {
-    type: 'not_downloaded' | 'downloading' | 'available' | 'corrupted' | 'error';
-    progress?: number;
-  };
-  size_mb: number;
-  context_size: number;
-  description: string;
-  gguf_file: string;
-}
 
 interface DownloadProgressInfo {
   downloadedMb: number;
@@ -40,7 +33,7 @@ export function BuiltInModelManager({
   onModelSelect,
   layout = 'inline',
 }: BuiltInModelManagerProps) {
-  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [models, setModels] = useState<BuiltInModelInfo[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [hasFetched, setHasFetched] = useState<boolean>(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
@@ -50,7 +43,7 @@ export function BuiltInModelManager({
   const fetchModels = async () => {
     try {
       setIsLoading(true);
-      const data = (await invoke('builtin_ai_list_models')) as ModelInfo[];
+      const data = await builtinAiListModels();
       setModels(data);
 
       // Auto-select first available model if none selected
@@ -71,6 +64,7 @@ export function BuiltInModelManager({
 
   useEffect(() => {
     fetchModels();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only fetch; fetchModels is recreated every render and would refetch in a loop
   }, []);
 
   // Listen for download progress events
@@ -78,7 +72,7 @@ export function BuiltInModelManager({
     let unlisten: (() => void) | undefined;
 
     const setupListener = async () => {
-      unlisten = await listen('builtin-ai-download-progress', (event: any) => {
+      unlisten = await listenBuiltinAiDownloadProgress((event) => {
         const { model, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
 
         // Update percentage progress
@@ -118,10 +112,12 @@ export function BuiltInModelManager({
           });
           // Clean up progress state
           setDownloadProgress((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
           setDownloadProgressInfo((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
@@ -139,10 +135,12 @@ export function BuiltInModelManager({
           });
           // Clean up progress state
           setDownloadProgress((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
           setDownloadProgressInfo((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
@@ -159,10 +157,12 @@ export function BuiltInModelManager({
           });
           // Clean up progress state
           setDownloadProgress((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
           setDownloadProgressInfo((prev) => {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars -- key omitted via rest destructuring
             const { [model]: _, ...rest } = prev;
             return rest;
           });
@@ -196,6 +196,7 @@ export function BuiltInModelManager({
         unlisten();
       }
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only event subscription; fetchModels is recreated every render and would re-subscribe on every render
   }, []);
 
   const downloadModel = async (modelName: string) => {
@@ -203,7 +204,7 @@ export function BuiltInModelManager({
       // Optimistically add to downloadingModels for immediate UI feedback
       setDownloadingModels((prev) => new Set([...prev, modelName]));
 
-      await invoke('builtin_ai_download_model', { modelName });
+      await builtinAiDownloadModel({ modelName });
     } catch (error) {
       console.error('Failed to download model:', error);
 
@@ -231,7 +232,7 @@ export function BuiltInModelManager({
 
   const cancelDownload = async (modelName: string) => {
     try {
-      await invoke('builtin_ai_cancel_download', { modelName });
+      await builtinAiCancelDownload({ modelName });
       toast.info(`Download of ${modelName} cancelled`);
       setDownloadingModels((prev) => {
         const newSet = new Set(prev);
@@ -245,7 +246,7 @@ export function BuiltInModelManager({
 
   const deleteModel = async (modelName: string) => {
     try {
-      await invoke('builtin_ai_delete_model', { modelName });
+      await builtinAiDeleteModel({ modelName });
       toast.success(`Model ${modelName} deleted`);
       fetchModels();
     } catch (error) {

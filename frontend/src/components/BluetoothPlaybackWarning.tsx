@@ -1,16 +1,9 @@
 "use client";
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { getActiveAudioOutput } from '@/lib/ipc/recording';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Speaker, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-
-interface AudioOutputInfo {
-  device_name: string;
-  is_bluetooth: boolean;
-  sample_rate: number | null;
-  device_type: string;
-}
 
 interface BluetoothPlaybackWarningProps {
   /** Check interval in milliseconds (default: 5000ms / 5 seconds) */
@@ -32,7 +25,7 @@ export function BluetoothPlaybackWarning({
 
     const checkAudioOutput = async () => {
       try {
-        const outputInfo = await invoke<AudioOutputInfo>('get_active_audio_output');
+        const outputInfo = await getActiveAudioOutput();
 
         if (outputInfo.is_bluetooth) {
           setIsBluetoothActive(true);
@@ -75,7 +68,7 @@ export function BluetoothPlaybackWarning({
             Bluetooth Playback Detected
           </AlertTitle>
           <AlertDescription className="text-yellow-800 mt-1">
-            You're using <strong>{deviceName}</strong> for playback.
+            You&apos;re using <strong>{deviceName}</strong> for playback.
             Recordings may sound distorted or sped up through Bluetooth devices.
             For accurate review, please use <strong>computer speakers</strong> or{' '}
             <strong>wired headphones</strong>.

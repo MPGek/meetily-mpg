@@ -1,0 +1,15 @@
+# DIHARD-3 (LDC2022S03) — license-gated; ships its own RTTM/UEM (dev split).
+# Drop the LDC archive into eval/raw/dihard3/.
+name: dihard3
+license: "LDC User Agreement (DIHARD-3, LDC2022S03)"
+parser: dihard3_rttm
+gated: true
+channel_policy: mono
+baseline_der: 21.7
+split: dev
+raw_files:
+  - LDCCeRC2022S03.tar.gz
+raw_hint: >
+  Obtain DIHARD-3 (LDC2022S03) from https://www.ldc.upenn.edu/ with an LDC account
+  and place the archive here as LDCCeRC2022S03.tar.gz.
+sources: []

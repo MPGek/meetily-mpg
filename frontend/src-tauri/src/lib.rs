@@ -28,26 +28,25 @@ macro_rules! perf_trace {
     ($($arg:tt)*) => {};
 }
 
-// Make these macros available to other modules
-pub(crate) use perf_debug;
-pub(crate) use perf_trace;
-
 // Re-export async logging macros for external use (removed due to macro conflicts)
 
 // Declare audio module
 pub mod analytics;
+pub mod anthropic;
 pub mod api;
 pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod groq;
+pub mod llm;
+pub mod model_download;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
 pub mod openai;
-pub mod anthropic;
-pub mod groq;
 pub mod openrouter;
+pub mod panic_log;
 pub mod parakeet_engine;
 pub mod state;
 pub mod summary;
@@ -55,7 +54,7 @@ pub mod tray;
 pub mod utils;
 pub mod whisper_engine;
 
-use audio::{list_audio_devices, AudioDevice, trigger_audio_permission};
+use audio::{list_audio_devices, trigger_audio_permission, AudioDevice};
 use log::{error as log_error, info as log_info};
 use notifications::commands::NotificationManagerState;
 use std::sync::Arc;
@@ -105,6 +104,9 @@ async fn start_recording<R: Runtime>(
         mic_device_name,
         system_device_name,
         meeting_name.clone(),
+        None,
+        None,
+        None,
     )
     .await
     {
@@ -124,10 +126,7 @@ async fn start_recording<R: Runtime>(
             )
             .await
             {
-                log_error!(
-                    "Failed to show recording started notification: {}",
-                    e
-                );
+                log_error!("Failed to show recording started notification: {}", e);
             } else {
                 log_info!("Successfully showed recording started notification");
             }
@@ -185,10 +184,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
             )
             .await
             {
-                log_error!(
-                    "Failed to show recording stopped notification: {}",
-                    e
-                );
+                log_error!("Failed to show recording stopped notification: {}", e);
             } else {
                 log_info!("Successfully showed recording stopped notification");
             }
@@ -300,7 +296,16 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(
+        app,
+        mic_device_name,
+        system_device_name,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -309,9 +314,12 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    diarization_mode: Option<String>,
+    max_speakers: Option<i32>,
+    expected_speaker_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
-    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
-             mic_device_name, system_device_name, meeting_name);
+    log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}, DiarizationMode: {:?}, MaxSpeakers: {:?}, ExpectedSpeakers: {:?}",
+             mic_device_name, system_device_name, meeting_name, diarization_mode, max_speakers, expected_speaker_ids);
 
     // Clone meeting_name for notification use later
     let meeting_name_for_notification = meeting_name.clone();
@@ -338,6 +346,9 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 mic_device_name,
                 system_device_name,
                 meeting_name,
+                diarization_mode,
+                max_speakers,
+                expected_speaker_ids,
             )
             .await
         }
@@ -357,10 +368,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
             )
             .await
             {
-                log_error!(
-                    "Failed to show recording started notification: {}",
-                    e
-                );
+                log_error!("Failed to show recording started notification: {}", e);
             }
 
             Ok(())
@@ -388,6 +396,8 @@ pub fn get_language_preference_internal() -> Option<String> {
 }
 
 pub fn run() {
+    panic_log::install();
+
     log::set_max_level(log::LevelFilter::Info);
 
     let mut builder = tauri::Builder::default();
@@ -416,7 +426,9 @@ pub fn run() {
             None::<notifications::manager::NotificationManager<tauri::Wry>>,
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
-        .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(summary::summary_engine::ModelManagerState(Arc::new(
+            tokio::sync::Mutex::new(None),
+        )))
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -430,7 +442,11 @@ pub fn run() {
             let app_for_notif = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let notif_state = app_for_notif.state::<NotificationManagerState<tauri::Wry>>();
-                match notifications::commands::initialize_notification_manager(app_for_notif.clone()).await {
+                match notifications::commands::initialize_notification_manager(
+                    app_for_notif.clone(),
+                )
+                .await
+                {
                     Ok(manager) => {
                         // Set default consent and permissions on first launch
                         if let Err(e) = manager.set_consent(true).await {
@@ -452,7 +468,7 @@ pub fn run() {
             });
 
             // Set models directory to use app_data_dir (unified storage location)
-            whisper_engine::commands::set_models_directory(&_app.handle());
+            whisper_engine::commands::set_models_directory(_app.handle());
 
             // Initialize Whisper engine on startup
             tauri::async_runtime::spawn(async {
@@ -462,7 +478,10 @@ pub fn run() {
             });
 
             // Set Parakeet models directory
-            parakeet_engine::commands::set_models_directory(&_app.handle());
+            parakeet_engine::commands::set_models_directory(_app.handle());
+
+            // Set alignment models directory (word-level-diarization-alignment)
+            audio::word_alignment::commands::set_models_directory(_app.handle());
 
             // Initialize Parakeet engine on startup
             tauri::async_runtime::spawn(async {
@@ -474,7 +493,11 @@ pub fn run() {
             // Initialize ModelManager for summary engine (async, non-blocking)
             let app_handle_for_model_manager = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                match summary::summary_engine::commands::init_model_manager_at_startup(&app_handle_for_model_manager).await {
+                match summary::summary_engine::commands::init_model_manager_at_startup(
+                    &app_handle_for_model_manager,
+                )
+                .await
+                {
                     Ok(_) => log::info!("ModelManager initialized successfully at startup"),
                     Err(e) => {
                         log::warn!("Failed to initialize ModelManager at startup: {}", e);
@@ -495,7 +518,7 @@ pub fn run() {
 
             // Initialize database (handles first launch detection and conditional setup)
             tauri::async_runtime::block_on(async {
-                database::setup::initialize_database_on_startup(&_app.handle()).await
+                database::setup::initialize_database_on_startup(_app.handle()).await
             })
             .expect("Failed to initialize database");
 
@@ -503,10 +526,73 @@ pub fn run() {
             log::info!("Initializing bundled templates directory...");
             if let Ok(resource_path) = _app.handle().path().resource_dir() {
                 let templates_dir = resource_path.join("templates");
-                log::info!("Setting bundled templates directory to: {:?}", templates_dir);
+                log::info!(
+                    "Setting bundled templates directory to: {:?}",
+                    templates_dir
+                );
                 summary::templates::set_bundled_templates_dir(templates_dir);
             } else {
                 log::warn!("Failed to resolve resource directory for templates");
+            }
+
+            // Lazy copy enhanced diarization models from bundled resources → AppData (first launch / repair).
+            // Non-fatal, idempotent: only copies when resource verifies and dest does not fully verify.
+            {
+                let app_data_models = _app
+                    .handle()
+                    .path()
+                    .app_data_dir()
+                    .map(|p| p.join("models"))
+                    .ok();
+                let resource_models = _app
+                    .handle()
+                    .path()
+                    .resource_dir()
+                    .map(|p| p.join("models"))
+                    .ok();
+                if let (Some(dest), Some(src)) = (app_data_models, resource_models) {
+                    let src_ready = crate::audio::embedder::is_enhanced_installed(&src);
+                    let dest_ready = crate::audio::embedder::is_enhanced_installed(&dest);
+                    if src_ready && !dest_ready {
+                        if let Err(e) = std::fs::create_dir_all(&dest) {
+                            log::warn!("Failed to create AppData models dir for lazy copy: {}", e);
+                        } else {
+                            let (seg_src, emb_src) =
+                                crate::audio::embedder::enhanced_model_paths(&src);
+                            let (seg_dst, emb_dst) =
+                                crate::audio::embedder::enhanced_model_paths(&dest);
+                            let copy_one = |src_p: &std::path::Path, dst_p: &std::path::Path| {
+                                if crate::audio::embedder::verify_enhanced_integrity(&dest).0
+                                    || crate::audio::embedder::verify_enhanced_integrity(&dest).1
+                                {
+                                    // If dest already verifies for the relevant file, skip. But we handle per-file below.
+                                }
+                                match std::fs::copy(src_p, dst_p) {
+                                    Ok(_) => log::info!(
+                                        "Lazy-copied {} to {}",
+                                        src_p.display(),
+                                        dst_p.display()
+                                    ),
+                                    Err(e) => log::warn!(
+                                        "Failed to lazy-copy {} to {}: {}",
+                                        src_p.display(),
+                                        dst_p.display(),
+                                        e
+                                    ),
+                                }
+                            };
+                            // Check per-file so we don't overwrite a verified dest file needlessly
+                            let (seg_ok, emb_ok) =
+                                crate::audio::embedder::verify_enhanced_integrity(&dest);
+                            if !seg_ok {
+                                copy_one(&seg_src, &seg_dst);
+                            }
+                            if !emb_ok {
+                                copy_one(&emb_src, &emb_dst);
+                            }
+                        }
+                    }
+                }
             }
 
             Ok(())
@@ -582,6 +668,12 @@ pub fn run() {
             parakeet_engine::commands::parakeet_cancel_download,
             parakeet_engine::commands::parakeet_delete_corrupted_model,
             parakeet_engine::commands::open_parakeet_models_folder,
+            audio::word_alignment::commands::list_alignment_models,
+            audio::word_alignment::commands::check_alignment_models,
+            audio::word_alignment::commands::download_alignment_model,
+            audio::word_alignment::commands::cancel_alignment_download,
+            audio::word_alignment::commands::delete_alignment_model,
+            audio::word_alignment::commands::set_word_alignment_settings,
             // Parallel processing commands
             whisper_engine::parallel_commands::initialize_parallel_processor,
             whisper_engine::parallel_commands::start_parallel_processing,
@@ -611,10 +703,6 @@ pub fn run() {
             // Reload sync commands (retrieve transcript history and meeting name)
             audio::recording_commands::get_transcript_history,
             audio::recording_commands::get_recording_meeting_name,
-            // Device monitoring commands (AirPods/Bluetooth disconnect/reconnect)
-            audio::recording_commands::poll_audio_device_events,
-            audio::recording_commands::get_reconnection_status,
-            audio::recording_commands::attempt_device_reconnect,
             // Playback device detection (Bluetooth warning)
             audio::recording_commands::get_active_audio_output,
             // Audio recovery commands (for transcript recovery feature)
@@ -647,6 +735,8 @@ pub fn run() {
             api::api_delete_meeting,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
+            api::get_meeting_audio_path,
+            api::prepare_audio_for_playback,
             api::api_get_meeting_transcripts,
             api::api_save_meeting_title,
             api::api_save_transcript,
@@ -749,6 +839,52 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Diarization commands
+            audio::diarization::start_diarization,
+            audio::diarization::set_diarization_clustering_settings,
+            audio::diarization::get_diarization_status,
+            audio::diarization::update_speaker_label_command,
+            audio::diarization::rematch_meeting_speakers,
+            audio::diarization::check_diarization_models,
+            // Enhanced models are bundled at build time (no runtime download/remove)
+            // Speaker identity registry commands
+            database::speaker_commands::list_speakers,
+            database::speaker_commands::assign_speaker,
+            database::speaker_commands::assign_block_speaker,
+            database::speaker_commands::apply_block_speaker_to_cluster,
+            database::speaker_commands::rename_speaker,
+            database::speaker_commands::confirm_block_speaker,
+            database::speaker_commands::set_expected_speakers,
+            database::speaker_commands::get_expected_speakers,
+            database::speaker_commands::speaker_storage_stats,
+            database::speaker_commands::list_voiceprints,
+            database::speaker_commands::reject_voiceprint,
+            database::speaker_commands::reconfirm_voiceprint,
+            database::speaker_commands::verify_voiceprint,
+            database::speaker_commands::verify_speaker,
+            database::speaker_commands::verify_meeting_caches,
+            database::speaker_commands::get_voiceprint_audio,
+            database::speaker_commands::replace_speaker,
+            database::speaker_commands::find_or_create_speaker,
+            database::speaker_commands::preview_replace_speaker,
+            database::speaker_commands::clear_all_voiceprints,
+            database::speaker_commands::purge_unconfirmed_caches,
+            // Meeting tag dictionary + links (meeting-notes-list-display-tags)
+            database::tag_commands::list_tags,
+            database::tag_commands::create_tag,
+            database::tag_commands::rename_tag,
+            database::tag_commands::set_tag_color,
+            database::tag_commands::delete_tag,
+            database::tag_commands::assign_tag,
+            database::tag_commands::unassign_tag,
+            database::tag_commands::create_and_assign_tag,
+            database::tag_commands::get_recording_pending_tags,
+            database::tag_commands::set_recording_pending_tags,
+            // Online session finalization and live speaker assignment
+            audio::recording_commands::finalize_online_session,
+            audio::recording_commands::assign_live_speaker,
+            // Live recording telemetry (read-only snapshot)
+            audio::recording_commands::get_recording_telemetry,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -770,7 +906,9 @@ pub fn run() {
                                 log::info!("Database cleanup completed successfully");
                             }
                         } else {
-                            log::warn!("AppState not available for database cleanup (likely first launch)");
+                            log::warn!(
+                                "AppState not available for database cleanup (likely first launch)"
+                            );
                         }
 
                         // Clean up sidecar

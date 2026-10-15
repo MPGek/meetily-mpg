@@ -4,7 +4,12 @@ import { Button } from '@/components/ui/button';
 import { Info, Loader2, Copy, Check } from 'lucide-react';
 import { AnalyticsContext } from './AnalyticsProvider';
 import { load } from '@tauri-apps/plugin-store';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  trackAnalyticsDisabled,
+  trackAnalyticsEnabled,
+  trackAnalyticsTransparencyViewed,
+} from '@/lib/ipc/analytics';
+import { openExternalUrl } from '@/lib/ipc/settings';
 import { Analytics } from '@/lib/analytics';
 import AnalyticsDataModal from './AnalyticsDataModal';
 
@@ -58,7 +63,7 @@ export default function AnalyticsConsentSwitch() {
       setShowModal(true);
       // Track that user viewed the transparency modal
       try {
-        await invoke('track_analytics_transparency_viewed');
+        await trackAnalyticsTransparencyViewed();
       } catch (error) {
         console.error('Failed to track transparency view:', error);
       }
@@ -108,7 +113,7 @@ export default function AnalyticsConsentSwitch() {
 
         // Track that user enabled analytics
         try {
-          await invoke('track_analytics_enabled');
+          await trackAnalyticsEnabled();
         } catch (error) {
           console.error('Failed to track analytics enabled:', error);
         }
@@ -117,7 +122,7 @@ export default function AnalyticsConsentSwitch() {
       } else {
         // Track that user disabled analytics BEFORE disabling
         try {
-          await invoke('track_analytics_disabled');
+          await trackAnalyticsDisabled();
         } catch (error) {
           console.error('Failed to track analytics disabled:', error);
         }
@@ -147,7 +152,7 @@ export default function AnalyticsConsentSwitch() {
 
   const handlePrivacyPolicyClick = async () => {
     try {
-      await invoke('open_external_url', { url: 'https://github.com/Zackriya-Solutions/meeting-minutes/blob/main/PRIVACY_POLICY.md' });
+      await openExternalUrl({ url: 'https://github.com/Zackriya-Solutions/meeting-minutes/blob/main/PRIVACY_POLICY.md' });
     } catch (error) {
       console.error('Failed to open privacy policy link:', error);
     }

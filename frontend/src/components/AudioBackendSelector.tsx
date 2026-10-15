@@ -1,12 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  getAudioBackendInfo,
+  getCurrentAudioBackend,
+  setAudioBackend,
+  type BackendInfo,
+} from '@/lib/ipc/recording';
 import { Info } from 'lucide-react';
-
-export interface BackendInfo {
-  id: string;
-  name: string;
-  description: string;
-}
 
 interface AudioBackendSelectorProps {
   currentBackend?: string;
@@ -33,12 +32,12 @@ export function AudioBackendSelector({
         setError(null);
 
         // Get backend info (includes name and description)
-        const backendInfo = await invoke<BackendInfo[]>('get_audio_backend_info');
+        const backendInfo = await getAudioBackendInfo();
         setBackends(backendInfo);
 
         // Get current backend if not provided via props
         if (!propBackend) {
-          const current = await invoke<string>('get_current_audio_backend');
+          const current = await getCurrentAudioBackend();
           setCurrentBackend(current);
         } else {
           setCurrentBackend(propBackend);
@@ -58,7 +57,7 @@ export function AudioBackendSelector({
   const handleBackendChange = async (backendId: string) => {
     try {
       setError(null);
-      await invoke('set_audio_backend', { backend: backendId });
+      await setAudioBackend({ backend: backendId });
       setCurrentBackend(backendId);
 
       // Notify parent component

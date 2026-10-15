@@ -2,9 +2,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { Summary, SummaryResponse } from '@/types';
-import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import Analytics from '@/lib/analytics';
-import { invoke } from '@tauri-apps/api/core';
+import { emitModelConfigUpdated, saveModelConfig } from '@/lib/ipc/settings';
+import type { SummaryStatusResponse } from '@/lib/ipc/summary';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
 import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
@@ -12,7 +12,7 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 
 // Custom hooks
 import { useMeetingData } from '@/hooks/meeting-details/useMeetingData';
-import { useSummaryGeneration } from '@/hooks/meeting-details/useSummaryGeneration';
+import { shouldAutoStartSummary, useSummaryGeneration } from '@/hooks/meeting-details/useSummaryGeneration';
 import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
@@ -21,10 +21,12 @@ import { useConfig } from '@/contexts/ConfigContext';
 export default function PageContent({
   meeting,
   summaryData,
+  initialSummary = null,
   shouldAutoGenerate = false,
   onAutoGenerateComplete,
   onMeetingUpdated,
   onRefetchTranscripts,
+  onUpdateSpeakerLabelLocal,
   // Pagination props for efficient transcript loading
   segments,
   hasMore,
@@ -32,13 +34,17 @@ export default function PageContent({
   totalCount,
   loadedCount,
   onLoadMore,
+  diarizationProgress,
 }: {
   meeting: any;
   summaryData: Summary | null;
+  /** Stored summary status read on open; resumes an in-progress run. */
+  initialSummary?: SummaryStatusResponse | null;
   shouldAutoGenerate?: boolean;
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
   onRefetchTranscripts?: () => Promise<void>;
+  onUpdateSpeakerLabelLocal?: (speaker: string, label: string, transcriptId?: string) => void;
   // Pagination props
   segments?: any[];
   hasMore?: boolean;
@@ -46,6 +52,12 @@ export default function PageContent({
   totalCount?: number;
   loadedCount?: number;
   onLoadMore?: () => void;
+  diarizationProgress?: {
+    status: string | null;
+    progress: number;
+    message: string;
+    isProcessing: boolean;
+  } | null;
 }) {
   console.log('📄 PAGE CONTENT: Initializing with data:', {
     meetingId: meeting.id,
@@ -60,9 +72,6 @@ export default function PageContent({
 
   // Ref to store the modal open function from SummaryGeneratorButtonGroup
   const openModelSettingsRef = useRef<(() => void) | null>(null);
-
-  // Sidebar context
-  const { serverAddress } = useSidebar();
 
   // Get model config from ConfigContext
   const { modelConfig, setModelConfig } = useConfig();
@@ -91,7 +100,7 @@ export default function PageContent({
   const handleSaveModelConfig = async (config?: ModelConfig) => {
     if (!config) return;
     try {
-      await invoke('api_save_model_config', {
+      await saveModelConfig({
         provider: config.provider,
         model: config.model,
         whisperModel: config.whisperModel,
@@ -100,8 +109,7 @@ export default function PageContent({
       });
 
       // Emit event so ConfigContext and other listeners stay in sync
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('model-config-updated', config);
+      await emitModelConfigUpdated(config);
 
       toast.success('Model settings saved successfully');
     } catch (error) {
@@ -120,6 +128,7 @@ export default function PageContent({
     updateMeetingTitle: meetingData.updateMeetingTitle,
     setAiSummary: meetingData.setAiSummary,
     onOpenModelSettings: handleOpenModelSettings,
+    initialSummary,
   });
 
   const copyOperations = useCopyOperations({
@@ -144,7 +153,10 @@ export default function PageContent({
     let cancelled = false;
 
     const autoGenerate = async () => {
-      if (shouldAutoGenerate && meetingData.transcripts.length > 0 && !cancelled) {
+      if (
+        shouldAutoStartSummary(shouldAutoGenerate, meetingData.transcripts.length, summaryGeneration.summaryStatus) &&
+        !cancelled
+      ) {
         console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
         await summaryGeneration.handleGenerateSummary('');
 
@@ -161,6 +173,7 @@ export default function PageContent({
     return () => {
       cancelled = true;
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- auto-generate must fire once per meeting; summaryGeneration and onAutoGenerateComplete are recreated every render and would re-trigger generation
   }, [shouldAutoGenerate, meeting.id]); // Re-run if meeting changes
 
   return (
@@ -191,6 +204,8 @@ export default function PageContent({
           meetingId={meeting.id}
           meetingFolderPath={meeting.folder_path}
           onRefetchTranscripts={onRefetchTranscripts}
+          onUpdateSpeakerLabelLocal={onUpdateSpeakerLabelLocal}
+          diarizationProgress={diarizationProgress}
         />
         <SummaryPanel
           meeting={meeting}

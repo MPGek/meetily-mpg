@@ -3,7 +3,7 @@
 
 use crate::summary::debug_log;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,9 +58,8 @@ lazy_static::lazy_static! {
 }
 
 // Model path cache to avoid repeated filesystem I/O and model lookups
-static MODEL_PATH_CACHE: Lazy<RwLock<HashMap<String, PathBuf>>> = Lazy::new(|| {
-    RwLock::new(HashMap::new())
-});
+static MODEL_PATH_CACHE: Lazy<RwLock<HashMap<String, PathBuf>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Initialize the global sidecar manager
 pub async fn init_sidecar_manager(app_data_dir: PathBuf) -> Result<()> {
@@ -79,7 +78,7 @@ async fn get_sidecar_manager() -> Result<Arc<SidecarManager>> {
 }
 
 /// Get cached model path with read-through caching to avoid repeated filesystem I/O
-fn get_cached_model_path(app_data_dir: &PathBuf, model_name: &str) -> Result<PathBuf> {
+fn get_cached_model_path(app_data_dir: &Path, model_name: &str) -> Result<PathBuf> {
     // Try read lock first (fast path for cache hits)
     {
         let cache = MODEL_PATH_CACHE.read().unwrap();
@@ -134,7 +133,7 @@ fn get_cached_model_path(app_data_dir: &PathBuf, model_name: &str) -> Result<Pat
 /// # Returns
 /// Generated text
 pub async fn generate_with_builtin(
-    app_data_dir: &PathBuf,
+    app_data_dir: &Path,
     model_name: &str,
     system_prompt: &str,
     user_prompt: &str,
@@ -163,14 +162,13 @@ pub async fn generate_with_builtin(
     let model_path = get_cached_model_path(app_data_dir, model_name)?;
 
     // Apply model-specific chat template
-    let formatted_prompt =
-        models::format_prompt(&model_def.template, system_prompt, user_prompt)?;
+    let formatted_prompt = models::format_prompt(&model_def.template, system_prompt, user_prompt)?;
     // Get or initialize sidecar manager
     let manager = {
         let mut global_manager = SIDECAR_MANAGER.lock().await;
         if global_manager.is_none() {
             log::info!("Initializing sidecar manager");
-            let new_manager = SidecarManager::new(app_data_dir.clone())?;
+            let new_manager = SidecarManager::new(app_data_dir.to_path_buf())?;
             *global_manager = Some(Arc::new(new_manager));
         }
         global_manager.clone().unwrap()

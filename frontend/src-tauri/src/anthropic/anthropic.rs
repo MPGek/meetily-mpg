@@ -95,17 +95,22 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
         }
     }
 
-    // Fetch from API
+    // Fetch from API (bounded retry on transient failures via the shared
+    // HTTP layer; any resulting error falls back to the hardcoded list
+    // exactly as a single failed attempt did before).
     log::info!("Fetching Anthropic models from API...");
-    let client = reqwest::Client::new();
-
-    let response = match client
-        .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
+    let policy = crate::llm::RetryPolicy::short();
+    let response = match crate::llm::send_with_retry(
+        || {
+            crate::llm::shared_client()
+                .get("https://api.anthropic.com/v1/models")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .timeout(Duration::from_secs(5))
+        },
+        &policy,
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
@@ -113,15 +118,6 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
             return Ok(get_fallback_models());
         }
     };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        log::warn!(
-            "Anthropic API returned status {}. Using fallback models.",
-            status
-        );
-        return Ok(get_fallback_models());
-    }
 
     let api_response: AnthropicApiResponse = match response.json().await {
         Ok(data) => data,

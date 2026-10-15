@@ -22,6 +22,22 @@ if errorlevel 1 set "PATH=%CUDA_ROOT%\bin;%PATH%"
 echo "%PATH%" | findstr /i /c:"%CUDA_ROOT%\bin\x64;" >nul 2>&1
 if errorlevel 1 set "PATH=%CUDA_ROOT%\bin\x64;%PATH%"
 
+REM Disable sccache for all compilation (sccache 0.17 + CUDA 13.3 breaks fatbinary PTX,
+REM and sccache + MSVC has PDB locking issues with parallel builds).
+REM sccache is also disabled in .cargo/config.toml (rustc-wrapper).
+REM
+REM Create a pass-through sccache.bat that invokes the compiler directly (no caching).
+REM This must be set as CMAKE_C/CXX_COMPILER_LAUNCHER by full path to:
+REM   1) Skip llama.cpp/whisper.cpp auto-detection (condition checks NOT CMAKE_C_COMPILER_LAUNCHER)
+REM   2) Use the pass-through for C/C++ (avoids real sccache PDB locking)
+REM CUDA gets no launcher (CMAKE_CUDA_COMPILER_LAUNCHER=), so nvcc runs directly.
+if not exist "%LOCALAPPDATA%\Temp\meetily-nosccache" mkdir "%LOCALAPPDATA%\Temp\meetily-nosccache"
+echo @echo off > "%LOCALAPPDATA%\Temp\meetily-nosccache\sccache.bat"
+echo %%* >> "%LOCALAPPDATA%\Temp\meetily-nosccache\sccache.bat"
+set "CMAKE_C_COMPILER_LAUNCHER=%LOCALAPPDATA%\Temp\meetily-nosccache\sccache.bat"
+set "CMAKE_CXX_COMPILER_LAUNCHER=%LOCALAPPDATA%\Temp\meetily-nosccache\sccache.bat"
+set "CMAKE_CUDA_COMPILER_LAUNCHER="
+
 REM Use the Ninja generator for llama.cpp (llama-helper) CMake builds when
 REM available: CUDA is driven by nvcc directly, so the NVIDIA CUDA platform
 REM toolset registered inside Visual Studio is not required (not yet shipped

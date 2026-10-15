@@ -100,7 +100,7 @@ Raw Audio (Mic + System)
 
 ### Audio Device Modularization (Recently Completed)
 
-**Context**: The audio system was refactored from a monolithic 1028-line `core.rs` file into focused modules. See [AUDIO_MODULARIZATION_PLAN.md](AUDIO_MODULARIZATION_PLAN.md) for details.
+**Context**: The audio system is split into focused modules (devices, capture, pipeline, recording, diarization, and more). See [CODEBASE_MAP_ARCHITECTURE.md](CODEBASE_MAP_ARCHITECTURE.md) for the system-level overview.
 
 ```
 audio/
@@ -197,9 +197,11 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 ### 1. Audio Buffer Management
 
 **Ring Buffer Mixing** (pipeline.rs):
-- Mic and system audio arrive asynchronously at different rates
-- Ring buffer accumulates samples until both streams have aligned windows (50ms)
-- Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
+- Mic and system audio arrive asynchronously, in uneven batches
+- The ring buffer cuts a 600 ms stereo window (L = mic, R = system) only when both sides hold a full window, so the saved file stays on the session timeline. A short side keeps its samples for its next window
+- A side that falls a full window plus 600 ms behind is starved (WASAPI loopback while output is silent, a mic during a switch). It is padded with silence so the live side keeps recording. When it delivers again, it is lined up with the other side's buffered tail
+- What is left in the ring buffer when the pipeline ends is saved as a final shorter chunk
+- The live path interleaves channels and does not duck; the ducking mixer in `ffmpeg_mixer.rs` is not used by the pipeline
 - Uses `VecDeque` for efficient windowed processing
 
 ### 2. Thread Safety and Async Boundaries
@@ -423,18 +425,18 @@ curl -fSL -o resource.tar.gz "https://download.example.com/resource"
 ## Key Files Reference
 
 **Core Coordination**:
-- [frontend/src-tauri/src/lib.rs](frontend/src-tauri/src/lib.rs) - Main Tauri entry point, command registration
-- [frontend/src-tauri/src/audio/mod.rs](frontend/src-tauri/src/audio/mod.rs) - Audio module exports
-- [frontend/src-tauri/src/database/mod.rs](frontend/src-tauri/src/database/mod.rs) - Local database module
+- [frontend/src-tauri/src/lib.rs](../frontend/src-tauri/src/lib.rs) - Main Tauri entry point, command registration
+- [frontend/src-tauri/src/audio/mod.rs](../frontend/src-tauri/src/audio/mod.rs) - Audio module exports
+- [frontend/src-tauri/src/database/mod.rs](../frontend/src-tauri/src/database/mod.rs) - Local database module
 
 **Audio System**:
-- [frontend/src-tauri/src/audio/recording_manager.rs](frontend/src-tauri/src/audio/recording_manager.rs) - Recording orchestration
-- [frontend/src-tauri/src/audio/pipeline.rs](frontend/src-tauri/src/audio/pipeline.rs) - Audio mixing and VAD
-- [frontend/src-tauri/src/audio/recording_saver.rs](frontend/src-tauri/src/audio/recording_saver.rs) - Audio file writing
+- [frontend/src-tauri/src/audio/recording_manager.rs](../frontend/src-tauri/src/audio/recording_manager.rs) - Recording orchestration
+- [frontend/src-tauri/src/audio/pipeline.rs](../frontend/src-tauri/src/audio/pipeline.rs) - Audio mixing and VAD
+- [frontend/src-tauri/src/audio/recording_saver.rs](../frontend/src-tauri/src/audio/recording_saver.rs) - Audio file writing
 
 **UI Components**:
-- [frontend/src/app/page.tsx](frontend/src/app/page.tsx) - Main recording interface
-- [frontend/src/components/Sidebar/SidebarProvider.tsx](frontend/src/components/Sidebar/SidebarProvider.tsx) - Global state management
+- [frontend/src/app/page.tsx](../frontend/src/app/page.tsx) - Main recording interface
+- [frontend/src/components/Sidebar/SidebarProvider.tsx](../frontend/src/components/Sidebar/SidebarProvider.tsx) - Global state management
 
 **Whisper Integration**:
-- [frontend/src-tauri/src/whisper_engine/whisper_engine.rs](frontend/src-tauri/src/whisper_engine/whisper_engine.rs) - Whisper model management and transcription
+- [frontend/src-tauri/src/whisper_engine/whisper_engine.rs](../frontend/src-tauri/src/whisper_engine/whisper_engine.rs) - Whisper model management and transcription

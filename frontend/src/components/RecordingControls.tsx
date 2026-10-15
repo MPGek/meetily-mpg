@@ -1,19 +1,29 @@
 'use client';
 
-import { invoke } from '@tauri-apps/api/core';
+import {
+  isRecording as isRecordingCommand,
+  listenSpeechDetected,
+  pauseRecording,
+  resumeRecording,
+  stopRecording,
+} from '@/lib/ipc/recording';
+import { listenTranscriptError, listenTranscriptionError } from '@/lib/ipc/transcript';
 import { appDataDir } from '@tauri-apps/api/path';
-import { useCallback, useEffect, useState, useRef } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Play, Pause, Square, Mic, AlertCircle, X } from 'lucide-react';
-import { ProcessRequest, SummaryResponse } from '@/types/summary';
-import { listen } from '@tauri-apps/api/event';
+import { SummaryResponse } from '@/types/summary';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import Analytics from '@/lib/analytics';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { DiarizationStatusLines } from '@/components/DiarizationStatusLines';
+import type { RecordingTelemetry } from '@/services/diarizationStatusService';
 
 interface RecordingControlsProps {
   isRecording: boolean;
   barHeights: string[];
+  /** Live recording telemetry, sampled by the parent while recording. */
+  recordingTelemetry?: RecordingTelemetry | null;
   onRecordingStop: (callApi?: boolean) => void;
   onRecordingStart: () => void;
   onTranscriptReceived: (summary: SummaryResponse) => void;
@@ -31,9 +41,9 @@ interface RecordingControlsProps {
 export const RecordingControls: React.FC<RecordingControlsProps> = ({
   isRecording,
   barHeights,
+  recordingTelemetry,
   onRecordingStop,
   onRecordingStart,
-  onTranscriptReceived,
   onTranscriptionError,
   onStopInitiated,
   isRecordingDisabled,
@@ -46,22 +56,20 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const isPaused = recordingState.isPaused;
 
   const [showPlayback, setShowPlayback] = useState(false);
-  const [recordingPath, setRecordingPath] = useState<string | null>(null);
-  const [transcript, setTranscript] = useState<string>('');
+  const [, setRecordingPath] = useState<string | null>(null);
+  const [, setTranscript] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isStarting, setIsStarting] = useState(false);
+  const [isStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
   const [isResuming, setIsResuming] = useState(false);
-  const MIN_RECORDING_DURATION = 2000; // 2 seconds minimum recording time
-  const [transcriptionErrors, setTranscriptionErrors] = useState(0);
-  const [isValidatingModel, setIsValidatingModel] = useState(false);
-  const [speechDetected, setSpeechDetected] = useState(false);
+  const [, setTranscriptionErrors] = useState(0);
+  const [isValidatingModel] = useState(false);
+  const [, setSpeechDetected] = useState(false);
   const [deviceError, setDeviceError] = useState<{ title: string, message: string } | null>(null);
 
   const currentTime = 0;
   const duration = 0;
-  const isPlaying = false;
   const progress = 0;
 
   const formatTime = (time: number) => {
@@ -73,7 +81,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   useEffect(() => {
     const checkTauri = async () => {
       try {
-        const result = await invoke('is_recording');
+        const result = await isRecordingCommand();
         console.log('Tauri is initialized and ready, is_recording result:', result);
       } catch (error) {
         console.error('Tauri initialization error:', error);
@@ -146,7 +154,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       const savePath = `${dataDir}/recording-${timestamp}.wav`;
       console.log('Saving recording to:', savePath);
       console.log('About to call stop_recording command');
-      const result = await invoke('stop_recording', {
+      const result = await stopRecording({
         args: {
           save_path: savePath
         }
@@ -208,7 +216,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     setIsPausing(true);
 
     try {
-      await invoke('pause_recording');
+      await pauseRecording();
       // isPaused state now managed by RecordingStateContext via events
       console.log('Recording paused successfully');
     } catch (error) {
@@ -226,7 +234,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     setIsResuming(true);
 
     try {
-      await invoke('resume_recording');
+      await resumeRecording();
       // isPaused state now managed by RecordingStateContext via events
       console.log('Recording resumed successfully');
     } catch (error) {
@@ -250,7 +258,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     const setupListeners = async () => {
       try {
         // Transcript error listener - handles both regular and actionable errors
-        const transcriptErrorUnsubscribe = await listen('transcript-error', (event) => {
+        const transcriptErrorUnsubscribe = await listenTranscriptError((event) => {
           console.log('transcript-error event received:', event);
           console.error('Transcription error received:', event.payload);
           const errorMessage = event.payload as string;
@@ -272,17 +280,15 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         });
 
         // Transcription error listener - handles structured error objects with actionable flag
-        const transcriptionErrorUnsubscribe = await listen('transcription-error', (event) => {
+        const transcriptionErrorUnsubscribe = await listenTranscriptionError((event) => {
           console.log('transcription-error event received:', event);
           console.error('Transcription error received:', event.payload);
 
           let errorMessage: string;
-          let isActionable = false;
 
           if (typeof event.payload === 'object' && event.payload !== null) {
             const payload = event.payload as { error: string, userMessage: string, actionable: boolean };
             errorMessage = payload.userMessage || payload.error;
-            isActionable = payload.actionable || false;
           } else {
             errorMessage = String(event.payload);
           }
@@ -311,7 +317,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         // No need for duplicate listeners here
 
         // Speech detected listener - for UX feedback when VAD detects speech
-        const speechDetectedUnsubscribe = await listen('speech-detected', (event) => {
+        const speechDetectedUnsubscribe = await listenSpeechDetected((event) => {
           console.log('speech-detected event received:', event);
           setSpeechDetected(true);
         });
@@ -342,7 +348,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   return (
     <TooltipProvider>
       <div className="flex flex-col space-y-2">
-        <div className="flex items-center space-x-2 bg-white rounded-full shadow-lg px-4 py-2">
+        <div className="flex min-h-12 items-center space-x-2">
           {isProcessing && !isParentProcessing ? (
             <div className="flex items-center space-x-2">
               <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900"></div>
@@ -427,21 +433,19 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               }
                             }}
                             disabled={isPausing || isResuming || isStopping}
+                            aria-label={isPausing ? 'Pausing...' : isResuming ? 'Resuming...' : isPaused ? 'Resume recording' : 'Pause recording'}
                             className={`w-10 h-10 flex items-center justify-center ${isPausing || isResuming || isStopping
                               ? 'bg-gray-200 border-2 border-gray-300 text-gray-400'
                               : 'bg-white border-2 border-gray-300 text-gray-600 hover:border-gray-400 hover:bg-gray-50'
                               } rounded-full transition-colors relative`}
                           >
-                            {isPaused ? <Play size={16} /> : <Pause size={16} />}
-                            {(isPausing || isResuming) && (
-                              <div className="absolute -top-8 text-gray-600 font-medium text-xs">
-                                {isPausing ? 'Pausing...' : 'Resuming...'}
-                              </div>
-                            )}
+                            {isPausing || isResuming ? (
+                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-500"></div>
+                            ) : isPaused ? <Play size={16} /> : <Pause size={16} />}
                           </button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>{isPaused ? 'Resume recording' : 'Pause recording'}</p>
+                          <p>{isPausing ? 'Pausing...' : isResuming ? 'Resuming...' : isPaused ? 'Resume recording' : 'Pause recording'}</p>
                         </TooltipContent>
                       </Tooltip>
 
@@ -453,19 +457,19 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               handleStopRecording();
                             }}
                             disabled={isStopping || isPausing || isResuming}
+                            aria-label={isStopping ? 'Stopping...' : 'Stop recording'}
                             className={`w-10 h-10 flex items-center justify-center ${isStopping || isPausing || isResuming ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
                               } rounded-full text-white transition-colors relative`}
                           >
-                            <Square size={16} />
-                            {isStopping && (
-                              <div className="absolute -top-8 text-gray-600 font-medium text-xs">
-                                Stopping...
-                              </div>
+                            {isStopping ? (
+                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                            ) : (
+                              <Square size={16} />
                             )}
                           </button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>Stop recording</p>
+                          <p>{isStopping ? 'Stopping...' : 'Stop recording'}</p>
                         </TooltipContent>
                       </Tooltip>
                     </>
@@ -484,6 +488,14 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                       />
                     ))}
                   </div>
+
+                  {/* Two per-channel status lines, immediately to the right of
+                      the animated indicator. Shown for every recording: the
+                      level bars and the ASR buffer do not depend on
+                      diarization. Hidden when not recording. */}
+                  {isRecording && recordingTelemetry && recordingTelemetry.pipeline.sample_rate > 0 && (
+                    <DiarizationStatusLines telemetry={recordingTelemetry} />
+                  )}
                 </>
               )}
             </>

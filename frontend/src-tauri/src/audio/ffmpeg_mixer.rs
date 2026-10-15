@@ -8,16 +8,13 @@
 // 2. Adaptive timeouts based on device type (Wired: 20-50ms, Bluetooth: 80-200ms)
 // 3. Gap detection and silence insertion for Bluetooth jitter
 // 4. Timestamp-aware mixing to maintain sync
-// 5. Professional audio mixing with RMS-based ducking
+// 5. Professional audio mixing with speech-driven ducking
 
+use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use log::{debug, warn, info};
 
 use super::device_detection::InputDeviceKind;
-
-/// Configuration flags for audio processing features
-pub const RNNOISE_APPLY_ENABLED: bool = true;  // Default: disabled (Whisper handles noise well)
 
 /// Timestamp for audio samples (reserved for future use)
 #[allow(dead_code)]
@@ -110,12 +107,17 @@ impl SourceBuffer {
         // Use max timeout for initial conservative approach
         let buffer_timeout = max_timeout;
 
-        info!("📦 SourceBuffer created for '{}' ({:?})", device_name, device_kind);
+        info!(
+            "📦 SourceBuffer created for '{}' ({:?})",
+            device_name, device_kind
+        );
         info!("   Sample rate: {} Hz", sample_rate);
-        info!("   Buffer timeout: {:.0}ms (range: {:.0}ms - {:.0}ms)",
-              buffer_timeout.as_secs_f64() * 1000.0,
-              min_timeout.as_secs_f64() * 1000.0,
-              max_timeout.as_secs_f64() * 1000.0);
+        info!(
+            "   Buffer timeout: {:.0}ms (range: {:.0}ms - {:.0}ms)",
+            buffer_timeout.as_secs_f64() * 1000.0,
+            min_timeout.as_secs_f64() * 1000.0,
+            max_timeout.as_secs_f64() * 1000.0
+        );
 
         Self {
             device_name,
@@ -138,23 +140,26 @@ impl SourceBuffer {
         // Detect gaps (significant delay between chunks)
         if let Some(last_time) = self.last_chunk_time {
             let gap_duration = last_time.elapsed();
-            let expected_duration = Duration::from_secs_f64(
-                chunk.samples.len() as f64 / self.sample_rate as f64
-            );
+            let expected_duration =
+                Duration::from_secs_f64(chunk.samples.len() as f64 / self.sample_rate as f64);
 
             // Gap threshold: 2x expected chunk duration
             if gap_duration > expected_duration.mul_f32(2.0) {
                 self.gaps_detected += 1;
 
                 if self.device_kind.is_bluetooth() {
-                    debug!("⚠️ Gap detected in '{}': {:.1}ms (expected ~{:.1}ms)",
-                           self.device_name,
-                           gap_duration.as_secs_f64() * 1000.0,
-                           expected_duration.as_secs_f64() * 1000.0);
+                    debug!(
+                        "⚠️ Gap detected in '{}': {:.1}ms (expected ~{:.1}ms)",
+                        self.device_name,
+                        gap_duration.as_secs_f64() * 1000.0,
+                        expected_duration.as_secs_f64() * 1000.0
+                    );
                 } else {
-                    warn!("⚠️ Unexpected gap in wired device '{}': {:.1}ms",
-                          self.device_name,
-                          gap_duration.as_secs_f64() * 1000.0);
+                    warn!(
+                        "⚠️ Unexpected gap in wired device '{}': {:.1}ms",
+                        self.device_name,
+                        gap_duration.as_secs_f64() * 1000.0
+                    );
                 }
             }
         }
@@ -206,9 +211,11 @@ impl SourceBuffer {
                 result.resize(sample_count, 0.0);
                 self.silence_inserted_samples += silence_count as u64;
 
-                debug!("🔇 Inserted {:.1}ms silence for '{}' (buffer underrun)",
-                       (silence_count as f64 / self.sample_rate as f64) * 1000.0,
-                       self.device_name);
+                debug!(
+                    "🔇 Inserted {:.1}ms silence for '{}' (buffer underrun)",
+                    (silence_count as f64 / self.sample_rate as f64) * 1000.0,
+                    self.device_name
+                );
                 break;
             }
         }
@@ -235,7 +242,8 @@ impl SourceBuffer {
             buffer_latency_ms: self.buffer_latency_ms(),
             chunks_received: self.chunks_received,
             gaps_detected: self.gaps_detected,
-            silence_inserted_ms: (self.silence_inserted_samples as f64 / self.sample_rate as f64) * 1000.0,
+            silence_inserted_ms: (self.silence_inserted_samples as f64 / self.sample_rate as f64)
+                * 1000.0,
         }
     }
 }
@@ -252,67 +260,87 @@ pub struct BufferStats {
     pub silence_inserted_ms: f64,
 }
 
-/// Professional audio mixer with RMS-based ducking
+/// Professional audio mixer with speech-driven ducking
+///
+/// Ducking (reducing system audio while the user speaks) is driven by a
+/// microphone speech-active flag rather than an RMS threshold, so loud
+/// non-speech noise never ducks system audio. Ducking engages immediately on
+/// speech, is held for a short debounce after speech ends, and transitions
+/// smoothly between the ducked and full system gain levels.
 struct AudioMixer {
-    /// Mic ducking factor (0.0 - 1.0)
+    /// Mic gain factor (0.0 - 1.0)
     mic_ducking: f32,
 
-    /// System audio ducking factor (0.0 - 1.0)
+    /// System audio gain when ducked (0.0 - 1.0)
     system_ducking: f32,
 
-    /// Enable RMS-based adaptive ducking
-    adaptive_ducking: bool,
+    /// Sample rate used to convert the debounce hold duration into samples
+    sample_rate: u32,
+
+    /// Remaining samples to keep system audio ducked after speech ends
+    duck_hold_samples: usize,
+
+    /// Current smoothed system gain (converges toward the target level)
+    current_system_gain: f32,
 }
 
 impl AudioMixer {
-    fn new(adaptive_ducking: bool) -> Self {
+    fn new(sample_rate: u32) -> Self {
         Self {
-            mic_ducking: 1.0,      // Full volume by default
-            system_ducking: 0.60,   // System audio at 40% when mic is active
-            adaptive_ducking,
+            mic_ducking: 1.0,     // Full volume by default
+            system_ducking: 0.60, // System audio at 60% while the user is speaking
+            sample_rate,
+            duck_hold_samples: 0,
+            current_system_gain: 1.0,
         }
     }
 
-    /// Mix mic and system audio with professional ducking
+    /// Mix mic and system audio with speech-driven ducking
     ///
     /// Strategy:
-    /// - When mic is active (speech detected), duck system audio
-    /// - When mic is silent, allow full system audio
-    /// - Use RMS to detect speech activity
-    fn mix(&mut self, mic: &[f32], system: &[f32]) -> Vec<f32> {
-        assert_eq!(mic.len(), system.len(), "Mic and system audio must have same length");
+    /// - When the mic speech flag is set, duck system audio immediately
+    /// - Keep it ducked for ~500ms after speech ends (debounce)
+    /// - Smoothly ramp system gain back to full level afterwards
+    /// - Never use the mic level itself as the ducking signal
+    fn mix(&mut self, mic: &[f32], system: &[f32], mic_speech_active: bool) -> Vec<f32> {
+        assert_eq!(
+            mic.len(),
+            system.len(),
+            "Mic and system audio must have same length"
+        );
 
         let mut result = Vec::with_capacity(mic.len());
 
-        if self.adaptive_ducking {
-            // Calculate RMS for mic to detect speech
-            let mic_rms = calculate_rms(mic);
+        // Debounce: hold the duck for ~500ms after the last speech frame
+        const DUCK_HOLD_MS: usize = 500;
+        let hold_samples = (self.sample_rate as usize * DUCK_HOLD_MS) / 1000;
 
-            // Speech detection threshold (calibrated for meetings)
-            const SPEECH_THRESHOLD: f32 = 0.01;
+        if mic_speech_active {
+            self.duck_hold_samples = hold_samples;
+        } else if self.duck_hold_samples > 0 {
+            self.duck_hold_samples = self.duck_hold_samples.saturating_sub(mic.len());
+        }
 
-            let is_speech = mic_rms > SPEECH_THRESHOLD;
-
-            // Adjust ducking based on speech detection
-            let system_gain = if is_speech {
-                self.system_ducking  // Duck system audio when mic has speech
-            } else {
-                1.0  // Full system audio when mic is silent
-            };
-
-            // Mix with ducking
-            for (m, s) in mic.iter().zip(system.iter()) {
-                let mixed = (m * self.mic_ducking) + (s * system_gain);
-                // Prevent clipping
-                result.push(mixed.clamp(-1.0, 1.0));
-            }
+        let target_gain = if self.duck_hold_samples > 0 {
+            self.system_ducking
         } else {
-            // Simple mixing without ducking
-            for (m, s) in mic.iter().zip(system.iter()) {
-                let mixed = m + s;
-                // Prevent clipping
-                result.push(mixed.clamp(-1.0, 1.0));
+            1.0
+        };
+
+        // Smooth transition over ~20ms so the gain change is inaudible
+        const RAMP_MS: usize = 20;
+        let ramp_step = 1.0 / ((RAMP_MS as f32 / 1000.0) * self.sample_rate as f32).max(1.0);
+
+        for (m, s) in mic.iter().zip(system.iter()) {
+            if self.current_system_gain < target_gain {
+                self.current_system_gain = (self.current_system_gain + ramp_step).min(target_gain);
+            } else if self.current_system_gain > target_gain {
+                self.current_system_gain = (self.current_system_gain - ramp_step).max(target_gain);
             }
+
+            let mixed = (m * self.mic_ducking) + (s * self.current_system_gain);
+            // Prevent clipping
+            result.push(mixed.clamp(-1.0, 1.0));
         }
 
         result
@@ -354,20 +382,28 @@ impl FFmpegAudioMixer {
         sample_rate: u32,
     ) -> Self {
         info!("🎛️ Creating FFmpeg Adaptive Audio Mixer");
-        info!("   Microphone: '{}' ({:?})", mic_device_name, mic_device_kind);
-        info!("   System Audio: '{}' ({:?})", system_device_name, system_device_kind);
+        info!(
+            "   Microphone: '{}' ({:?})",
+            mic_device_name, mic_device_kind
+        );
+        info!(
+            "   System Audio: '{}' ({:?})",
+            system_device_name, system_device_kind
+        );
         info!("   Sample Rate: {} Hz", sample_rate);
 
         // 50ms mixing window (same as Cap)
         let mixing_window_samples = ((sample_rate as f64 * 0.050) as usize).max(1);
-        info!("   Mixing Window: {:.1}ms ({} samples)",
-              (mixing_window_samples as f64 / sample_rate as f64) * 1000.0,
-              mixing_window_samples);
+        info!(
+            "   Mixing Window: {:.1}ms ({} samples)",
+            (mixing_window_samples as f64 / sample_rate as f64) * 1000.0,
+            mixing_window_samples
+        );
 
         Self {
             mic_buffer: SourceBuffer::new(mic_device_name, mic_device_kind, sample_rate),
             system_buffer: SourceBuffer::new(system_device_name, system_device_kind, sample_rate),
-            mixer: AudioMixer::new(true),  // Enable adaptive ducking
+            mixer: AudioMixer::new(sample_rate),
             sample_rate,
             mixing_window_samples,
             windows_mixed: 0,
@@ -391,8 +427,10 @@ impl FFmpegAudioMixer {
 
     /// Pop mixed audio (returns None if not ready)
     ///
-    /// Returns a 50ms window of mixed audio when both sources are ready
-    pub fn pop_mixed(&mut self) -> Option<Vec<f32>> {
+    /// Returns a 50ms window of mixed audio when both sources are ready.
+    /// `mic_speech_active` is the per-channel microphone speech flag (Silero VAD):
+    /// it is the only signal used to decide whether system audio is ducked.
+    pub fn pop_mixed(&mut self, mic_speech_active: bool) -> Option<Vec<f32>> {
         if !self.has_data_ready() {
             return None;
         }
@@ -402,12 +440,15 @@ impl FFmpegAudioMixer {
         let system_samples = self.system_buffer.pop_samples(self.mixing_window_samples)?;
 
         // Mix the samples
-        let mixed = self.mixer.mix(&mic_samples, &system_samples);
+        let mixed = self
+            .mixer
+            .mix(&mic_samples, &system_samples, mic_speech_active);
 
         self.windows_mixed += 1;
 
         // Log statistics periodically
-        if self.windows_mixed % 200 == 0 {  // Every ~10 seconds at 50ms windows
+        if self.windows_mixed % 200 == 0 {
+            // Every ~10 seconds at 50ms windows
             self.log_stats();
         }
 
@@ -423,15 +464,18 @@ impl FFmpegAudioMixer {
     fn log_stats(&self) {
         let (mic_stats, sys_stats) = self.get_stats();
 
-        info!("🎛️ Mixer Statistics (after {} windows):", self.windows_mixed);
-        info!("   Mic: {:.0}ms buffer, {} gaps, {:.1}ms silence inserted",
-              mic_stats.buffer_latency_ms,
-              mic_stats.gaps_detected,
-              mic_stats.silence_inserted_ms);
-        info!("   System: {:.0}ms buffer, {} gaps, {:.1}ms silence inserted",
-              sys_stats.buffer_latency_ms,
-              sys_stats.gaps_detected,
-              sys_stats.silence_inserted_ms);
+        info!(
+            "🎛️ Mixer Statistics (after {} windows):",
+            self.windows_mixed
+        );
+        info!(
+            "   Mic: {:.0}ms buffer, {} gaps, {:.1}ms silence inserted",
+            mic_stats.buffer_latency_ms, mic_stats.gaps_detected, mic_stats.silence_inserted_ms
+        );
+        info!(
+            "   System: {:.0}ms buffer, {} gaps, {:.1}ms silence inserted",
+            sys_stats.buffer_latency_ms, sys_stats.gaps_detected, sys_stats.silence_inserted_ms
+        );
     }
 
     /// Get microphone buffer size
@@ -445,27 +489,13 @@ impl FFmpegAudioMixer {
     }
 }
 
-/// Calculate RMS (Root Mean Square) for audio samples
-fn calculate_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-
-    let sum_squares: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_squares / samples.len() as f32).sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_source_buffer_basic() {
-        let mut buffer = SourceBuffer::new(
-            "Test Mic".to_string(),
-            InputDeviceKind::Wired,
-            48000,
-        );
+        let mut buffer = SourceBuffer::new("Test Mic".to_string(), InputDeviceKind::Wired, 48000);
 
         // Push some samples
         buffer.push(vec![0.1, 0.2, 0.3, 0.4]);
@@ -485,29 +515,115 @@ mod tests {
         );
 
         assert_eq!(mixer.sample_rate, 48000);
-        assert_eq!(mixer.mixing_window_samples, 2400);  // 50ms at 48kHz
-    }
-
-    #[test]
-    fn test_rms_calculation() {
-        let samples = vec![0.5, -0.5, 0.5, -0.5];
-        let rms = calculate_rms(&samples);
-        assert!((rms - 0.5).abs() < 0.001);
+        assert_eq!(mixer.mixing_window_samples, 2400); // 50ms at 48kHz
     }
 
     #[test]
     fn test_audio_mixer_clipping_prevention() {
-        let mut mixer = AudioMixer::new(false);
+        let mut mixer = AudioMixer::new(48000);
 
         // Test clipping prevention with extreme values
         let mic = vec![0.8, 0.8, 0.8, 0.8];
         let system = vec![0.8, 0.8, 0.8, 0.8];
 
-        let mixed = mixer.mix(&mic, &system);
+        let mixed = mixer.mix(&mic, &system, false);
 
         // All values should be clamped to 1.0
         for sample in mixed {
-            assert!(sample <= 1.0 && sample >= -1.0);
+            assert!((-1.0..=1.0).contains(&sample));
         }
+    }
+
+    #[test]
+    fn test_mixer_no_speech_keeps_system_full() {
+        let mut mixer = AudioMixer::new(48000);
+        let mic = vec![0.0; 4800];
+        let system = vec![0.5; 4800];
+
+        let mixed = mixer.mix(&mic, &system, false);
+
+        // No speech: system audio passes at full level (gain stays 1.0)
+        for sample in mixed {
+            assert!(
+                (sample - 0.5).abs() < 1e-4,
+                "system should stay at full level, got {sample}"
+            );
+        }
+        assert!((mixer.current_system_gain - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mixer_speech_ducks_system() {
+        let mut mixer = AudioMixer::new(48000);
+        let mic = vec![0.0; 4800];
+        let system = vec![0.5; 4800];
+
+        let mixed = mixer.mix(&mic, &system, true);
+
+        // Speech: system gain ramps smoothly to the ducked level (0.6)
+        let first = mixed.first().copied().unwrap();
+        let last = mixed.last().copied().unwrap();
+        assert!(
+            (first - 0.5).abs() < 1e-3,
+            "gain must ramp (no hard switch), first={first}"
+        );
+        assert!(
+            (last - 0.3).abs() < 0.02,
+            "system should be ducked to 0.6 gain, got {last}"
+        );
+        assert!(
+            first > last,
+            "gain should decrease smoothly: {first} <= {last}"
+        );
+    }
+
+    #[test]
+    fn test_mixer_duck_hold_and_release() {
+        let mut mixer = AudioMixer::new(48000);
+        let mic = vec![0.0; 4800];
+        let system = vec![0.5; 4800];
+
+        // Speech engages the duck immediately
+        let ducked = mixer.mix(&mic, &system, true);
+        let at_duck = ducked.last().copied().unwrap();
+        assert!((at_duck - 0.3).abs() < 0.02);
+
+        // A silence window right after still holds the duck (~500ms debounce)
+        let held = mixer.mix(&mic, &system, false);
+        let held_last = held.last().copied().unwrap();
+        assert!(
+            (held_last - 0.3).abs() < 0.02,
+            "debounce should keep the duck, got {held_last}"
+        );
+
+        // After the hold elapses, system audio returns to full level
+        for _ in 0..10 {
+            mixer.mix(&mic, &system, false);
+        }
+        let released = mixer.mix(&mic, &system, false);
+        let released_last = released.last().copied().unwrap();
+        assert!(
+            (released_last - 0.5).abs() < 0.02,
+            "system should return to full, got {released_last}"
+        );
+    }
+
+    #[test]
+    fn test_mixer_loud_noise_without_speech_not_ducked() {
+        let mut mixer = AudioMixer::new(48000);
+        // Loud non-speech mic content (e.g. street noise) at high amplitude
+        let mic = vec![0.2; 4800];
+        let system = vec![0.5; 4800];
+
+        let mixed = mixer.mix(&mic, &system, false);
+
+        // No speech flag: system audio is never ducked, regardless of mic level
+        for sample in mixed {
+            assert!(
+                (sample - 0.7).abs() < 1e-3,
+                "system must stay at full level, got {sample}"
+            );
+        }
+        assert!((mixer.current_system_gain - 1.0).abs() < 1e-6);
     }
 }

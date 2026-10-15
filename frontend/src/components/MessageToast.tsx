@@ -1,4 +1,4 @@
-import {useEffect, useState} from 'react';
+import {useEffect} from 'react';
 
 interface MessageToastProps {
     message: string;
@@ -15,6 +15,7 @@ export function MessageToast({ message, type, show, setShow }: MessageToastProps
         }, 3000);
         
         return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- setShow is a prop; the 3s auto-hide timer must start once on mount, not restart on every parent render
     }, []); 
     
     return (

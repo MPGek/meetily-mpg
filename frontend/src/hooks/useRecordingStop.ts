@@ -1,12 +1,15 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { listen } from '@tauri-apps/api/event';
+import { listenRecordingStopped } from '@/lib/ipc/recording';
+import { listenTranscriptionComplete } from '@/lib/ipc/transcript';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { recordingService } from '@/services/recordingService';
+import { loadDiarizationSettings } from '@/lib/diarization';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -14,6 +17,10 @@ import {
 } from '@/lib/summary-language-preferences';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+
+interface WindowWithTauriHooks extends Window {
+  handleRecordingStop?: (callApi?: boolean) => void;
+}
 
 interface UseRecordingStopReturn {
   handleRecordingStop: (callApi: boolean) => Promise<void>;
@@ -62,8 +69,6 @@ export function useRecordingStop(
   const {
     refetchMeetings,
     setCurrentMeeting,
-    setMeetings,
-    meetings,
     setIsMeetingActive,
   } = useSidebar();
 
@@ -75,6 +80,10 @@ export function useRecordingStop(
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
 
+  // Online diarization results carried in the recording-stopped event
+  const speakerAssignmentsRef = useRef<{ sequence_id: number; speaker: string }[]>([]);
+  const onlineDiarizationUsedRef = useRef(false);
+
   // Set up recording-stopped listener for meeting navigation
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
@@ -82,14 +91,10 @@ export function useRecordingStop(
     const setupRecordingStoppedListener = async () => {
       try {
         console.log('Setting up recording-stopped listener for navigation...');
-        unlistenFn = await listen<{
-          message: string;
-          folder_path?: string;
-          meeting_name?: string;
-        }>('recording-stopped', async (event) => {
+        unlistenFn = await listenRecordingStopped(async (event) => {
           // Create promise that resolves when sessionStorage is set (prevents race condition)
           recordingStoppedDataRef.current = (async () => {
-            const { folder_path, meeting_name } = event.payload;
+            const { folder_path, meeting_name, online_diarization_used, speaker_assignments } = event.payload;
 
             // Store folder_path and meeting_name for later use in handleRecordingStop
             if (folder_path) {
@@ -98,6 +103,14 @@ export function useRecordingStop(
             if (meeting_name) {
               sessionStorage.setItem('last_recording_meeting_name', meeting_name);
             }
+
+            // Store online diarization results for the save step
+            onlineDiarizationUsedRef.current = online_diarization_used === true;
+            speakerAssignmentsRef.current = speaker_assignments || [];
+            console.log('Recording stopped payload:', {
+              online_diarization_used: onlineDiarizationUsedRef.current,
+              speaker_assignments: speakerAssignmentsRef.current.length
+            });
           })();
 
         });
@@ -119,6 +132,11 @@ export function useRecordingStop(
 
   // Main recording stop handler
   const handleRecordingStop = useCallback(async (isCallApi: boolean) => {
+    // Reset per-recording online diarization state (before the listener's
+    // recording-stopped data is awaited, which repopulates these refs)
+    onlineDiarizationUsedRef.current = false;
+    speakerAssignmentsRef.current = [];
+
     if (recordingStoppedDataRef.current) {
       await recordingStoppedDataRef.current;
     }
@@ -155,7 +173,7 @@ export function useRecordingStop(
       let transcriptionComplete = false;
 
       // Listen for transcription-complete event
-      const unlistenComplete = await listen('transcription-complete', () => {
+      const unlistenComplete = await listenTranscriptionComplete(() => {
         console.log('Received transcription-complete event');
         transcriptionComplete = true;
       });
@@ -240,6 +258,21 @@ export function useRecordingStop(
         // Get fresh transcript state (ALL transcripts including late ones)
         const freshTranscripts = [...transcriptsRef.current];
 
+        // Apply online diarization speaker labels (computed at stop in Rust)
+        // before the DB save, keyed by sequence_id. Stop-time assignments are
+        // authoritative: overwrite any transient live label and clear it where
+        // the stop-time pass produced no assignment, so live labels never leak
+        // into the database.
+        if (speakerAssignmentsRef.current.length > 0) {
+          const assignmentBySequence = new Map(
+            speakerAssignmentsRef.current.map(a => [a.sequence_id, a.speaker])
+          );
+          for (const transcript of freshTranscripts) {
+            transcript.speaker = assignmentBySequence.get(transcript.sequence_id ?? -1);
+          }
+          console.log('Applied online diarization labels to', freshTranscripts.length, 'transcripts');
+        }
+
         // Get folder_path and meeting_name from recording-stopped event
         const folderPath = sessionStorage.getItem('last_recording_folder_path');
         const savedMeetingName = sessionStorage.getItem('last_recording_meeting_name');
@@ -263,6 +296,21 @@ export function useRecordingStop(
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);
             throw new Error('No meeting ID received from save operation');
+          }
+
+          // Finalize the online diarization session now that the meeting row
+          // exists: persists cluster centroids + exemplar caches, runs
+          // auto-recognition, enrolls user-assigned clusters, and persists the
+          // expected-speaker allowlist. Stop-time assignments were already
+          // applied above; this adds the speaker-registry side. Always
+          // attempted on every saved meeting so live speaker bindings are
+          // never dropped when the online_diarization_used flag is false —
+          // the backend no-ops when no session data is pending.
+          try {
+            const finalized = await recordingService.finalizeOnlineSession(meetingId);
+            console.log('Finalized online diarization session:', finalized);
+          } catch (finalizeError) {
+            console.error('Failed to finalize online diarization session:', finalizeError);
           }
 
           let shouldDetectSummaryLanguage = false;
@@ -305,6 +353,12 @@ export function useRecordingStop(
           // Refetch meetings and set current meeting
           await refetchMeetings();
 
+          // Surface pending-tag link warnings (change:
+          // tags-before-during-recording): the meeting itself is saved.
+          for (const warning of responseData.tag_warnings ?? []) {
+            toast.warning(warning);
+          }
+
           try {
             const meetingData = await storageService.getMeeting(meetingId);
             if (meetingData) {
@@ -321,6 +375,47 @@ export function useRecordingStop(
 
           // Mark as completed
           setStatus(RecordingStatus.COMPLETED);
+
+          // Auto-trigger speaker diarization when enabled
+          // Online modes already applied speaker labels at stop (Rust side),
+          // so only the offline path (mode "off" or online failure) triggers here.
+          const diarizationSettings = loadDiarizationSettings();
+          if (diarizationSettings.enabled && diarizationSettings.autoRun && !onlineDiarizationUsedRef.current) {
+            (async () => {
+              try {
+                const modelStatus = await recordingService.checkDiarizationModels();
+                if (!modelStatus.ready) {
+                  toast.error('Enhanced diarization models not bundled', {
+                    description: 'The enhanced models (segmentation-3.0 + TitaNet-Large) are bundled at build time near the executable; rebuild with network or install a build that includes them. Searched: AppData, bundled resources, and dev manifest.',
+                    action: {
+                      label: 'Open Settings',
+                      onClick: () => router.push('/settings?tab=general'),
+                    },
+                    duration: 10000,
+                  });
+                  return;
+                }
+                await recordingService.startDiarization(
+                  meetingId,
+                  diarizationSettings.maxSpeakers || undefined
+                );
+              } catch (diarizationError) {
+                console.error('Auto diarization failed:', diarizationError);
+                const message = diarizationError instanceof Error ? diarizationError.message : String(diarizationError);
+                const isModelMissing = /model.*not found|download models/i.test(message);
+                toast.error('Speaker analysis failed', {
+                  description: message,
+                  action: isModelMissing
+                    ? {
+                        label: 'Open Settings',
+                        onClick: () => router.push('/settings?tab=general'),
+                      }
+                    : undefined,
+                  duration: 8000,
+                });
+              }
+            })();
+          }
 
           // Show success toast with navigation option
           toast.success('Recording saved successfully!', {
@@ -431,8 +526,6 @@ export function useRecordingStop(
     markMeetingAsSaved,
     refetchMeetings,
     setCurrentMeeting,
-    setMeetings,
-    meetings,
     setIsMeetingActive,
     router,
   ]);
@@ -444,13 +537,13 @@ export function useRecordingStop(
   });
 
   useEffect(() => {
-    (window as any).handleRecordingStop = (callApi: boolean = true) => {
+    (window as WindowWithTauriHooks).handleRecordingStop = (callApi: boolean = true) => {
       handleRecordingStopRef.current(callApi);
     };
 
     // Cleanup on unmount
     return () => {
-      delete (window as any).handleRecordingStop;
+      delete (window as WindowWithTauriHooks).handleRecordingStop;
     };
   }, []);
 

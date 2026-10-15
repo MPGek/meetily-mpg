@@ -1,4 +1,12 @@
-import { invoke } from '@tauri-apps/api/core';
+import {
+  detectTranscriptSummaryLanguage as detectTranscriptSummaryLanguageCommand,
+  getMeetingDetectedSummaryLanguage,
+  getMeetingSummaryLanguage,
+  saveMeetingDetectedSummaryLanguage,
+  saveMeetingSummaryLanguage as saveMeetingSummaryLanguageCommand,
+  type MeetingSummaryLanguagePreference,
+  type SummaryLanguageDetectionResult,
+} from '@/lib/ipc/summary';
 import { normaliseLanguageCode } from '@/lib/summary-languages';
 
 export const SUMMARY_LANGUAGE_RECENTS_KEY = 'summaryLanguageRecents';
@@ -6,29 +14,17 @@ export const SUMMARY_LANGUAGE_DEFAULT_KEY = 'summaryLanguageDefault';
 const SUMMARY_LANGUAGE_FALLBACK_PREFIX = 'summaryLanguageFallback';
 const DETECTED_SUMMARY_LANGUAGE_FALLBACK_PREFIX = 'detectedSummaryLanguageFallback';
 
-export type SummaryLanguageStorage = 'metadata' | 'local_fallback';
-
-export interface MeetingSummaryLanguagePreference {
-  language: string | null;
-  storage: SummaryLanguageStorage;
-}
+export type {
+  MeetingSummaryLanguagePreference,
+  SummaryLanguageDetectionReason,
+  SummaryLanguageDetectionResult,
+  SummaryLanguageStorage,
+} from '@/lib/ipc/summary';
 
 type RawMeetingSummaryLanguagePreference =
   | MeetingSummaryLanguagePreference
   | string
   | null;
-
-export type SummaryLanguageDetectionReason =
-  | 'detected'
-  | 'tie'
-  | 'low_confidence'
-  | 'unsupported'
-  | 'empty';
-
-export interface SummaryLanguageDetectionResult {
-  language: string | null;
-  reason: SummaryLanguageDetectionReason;
-}
 
 export function readPinnedSummaryLanguageDefault(): string | null {
   if (typeof window === 'undefined') return null;
@@ -100,7 +96,7 @@ export async function readMeetingSummaryLanguage(
   meetingId: string
 ): Promise<MeetingSummaryLanguagePreference> {
   const response = normalisePreferenceResponse(
-    await invoke<RawMeetingSummaryLanguagePreference>('api_get_meeting_summary_language', {
+    await getMeetingSummaryLanguage({
       meetingId,
     })
   );
@@ -122,7 +118,7 @@ export async function saveMeetingSummaryLanguage(
 ): Promise<MeetingSummaryLanguagePreference> {
   const normalised = language ? normaliseLanguageCode(language) : null;
   const response = normalisePreferenceResponse(
-    await invoke<RawMeetingSummaryLanguagePreference>('api_save_meeting_summary_language', {
+    await saveMeetingSummaryLanguageCommand({
       meetingId,
       summaryLanguage: normalised,
     })
@@ -156,10 +152,7 @@ export async function applyPinnedSummaryLanguageToMeeting(meetingId: string): Pr
 
 export async function readCachedDetectedSummaryLanguage(meetingId: string): Promise<string | null> {
   const response = normalisePreferenceResponse(
-    await invoke<RawMeetingSummaryLanguagePreference>(
-      'api_get_meeting_detected_summary_language',
-      { meetingId }
-    )
+    await getMeetingDetectedSummaryLanguage({ meetingId })
   );
 
   if (response.storage === 'local_fallback') {
@@ -176,13 +169,10 @@ export async function saveCachedDetectedSummaryLanguage(
 ): Promise<void> {
   const normalised = language ? normaliseLanguageCode(language) : null;
   const response = normalisePreferenceResponse(
-    await invoke<RawMeetingSummaryLanguagePreference>(
-      'api_save_meeting_detected_summary_language',
-      {
-        meetingId,
-        detectedSummaryLanguage: normalised,
-      }
-    )
+    await saveMeetingDetectedSummaryLanguage({
+      meetingId,
+      detectedSummaryLanguage: normalised,
+    })
   );
 
   if (response.storage === 'local_fallback') {
@@ -200,10 +190,7 @@ export async function saveCachedDetectedSummaryLanguage(
 export async function detectTranscriptSummaryLanguage(
   transcriptTexts: string[]
 ): Promise<SummaryLanguageDetectionResult> {
-  const detection = await invoke<SummaryLanguageDetectionResult>(
-    'api_detect_transcript_summary_language',
-    { transcriptTexts }
-  );
+  const detection = await detectTranscriptSummaryLanguageCommand({ transcriptTexts });
 
   return {
     language: normaliseLanguageCode(detection.language),

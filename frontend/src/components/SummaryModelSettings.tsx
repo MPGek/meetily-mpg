@@ -1,7 +1,14 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import {
+  emitModelConfigUpdated,
+  getApiKey,
+  getCustomOpenaiConfig,
+  getModelConfig,
+  listenModelConfigUpdated,
+  saveModelConfig,
+} from '@/lib/ipc/settings';
 import { toast } from 'sonner';
 import { ModelConfig, ModelSettingsModal } from '@/components/ModelSettingsModal';
 import { SummaryLanguageSettings } from '@/components/SummaryLanguageSettings';
@@ -26,14 +33,14 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
   // Reusable fetch function
   const fetchModelConfig = useCallback(async () => {
     try {
-      const data = await invoke('api_get_model_config') as any;
+      const data = await getModelConfig() as any;
       if (data && data.provider !== null) {
         // Fetch API key if not included and provider requires it
         if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && !data.apiKey) {
           try {
-            const apiKeyData = await invoke('api_get_api_key', {
+            const apiKeyData = await getApiKey({
               provider: data.provider
-            }) as string;
+            });
             data.apiKey = apiKeyData;
           } catch (err) {
             console.error('Failed to fetch API key:', err);
@@ -42,7 +49,7 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
         // Fetch Custom OpenAI config if that's the active provider
         if (data.provider === 'custom-openai') {
           try {
-            const customConfig = (await invoke('api_get_custom_openai_config')) as any;
+            const customConfig = (await getCustomOpenaiConfig()) as any;
             if (customConfig) {
               data.customOpenAIDisplayName = customConfig.displayName || null;
               data.customOpenAIEndpoint = customConfig.endpoint || null;
@@ -81,8 +88,7 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
   // Listen for model config updates from other components
   useEffect(() => {
     const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
+      const unlisten = await listenModelConfigUpdated((event) => {
         console.log('SummaryModelSettings received model-config-updated event:', event.payload);
         setModelConfig(event.payload);
       });
@@ -101,7 +107,7 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
   // Save handler
   const handleSaveModelConfig = async (config: ModelConfig) => {
     try {
-      await invoke('api_save_model_config', {
+      await saveModelConfig({
         provider: config.provider,
         model: config.model,
         whisperModel: config.whisperModel,
@@ -112,8 +118,7 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
       setModelConfig(config);
 
       // Emit event to sync other components
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('model-config-updated', config);
+      await emitModelConfigUpdated(config);
 
       toast.success('Model settings saved successfully');
     } catch (error) {

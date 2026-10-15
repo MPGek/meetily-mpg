@@ -35,6 +35,10 @@ concurrency:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  # Build whisper.cpp for a portable x64 baseline, not the runner's CPU
+  # (e.g. AVX-512), which crashes with 0xC000001D on other machines.
+  # whisper-rs-sys forwards GGML_* env vars to CMake.
+  GGML_NATIVE: "OFF"
 
 jobs:
   build-windows:
@@ -474,13 +478,13 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          version: 11.20.0
           run_install: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Get pnpm store directory
         shell: bash
@@ -504,7 +508,9 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: windows-x64-vulkan-v2
+          # -portable-v1: whisper-rs-sys does not rerun on GGML_* changes,
+          # so the cached native build must be invalidated once.
+          key: windows-x64-vulkan-v2-portable-v1
 
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -635,7 +641,7 @@ jobs:
       - name: Install frontend dependencies
         run: |
           cd frontend
-          pnpm install
+          pnpm install --frozen-lockfile
 
       - name: Build llama-helper sidecar
         shell: pwsh
@@ -666,6 +672,24 @@ jobs:
           path: frontend/src-tauri/binaries/ffmpeg-*.exe
           key: ${{ runner.os }}-ffmpeg-${{ hashFiles('frontend/src-tauri/build.rs', 'frontend/src-tauri/build/ffmpeg.rs') }}
 
+      - name: Configure Whisper portability check
+        id: windows-portability
+        shell: pwsh
+        env:
+          PORTABLE_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
+        run: |
+          $buildDirectory = "target/x86_64-pc-windows-msvc/$env:PORTABLE_BUILD_PROFILE"
+          $configPath = (Join-Path $env:RUNNER_TEMP "tauri.windows-portable.conf.json").Replace('\', '/')
+          @{
+            build = @{
+              beforeBundleCommand = @{
+                script = "node .github/verify-portable-ggml.cjs $buildDirectory"
+                cwd = $env:GITHUB_WORKSPACE
+              }
+            }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Path $configPath -Encoding utf8
+          "args=--config `"$configPath`"" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -680,7 +704,34 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         with:
           projectPath: frontend
-          args: --target x86_64-pc-windows-msvc --features vulkan ${{ steps.build-profile.outputs.args }}
+          args: --target x86_64-pc-windows-msvc --features vulkan ${{ steps.build-profile.outputs.args }} ${{ steps.windows-portability.outputs.args }}
+
+      - name: Verify bundled diarization models
+        shell: pwsh
+        run: |
+          Write-Host "Verifying bundled enhanced diarization models..."
+          if (Test-Path "frontend/src-tauri/models/segmentation-3.0.onnx" -and Test-Path "frontend/src-tauri/models/titanet_large.onnx") {
+            $segSize = (Get-Item "frontend/src-tauri/models/segmentation-3.0.onnx").Length
+            $embSize = (Get-Item "frontend/src-tauri/models/titanet_large.onnx").Length
+            Write-Host "✅ segmentation-3.0.onnx ($segSize bytes)"
+            Write-Host "✅ titanet_large.onnx ($embSize bytes)"
+            if ($segSize -le 1024 -or $embSize -le 1024) {
+              Write-Error "Bundled models too small — expected >1KB"
+              exit 1
+            }
+          } else {
+            Write-Host "⚠️ Enhanced models not found in frontend/src-tauri/models/"
+            if ("${{ steps.build-profile.outputs.profile }}" -eq "release") {
+              Write-Error "Release build requires bundled enhanced models (segmentation-3.0 + TitaNet-Large). Diarization will fail at runtime."
+              exit 1
+            } else {
+              Write-Host "Debug build — skipping strict bundling check"
+            }
+          }
+          # Also run the verify script if present
+          if (Test-Path "scripts/verify-bundled-models.ps1") {
+            & "scripts/verify-bundled-models.ps1"
+          }
 
       - name: Verify build artifacts
         shell: bash

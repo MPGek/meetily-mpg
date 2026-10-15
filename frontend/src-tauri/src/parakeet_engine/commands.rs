@@ -1,8 +1,10 @@
-use crate::parakeet_engine::{ModelInfo, ModelStatus, ParakeetEngine, DownloadProgress};
+use crate::parakeet_engine::{
+    is_download_cancelled, CancelDownloadOutcome, DownloadProgress, ModelInfo, ParakeetEngine,
+};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::Arc;
-use tauri::{command, Emitter, AppHandle, Manager, Runtime};
+use std::sync::Mutex;
+use tauri::{command, AppHandle, Emitter, Manager, Runtime};
 
 // Global parakeet engine
 pub static PARAKEET_ENGINE: Mutex<Option<Arc<ParakeetEngine>>> = Mutex::new(None);
@@ -13,7 +15,9 @@ static MODELS_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Initialize the models directory path using app_data_dir
 /// This should be called during app setup before parakeet_init
 pub fn set_models_directory<R: Runtime>(app: &AppHandle<R>) {
-    let app_data_dir = app.path().app_data_dir()
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
         .expect("Failed to get app data dir");
 
     let models_dir = app_data_dir.join("models");
@@ -71,7 +75,7 @@ pub async fn parakeet_get_available_models() -> Result<Vec<ModelInfo>, String> {
 #[command]
 pub async fn parakeet_load_model<R: Runtime>(
     app_handle: AppHandle<R>,
-    model_name: String
+    model_name: String,
 ) -> Result<(), String> {
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap();
@@ -102,7 +106,10 @@ pub async fn parakeet_load_model<R: Runtime>(
                     "modelName": model_name
                 }),
             ) {
-                log::error!("Failed to emit parakeet-model-loading-completed event: {}", e);
+                log::error!(
+                    "Failed to emit parakeet-model-loading-completed event: {}",
+                    e
+                );
             }
         } else if let Err(ref error) = result {
             if let Err(e) = app_handle.emit(
@@ -209,7 +216,8 @@ pub async fn parakeet_validate_model_ready() -> Result<String, String> {
         }
 
         // Try to load the first available model (prefer int8 for speed)
-        let first_model = available_models.iter()
+        let first_model = available_models
+            .iter()
             .find(|m| m.quantization == crate::parakeet_engine::QuantizationType::Int8)
             .or_else(|| available_models.first())
             .unwrap();
@@ -304,7 +312,10 @@ pub async fn parakeet_validate_model_ready_with_config<R: tauri::Runtime>(
         let model_name = if let Some(configured_model) = model_to_load {
             // Check if configured model is available
             if available_models.iter().any(|m| m.name == configured_model) {
-                log::info!("Loading user's configured Parakeet model: {}", configured_model);
+                log::info!(
+                    "Loading user's configured Parakeet model: {}",
+                    configured_model
+                );
                 configured_model
             } else {
                 log::warn!(
@@ -393,8 +404,11 @@ pub async fn parakeet_download_model<R: Runtime>(
         let progress_callback = Box::new(move |progress: DownloadProgress| {
             log::info!(
                 "Parakeet download progress for {}: {:.1} MB / {:.1} MB ({:.1} MB/s) - {}%",
-                model_name_clone, progress.downloaded_mb, progress.total_mb,
-                progress.speed_mbps, progress.percent
+                model_name_clone,
+                progress.downloaded_mb,
+                progress.total_mb,
+                progress.speed_mbps,
+                progress.percent
             );
 
             // Emit download progress event with detailed info
@@ -408,6 +422,7 @@ pub async fn parakeet_download_model<R: Runtime>(
                     "downloaded_mb": progress.downloaded_mb,
                     "total_mb": progress.total_mb,
                     "speed_mbps": progress.speed_mbps,
+                    // In-flight percent is capped at 99; 100 is reported only after commit.
                     "status": if progress.percent == 100 { "completed" } else { "downloading" }
                 }),
             ) {
@@ -444,6 +459,22 @@ pub async fn parakeet_download_model<R: Runtime>(
 
                 Ok(())
             }
+            Err(e) if is_download_cancelled(&e) => {
+                // A user cancel is not an error: the progress event is the single
+                // source of cancel state in the UI.
+                if let Err(emit_e) = app_handle.emit(
+                    "parakeet-model-download-progress",
+                    serde_json::json!({
+                        "modelName": model_name,
+                        "progress": 0,
+                        "status": "cancelled"
+                    }),
+                ) {
+                    log::error!("Failed to emit Parakeet cancellation event: {}", emit_e);
+                }
+                log::info!("Parakeet download cancelled: {}", model_name);
+                Ok(())
+            }
             Err(e) => {
                 // Emit error event
                 if let Err(emit_e) = app_handle.emit(
@@ -464,33 +495,19 @@ pub async fn parakeet_download_model<R: Runtime>(
 }
 
 #[command]
-pub async fn parakeet_cancel_download<R: Runtime>(
-    app_handle: AppHandle<R>,
-    model_name: String,
-) -> Result<(), String> {
+pub async fn parakeet_cancel_download(model_name: String) -> Result<CancelDownloadOutcome, String> {
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
     };
 
     if let Some(engine) = engine {
-        engine
+        let outcome = engine
             .cancel_download(&model_name)
             .await
             .map_err(|e| format!("Failed to cancel Parakeet download: {}", e))?;
-
-        // Emit cancellation event to update UI (global toast and component state)
-        let _ = app_handle.emit(
-            "parakeet-model-download-progress",
-            serde_json::json!({
-                "modelName": model_name,
-                "progress": 0,
-                "status": "cancelled"
-            }),
-        );
-
-        log::info!("Parakeet download cancelled: {}", model_name);
-        Ok(())
+        log::info!("Parakeet cancel requested for {}: {:?}", model_name, outcome);
+        Ok(outcome)
     } else {
         Err("Parakeet engine not initialized".to_string())
     }
@@ -508,30 +525,9 @@ pub async fn parakeet_retry_download<R: Runtime>(
         guard.as_ref().cloned()
     };
 
-    if let Some(engine) = engine {
-        // DEFENSIVE: Ensure clean state before retry
-        // This handles any edge cases where error handler didn't complete
-        {
-            let mut active = engine.active_downloads.write().await;
-            if active.contains(&model_name) {
-                log::warn!("Retry: Model {} was still in active downloads, removing", model_name);
-                active.remove(&model_name);
-            }
-        }
-
-        // DEFENSIVE: Force model status to Missing to allow fresh download
-        {
-            let mut models = engine.available_models.write().await;
-            if let Some(model) = models.get_mut(&model_name) {
-                log::info!("Retry: Resetting model {} status from {:?} to Missing", model_name, model.status);
-                model.status = ModelStatus::Missing;
-            }
-        }
-
-        // Rediscover models to refresh state based on disk files
-        let _ = engine.discover_models().await;
-
-        // Call regular download (emits events)
+    if engine.is_some() {
+        // Retry uses the normal download entrypoint, whose owner reservation rejects
+        // a second writer until cancellation cleanup has completed.
         parakeet_download_model(app_handle, model_name).await
     } else {
         Err("Parakeet engine not initialized".to_string())

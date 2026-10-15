@@ -1,0 +1,6 @@
+[cache]
+    type = copy
+[core]
+    remote = local-server
+['remote "local-server"']
+    url = \\192.168.17.34\UsersHome\Vasiliy.Kotov\DVC\meetily-asr\

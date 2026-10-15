@@ -1,0 +1,18 @@
+# MSDWild (X-LANCE/MSDWILD, Interspeech 2022). Audio zip on Google Drive,
+# reference RTTM from the repo. License: research use only, eval-only.
+name: msdwild
+license: "Research use only (MSDWILD license agreement)"
+parser: rttm_passthrough
+channel_policy: mono
+baseline_der: 25.3
+normalize:
+  audio_archive: msdwild_wavs.zip
+  rttm_file: all.rttm
+sources:
+  - kind: gdrive
+    file_id: 1I5qfuPPGBM9keJKz0VN-OYEeRMJ7dgpl
+    filename: msdwild_wavs.zip
+    sha256: 651db2f8302136d29fa6dc6d8eb8b6d5a691a10127029406fb45e50b2f52a005
+  - kind: http
+    url: https://raw.githubusercontent.com/X-LANCE/MSDWILD/master/rttms/all.rttm
+    filename: all.rttm

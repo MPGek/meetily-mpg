@@ -1,0 +1,6 @@
+outs:
+- md5: 130cc2b53dfb71564982d80e6299026f.dir
+  size: 2338725674
+  nfiles: 218
+  hash: md5
+  path: voxconverse-dev

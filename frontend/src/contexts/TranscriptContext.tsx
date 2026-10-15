@@ -1,12 +1,16 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
-import { Transcript, TranscriptUpdate } from '@/types';
+import { Transcript, TranscriptUpdate, LiveTranscriptBlock, LiveTranscriptBlocks } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
-import { recordingService } from '@/services/recordingService';
+import { recordingService, type SpeakerTurn } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
+import { getMeetingFolderPath } from '@/lib/ipc/meetings';
+import { loadDiarizationSettings } from '@/lib/diarization';
+import { dedupeAndInsertTranscript, formatTranscriptForClipboard } from '@/lib/transcript-formatting';
+import { rematchTranscripts, rewriteTurnsForBinding, rewriteTurnsInWindow, upsertLiveBlocks, resolveMergedLiveBlocks, type LiveWindowOverride } from '@/lib/live-speaker-labels';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
@@ -14,12 +18,28 @@ interface TranscriptContextType {
   addTranscript: (update: TranscriptUpdate) => void;
   copyTranscript: () => void;
   flushBuffer: () => void;
-  transcriptContainerRef: React.RefObject<HTMLDivElement>;
+  transcriptContainerRef: React.RefCallback<HTMLDivElement>;
+  isFollowingBottom: boolean;
+  scrollToBottom: () => void;
   meetingTitle: string;
   setMeetingTitle: (title: string) => void;
   clearTranscripts: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
+  applyLiveSpeakerLabel: (
+    clusterLabel: string,
+    name: string,
+    transcriptId?: string,
+    startTime?: number,
+    endTime?: number,
+    subRow?: boolean
+  ) => void;
+  /**
+   * Live word-level diarization sub-rows for a transcript, resolved against
+   * live user assignments. Undefined unless the block was split into >1
+   * speaker run (live-word-level-diarization).
+   */
+  getLiveBlocksFor: (transcript: Transcript) => LiveTranscriptBlock[] | undefined;
 }
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
@@ -28,58 +48,187 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
   const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
+  // Mirror of isFollowingRef exposed as state so the scroll-to-bottom button
+  // can render.
+  const [isFollowingBottom, setIsFollowingBottom] = useState<boolean>(true);
+  // The live transcript scroll container, held in state so the scroll
+  // listeners re-attach when TranscriptPanel remounts (page navigation).
+  const [transcriptContainer, setTranscriptContainer] = useState<HTMLDivElement | null>(null);
 
   // Recording state context - provides backend-synced state
   const recordingState = useRecordingState();
 
   // Refs for transcript management
   const transcriptsRef = useRef<Transcript[]>(transcripts);
-  const isUserAtBottomRef = useRef<boolean>(true);
-  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const isFollowingRef = useRef<boolean>(true);
+  const transcriptContainerElRef = useRef<HTMLDivElement | null>(null);
+  const transcriptContainerRef = useCallback((el: HTMLDivElement | null) => {
+    transcriptContainerElRef.current = el;
+    setTranscriptContainer(el);
+  }, []);
   const finalFlushRef = useRef<(() => void) | null>(null);
+  const turnsRef = useRef<SpeakerTurn[]>([]);
+  // Live word-level diarization: latest display revision per parent
+  // sequence_id (live-word-level-diarization). Display-only.
+  const [liveBlocks, setLiveBlocks] = useState<Map<number, LiveTranscriptBlocks>>(new Map());
+  const liveBlocksRef = useRef<Map<number, LiveTranscriptBlocks>>(new Map());
+  // Window-scoped single-turn overrides, re-keyed onto the covering sub-row
+  // when a block is live-split (live-speaker-labels delta).
+  const windowOverridesRef = useRef<LiveWindowOverride[]>([]);
+  // User-pinned live labels by transcript id: the name the user gave a whole
+  // (unsplit) block, applied to every sub-row of its cluster after a split.
+  const userAssignmentsRef = useRef<Map<string, { cluster: string; name: string }>>(new Map());
+  // Transcripts the user edited (whole block or a sub-row): frozen for the
+  // rest of the session, never re-matched against the live turn stream, so no
+  // later (possibly stale) turn can revert the user's choice.
+  const frozenTranscriptsRef = useRef<Set<string>>(new Set());
+  // Cluster-wide live bindings: cluster label -> person name (apply-to-all).
+  // Used to (re)apply the binding to the turn stream and future re-matches.
+  const clusterBindingsRef = useRef<Map<string, string>>(new Map());
+
+  // Record a per-transcript assignment (single-block edit).
+  const pinTranscript = (id: string, cluster: string, name: string) => {
+    userAssignmentsRef.current.set(id, { cluster, name });
+    frozenTranscriptsRef.current.add(id);
+  };
+
+  // Record an apply-to-all cluster binding and rewrite the turn stream so every
+  // turn of the cluster carries the user's name (self-consistent re-matching).
+  const bindCluster = (clusterLabel: string, name: string) => {
+    clusterBindingsRef.current.set(clusterLabel, name);
+    turnsRef.current = rewriteTurnsForBinding(turnsRef.current, clusterLabel, name);
+  };
 
   // Keep ref updated with current transcripts
   useEffect(() => {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
 
-  // Smart auto-scroll: Track user scroll position
-  useEffect(() => {
-    const handleScroll = () => {
-      const container = transcriptContainerRef.current;
-      if (!container) return;
-
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const isAtBottom = scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
-      isUserAtBottomRef.current = isAtBottom;
-    };
-
-    const container = transcriptContainerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll);
-      return () => container.removeEventListener('scroll', handleScroll);
-    }
+  // Live auto-follow. Following changes only on user intent: an upward
+  // scroll pauses it; reaching the bottom or the button resumes it. Where a
+  // programmatic scroll or content growth leaves the view never turns it off,
+  // because content keeps growing (new segments, typewriter text, speaker
+  // labels, sub-rows) after any scroll has been aimed at the old bottom.
+  const isContainerAtBottom = useCallback((container: HTMLDivElement) => {
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    return scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
   }, []);
 
-  // Auto-scroll when transcripts change (only if user is at bottom)
-  useEffect(() => {
-    // Only auto-scroll if user was at the bottom before new content
-    if (isUserAtBottomRef.current && transcriptContainerRef.current) {
-      // Wait for Framer Motion animation to complete (150ms) before scrolling
-      // This ensures scrollHeight includes the full rendered height of the new transcript
-      const scrollTimeout = setTimeout(() => {
-        const container = transcriptContainerRef.current;
-        if (container) {
-          container.scrollTo({
-            top: container.scrollHeight,
-            behavior: 'smooth'
-          });
-        }
-      }, 150); // Match Framer Motion transition duration
+  const setFollowing = useCallback((following: boolean) => {
+    isFollowingRef.current = following;
+    setIsFollowingBottom(following);
+  }, []);
 
-      return () => clearTimeout(scrollTimeout);
+  useEffect(() => {
+    const container = transcriptContainer;
+    if (!container) return;
+
+    // A freshly mounted panel starts at the live bottom.
+    setFollowing(true);
+    container.scrollTop = container.scrollHeight;
+    let lastScrollTop = container.scrollTop;
+
+    const handleScroll = () => {
+      const scrollTop = container.scrollTop;
+      if (isContainerAtBottom(container)) {
+        setFollowing(true);
+      } else if (scrollTop < lastScrollTop - 1) {
+        // Only the user moves the view up: pinning, clamping and content
+        // growth move it down or leave it at the bottom.
+        setFollowing(false);
+      }
+      lastScrollTop = scrollTop;
+    };
+
+    // The wheel event arrives before the scroll it causes, so a wheel-up is
+    // never undone by a pin from content that grew in the same frame.
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0 && container.scrollTop > 0) {
+        setFollowing(false);
+      }
+    };
+
+    // Pin to the bottom whenever the container or its content changes size.
+    const resizeObserver = new ResizeObserver(() => {
+      if (isFollowingRef.current) {
+        container.scrollTop = container.scrollHeight;
+      }
+    });
+    resizeObserver.observe(container);
+    Array.from(container.children).forEach(child => resizeObserver.observe(child));
+
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    container.addEventListener('wheel', handleWheel, { passive: true });
+    return () => {
+      resizeObserver.disconnect();
+      container.removeEventListener('scroll', handleScroll);
+      container.removeEventListener('wheel', handleWheel);
+    };
+  }, [transcriptContainer, isContainerAtBottom, setFollowing]);
+
+  // Return to the live bottom and resume auto-follow (scroll-to-bottom button).
+  const scrollToBottom = useCallback(() => {
+    setFollowing(true);
+    const container = transcriptContainerElRef.current;
+    if (container) {
+      container.scrollTop = container.scrollHeight;
     }
-  }, [transcripts]);
+  }, [setFollowing]);
+
+  // Listen for live speaker turns (Fast-mode online diarization) and
+  // retroactively assign `speaker` to transcript segments by time overlap.
+  useEffect(() => {
+    let unlistenSpeakerTurn: (() => void) | undefined;
+
+    const setupSpeakerTurnListener = async () => {
+      try {
+        unlistenSpeakerTurn = await recordingService.onSpeakerTurn((turn) => {
+          turnsRef.current = [...turnsRef.current, turn];
+          setTranscripts(prev =>
+            rematchTranscripts(prev, turnsRef.current, frozenTranscriptsRef.current)
+          );
+        });
+      } catch (error) {
+        console.error('Failed to setup speaker turn listener:', error);
+      }
+    };
+
+    setupSpeakerTurnListener();
+
+    return () => {
+      if (unlistenSpeakerTurn) {
+        unlistenSpeakerTurn();
+      }
+    };
+  }, []);
+
+  // Listen for live word-level diarization display revisions and keep only the
+  // latest revision per parent sequence_id (replace semantics, no duplicate
+  // rows across re-attribution).
+  useEffect(() => {
+    let unlistenLiveBlocks: (() => void) | undefined;
+
+    const setupLiveBlocksListener = async () => {
+      try {
+        unlistenLiveBlocks = await recordingService.onLiveTranscriptBlocks((payload) => {
+          const next = upsertLiveBlocks(liveBlocksRef.current, payload);
+          if (next === liveBlocksRef.current) return;
+          liveBlocksRef.current = next;
+          setLiveBlocks(next);
+        });
+      } catch (error) {
+        console.error('Failed to setup live-transcript-blocks listener:', error);
+      }
+    };
+
+    setupLiveBlocksListener();
+
+    return () => {
+      if (unlistenLiveBlocks) {
+        unlistenLiveBlocks();
+      }
+    };
+  }, []);
 
   // Initialize IndexedDB and listen for recording-started/stopped events
   useEffect(() => {
@@ -94,6 +243,16 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         // Listen for recording-started event
         unlistenRecordingStarted = await recordingService.onRecordingStarted(async () => {
           try {
+            // Reset live speaker turns for the new recording session
+            turnsRef.current = [];
+            userAssignmentsRef.current = new Map();
+            frozenTranscriptsRef.current = new Set();
+            clusterBindingsRef.current = new Map();
+            // Reset live word-level diarization display state too.
+            liveBlocksRef.current = new Map();
+            windowOverridesRef.current = [];
+            setLiveBlocks(new Map());
+
             // Generate unique meeting ID
             const meetingId = `meeting-${Date.now()}`;
             setCurrentMeetingId(meetingId);
@@ -105,8 +264,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             // Get meeting name
             const meetingName = await recordingService.getRecordingMeetingName();
 
-            // Use a better fallback that matches the backend's naming pattern
-            const effectiveTitle = meetingName || `Meeting ${new Date().toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-')}`;
+            // Fallback matching the local YYYY-MM-DD_HH-MM naming format
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const day = String(now.getDate()).padStart(2, '0');
+            const hours = String(now.getHours()).padStart(2, '0');
+            const minutes = String(now.getMinutes()).padStart(2, '0');
+            const effectiveTitle = meetingName || `Meeting ${year}-${month}-${day}_${hours}-${minutes}`;
 
             // Initialize meeting metadata in IndexedDB
             await indexedDBService.saveMeetingMetadata({
@@ -125,8 +290,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             // Fetch folder path from backend and update metadata
             // This ensures folder path is persisted even if app crashes
             try {
-              const { invoke } = await import('@tauri-apps/api/core');
-              const folderPath = await invoke<string>('get_meeting_folder_path');
+              const folderPath = await getMeetingFolderPath();
               if (folderPath) {
                 const metadata = await indexedDBService.getMeetingMetadata(meetingId);
                 if (metadata) {
@@ -134,7 +298,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
                   await indexedDBService.saveMeetingMetadata(metadata);
                 }
               }
-            } catch (error) {
+            } catch {
               // Non-fatal - will be set on stop if recording completes normally
             }
           } catch (error) {
@@ -152,6 +316,29 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
               if (metadata && payload.folder_path) {
                 metadata.folderPath = payload.folder_path;
                 await indexedDBService.saveMeetingMetadata(metadata);
+              }
+
+              // Auto-trigger speaker diarization if enabled.
+              // Online modes ("fast"/"efficient") apply speaker labels at
+              // recording stop on the Rust side, so offline diarization is
+              // only triggered for mode "off" or when online processing failed.
+              const diarSettings = loadDiarizationSettings();
+              const onlineDiarizationUsed = payload.online_diarization_used === true;
+              if (diarSettings.enabled && diarSettings.autoRun && !onlineDiarizationUsed) {
+                try {
+                  const modelStatus = await recordingService.checkDiarizationModels();
+                  if (modelStatus.ready) {
+                    console.log('[Diarization] Auto-triggering speaker analysis for meeting:', currentMeetingId);
+                    await recordingService.startDiarization(
+                      currentMeetingId,
+                      diarSettings.maxSpeakers || undefined
+                    );
+                  } else {
+                    console.log('[Diarization] Enhanced models not ready, skipping auto-trigger');
+                  }
+                } catch (diarError) {
+                  console.error('[Diarization] Auto-trigger failed:', diarError);
+                }
               }
             }
           } catch (error) {
@@ -181,7 +368,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
     let transcriptCounter = 0;
-    let transcriptBuffer = new Map<number, Transcript>();
+    const transcriptBuffer = new Map<number, Transcript>();
     let lastProcessedSequence = 0;
     let processingTimer: NodeJS.Timeout | undefined;
 
@@ -264,11 +451,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           const combined = [...prev, ...uniqueNewTranscripts];
 
           // Sort by chunk_start_time first, then by sequence_id
-          return combined.sort((a, b) => {
+          const sorted = combined.sort((a, b) => {
             const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
             if (chunkTimeDiff !== 0) return chunkTimeDiff;
             return (a.sequence_id || 0) - (b.sequence_id || 0);
           });
+          // The diarizer often emits a row's turn before the row arrives;
+          // match now instead of waiting for the next turn.
+          return rematchTranscripts(sorted, turnsRef.current, frozenTranscriptsRef.current);
         });
 
         // Log the processing summary
@@ -316,6 +506,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_end_time: update.audio_end_time,
             duration: update.duration,
             source_device: update.source_device,
+            tokens: update.tokens,
           };
 
           // Add to buffer
@@ -373,7 +564,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           console.log(`[Reload Sync] Retrieved ${history.length} transcript segments from backend`);
 
           // Convert backend format to frontend Transcript format
-          const formattedTranscripts: Transcript[] = history.map((segment: any) => ({
+          const formattedTranscripts: Transcript[] = history.map((segment) => ({
             id: segment.id,
             text: segment.text,
             timestamp: segment.display_time, // Use display_time for UI
@@ -385,6 +576,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_end_time: segment.audio_end_time,
             duration: segment.duration,
             source_device: segment.source_device,
+            tokens: segment.tokens,
           }));
 
           setTranscripts(formattedTranscripts);
@@ -404,6 +596,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     };
 
     syncFromBackend();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- reload sync keyed on recording state; adding transcripts.length would re-fetch history from the backend whenever transcripts are cleared mid-recording
   }, [recordingState.isRecording]); // Run when recording state changes
 
   // Manual transcript update handler (for RecordingControls component)
@@ -427,23 +620,17 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       audio_end_time: update.audio_end_time,
       duration: update.duration,
       source_device: update.source_device,
+      tokens: update.tokens,
     };
 
     setTranscripts(prev => {
       console.log('📊 Current transcripts count before update:', prev.length);
 
-      // Check if this transcript already exists
-      const exists = prev.some(
-        t => t.text === update.text && t.timestamp === update.timestamp
-      );
-      if (exists) {
+      const sorted = dedupeAndInsertTranscript(prev, newTranscript);
+      if (sorted === prev) {
         console.log('🚫 Duplicate transcript detected, skipping:', update.text.substring(0, 30) + '...');
         return prev;
       }
-
-      // Add new transcript and sort by sequence_id to maintain order
-      const updated = [...prev, newTranscript];
-      const sorted = updated.sort((a, b) => (a.sequence_id || 0) - (b.sequence_id || 0));
 
       console.log('✅ Added new transcript. New count:', sorted.length);
       console.log('📝 Latest transcript:', {
@@ -458,18 +645,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Copy transcript to clipboard with recording-relative timestamps
   const copyTranscript = useCallback(() => {
-    // Format timestamps as recording-relative [MM:SS] instead of wall-clock time
-    const formatTime = (seconds: number | undefined): string => {
-      if (seconds === undefined) return '[--:--]';
-      const totalSecs = Math.floor(seconds);
-      const mins = Math.floor(totalSecs / 60);
-      const secs = totalSecs % 60;
-      return `[${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
-    };
-
-    const fullTranscript = transcripts
-      .map(t => `${formatTime(t.audio_start_time)} ${t.text}`)
-      .join('\n');
+    const fullTranscript = formatTranscriptForClipboard(transcripts);
     navigator.clipboard.writeText(fullTranscript);
 
     toast.success("Transcript copied to clipboard");
@@ -486,6 +662,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // Clear transcripts (used when starting new recording)
   const clearTranscripts = useCallback(() => {
     setTranscripts([]);
+    turnsRef.current = [];
+    userAssignmentsRef.current = new Map();
+    frozenTranscriptsRef.current = new Set();
+    clusterBindingsRef.current = new Map();
+    liveBlocksRef.current = new Map();
+    windowOverridesRef.current = [];
+    setLiveBlocks(new Map());
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -512,6 +695,96 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, [currentMeetingId]);
 
+  // Apply a live Fast-mode rename locally. Default (no transcriptId): every
+  // block of the cluster shows the chosen name immediately (cluster-wide
+  // bind/prototype update already done by the backend). When a transcriptId
+  // is given (single-block scope), only that segment is relabeled via its
+  // per-turn override; the backend already recorded it in session state.
+  const applyLiveSpeakerLabel = useCallback((
+    clusterLabel: string,
+    name: string,
+    transcriptId?: string,
+    startTime?: number,
+    endTime?: number,
+    subRow?: boolean
+  ) => {
+    // Mutate refs OUTSIDE the state updater so the assignment maps stay in
+    // sync and are never re-run/re-ordered by React batching.
+    if (transcriptId !== undefined) {
+      // Single-block edit: rewrite only the turn(s) overlapping this
+      // transcript's window (so a later re-match can't see the stale auto
+      // turn for that window) and freeze just this transcript.
+      const target = transcriptsRef.current.find(t => t.id === transcriptId);
+      const tStart = startTime ?? target?.audio_start_time ?? 0;
+      const tEnd = endTime ?? target?.audio_end_time ?? tStart;
+      if (target) {
+        turnsRef.current = rewriteTurnsInWindow(
+          turnsRef.current,
+          clusterLabel,
+          target.source_device,
+          tStart,
+          tEnd,
+          name
+        );
+      }
+      if (subRow) {
+        // One sub-row of a split block: a window-scoped override for that
+        // sub-row only. The block's pin is left alone so siblings of the same
+        // cluster keep their own names (and confirm affordances).
+        windowOverridesRef.current = [
+          ...windowOverridesRef.current,
+          { cluster: clusterLabel, sourceDevice: target?.source_device, start: tStart, end: tEnd, name },
+        ];
+        frozenTranscriptsRef.current.add(transcriptId);
+      } else {
+        // Whole (unsplit) block: pin it; a later split carries the name onto
+        // every sub-row of this cluster.
+        pinTranscript(transcriptId, clusterLabel, name);
+      }
+    } else {
+      // Apply-to-all: record the cluster binding and rewrite every turn of
+      // the cluster to the user's name.
+      bindCluster(clusterLabel, name);
+      transcriptsRef.current.forEach(t => {
+        if (t.speaker === clusterLabel) {
+          pinTranscript(t.id, clusterLabel, name);
+        }
+      });
+    }
+
+    setTranscripts(prev =>
+      prev.map(t => {
+        if (transcriptId !== undefined) {
+          if (t.id !== transcriptId) return t;
+          // A sub-row edit leaves the parent's own label alone; the new
+          // object only re-resolves this block's sub-rows.
+          if (subRow) return { ...t };
+          return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
+        }
+        if (t.speaker !== clusterLabel) return t;
+        return { ...t, speaker_label: name, speaker_matched_by: 'user', speaker_match_score: undefined };
+      })
+    );
+  }, []);
+
+  // Resolve a transcript's live word-level diarization sub-rows against the
+  // session's live user assignments, merging adjacent sub-rows of the same
+  // visible speaker. Only blocks split into >1 speaker run are returned, so
+  // single-speaker blocks render exactly as before; a split whose runs all
+  // merge comes back as one run, which the panel uses as the row's label.
+  const getLiveBlocksFor = useCallback((transcript: Transcript): LiveTranscriptBlock[] | undefined => {
+    const seq = transcript.sequence_id;
+    if (seq === undefined || seq === null) return undefined;
+    const payload = liveBlocks.get(seq);
+    if (!payload || payload.blocks.length < 2) return undefined;
+    return resolveMergedLiveBlocks(payload.blocks, {
+      clusterBindings: clusterBindingsRef.current,
+      pinned: userAssignmentsRef.current.get(transcript.id),
+      windowOverrides: windowOverridesRef.current,
+      sourceDevice: transcript.source_device,
+    });
+  }, [liveBlocks]);
+
   const value: TranscriptContextType = {
     transcripts,
     transcriptsRef,
@@ -519,11 +792,15 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     copyTranscript,
     flushBuffer,
     transcriptContainerRef,
+    isFollowingBottom,
+    scrollToBottom,
     meetingTitle,
     setMeetingTitle,
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,
+    applyLiveSpeakerLabel,
+    getLiveBlocksFor,
   };
 
   return (
