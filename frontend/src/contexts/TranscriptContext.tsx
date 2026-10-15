@@ -451,11 +451,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
           const combined = [...prev, ...uniqueNewTranscripts];
 
           // Sort by chunk_start_time first, then by sequence_id
-          return combined.sort((a, b) => {
+          const sorted = combined.sort((a, b) => {
             const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
             if (chunkTimeDiff !== 0) return chunkTimeDiff;
             return (a.sequence_id || 0) - (b.sequence_id || 0);
           });
+          // The diarizer often emits a row's turn before the row arrives;
+          // match now instead of waiting for the next turn.
+          return rematchTranscripts(sorted, turnsRef.current, frozenTranscriptsRef.current);
         });
 
         // Log the processing summary

@@ -136,9 +136,28 @@ describe("rematchTranscripts freeze", () => {
     expect(out[0].speaker_label).toBe("Dana");
     expect(out[0].speaker_matched_by).toBe("auto");
   });
+
+  test("a row that arrives after its covering turn is labeled on arrival", () => {
+    // The turn was received first; the row is appended with no further turn.
+    const turns = [turn({ start_time: 60, end_time: 69.5, speaker: "SPEAKER_02", display_name: "Artsiom" })];
+    const existing = [transcript({ id: "A", audio_start_time: 50, audio_end_time: 55, speaker: "SPEAKER_02", speaker_label: "Artsiom" })];
+    const arrived = transcript({ id: "B", audio_start_time: 68, audio_end_time: 70 });
+    const out = rematchTranscripts([...existing, arrived], turns, new Set<string>());
+    expect(out[1].speaker).toBe("SPEAKER_02");
+    expect(out[1].speaker_label).toBe("Artsiom");
+  });
+
+  test("a frozen row keeps its label when new rows arrive", () => {
+    const turns = [turn({ start_time: 0, end_time: 10, speaker: "SPEAKER_04", display_name: "Bob", matched_by: "auto" })];
+    const pinned = transcript({ id: "T", audio_start_time: 0, audio_end_time: 3, speaker: "SPEAKER_01", speaker_label: "Alice", speaker_matched_by: "user" });
+    const arrived = transcript({ id: "N", audio_start_time: 5, audio_end_time: 7 });
+    const out = rematchTranscripts([pinned, arrived], turns, new Set(["T"]));
+    expect(out[0]).toBe(pinned);
+    expect(out[1].speaker).toBe("SPEAKER_04");
+  });
 });
 
-const liveBlocks = (partial: Partial<LiveTranscriptBlocks>): LiveTranscriptBlocks => ({
+const liveBlocks =(partial: Partial<LiveTranscriptBlocks>): LiveTranscriptBlocks => ({
   parent_sequence_id: 7,
   source_device: "Microphone",
   revision: 1,
