@@ -57,8 +57,9 @@ struct Args {
     /// Maximum number of speakers (omit for the configured ceiling)
     #[arg(long)]
     max_speakers: Option<i32>,
-    /// Chunking policy: production (default, the recording pipeline's recipe)
-    /// or fixed:<secs> (an ablation, never valid for a parity claim)
+    /// Chunking policy: production (default, the recording pipeline's recipe),
+    /// fixed:<secs> or gap:<ms>[,short:<ms><<ms>] (ablations, never valid
+    /// for a parity claim)
     #[arg(long, default_value = "production")]
     chunking: String,
     /// Recording URI field in RTTM lines (default: input file stem)
@@ -97,12 +98,63 @@ enum ChunkingPolicy {
     /// the segmentation the pipeline sees, so its numbers are not comparable
     /// to production.
     FixedWindow { secs: f64 },
+    /// The production recipe with another flush gap: `gap:<ms>`, optionally
+    /// `gap:<ms>,short:<ms><<below ms>` for a different gap while the pending
+    /// span is shorter than `below`. An ablation for live-gap sweeps.
+    Gap(GapRule),
+}
+
+/// The silence after the pending tail that flushes it, as `pipeline.rs`
+/// decides it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GapRule {
+    gap_ms: f64,
+    /// (gap, below): use `gap` while the pending span is shorter than `below`.
+    short: Option<(f64, f64)>,
+}
+
+const PRODUCTION_GAP: GapRule = GapRule {
+    gap_ms: FLUSH_GAP_MS,
+    short: None,
+};
+
+impl GapRule {
+    fn for_pending(&self, pending: &[SpeechSegment]) -> f64 {
+        match (self.short, pending.first(), pending.last()) {
+            (Some((short, below)), Some(first), Some(last))
+                if last.end_timestamp_ms - first.start_timestamp_ms < below =>
+            {
+                short
+            }
+            _ => self.gap_ms,
+        }
+    }
+
+    /// Gaps inside one pending group all stayed below its rule, so merging
+    /// with the largest rule keeps the group whole.
+    fn merge_gap_ms(&self) -> f64 {
+        self.short.map_or(self.gap_ms, |(s, _)| s.max(self.gap_ms))
+    }
 }
 
 impl ChunkingPolicy {
     fn parse(raw: &str) -> Result<Self, String> {
         if raw.eq_ignore_ascii_case("production") {
             return Ok(Self::Production);
+        }
+        if let Some(rest) = raw.strip_prefix("gap:") {
+            let bad = || format!("invalid --chunking '{raw}' (expected gap:<ms>[,short:<ms><<ms>])");
+            let (gap, short) = match rest.split_once(",short:") {
+                Some((gap, short)) => {
+                    let (s, below) = short.split_once('<').ok_or_else(bad)?;
+                    let s: f64 = s.trim().parse().map_err(|_| bad())?;
+                    let below: f64 = below.trim().parse().map_err(|_| bad())?;
+                    (gap, Some((s, below)))
+                }
+                None => (rest, None),
+            };
+            let gap_ms: f64 = gap.trim().parse().map_err(|_| bad())?;
+            return Ok(Self::Gap(GapRule { gap_ms, short }));
         }
         if let Some(rest) = raw.strip_prefix("fixed:") {
             let secs: f64 = rest
@@ -123,6 +175,11 @@ impl ChunkingPolicy {
         match self {
             Self::Production => "production".to_string(),
             Self::FixedWindow { secs } => format!("fixed:{secs}"),
+            Self::Gap(GapRule { gap_ms, short: None }) => format!("gap:{gap_ms}"),
+            Self::Gap(GapRule {
+                gap_ms,
+                short: Some((s, below)),
+            }) => format!("gap:{gap_ms},short:{s}<{below}"),
         }
     }
 
@@ -139,7 +196,11 @@ impl ChunkingPolicy {
 /// drops, so that mapping is the identity and VAD-counter time *is* the file
 /// offset. The caller asserts the resulting times against the recording
 /// duration.
-fn production_chunks(samples: &[f32], sample_rate: u32) -> Result<Vec<AudioChunk>, String> {
+fn production_chunks(
+    samples: &[f32],
+    sample_rate: u32,
+    rule: GapRule,
+) -> Result<Vec<AudioChunk>, String> {
     let vad_config = VadConfig::live();
     let min_segment_samples = vad_config.min_segment_samples;
     let mut vad = ContinuousVadProcessor::new(sample_rate, vad_config)
@@ -161,16 +222,17 @@ fn production_chunks(samples: &[f32], sample_rate: u32) -> Result<Vec<AudioChunk
             .map_err(|e| format!("VAD failed: {e}"))?;
 
         // Flush when the first new segment is distant from the pending tail.
+        let flush_gap_ms = rule.for_pending(pending);
         let should_flush = segments
             .first()
             .and_then(|first| {
                 pending
                     .last()
-                    .map(|last| (first.start_timestamp_ms - last.end_timestamp_ms) >= FLUSH_GAP_MS)
+                    .map(|last| (first.start_timestamp_ms - last.end_timestamp_ms) >= flush_gap_ms)
             })
             .unwrap_or(false);
         if should_flush {
-            flush_pending(pending, min_segment_samples, chunks);
+            flush_pending(pending, min_segment_samples, rule.merge_gap_ms(), chunks);
         }
 
         pending.append(&mut segments);
@@ -180,7 +242,7 @@ fn production_chunks(samples: &[f32], sample_rate: u32) -> Result<Vec<AudioChunk
             .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
             .sum();
         if total_ms > FLUSH_ACCUMULATED_MS {
-            flush_pending(pending, min_segment_samples, chunks);
+            flush_pending(pending, min_segment_samples, rule.merge_gap_ms(), chunks);
         }
         Ok(())
     };
@@ -201,22 +263,24 @@ fn production_chunks(samples: &[f32], sample_rate: u32) -> Result<Vec<AudioChunk
         Ok(mut tail) => pending.append(&mut tail),
         Err(e) => return Err(format!("VAD flush failed: {e}")),
     }
-    flush_pending(&mut pending, min_segment_samples, &mut chunks);
+    flush_pending(&mut pending, min_segment_samples, rule.merge_gap_ms(), &mut chunks);
 
     Ok(chunks)
 }
 
-/// The pipeline's flush: merge segments closer than 500 ms, drop anything
-/// below the live minimum length, and emit one chunk per merged segment.
+/// The pipeline's flush: merge segments closer than `merge_gap_ms` (500 ms in
+/// production), drop anything below the live minimum length, and emit one
+/// chunk per merged segment.
 fn flush_pending(
     pending: &mut Vec<SpeechSegment>,
     min_segment_samples: usize,
+    merge_gap_ms: f64,
     chunks: &mut Vec<AudioChunk>,
 ) {
     if pending.is_empty() {
         return;
     }
-    let merged = merge_segments(pending, FLUSH_GAP_MS, 25 * LIVE_SAMPLE_RATE as usize);
+    let merged = merge_segments(pending, merge_gap_ms, 25 * LIVE_SAMPLE_RATE as usize);
     // The pipeline clears the accumulator after dispatching the merged set.
     pending.clear();
     for segment in merged {
@@ -363,7 +427,8 @@ fn run(args: Args) -> Result<(), String> {
         .unwrap_or_else(|| "unknown".to_string());
 
     let chunks = match policy {
-        ChunkingPolicy::Production => production_chunks(&samples, decoded.sample_rate)?,
+        ChunkingPolicy::Production => production_chunks(&samples, decoded.sample_rate, PRODUCTION_GAP)?,
+        ChunkingPolicy::Gap(rule) => production_chunks(&samples, decoded.sample_rate, rule)?,
         ChunkingPolicy::FixedWindow { secs } => {
             fixed_window_chunks(&samples, decoded.sample_rate, secs)
         }
@@ -648,7 +713,7 @@ mod tests {
             segment(4100.0, 5200.0), // 1.08 s later: its own chunk
         ];
         let mut chunks = Vec::new();
-        flush_pending(&mut pending, min_samples, &mut chunks);
+        flush_pending(&mut pending, min_samples, FLUSH_GAP_MS, &mut chunks);
 
         assert!(
             pending.is_empty(),
@@ -694,7 +759,7 @@ mod tests {
         samples.extend_from_slice(&speech[half..]);
         let duration = samples.len() as f64 / LIVE_SAMPLE_RATE as f64;
 
-        let chunks = production_chunks(&samples, LIVE_SAMPLE_RATE).expect("chunking runs");
+        let chunks = production_chunks(&samples, LIVE_SAMPLE_RATE, PRODUCTION_GAP).expect("chunking runs");
         eprintln!(
             "gap {:.3}-{:.3}s of {:.3}s; chunks: {:?}",
             gap_start,
