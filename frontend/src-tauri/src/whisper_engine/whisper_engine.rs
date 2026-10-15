@@ -1,6 +1,7 @@
 // Commit name to recover the serial whisper engine processing for smaller meetings [Slower processing but dooes not fail] - "before parallel processing implementation"
 
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
+use super::hallucination_filter::{drop_hallucinated_text, drop_hallucinated_tokens};
 use crate::config::WHISPER_MODEL_CATALOG;
 use crate::model_download::{
     is_download_cancelled, CancelDownloadOutcome, DownloadCancelled, DownloadOwner,
@@ -715,6 +716,16 @@ impl WhisperEngine {
             }
         }
 
+        let (kept_text, removed) = drop_hallucinated_tokens(&mut all_tokens);
+        if !removed.is_empty() {
+            perf_debug!(
+                "Removed {} Whisper hallucination sentence(s): {:?}",
+                removed.len(),
+                removed
+            );
+            result = kept_text;
+        }
+
         let final_result = result.trim().to_string();
         let cleaned_result = Self::clean_repetitive_text(&final_result);
 
@@ -855,6 +866,15 @@ impl WhisperEngine {
                     result.push_str(clean);
                 }
             }
+        }
+        let (kept_text, removed) = drop_hallucinated_tokens(&mut all_tokens);
+        if !removed.is_empty() {
+            perf_debug!(
+                "Removed {} Whisper hallucination sentence(s): {:?}",
+                removed.len(),
+                removed
+            );
+            result = kept_text;
         }
         let final_text = Self::clean_repetitive_text(result.trim());
         if final_text != result.trim() && !all_tokens.is_empty() && !final_text.is_empty() {
@@ -1058,7 +1078,16 @@ impl WhisperEngine {
             }
         }
 
-        let final_result = result.trim().to_string();
+        let mut final_result = result.trim().to_string();
+        let (kept_text, removed) = drop_hallucinated_text(&final_result);
+        if !removed.is_empty() {
+            perf_debug!(
+                "Removed {} Whisper hallucination sentence(s): {:?}",
+                removed.len(),
+                removed
+            );
+            final_result = kept_text;
+        }
 
         // Check for repetition loops and clean them up
         let cleaned_result = Self::clean_repetitive_text(&final_result);
